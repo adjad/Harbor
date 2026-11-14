@@ -25,7 +25,10 @@ Harbor is a Swift app plus a bundled Python (FastAPI) service. It is Apache-2.0 
 - **Study.** Reads coursework from Canvas pages you have open in your browser (through the
   Accessibility API; Harbor never clicks, submits or types on a school site) and from Google Docs
   and Slides you pick in Google Drive. It makes study guides, practice quizzes, short lessons and
-  flash cards. Study material is written by a cloud model you connect with your own key.
+  flash cards. Study material is written by a cloud model you connect with your own key. Drive
+  slides and PDFs are read one page at a time with Gemini. Brief then shows "Ready for tomorrow"
+  with a prepared quiz, Day shows the slides that match a deadline and a "Review (15 min)" item,
+  and Ask answers cite the deck and page.
 
 Also in the app: meeting notes, reading files attached to email, and an optional mode where Harbor
 adds events and reminders by itself from trusted sources (off until you say yes, with an Undo on
@@ -57,15 +60,6 @@ where you connect it.
   Tasks and Contacts. Harbor cannot send, edit or delete anything in your Google account. Brief and
   Day use Gmail and Calendar; Study and Ask use Drive and Docs. See
   [docs/google-cloud-setup.md](docs/google-cloud-setup.md) for the exact scopes and APIs.
-
-### Coming in the next update
-
-This change is written but is not in this source tree yet. It will land as a later commit.
-
-- **Slides and PDFs from Drive, page by page.** Gemini reads Drive slides and PDFs one page at a
-  time, and the result is tied into the rest of the app. Brief shows "Ready for tomorrow" with a
-  prepared quiz. Day shows matching slides, a "Review (15 min)" item, and offers a study block in a
-  free calendar gap. Ask answers cite the deck and page.
 
 ## Privacy
 

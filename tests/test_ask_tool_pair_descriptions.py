@@ -68,8 +68,9 @@ def test_sharpened_descriptions_did_not_grow_the_schema_budget():
     # Batch 3 adds `inside`/`across` to it and two tools, read_message_attachments
     # and save_email_attachment (96 built-ins): 42,140.
     builtin = [t for t in REGISTRY.values() if t.category not in {"skill_tool", "mcp_read", "mcp_action"}]
-    # 42,262 once the descriptions name the product "Harbor", two letters longer per mention.
-    assert sum(len(t.description or "") for t in builtin) <= 42_270  # +29: delete_note is a new tool ("Delete one note, by exact title.")
+    # study_slides and study_make (Study's two Ask tools) add 191: 42,391.
+    # 42,453 once the descriptions name the product "Harbor", two letters longer per mention.
+    assert sum(len(t.description or "") for t in builtin) <= 42_470  # +29: delete_note is a new tool ("Delete one note, by exact title.")
 
 
 def test_retrieval_text_stays_pinned_so_rankings_do_not_move():
