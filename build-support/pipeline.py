@@ -1,0 +1,1607 @@
+#!/usr/bin/env python3
+"""Harbor's source-to-artifact pipeline. Stdlib driver; no app launch or install."""
+from __future__ import annotations
+
+import argparse
+import contextlib
+from datetime import datetime, timezone
+import hashlib
+import http.client
+import json
+import mimetypes
+import os
+from pathlib import Path
+import platform
+import plistlib
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.parse import quote, urlencode
+import zipfile
+
+import engine as engine_build
+import engine_licenses
+import uv_tool
+
+ROOT = Path(__file__).resolve().parents[1]
+SUPPORT = ROOT / "build-support"
+CONFIG = json.loads((SUPPORT / "toolchain.json").read_text())
+STATE = ROOT / ".harbor-build"
+MACH_MAGICS = {b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xfe\xed\xfa\xce", b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca", b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca"}
+
+
+class BuildError(RuntimeError):
+    pass
+
+
+def digest(path: Path) -> str:
+    with path.open("rb") as handle:
+        result = hashlib.sha256()
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            result.update(chunk)
+        return result.hexdigest()
+
+
+def json_write(path: Path, value) -> None:
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+
+
+def git(*args: str) -> str:
+    return subprocess.check_output(["git", "-C", str(ROOT), *args], text=True).strip()
+
+
+def metadata(allow_dirty=False, build_number=None, preview=False) -> dict:
+    version = CONFIG["version"]
+    if not re.fullmatch(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)", version):
+        raise BuildError("toolchain.json version must be a numeric major.minor.patch")
+    dirty = bool(git("status", "--porcelain", "--untracked-files=normal"))
+    if dirty and not (allow_dirty or preview):
+        raise BuildError("Commit source changes first, or use --allow-dirty for a local preview.")
+    if git("rev-parse", "--is-shallow-repository") == "true":
+        raise BuildError("Full Git history is required for build numbers and release notes (fetch-depth: 0).")
+    number = build_number or git("rev-list", "--count", "HEAD")
+    if not re.fullmatch(r"[1-9]\d{0,3}(?:\.(?:0|[1-9]\d?)){0,2}", number):
+        raise BuildError("Build number must fit Apple's 4.2.2 digit CFBundleVersion format.")
+    commit = git("rev-parse", "HEAD")
+    ref = os.environ.get("GITHUB_REF", "")
+    # A tag build is the version itself or one of its pre-releases (v0.5.0-dev8, v0.5.0-rc3,
+    # v0.5.0-rc2-beta2). Publishing stays final-only: release.py still demands the exact tag.
+    if ref.startswith("refs/tags/") and not re.fullmatch(
+            r"refs/tags/v" + re.escape(version) + r"(?:-(?:dev|rc)\d+(?:-beta\d+)?)?", ref):
+        raise BuildError("Release tag must be v + toolchain.json version, "
+                         "optionally followed by -devN, -rcN or -rcN-betaN.")
+    return {"version": version, "build_number": number, "commit": commit,
+            "source_epoch": int(git("show", "-s", "--format=%ct", "HEAD")),
+            "dirty": dirty, "preview": bool(preview), "architecture": CONFIG["architecture"],
+            "minimum_macos": CONFIG["minimum_macos"]}
+
+
+def source_fingerprint():
+    value = hashlib.sha256()
+    paths = [name for name in git("ls-files", "-z").split("\0") if name]
+    for name in sorted(paths):
+        path = ROOT / name
+        value.update(name.encode() + b"\0")
+        value.update((os.readlink(path) if path.is_symlink() else digest(path) if path.is_file() else "<deleted>").encode())
+    return value.hexdigest()
+
+
+def clean_env() -> dict[str, str]:
+    # Do not inherit package indexes, Python injection, signing or app credentials.
+    keep = {"PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "DEVELOPER_DIR", "SDKROOT", "LANG"}
+    env = {k: v for k, v in os.environ.items() if k in keep}
+    env.update(PYTHONDONTWRITEBYTECODE="1", PYTHONNOUSERSITE="1", PYTHONHASHSEED="0",
+               UV_CACHE_DIR=str(STATE / "uv-cache"), UV_PYTHON_INSTALL_DIR=str(STATE / "python"),
+               UV_LINK_MODE="copy", UV_KEYRING_PROVIDER="disabled", UV_NO_CONFIG="1",
+               CLANG_MODULE_CACHE_PATH=str(STATE / "module-cache"),
+               SWIFTPM_MODULECACHE_OVERRIDE=str(STATE / "module-cache"),
+               MACOSX_DEPLOYMENT_TARGET=CONFIG["minimum_macos"], TZ="UTC")
+    return env
+
+
+class Runner:
+    def __init__(self):
+        STATE.mkdir(exist_ok=True)
+        self.logs = Path(tempfile.mkdtemp(prefix="run-", dir=STATE))
+        self.records = []
+        self.env = clean_env()
+
+    def run(self, label, command, *, cwd=ROOT, env=None, timeout=1200, check=True,
+            pass_fds=()):
+        log = self.logs / (re.sub(r"[^a-zA-Z0-9_.-]", "-", label) + ".log")
+        print(f"→ {label}", flush=True)
+        started = time.monotonic()
+        with log.open("w") as output:
+            try:
+                proc = subprocess.run([str(c) for c in command], cwd=cwd, env=env or self.env,
+                                      stdout=output, stderr=subprocess.STDOUT, timeout=timeout,
+                                      pass_fds=tuple(pass_fds))
+                code = proc.returncode
+            except subprocess.TimeoutExpired:
+                code = 124
+                output.write(f"\nTIMEOUT after {timeout}s\n")
+        self.records.append({"step": label, "exit_code": code, "seconds": round(time.monotonic()-started, 2), "log": log.name})
+        json_write(self.logs / "results.json", self.records)
+        if code:
+            print(log.read_text(errors="replace")[-7000:], file=sys.stderr)
+            if check:
+                raise BuildError(f"{label} failed ({code}); diagnostics: {log}")
+        return code, log
+
+    def uv(self, label, args, *, offline=False):
+        return self.run(label, ["uv", *args, "--no-config", "--cache-dir", STATE / "uv-cache", *(["--offline"] if offline else [])])
+
+
+def doctor(runner: Runner, strict=False, offline=False) -> dict:
+    if platform.system() != "Darwin" or platform.machine() != CONFIG["architecture"]:
+        raise BuildError("This pipeline targets Apple Silicon macOS only; cross-compilation is not supported.")
+    from bootstrap_uv import ensure_uv
+    try:
+        uv_path = ensure_uv(CONFIG, STATE, offline)
+    except (RuntimeError, OSError) as exc:
+        raise BuildError(str(exc)) from None
+    runner.env["PATH"] = str(uv_path.parent) + os.pathsep + runner.env.get("PATH", "")
+    for tool in ("git", "swift", "swiftc", "xcrun", "iconutil", "codesign", "otool", "lipo", "sandbox-exec"):
+        if not shutil.which(tool):
+            raise BuildError(f"Missing {tool}; see docs/build-release.md bootstrap prerequisites.")
+    _, log = runner.run("uv-version", ["uv", "--version"])
+    if log.read_text().split()[1] != CONFIG["uv"]:
+        raise BuildError(f"Use uv {CONFIG['uv']} exactly; tool versions are release inputs.")
+    _, log = runner.run("swift-version", ["swift", "--version"])
+    swift = log.read_text().strip()
+    runner.run("sdk", ["xcrun", "--show-sdk-version"])
+    xcode = "Command Line Tools"
+    code, log = runner.run("xcode-version", ["xcodebuild", "-version"], check=False)
+    if code == 0:
+        xcode = log.read_text().strip()
+    else:
+        runner.records[-1]["optional"] = True
+    if strict and (f"Xcode {CONFIG['ci_xcode']}\n" not in xcode + "\n" or f"Swift version {CONFIG['ci_swift']} " not in swift):
+        raise BuildError("Release builds require the exact Xcode/Swift versions in toolchain.json.")
+    runner.run("test-sandbox-available", ["sandbox-exec", "-p", "(version 1)(allow default)(deny network*)", "/usr/bin/true"])
+    result = {"uv": CONFIG["uv"], "swift": swift, "xcode": xcode, "macos": platform.mac_ver()[0], "strict_toolchain": strict}
+    json_write(runner.logs / "toolchain.json", result)
+    return result
+
+
+def lock_inputs() -> list[Path]:
+    return [ROOT / "requirements-runtime.txt", SUPPORT / "requirements-test.in", SUPPORT / "toolchain.json"]
+
+
+def check_locks() -> None:
+    path = SUPPORT / "locks.json"
+    if not path.exists():
+        raise BuildError("Dependency locks are absent. Run ./scripts/harbor-build lock.")
+    expected = json.loads(path.read_text())
+    for name, sha in expected.items():
+        file = ROOT / name
+        if not file.is_file() or digest(file) != sha:
+            raise BuildError(f"Dependency lock drift: {name}; regenerate and review with harbor-build lock.")
+    required = {str(p.relative_to(ROOT)) for p in lock_inputs()} | {
+        "build-support/requirements-runtime.lock", "build-support/requirements-test.lock"}
+    if set(expected) != required:
+        raise BuildError("locks.json must cover exactly the dependency and toolchain inputs.")
+    for name in ("runtime", "test"):
+        content = (SUPPORT / f"requirements-{name}.lock").read_text()
+        if "--hash=sha256:" not in content or "--index-url" in content or " @ " in content:
+            raise BuildError("Dependency locks must contain hashes and only registry-pinned requirements.")
+
+
+def lock(runner: Runner, offline=False) -> None:
+    for name, source in (("runtime", ROOT / "requirements-runtime.txt"), ("test", SUPPORT / "requirements-test.in")):
+        runner.uv("lock-" + name, ["pip", "compile", source, "--python-version", CONFIG["python"],
+                 "--python-platform", "aarch64-apple-darwin", "--generate-hashes", "--no-header",
+                 "--no-emit-index-url", "--default-index", "https://pypi.org/simple", "--only-binary", ":all:",
+                 "-o", SUPPORT / f"requirements-{name}.lock"], offline=offline)
+    inputs = lock_inputs() + [SUPPORT / f"requirements-{n}.lock" for n in ("runtime", "test")]
+    json_write(SUPPORT / "locks.json", {str(p.relative_to(ROOT)): digest(p) for p in inputs})
+    check_locks()
+
+
+def bootstrap(runner: Runner, offline=False) -> Path:
+    check_locks()
+    from bootstrap_uv import ensure_python_archive
+    try:
+        mirror = ensure_python_archive(CONFIG, STATE, offline)
+    except (RuntimeError, OSError) as exc:
+        raise BuildError(str(exc)) from None
+    runner.uv("python-bootstrap", ["python", "install", CONFIG["python"], "--mirror", mirror,
+                                  "--no-bin", "--install-dir", STATE / "python"], offline=offline)
+    runtime = STATE / "python" / f"cpython-{CONFIG['python']}-macos-aarch64-none"
+    if not (runtime / "BUILD").is_file() or (runtime / "BUILD").read_text().strip() != CONFIG["python_build"]:
+        raise BuildError("Unexpected python-build-standalone build; refuse to package an unpinned runtime.")
+    python = runtime / "bin" / "python3"
+    runner.run("python-version", [python, "-I", "-B", "-c", f"import platform; assert platform.python_version() == {CONFIG['python']!r}"])
+    test_env = STATE / "test-env"
+    runner.uv("test-environment", ["venv", "--python", python, "--no-python-downloads", "--allow-existing", test_env], offline=offline)
+    test_python = test_env / "bin" / "python"
+    runner.uv("test-dependencies", ["pip", "sync", "--python", test_python, "--no-python-downloads", "--require-hashes",
+              "--only-binary", ":all:", "--strict", "--default-index", "https://pypi.org/simple", SUPPORT / "requirements-test.lock"], offline=offline)
+    return test_python
+
+
+def sandbox_profile(scratch: Path, root: Path, python: Path, *, executables=()) -> str:
+    def q(path):
+        return json.dumps(str(Path(path).resolve()))
+    # OS enforcement covers SQLite/native extensions; Python guard adds diagnostics.
+    runtime = python.resolve().parent.parent
+    framework_launcher = runtime / "Resources/Python.app/Contents/MacOS/Python"
+    if framework_launcher.is_file():
+        executables = (*executables, framework_launcher)
+    paths = [root, scratch, runtime, python.absolute().parent.parent, STATE / "test-env"]
+    return "\n".join([
+        "(version 1)", "(allow default)", "(deny network*)", "(deny process-exec)",
+        "(allow process-exec " + " ".join(f"(literal {q(p)})" for p in [python, *executables]) + ")",
+        "(deny file-write*)", f"(allow file-write* (subpath {q(scratch)}) (literal \"/dev/null\"))",
+        f"(deny file-read-data (subpath {q(Path.home())}))",
+        "(allow file-read-data " + " ".join(f"(subpath {q(p)})" for p in paths) + ")",
+    ])
+
+
+def guarded(runner, label, python, kind, target, *, root=ROOT, timeout=180):
+    scratch = Path(tempfile.mkdtemp(prefix="test-", dir=runner.logs)).resolve()
+    env = dict(runner.env, HARBOR_HOME=str(scratch / "moe"), TMPDIR=str(scratch),
+               HARBOR_SANDBOX_HOME=str(scratch / "sandbox"), HARBOR_LING_TEMPLATE=str(scratch / "absent-template"),
+               PYTEST_DISABLE_PLUGIN_AUTOLOAD="1", TZ="America/Los_Angeles")
+    worker = scratch / "test_worker.py"
+    shutil.copy2(SUPPORT / "test_worker.py", worker)
+    profile = sandbox_profile(scratch, root, python)
+    result = runner.run(label, ["sandbox-exec", "-p", profile, python, "-B", worker, kind, target,
+                        "--root", root, "--scratch", scratch], cwd=root, env=env, timeout=timeout, check=False)
+    # Never retain databases/fixtures in CI logs; only textual test output.
+    shutil.rmtree(scratch)
+    return result[0]
+
+
+def interpreter_read_roots(python):
+    """Base runtime plus explicitly selected virtualenv prefixes, never HOME."""
+    selected = python.absolute()
+    roots = {selected.resolve(strict=True).parent.parent}
+    seen = set()
+    while selected not in seen:
+        seen.add(selected)
+        # Resolve directory aliases without losing the invocation's venv prefix
+        # when bin/python itself links to an interpreter in a different runtime.
+        parent = selected.parent.resolve(strict=True)
+        for prefix in (parent, parent.parent):
+            if (prefix / "pyvenv.cfg").is_file():
+                roots.add(prefix)
+        if not selected.is_symlink():
+            break
+        target = Path(os.readlink(selected))
+        selected = target if target.is_absolute() else selected.parent / target
+    if any(Path.home().resolve().is_relative_to(prefix) for prefix in roots):
+        raise BuildError("Interpreter requires a dedicated runtime prefix, not private HOME or its ancestors")
+    return sorted(roots)
+
+
+def _qa_node_runtime(expected=None):
+    # Import only the checked-in, stdlib-only QA resolver. This is Python module
+    # lookup, not a change to the child executable PATH.
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from scripts.run_simulation_qa import resolve_node_runtime
+    try:
+        return resolve_node_runtime(expected)
+    except (OSError, RuntimeError) as exc:
+        raise BuildError(str(exc)) from None
+
+
+def simulation_profile(scratch, python, *, local_signing=False, node_runtime=None, node_only=False):
+    if node_only and (node_runtime is None or local_signing):
+        raise BuildError("Node-only qualification requires its runtime and cannot grant signing")
+    def q(path):
+        return json.dumps(str(Path(path).resolve()))
+    developer = subprocess.check_output(["xcode-select", "-p"], text=True).strip()
+    shared_git = Path(git("rev-parse", "--git-common-dir"))
+    if not shared_git.is_absolute():
+        shared_git = ROOT / shared_git
+    runtime = python.resolve().parent.parent
+    readable = [ROOT, scratch, shared_git, *interpreter_read_roots(python)]
+    # Foundation atomic writes stage beside the OS user temp directory. Permit
+    # only replacement folders bearing this run's unique executable prefix.
+    native_temp = Path(subprocess.check_output(["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"], text=True).strip()).resolve() / "TemporaryItems"
+    fixture_prefix = "harborqa-" + scratch.name.rsplit("-", 1)[-1]
+    replacements = json.dumps("^" + re.escape(str(native_temp)) + "/NSIRD_" + re.escape(fixture_prefix) + "-[^/]+_[^/]+(/|$)")
+    executables = [python, "/bin/bash", "/bin/sh", "/bin/ls", "/bin/cat", "/bin/pwd",
+                   "/bin/echo", "/bin/rm", "/bin/mv", "/bin/date", "/usr/bin/tee", "/usr/bin/grep",
+                   "/usr/bin/dirname", "/usr/bin/mktemp",
+                   "/usr/bin/env", "/usr/bin/git", "/usr/bin/swiftc", "/usr/bin/swift", "/usr/bin/xcrun",
+                   "/usr/bin/osacompile", "/usr/bin/head", "/usr/bin/tail", "/usr/bin/wc",
+                   "/usr/bin/uname", "/usr/bin/sandbox-exec", "/usr/bin/openssl"]
+    # The mandatory A05 fixture wrapper uses these same fixed fallbacks under
+    # Simulation QA's system-only PATH. Authorize one canonical native binary,
+    # never an installation directory, PATH shim, script or private-home alias.
+    if node_runtime is not None:
+        selected_node = _qa_node_runtime(node_runtime)
+        executables = [selected_node] if node_only else [*executables, selected_node]
+    # Publisher verification/signing tests use the system crypto executable on
+    # synthetic files only. Network, Apple events and private HOME remain denied.
+    if local_signing:
+        executables.append("/usr/bin/codesign")
+    execution_rule = "(allow process-exec " + " ".join(f"(literal {q(p)})" for p in executables)
+    if not node_only:
+        # Legacy Python/native QA needs these tools/directories. The dedicated
+        # Node qualification intentionally receives none of these permissions.
+        execution_rule += f" (subpath {q(developer)}) (subpath {q(scratch)}) (subpath {q(runtime)})"
+    execution_rule += ")"
+    # Node fixtures need only their disposable scratch directory. Do not inherit
+    # build-state or Foundation temporary-write permissions from legacy QA.
+    write_rule = f'(allow file-write* (subpath {q(scratch)}))' if node_only else (
+        f'(allow file-write* (subpath {q(scratch)}) (subpath {q(STATE)}) (literal "/dev/null") (literal {q(native_temp)}) (regex {replacements}))')
+    return "\n".join([
+        "(version 1)", "(allow default)", "(deny network*)", "(deny appleevent-send)",
+        "(deny process-exec)",
+        execution_rule,
+        "(deny file-write*)",
+        write_rule,
+        f"(deny file-read-data (subpath {q(Path.home())}))",
+        "(allow file-read-data " + " ".join(f"(subpath {q(p)})" for p in readable) + ")",
+    ])
+
+
+def simulation_tests(runner, python, *, allow_dirty=False, native_only=False, jobs=None):
+    # Record dirty_allowed only when the tree is really dirty, so the final
+    # distribution check (which derives it from meta["dirty"]) stays consistent.
+    allow_dirty = bool(allow_dirty and git("status", "--porcelain", "--untracked-files=normal"))
+    # Only full QA selects the A05 Python wrapper. Native-only qualification
+    # must not acquire a JavaScript runtime prerequisite or execution permission.
+    node_runtime = None if native_only else str(_qa_node_runtime())
+    # Applying Seatbelt twice is prohibited on macOS. Exercise the real external
+    # venv read/deny boundary as a mandatory isolated probe before full QA enters
+    # its outer sandbox; its fixture setup touches only disposable test paths.
+    runner.run("external-venv-sandbox-contract", [python, "-B",
+               ROOT / "tests/build_pipeline/pipeline_checks.py",
+               "PipelineTests.check_external_virtualenv_sandbox", "-q"], timeout=180)
+    runner.run("local-signing-sandbox-contract", [python, "-B",
+               ROOT / "tests/build_pipeline/pipeline_checks.py",
+               "PipelineTests.check_local_signing_sandbox", "-q"], timeout=180)
+    if node_runtime is not None:
+        runner.run("node-sandbox-contract", [python, "-B",
+                   ROOT / "tests/build_pipeline/pipeline_checks.py",
+                   "PipelineTests.check_node_sandbox", "-q"],
+                   env=dict(runner.env, QA_NODE_RUNTIME=node_runtime), timeout=180)
+    with tempfile.TemporaryDirectory(prefix="harbor-build-qa-") as tmp:
+        scratch = Path(tmp).resolve()
+        report = scratch / "simulation.json"
+        # Real socket ownership checks need their own least-privilege boundary;
+        # never relax the outer no-network Simulation profile for other tests.
+        native_report = scratch / 'native-peer.json'
+        native_command = [python, '-B', SUPPORT / 'native_peer_gate.py', '--expected-sha',
+                          git('rev-parse','HEAD'), '--report', native_report]
+        if allow_dirty:native_command.append('--allow-dirty')
+        native_code,_=runner.run('native-disposable-peer-security', native_command, timeout=240,check=False)
+        if native_report.is_file():shutil.copyfile(native_report,runner.logs/'native-peer.json')
+        if native_code or not native_report.is_file():raise BuildError('Native peer security gate failed; inspect native-peer.json')
+        from native_peer_gate import validate as validate_native_peer
+        validate_native_peer(json.loads(native_report.read_text()),git('rev-parse','HEAD'),allow_dirty=allow_dirty)
+        browser_report = scratch / 'browser-bridge.json'
+        browser_command = [python, '-B', SUPPORT / 'browser_bridge_gate.py', '--expected-sha',
+                           git('rev-parse', 'HEAD'), '--report', browser_report]
+        if allow_dirty:
+            browser_command.append('--allow-dirty')
+        browser_code, _ = runner.run('browser-disposable-transport-security', browser_command,
+                                     timeout=240, check=False)
+        if browser_report.is_file():
+            shutil.copyfile(browser_report, runner.logs / 'browser-bridge.json')
+        if browser_code or not browser_report.is_file():
+            raise BuildError('Browser bridge security gate failed; inspect browser-bridge.json')
+        from browser_bridge_gate import validate as validate_browser_bridge
+        validate_browser_bridge(json.loads(browser_report.read_text()), git('rev-parse', 'HEAD'),
+                                allow_dirty=allow_dirty)
+        benchmark_report = scratch / "release-benchmark-contracts.json"
+        benchmark_command = [python, "-B", SUPPORT / "release_performance_gate.py", "--expected-sha",
+                             git("rev-parse", "HEAD"), "--report", benchmark_report]
+        if allow_dirty:
+            benchmark_command.append("--allow-dirty")
+        benchmark_code, _ = runner.run("release-benchmark-contracts", benchmark_command, timeout=300, check=False)
+        if benchmark_report.is_file():
+            shutil.copyfile(benchmark_report, runner.logs / "release-benchmark-contracts.json")
+        if benchmark_code or not benchmark_report.is_file():
+            raise BuildError("Benchmark contracts failed; inspect release-benchmark-contracts.json")
+        from release_performance_gate import validate as validate_benchmark
+        validate_benchmark(json.loads(benchmark_report.read_text()), git("rev-parse", "HEAD"), allow_dirty=allow_dirty)
+        command = ["sandbox-exec", "-p", simulation_profile(scratch, python, node_runtime=node_runtime), python, "-B",
+                   SUPPORT / "simulation.py", "--expected-sha", git("rev-parse", "HEAD"),
+                   "--profile", "full", "--report", report]
+        if allow_dirty:
+            command.append("--allow-dirty")
+        if native_only:
+            command.append("--only-native")
+        if jobs is not None:
+            # Concurrency only; every gate keeps its own process and state.
+            command.extend(["--jobs", str(jobs)])
+        qa_env = dict(runner.env, TMPDIR=str(scratch), HARBOR_BUILD_FIXTURE_PREFIX="harborqa-" + scratch.name.rsplit("-", 1)[-1],
+                      PEER_TEST_GATE_REPORT=str(native_report), PEER_TEST_GATE_SHA256=digest(native_report),
+                      BENCHMARK_GATE_REPORT=str(benchmark_report), BENCHMARK_GATE_SHA256=digest(benchmark_report),
+                      BROWSER_BRIDGE_GATE_REPORT=str(browser_report),
+                      BROWSER_BRIDGE_GATE_SHA256=digest(browser_report))
+        qa_env.pop("QA_NODE_RUNTIME", None)
+        if node_runtime is not None:
+            qa_env["QA_NODE_RUNTIME"] = node_runtime
+        code, _ = runner.run("simulation-qa", command, env=qa_env,
+                             timeout=2400, check=False)
+        if report.is_file():
+            shutil.copyfile(report, runner.logs / "simulation-qa.json")
+        if code or not report.is_file():
+            raise BuildError("Simulation QA failed; inspect simulation-qa.log and simulation-qa.json")
+        validate_simulation(json.loads(report.read_text()), git("rev-parse", "HEAD"),
+                            allow_dirty=allow_dirty, native_only=native_only)
+
+
+def validate_simulation(report, commit, *, allow_dirty=False, native_only=False):
+    totals = report.get("totals", {})
+    if (report.get("schema_version") != 3 or report.get("status") != "PASS"
+        or report.get("candidate_sha") != commit or report.get("ending_sha") != commit
+        or not report.get("sha_stable") or report.get("profiles") != ["full"]
+        or report.get("safety_mode") != "offline"
+        or report.get("native_mode") != ("only" if native_only else "included")
+        or not totals.get("gates") or totals.get("failed_gates") != 0
+        or totals.get("blocked_gates") != 0 or totals.get("passed_gates") != totals.get("gates")
+        or (not allow_dirty and (report.get("dirty_allowed") or not report.get("worktree_clean")))):
+        raise BuildError("Simulation QA evidence does not cover this candidate")
+    if not native_only:
+        from native_peer_gate import MODULE, validate as validate_native_peer
+        gates=[r for r in report.get('results',[]) if r.get('name')==MODULE]
+        if len(gates)!=1:raise BuildError('Missing mandatory native peer evidence')
+        if any(gates[0].get(k)!=v for k,v in {'status':'PASS','returncode':0,'passed':9,'failed':0,'skipped':0}.items()):
+            raise BuildError('Incomplete mandatory native peer evidence')
+        try:
+            validate_native_peer(json.loads(gates[0]['stdout'])['native_gate'],commit,allow_dirty=allow_dirty)
+        except (KeyError,TypeError,ValueError):
+            raise BuildError('Invalid mandatory native peer evidence') from None
+
+        from release_performance_gate import EXPECTED_COUNT, MODULE as BENCHMARK_MODULE, validate as validate_benchmark
+        benchmark_gates = [r for r in report.get("results", []) if r.get("name") == BENCHMARK_MODULE]
+        if len(benchmark_gates) != 1 or any(benchmark_gates[0].get(k) != v for k, v in
+                {"status": "PASS", "returncode": 0, "passed": EXPECTED_COUNT, "failed": 0, "skipped": 0}.items()):
+            raise BuildError("Missing or incomplete mandatory benchmark contract evidence")
+        try:
+            validate_benchmark(json.loads(benchmark_gates[0]["stdout"])["benchmark_gate"], commit, allow_dirty=allow_dirty)
+        except (KeyError, TypeError, ValueError):
+            raise BuildError("Invalid mandatory benchmark contract evidence") from None
+
+        from browser_bridge_gate import EXPECTED as BROWSER_EXPECTED, MODULE as BROWSER_MODULE, validate as validate_browser_bridge
+        browser_gates = [r for r in report.get('results', []) if r.get('name') == BROWSER_MODULE]
+        if len(browser_gates) != 1:
+            raise BuildError('Missing mandatory browser bridge evidence')
+        gate = browser_gates[0]
+        if any(gate.get(k) != v for k, v in
+               {'status': 'PASS', 'returncode': 0, 'passed': len(BROWSER_EXPECTED), 'failed': 0, 'skipped': 0}.items()):
+            raise BuildError('Incomplete mandatory browser bridge evidence')
+        try:
+            validate_browser_bridge(json.loads(gate['stdout'])['browser_bridge_gate'], commit,
+                                    allow_dirty=allow_dirty)
+        except (KeyError, TypeError, ValueError):
+            raise BuildError('Invalid mandatory browser bridge evidence') from None
+
+
+def production_backend_source(source):
+    # The development checkout fallback must never ship in the packaged app.
+    pattern = (r'\n        let devRoot = URL\(fileURLWithPath: "[^"\n]+"\)\n'
+               r'        if FileManager\.default\.fileExists\(atPath: devRoot\.appendingPathComponent\("service/main\.py"\)\.path\) \{\n'
+               r'            return devRoot\n        \}\n')
+    result, count = re.subn(pattern, "\n", source)
+    if count != 1:
+        raise BuildError("Review the production BackendManager staging rule: expected one development fallback")
+    return result
+
+
+def stage_swift_sources():
+    stage = STATE / "swift-source"
+    if stage.exists():
+        shutil.rmtree(stage)
+    for name in filter(None, git("ls-files", "-z", "--", "app").split("\0")):
+        source = ROOT / name
+        if source.is_symlink() or not source.is_file():
+            raise BuildError("Unsafe Swift source entry: " + name)
+        target = stage / Path(name).relative_to("app")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if name == "app/Sources/HarborApp/BackendManager.swift":
+            target.write_text(production_backend_source(source.read_text()))
+        else:
+            shutil.copyfile(source, target)
+    return stage
+
+
+def build_swift(runner: Runner) -> Path:
+    stage = stage_swift_sources()
+    args = ["swift", "build", "--package-path", stage, "--scratch-path", STATE / "swift",
+            "--disable-sandbox", "-c", "release", "--arch", "arm64"]
+    for source, replacement in ((stage, "/harbor/source/app"), (ROOT, "/harbor/source")):
+        for flag in ("-debug-prefix-map", "-file-prefix-map"):
+            args.extend(["-Xswiftc", flag, "-Xswiftc", f"{source}={replacement}"])
+    runner.run("swift-release-build", args, timeout=1800)
+    _, log = runner.run("swift-binary-path", [*args, "--show-bin-path"])
+    binary = Path(log.read_text().strip()) / "HarborApp"
+    if not binary.is_file():
+        raise BuildError("Swift did not produce HarborApp")
+    return binary
+
+
+def plist(meta: dict) -> dict:
+    return {
+        "CFBundleName": "Harbor", "CFBundleDisplayName": "Harbor", "CFBundleIdentifier": CONFIG["bundle_identifier"],
+        "CFBundleVersion": meta["build_number"], "CFBundleShortVersionString": meta["version"],
+        "CFBundleExecutable": "Harbor", "CFBundleIconFile": "AppIcon", "CFBundlePackageType": "APPL",
+        "LSMinimumSystemVersion": CONFIG["minimum_macos"], "NSHighResolutionCapable": True,
+        "NSCalendarsFullAccessUsageDescription": "Harbor reads your calendar to plan your day, and adds, moves or cancels events only when you ask.",
+        "NSCalendarsUsageDescription": "Harbor reads your calendar to plan your day, and adds, moves or cancels events only when you ask.",
+        "NSRemindersFullAccessUsageDescription": "Harbor reads your reminders to show what is due, and adds, completes or removes ones you ask for.",
+        "NSRemindersUsageDescription": "Harbor reads your reminders to show what is due, and adds, completes or removes ones you ask for.",
+        "NSAppleEventsUsageDescription": "Harbor reads Mail and Notes to find what needs your attention, and, only when you approve, sends emails and messages or opens a script in Terminal.",
+        "NSContactsUsageDescription": "Harbor reads your contacts to show names instead of phone numbers in messages.",
+        "NSMicrophoneUsageDescription": "Harbor listens only while you ask by voice (the mic or ⌥⇧Space) or while a meeting you started in Meet is recording. What is said is turned into text on this Mac; Harbor keeps no recording and never sends it off your Mac.",
+        "HarborSourceCommit": meta["commit"], "HarborPreviewBuild": bool(meta["dirty"] or meta.get("preview")),
+    }
+
+
+# The built-in Google OAuth client (service/gmail_source.py BUILTIN_CLIENT_PATH).
+# The repository is public: the value comes only from the CI secret or a local
+# file at build time, is written straight into the bundle, and is never logged,
+# put on a command line, or recorded anywhere but the bundle (build-info and
+# provenance say only whether it is present).
+GOOGLE_OAUTH_CLIENT_ENV = "HARBOR_GOOGLE_OAUTH_CLIENT"
+GOOGLE_OAUTH_CLIENT_BUNDLE = "Contents/Resources/backend/service/google_oauth_client.json"
+
+
+def _google_oauth_client_json(raw: str) -> bytes:
+    """Canonical {"client_id","client_secret"} JSON. Errors never echo input."""
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        raise BuildError("The Google OAuth client is not valid JSON") from None
+    if isinstance(data, dict) and isinstance(data.get("installed"), dict):
+        data = data["installed"]          # the JSON Google Cloud Console downloads
+    client_id = data.get("client_id") if isinstance(data, dict) else None
+    secret = data.get("client_secret") if isinstance(data, dict) else None
+    if not (isinstance(client_id, str) and isinstance(secret, str)
+            and client_id.strip() and secret.strip()):
+        raise BuildError("The Google OAuth client needs non-empty client_id and client_secret strings")
+    return json.dumps({"client_id": client_id.strip(), "client_secret": secret.strip()},
+                      separators=(",", ":"), sort_keys=True).encode()
+
+
+def google_oauth_client(path: Path | None = None, environ=None) -> bytes | None:
+    """The built-in Google OAuth client to ship, or None for a build without one.
+
+    `--google-oauth-client PATH` wins; otherwise HARBOR_GOOGLE_OAUTH_CLIENT (the
+    CI secret, empty on pull requests from forks). The variable is removed from
+    this process once read, so no later step can inherit it (clean_env already
+    leaves it out of every child)."""
+    environ = os.environ if environ is None else environ
+    raw = environ.pop(GOOGLE_OAUTH_CLIENT_ENV, "") or ""
+    if path is not None:
+        try:
+            raw = Path(path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            raise BuildError("Could not read the Google OAuth client file") from None
+        if not raw.strip():
+            raise BuildError("The Google OAuth client file is empty")
+    if not raw.strip():
+        return None
+    return _google_oauth_client_json(raw)
+
+
+def write_google_oauth_client(bundle: Path, meta: dict, google_client: bytes | None) -> None:
+    """Ship the client (or record that there is none) in an assembled bundle.
+    Written directly, never through a subprocess, a command line or a log."""
+    target = bundle / GOOGLE_OAUTH_CLIENT_BUNDLE
+    if target.exists() or target.is_symlink():
+        raise BuildError("Tracked source must not provide the Google OAuth client")
+    meta["google_oauth_client"] = google_client is not None
+    if google_client is None:
+        return
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(google_client)
+
+
+def validate_google_oauth_client(bundle: Path, meta: dict) -> None:
+    """The bundle ships the client exactly when build-info says it does."""
+    expected = meta.get("google_oauth_client")
+    shipped = bundle / GOOGLE_OAUTH_CLIENT_BUNDLE
+    if expected is None:          # metadata from before the built-in client
+        return
+    if not expected:
+        if shipped.exists() or shipped.is_symlink():
+            raise BuildError("Bundle has a Google OAuth client its build-info does not declare")
+        return
+    if shipped.is_symlink() or not shipped.is_file():
+        raise BuildError("Missing bundled Google OAuth client")
+    try:
+        canonical = _google_oauth_client_json(shipped.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError):
+        raise BuildError("Unreadable bundled Google OAuth client") from None
+    if canonical != shipped.read_bytes():
+        raise BuildError("Bundled Google OAuth client is not in canonical form")
+
+
+def packaging_output(requested: Path | None, meta: dict, preview: bool) -> Path:
+    """Where this build's artifacts go: a directory below dist/ that does not exist yet.
+
+    Path logic only, so main() can settle it before any test or build step runs."""
+    dist = (ROOT / "dist").resolve()
+    name = f"{meta['version']}-{meta['build_number']}-{meta['commit'][:12]}{'-preview' if preview else ''}"
+    output = (requested or ROOT / "dist" / name).resolve()
+    if not output.is_relative_to(dist) or output == dist:
+        raise BuildError("Output must be a new directory below this checkout's dist/")
+    if output.exists():
+        raise BuildError(f"Output directory already exists: {output}. Remove it or pass a new --output.")
+    return output
+
+
+def check_engine_source(engine_app: Path) -> None:
+    """Refuse, before the tests and the Swift build, an oMLX source the engine stage would refuse
+    anyway: not the genuine signed app, or another release than engine.lock.json pins.
+
+    Only the early answer lives here. engine_build.stage still compares the whole staged tree
+    with the lock, so a source that passes this check can still be refused there."""
+    try:
+        facts = engine_build.verify_source_identity(engine_app)
+        lock = engine_build.load_lock()
+    except engine_build.EngineBuildError as exc:
+        raise BuildError(str(exc)) from None
+    if lock is not None and facts["version"] != lock["omlx_version"]:
+        raise BuildError("oMLX source does not match engine.lock.json "
+                         f"(version {facts['version']!r}, the lock pins {lock['omlx_version']!r})")
+
+
+def source_files() -> list[Path]:
+    files = [name for name in git("ls-files", "-z", "--", "service").split("\0") if name]
+    if not files or not files[0]:
+        raise BuildError("No tracked backend source")
+    result = []
+    for name in files:
+        p = ROOT / name
+        if p.is_symlink() or not p.is_file() or p.suffix in (".db", ".pyc"):
+            raise BuildError(f"Unsafe backend source entry: {name}")
+        result.append(p)
+    return result
+
+
+def assemble(runner, binary, destination, meta, offline=False, engine_app=None, google_client=None,
+             uv_archive=None):
+    bundle = destination / "Harbor.app"
+    contents = bundle / "Contents"
+    resources = contents / "Resources"
+    backend = resources / "backend"
+    (contents / "MacOS").mkdir(parents=True)
+    backend.mkdir(parents=True)
+    shutil.copy2(binary, contents / "MacOS" / "Harbor")
+    corpus = ROOT / "app/Sources/HarborApp/Resources/assistant-task-corpus-v1.jsonl"
+    if not corpus.is_file():
+        raise BuildError("Missing source assistant task corpus")
+    shutil.copyfile(corpus, resources / corpus.name)
+    with (contents / "Info.plist").open("wb") as output:
+        plistlib.dump(plist(meta), output, sort_keys=True)
+    iconset = runner.logs / "Harbor.iconset"
+    runner.run("generate-icon", ["swift", "-module-cache-path", STATE / "module-cache", ROOT / "scripts/make_icon.swift", iconset])
+    runner.run("compile-icon", ["iconutil", "-c", "icns", iconset, "-o", resources / "AppIcon.icns"])
+    shutil.rmtree(iconset)
+    for path in source_files():
+        dest = backend / path.relative_to(ROOT)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, dest)
+    write_google_oauth_client(bundle, meta, google_client)
+    # uv/uvx for the Google tools (uv_tool.py): pinned, digest-checked, signed
+    # with the app below. None only for an explicit --no-uv build.
+    try:
+        meta["uv"] = uv_tool.stage(bundle, uv_archive) if uv_archive is not None else None
+    except uv_tool.UVToolError as exc:
+        raise BuildError(str(exc)) from None
+    embedded = backend / ".venv"
+    from bootstrap_uv import unpack_runtime
+    unpack_runtime(CONFIG, STATE, embedded)
+    python = embedded / "bin" / "python3"
+    # This is an owned copy, not the uv-managed bootstrap interpreter.
+    for marker in embedded.glob("lib/python*/EXTERNALLY-MANAGED"):
+        marker.unlink()
+    runner.run("verify-runtime-prefix", [python, "-I", "-B", "-c",
+        f"import sys; from pathlib import Path; assert Path(sys.prefix).resolve() == Path({str(embedded)!r}).resolve(), sys.prefix"])
+    runner.uv("bundle-dependencies", ["pip", "sync", "--python", python, "--prefix", embedded, "--no-python-downloads", "--require-hashes",
+              "--only-binary", ":all:", "--strict", "--link-mode", "copy", "--default-index", "https://pypi.org/simple",
+              SUPPORT / "requirements-runtime.lock"], offline=offline)
+    # Console scripts encode the build prefix and are not used by BackendManager (-m uvicorn).
+    for entry in (embedded / "bin").iterdir():
+        if entry.name not in ("python", "python3", "python" + ".".join(CONFIG["python"].split(".")[:2])):
+            if entry.is_dir():
+                raise BuildError("Unexpected directory in runtime bin")
+            entry.unlink()
+    if not (embedded / "bin/python").exists():
+        (embedded / "bin/python").symlink_to("python3")
+    docs = resources / "Documentation"
+    docs.mkdir()
+    for name in ("CHANGELOG.md", "docs/build-release.md"):
+        shutil.copyfile(ROOT / name, docs / Path(name).name)
+    # This version's release notes: harbor_status(topic="whats_new") answers from the newest.
+    notes = docs / "releases"
+    notes.mkdir()
+    for page in sorted((ROOT / "docs/releases").glob(meta["version"] + "*.md")):
+        if re.fullmatch(re.escape(meta["version"]) + r"(?:-(?:dev|rc)\d+)?\.md", page.name):
+            shutil.copyfile(page, notes / page.name)
+    shutil.copyfile(SUPPORT / "requirements-runtime.lock", docs / "requirements-runtime.lock")
+    if engine_app is not None:
+        # Release candidates must match engine.lock.json; previews may use an unpinned local oMLX.
+        release = not (meta["dirty"] or meta.get("preview"))
+        try:
+            meta["engine"] = engine_build.stage(bundle, engine_app, lock=engine_build.load_lock(), release=release)
+        except engine_build.EngineBuildError as exc:
+            raise BuildError(str(exc)) from None
+        meta["engine_smoke"] = engine_build.smoke_plan(bundle)
+        try:
+            engine_licenses.write_notices(bundle)
+        except engine_licenses.LicenseError as exc:
+            raise BuildError(str(exc)) from None
+    json_write(resources / "build-info.json", meta)
+    # Normalize modes before signing so umask does not change candidate archives.
+    for path in bundle.rglob("*"):
+        if not path.is_symlink():
+            path.chmod(0o755 if path.is_dir() or os.access(path, os.X_OK) else 0o644)
+    # RECORD paths for installed wheel files remain intact; keep upstream licenses.
+    runner.run("bundle-dependency-inventory", [python, "-I", "-B", "-c",
+        "import importlib.metadata as m,json; print(json.dumps(sorted([{'name':d.metadata['Name'],'version':d.version,'license':d.metadata.get('License-Expression') or d.metadata.get('License','')} for d in m.distributions()],key=lambda d:d['name']),indent=2))"])
+    shutil.copyfile(runner.logs / "bundle-dependency-inventory.log", destination / "dependencies.json")
+    return bundle
+
+
+def is_macho(path):
+    if not path.is_file() or path.is_symlink():
+        return False
+    with path.open("rb") as f:
+        return f.read(4) in MACH_MAGICS
+
+
+def validate_structure(bundle: Path, meta: dict):
+    bundle = bundle.resolve()
+    required = ["Contents/MacOS/Harbor", "Contents/Info.plist", "Contents/Resources/AppIcon.icns",
+                "Contents/Resources/assistant-task-corpus-v1.jsonl",
+                "Contents/Resources/build-info.json", "Contents/Resources/backend/.venv/bin/python",
+                "Contents/Resources/backend/service/main.py", "Contents/Resources/backend/service/config/models.yaml",
+                "Contents/Resources/backend/service/config/policy.yaml",
+                "Contents/Resources/backend/service/skills/bundled/interview-me/SKILL.md",
+                "Contents/Resources/backend/service/skills/bundled/idea-refine/SKILL.md",
+                "Contents/Resources/backend/service/skills/bundled/humanizer/SKILL.md",
+                "Contents/Resources/backend/service/skills/bundled/mac-controls/SKILL.md",
+                "Contents/Resources/backend/service/skills/bundled/mac-controls/controls.sh"]
+    for name in required:
+        if not (bundle / name).is_file():
+            raise BuildError(f"Missing bundle resource: {name}")
+    bundled_corpus = bundle / "Contents/Resources/assistant-task-corpus-v1.jsonl"
+    source_corpus = ROOT / "training/assistant-task-corpus-v1/cases.jsonl"
+    if bundled_corpus.read_bytes() != source_corpus.read_bytes():
+        raise BuildError("Packaged assistant task corpus differs from the repository corpus")
+    actual = plistlib.loads((bundle / "Contents/Info.plist").read_bytes())
+    for key, value in plist(meta).items():
+        if actual.get(key) != value:
+            raise BuildError(f"Info.plist mismatch: {key}")
+    for path in bundle.rglob("*"):
+        if path.is_symlink():
+            if os.path.isabs(os.readlink(path)) or not path.resolve().is_relative_to(bundle) or not path.exists():
+                raise BuildError(f"Non-relocatable symlink: {path.relative_to(bundle)}")
+        elif path.is_file() and (path.stat().st_mode & 0o6000):
+            raise BuildError("setuid/setgid file in artifact")
+        if path.name in (".DS_Store", "__pycache__", "pyvenv.cfg", ".env", ".git") or path.suffix in (".db", ".pyc", ".p12", ".p8"):
+            raise BuildError(f"Unwanted bundle file: {path.relative_to(bundle)}")
+    for name in ("Contents/MacOS/Harbor", "Contents/Resources/backend/.venv/bin/python"):
+        if not os.access(bundle / name, os.X_OK):
+            raise BuildError(f"Bundle program is not executable: {name}")
+    validate_google_oauth_client(bundle, meta)
+    if "uv" in meta:                 # metadata from before bundled uv has no record
+        try:
+            uv_tool.validate(bundle, meta["uv"])
+        except uv_tool.UVToolError as exc:
+            raise BuildError(str(exc)) from None
+    if engine_build.read_engine_json(bundle) is not None or meta.get("engine"):
+        try:
+            engine_build.validate_structure(bundle, meta.get("engine"))
+            engine_licenses.validate(bundle)
+        except (engine_build.EngineBuildError, engine_licenses.LicenseError) as exc:
+            raise BuildError(str(exc)) from None
+
+
+def validate_native(runner, bundle, meta):
+    rows = []
+    minimum = tuple(map(int, CONFIG["minimum_macos"].split(".")))
+    engine_doc = engine_build.read_engine_json(bundle)
+    engine_minimum = tuple(map(int, engine_doc["minimum_macos"].split("."))) if engine_doc else None
+    for i, path in enumerate(p for p in bundle.rglob("*") if is_macho(p)):
+        # The bundled engine (MLX) targets a newer macOS than the app; it is held to its own,
+        # recorded minimum and the app refuses to use it on older systems (service/engine/mode.py).
+        limit = engine_minimum if engine_minimum and engine_build.is_engine_target(bundle, path) else minimum
+        _, log = runner.run(f"macho-{i}", ["lipo", "-archs", path])
+        if "arm64" not in log.read_text().split():
+            raise BuildError(f"Missing arm64 slice: {path.relative_to(bundle)}")
+        _, log = runner.run(f"load-commands-{i}", ["otool", "-arch", "arm64", "-l", path])
+        text = log.read_text()
+        versions = re.findall(r"\bminos (\d+(?:\.\d+)+)", text)
+        versions += re.findall(r"cmd LC_VERSION_MIN_MACOSX\s+cmdsize \d+\s+version (\d+(?:\.\d+)+)", text)
+        if not versions:
+            raise BuildError(f"No macOS deployment target: {path.relative_to(bundle)}")
+        for version in versions:
+            nums = tuple(map(int, version.split(".")))
+            if (nums + (0, 0, 0))[:3] > (limit + (0, 0, 0))[:3]:
+                raise BuildError(f"{path.relative_to(bundle)} requires macOS {version}, above "
+                                 + ("the engine's own minimum" if limit is engine_minimum else "advertised minimum"))
+        _, log = runner.run(f"dylibs-{i}", ["otool", "-arch", "arm64", "-L", path])
+        # otool -L prints a dylib's own LC_ID_DYLIB before its dependencies.
+        # That identity is not a library loaded at runtime (wheel builders often
+        # leave an absolute build label there). Validate actual loads separately.
+        identity = re.search(r"cmd LC_ID_DYLIB\s+cmdsize \d+\s+name (.+?) \(offset \d+\)", text)
+        dependencies = []
+        for index, line in enumerate(log.read_text().splitlines()[1:]):
+            dependency = line.strip().split(" (", 1)[0]
+            if index == 0 and identity and dependency == identity.group(1):
+                continue
+            dependencies.append(dependency)
+            if dependency.startswith("/") and not dependency.startswith(("/usr/lib/", "/System/Library/")):
+                raise BuildError(f"Nonportable dylib dependency {dependency}")
+        rpaths = re.findall(r"cmd LC_RPATH\s+cmdsize \d+\s+path (\S+)", text)
+        absolute_rpaths = [entry for entry in rpaths if entry.startswith("/")]
+        # Wheel builds can retain an unused search path on a leaf dylib. It
+        # cannot affect this library's declared system-only dependencies.
+        system_only = all(dep.startswith(("/usr/lib/", "/System/Library/")) for dep in dependencies)
+        if absolute_rpaths and not system_only:
+            raise BuildError(f"Absolute rpath with non-system dependencies in {path.relative_to(bundle)}")
+        rows.append({"path": str(path.relative_to(bundle)), "minimum_macos": versions,
+                     "install_id": identity.group(1) if identity else None,
+                     "dependencies": dependencies, "unused_rpaths": absolute_rpaths})
+    if len(rows) < 2:
+        raise BuildError("Expected native app and Python interpreter")
+    json_write(runner.logs / "native-inventory.json", rows)
+
+
+def scan_host_paths(bundle):
+    """Reject this host's checkout/home paths in every distributed Mach-O."""
+    source = (ROOT / "app/Sources/HarborApp/BackendManager.swift").read_text()
+    fallback = re.search(r'let devRoot = URL\(fileURLWithPath: "([^"\n]+)"\)', source)
+    markers = {str(ROOT), str(STATE), str(Path(tempfile.gettempdir()).resolve()) + "/"}
+    if fallback:
+        markers.add(fallback.group(1))
+        parts = Path(fallback.group(1)).parts
+        if len(parts) >= 3 and parts[1] in ("Users", "home"):
+            markers.add(str(Path(*parts[:3])) + "/")
+    for path in bundle.rglob("*"):
+        if is_macho(path):
+            scoped = markers | ({"/Users/", "/home/", "/private/var/folders/"}
+                                if path == bundle / "Contents/MacOS/Harbor" else set())
+            needles = {value.encode(encoding) for value in scoped for encoding in ("utf-8", "utf-16-le", "utf-16-be")}
+            data = path.read_bytes()
+            if any(needle in data for needle in needles):
+                raise BuildError(f"Host build path in distributable Mach-O: {path.relative_to(bundle)}")
+
+
+def prepare_native_for_signing(runner, bundle):
+    for i, path in enumerate(p for p in bundle.rglob("*") if is_macho(p)):
+        if not engine_build.is_engine_target(bundle, path):
+            runner.run(f"strip-debug-{i}", ["/usr/bin/strip", "-S", path])
+        _, log = runner.run(f"signing-load-commands-{i}", ["otool", "-arch", "arm64", "-l", path])
+        commands = log.read_text()
+        rpaths = re.findall(r"cmd LC_RPATH\s+cmdsize \d+\s+path (\S+)", commands)
+        absolute = [rpath for rpath in rpaths if rpath.startswith("/")]
+        if absolute:
+            loads = re.findall(r"cmd LC_(?:LOAD|LOAD_WEAK|REEXPORT|LOAD_UPWARD)_DYLIB\s+cmdsize \d+\s+name (.+?) \(offset \d+\)", commands)
+            external = [dep for dep in loads if not dep.startswith(("/usr/lib/", "/System/Library/"))]
+            # oMLX's custom kernels were linked on the developer's machine: their absolute
+            # rpaths point at a build tree that does not exist anywhere else, and they load
+            # @rpath/libmlx.dylib, which dyld resolves to the image `import mlx.core` already
+            # loaded (same install name). Removing the dead absolute paths is therefore safe,
+            # but only for the engine and only for @rpath names, never for absolute libraries.
+            if external and not (engine_build.is_engine_target(bundle, path)
+                                 and all(dep.startswith("@rpath/") for dep in external)):
+                raise BuildError("Cannot remove an absolute search path used by non-system dependencies")
+            for rpath in absolute:
+                runner.run(f"remove-unused-rpath-{i}", ["/usr/bin/install_name_tool", "-delete_rpath", rpath, path])
+    scan_host_paths(bundle)
+
+
+def signing_targets(bundle):
+    targets = [path for path in bundle.rglob("*") if not path.is_symlink() and
+               (is_macho(path) or (path.is_dir() and path.suffix in (".app", ".framework", ".xpc", ".appex", ".bundle")))]
+    return sorted(targets, key=lambda path: (-len(path.parts), str(path))) + [bundle]
+
+
+def verify_bundle_signature(bundle, expected, runner=None, prefix="bundle-signature"):
+    if expected not in ("ad-hoc", "Developer ID Application"):
+        raise BuildError("Unsupported candidate signature state")
+    commands = (["/usr/bin/codesign", "--verify", "--deep", "--strict", "--verbose=2", bundle],
+                ["/usr/bin/codesign", "--display", "--verbose=4", bundle])
+    description = ""
+    for i, command in enumerate(commands):
+        if runner is not None:
+            _, log = runner.run(f"{prefix}-{i}", command)
+            description = log.read_text()
+        else:
+            result = subprocess.run([str(value) for value in command], env=clean_env(),
+                                    capture_output=True, text=True, timeout=120)
+            if result.returncode:
+                raise BuildError("Strict bundle signature verification failed: " + result.stderr[-1000:])
+            description = result.stdout + result.stderr
+    if expected == "ad-hoc":
+        valid = "Signature=adhoc" in description and "Authority=" not in description and "TeamIdentifier=not set" in description
+    else:
+        valid = "Authority=Developer ID Application:" in description and "TeamIdentifier=not set" not in description
+    if not valid:
+        raise BuildError("Actual bundle signature differs from provenance")
+
+
+def sign_adhoc(runner, bundle):
+    scan_host_paths(bundle)
+    for i, target in enumerate(signing_targets(bundle)):
+        runner.run(f"adhoc-sign-{i}", ["/usr/bin/codesign", "--force", "--sign", "-", "--timestamp=none",
+                                       *engine_build.codesign_identifier_args(bundle, target), target])
+    verify_bundle_signature(bundle, "ad-hoc", runner, "adhoc-verification")
+
+
+def relocation_smoke(runner, bundle):
+    # Spaces and a changed prefix catch scripts/symlinks that retain a build path.
+    with tempfile.TemporaryDirectory(prefix="relocation-", dir=runner.logs) as tmp:
+        moved = Path(tmp) / "A Folder With Spaces" / "Harbor.app"
+        moved.parent.mkdir()
+        shutil.copytree(bundle, moved, symlinks=True)
+        backend = moved / "Contents/Resources/backend"
+        if guarded(runner, "relocated-backend-smoke", backend / ".venv/bin/python", "smoke", "-", root=backend):
+            raise BuildError("Relocated bundled backend import failed")
+        if engine_build.read_engine_json(moved) is not None:
+            plan = engine_build.smoke_plan(moved)
+            if plan["mode"] == "run":
+                engine_smoke(runner, moved)
+            else:
+                (runner.logs / "relocated-engine-smoke.log").write_text(
+                    "engine import smoke skipped: " + plan["reason"] + "\n")
+                print("engine import smoke skipped: " + plan["reason"])
+
+
+def engine_smoke(runner, bundle):
+    """Import the engine's server and initialise MLX from a relocated, signed bundle.
+
+    Runs without -I on purpose: like the engine manager, it relies on PYTHONPATH.
+
+    Needs working code-signing services on the build host: on a host where newly
+    created executables stall in dyld this step times out and the build fails, which
+    is the correct outcome (an engine that cannot start must not ship)."""
+    root = bundle / engine_build.ENGINE_DIR
+    scratch = Path(tempfile.mkdtemp(prefix="engine-smoke-", dir=runner.logs)).resolve()
+    env = {"HOME": str(scratch), "PATH": "/usr/bin:/bin", "TMPDIR": str(scratch), "LANG": "en_US.UTF-8",
+           "PYTHONPATH": f"{root}:{root / 'sp'}", "PYTHONDONTWRITEBYTECODE": "1"}
+    code = ("import omlx.server, mlx.core as mx; "
+            "assert mx.default_device().type == mx.DeviceType.gpu, mx.default_device(); "
+            "import mlx_lm, mlx_embeddings, transformers; print('engine-import-ok')")
+    status, log = runner.run("relocated-engine-smoke", [root / "py/bin/python3", "-B", "-c", code],
+                             cwd=scratch, env=env, timeout=300, check=False)
+    shutil.rmtree(scratch, ignore_errors=True)
+    if status or "engine-import-ok" not in log.read_text():
+        raise BuildError("Relocated bundled engine failed its import smoke test")
+
+
+def inventory(bundle):
+    bundle = Path(bundle)
+    root = bundle.lstat()
+    if not stat.S_ISDIR(root.st_mode):
+        raise BuildError("Bundle inventory root must be a directory")
+    rows = {".": {"directory": True, "mode": stat.S_IMODE(root.st_mode)}}
+    for p in sorted(bundle.rglob("*")):
+        rel = str(p.relative_to(bundle))
+        info = p.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            rows[rel] = {"symlink": os.readlink(p)}
+        elif stat.S_ISDIR(info.st_mode):
+            rows[rel] = {"directory": True, "mode": stat.S_IMODE(info.st_mode)}
+        elif stat.S_ISREG(info.st_mode):
+            rows[rel] = {"sha256": digest(p), "mode": stat.S_IMODE(info.st_mode),
+                         "size": info.st_size}
+        else:
+            raise BuildError("Unsupported bundle inventory entry")
+    return rows
+
+
+def archive(bundle: Path, output: Path, epoch: int):
+    # Stable order, timestamps, permissions; store symlinks as symlinks for Finder.
+    stamp = datetime.fromtimestamp(max(epoch, 315532800), timezone.utc).timetuple()[:6]
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+        for p in [bundle, *sorted(bundle.rglob("*"))]:
+            name = str(p.relative_to(bundle.parent)) + ("/" if p.is_dir() and not p.is_symlink() else "")
+            info = zipfile.ZipInfo(name, stamp)
+            info.create_system = 3
+            info.external_attr = p.lstat().st_mode << 16
+            info.compress_type = zipfile.ZIP_DEFLATED
+            data = os.readlink(p).encode() if p.is_symlink() else b"" if p.is_dir() else p.read_bytes()
+            z.writestr(info, data)
+    with zipfile.ZipFile(output) as z:
+        if z.testzip():
+            raise BuildError("ZIP integrity check failed")
+
+
+def notes(meta):
+    previous = subprocess.run(["git", "-C", str(ROOT), "describe", "--tags", "--match", "v[0-9]*", "--abbrev=0", "HEAD^"], capture_output=True, text=True)
+    base = previous.stdout.strip() if previous.returncode == 0 else None
+    history = git("log", "--no-merges", "--format=- %s (%h)", f"{base}..HEAD" if base else "HEAD")
+    skipped = (meta.get("engine_smoke") or {}).get("mode") == "skip"
+    smoke_note = (f"The engine's import smoke test was not run on the build host ({meta['engine_smoke']['reason']}); "
+                  "the engine files are verified against the pinned oMLX release instead.\n\n" if skipped else "")
+    return f"# Harbor {meta['version']} (build {meta['build_number']})\n\nSource: `{meta['commit']}`\n\nApple Silicon, macOS {meta['minimum_macos']} or newer. " + ("Includes a built-in AI engine (macOS " + str(meta["engine"]["minimum_macos"]) + " or newer for the engine); models are downloaded separately.\n\n" + smoke_note if meta.get("engine") else "Requires a separately installed oMLX server and models.\n\n") + ("LOCAL PREVIEW — uncommitted source; do not distribute.\n\n" if meta['dirty'] or meta.get('preview') else "") + f"Changes since {base or 'repository creation'}:\n\n{history}\n"
+
+
+def finalize(runner, bundle, destination, meta, toolchain):
+    scan_host_paths(bundle)
+    verify_bundle_signature(bundle, "ad-hoc")
+    json_write(destination / "bundle-manifest.json", inventory(bundle))
+    (destination / "release-notes.md").write_text(notes(meta))
+    provenance = {"schema": 1, "source": meta, "toolchain": toolchain, "inputs": json.loads((SUPPORT / "locks.json").read_text()),
+                  "signature": "ad-hoc", "notarized": False, "tests": runner.records,
+                  "reproducibility": "Pinned inputs and normalized archive; bit-for-bit Swift/SDK and signed outputs are not guaranteed."}
+    prefix = f"Harbor-{meta['version']}-{meta['build_number']}-arm64" + ("-preview" if meta["dirty"] or meta.get("preview") else "-candidate")
+    zip_path = destination / (prefix + ".zip")
+    archive(bundle, zip_path, meta["source_epoch"])
+    distribution_roundtrip(runner, zip_path, bundle, meta)
+    if meta.get("preview"):
+        provenance["preview"] = True
+    else:
+        shutil.copyfile(runner.logs / "simulation-qa.json", destination / "simulation-qa.json")
+        provenance["simulation_sha256"] = digest(destination / "simulation-qa.json")
+    json_write(destination / "provenance.json", provenance)
+    checksums(destination)
+
+
+
+def distribution_roundtrip(runner, zip_path, bundle, meta, notarized=False,
+                           archive_descriptor=None):
+    with tempfile.TemporaryDirectory(prefix="distribution-", dir=runner.logs) as tmp:
+        target = Path(tmp)
+        archive_input = zip_path
+        pass_fds = ()
+        if archive_descriptor is not None:
+            info = os.fstat(archive_descriptor)
+            if not stat.S_ISREG(info.st_mode):
+                raise BuildError("Bound distribution archive is not a regular file")
+            archive_input = f"/dev/fd/{archive_descriptor}"
+            pass_fds = (archive_descriptor,)
+        command = ["ditto", "-x", "-k", archive_input, target]
+        if pass_fds:
+            runner.run("extract-distribution", command, pass_fds=pass_fds)
+        else:
+            runner.run("extract-distribution", command)
+        extracted = target / "Harbor.app"
+        validate_structure(extracted, meta)
+        if inventory(extracted) != inventory(bundle):
+            raise BuildError("Archive roundtrip changed files, permissions, or symlinks")
+        scan_host_paths(extracted)
+        verify_bundle_signature(extracted, "Developer ID Application" if notarized else "ad-hoc", runner, "distributed-signature")
+        if notarized:
+            runner.run("verify-distributed-ticket", ["xcrun", "stapler", "validate", extracted])
+            runner.run("verify-distributed-gatekeeper", ["spctl", "--assess", "--type", "execute", extracted])
+        relocation_smoke(runner, extracted)
+
+
+def _descriptor_bytes(descriptor):
+    result, offset = bytearray(), 0
+    while block := os.pread(descriptor, 1_048_576, offset):
+        result.extend(block)
+        offset += len(block)
+    return bytes(result)
+
+
+def _descriptor_digest(descriptor):
+    value, offset = hashlib.sha256(), 0
+    while block := os.pread(descriptor, 1_048_576, offset):
+        value.update(block)
+        offset += len(block)
+    return value.hexdigest()
+
+
+def _open_regular_asset(path):
+    before = path.lstat()
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        raise BuildError("Release assets must be single-link regular files")
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    after = os.fstat(descriptor)
+    if (not stat.S_ISREG(after.st_mode) or after.st_nlink != 1
+            or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)):
+        os.close(descriptor)
+        raise BuildError("Release asset identity changed while opening")
+    return descriptor
+
+
+class BoundReleaseAssets:
+    """No-follow descriptors shared by verification and release upload."""
+    def __init__(self, destination):
+        self.destination = Path(destination).resolve(strict=True)
+        self.descriptors = {}
+        self.digests = {}
+        self.identities = {}
+        self.expected_files = set()
+
+    def __enter__(self):
+        try:
+            for path in sorted(self.destination.iterdir()):
+                info = path.lstat()
+                if stat.S_ISLNK(info.st_mode):
+                    raise BuildError("Artifact directories may not contain top-level symlinks")
+                if stat.S_ISREG(info.st_mode):
+                    descriptor = _open_regular_asset(path)
+                    self.descriptors[path.name] = descriptor
+                    self.digests[path.name] = _descriptor_digest(descriptor)
+                    opened = os.fstat(descriptor)
+                    self.identities[path.name] = (opened.st_dev, opened.st_ino)
+            return self
+        except Exception:
+            self.close()
+            raise
+
+    def close(self):
+        for descriptor in self.descriptors.values():
+            os.close(descriptor)
+        self.descriptors.clear()
+        self.identities.clear()
+
+    def __exit__(self, *_args):
+        self.close()
+
+    def read_bytes(self, name):
+        try:
+            self.assert_paths_unchanged()
+            return _descriptor_bytes(self.descriptors[name])
+        except KeyError:
+            raise BuildError(f"Missing verified release asset: {name}") from None
+
+    def read_text(self, name):
+        try:
+            return self.read_bytes(name).decode()
+        except UnicodeError:
+            raise BuildError(f"Invalid text release asset: {name}") from None
+
+    def contains_markers(self, name, markers):
+        self.assert_paths_unchanged()
+        data, carry, overlap, offset = b"", b"", max(map(len, markers)) - 1, 0
+        descriptor = self.descriptors[name]
+        while data := os.pread(descriptor, 1_048_576, offset):
+            sample = carry + data
+            if any(marker in sample for marker in markers):
+                return True
+            carry, offset = sample[-overlap:], offset + len(data)
+        return False
+
+    def assert_paths_unchanged(self):
+        actual = set()
+        for path in self.destination.iterdir():
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                raise BuildError("Artifact directories may not contain top-level symlinks")
+            if stat.S_ISREG(info.st_mode):
+                actual.add(path.name)
+                if self.identities.get(path.name) != (info.st_dev, info.st_ino):
+                    raise BuildError(f"Release asset identity changed: {path.name}")
+        if actual != set(self.descriptors):
+            raise BuildError("Release asset set changed after binding")
+        for name, descriptor in self.descriptors.items():
+            info = os.fstat(descriptor)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or self.identities.get(name) != (info.st_dev, info.st_ino)
+                    or _descriptor_digest(descriptor) != self.digests.get(name)):
+                raise BuildError(f"Release asset content changed: {name}")
+
+    def write_checksums(self, *, exclude=()):
+        if "SHA256SUMS" in self.descriptors or (self.destination / "SHA256SUMS").exists():
+            raise BuildError("Artifact checksum manifest already exists")
+        exclude = set(exclude)
+        if not exclude.issubset({"release-notes.md"}) or not exclude.issubset(self.descriptors):
+            raise BuildError("Invalid unpublished checksum exclusion")
+        self.assert_paths_unchanged()
+        body = "".join(f"{self.digests[name]}  {name}\n"
+                       for name in sorted(self.descriptors) if name not in exclude).encode()
+        path = self.destination / "SHA256SUMS"
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o644)
+        try:
+            offset = 0
+            while offset < len(body):
+                count = os.write(descriptor, body[offset:])
+                if count <= 0:
+                    raise BuildError("Could not write artifact checksum manifest")
+                offset += count
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        descriptor = _open_regular_asset(path)
+        self.descriptors[path.name] = descriptor
+        self.digests[path.name] = _descriptor_digest(descriptor)
+        opened = os.fstat(descriptor)
+        self.identities[path.name] = (opened.st_dev, opened.st_ino)
+        self.assert_paths_unchanged()
+
+    def validate_checksums(self, *, allow_unpublished_notes=False):
+        self.assert_paths_unchanged()
+        if "SHA256SUMS" not in self.descriptors:
+            raise BuildError("Missing artifact checksum manifest")
+        self.expected_files.clear()
+        try:
+            lines = self.read_text("SHA256SUMS").splitlines()
+            for line in lines:
+                sha, name = line.split("  ", 1)
+                if (Path(name).name != name or not re.fullmatch(r"[a-f0-9]{64}", sha)
+                        or name in self.expected_files):
+                    raise BuildError("Malformed checksum manifest")
+                self.expected_files.add(name)
+                if self.digests.get(name) != sha:
+                    raise BuildError(f"Artifact checksum mismatch: {name}")
+        except ValueError:
+            raise BuildError("Malformed checksum manifest") from None
+        actual = set(self.descriptors) - {"SHA256SUMS"}
+        required = actual - ({"release-notes.md"} if allow_unpublished_notes else set())
+        if self.expected_files != required or not any(
+                name.endswith(".zip") for name in self.expected_files):
+            raise BuildError("Incomplete artifact checksum manifest")
+
+    def upload_assets(self):
+        self.assert_paths_unchanged()
+        return [(name, release_asset_content_type(name), self.descriptors[name], self.digests[name],
+                 os.fstat(self.descriptors[name]).st_size)
+                for name in sorted(self.descriptors) if name != "release-notes.md"]
+
+
+def checksums(destination, *, exclude=()):
+    destination = Path(destination)
+    manifest = destination / "SHA256SUMS"
+    if manifest.exists() or manifest.is_symlink():
+        info = manifest.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise BuildError("Artifact checksum manifest must be a regular file")
+        manifest.unlink()
+    with BoundReleaseAssets(destination) as assets:
+        assets.write_checksums(exclude=exclude)
+
+
+def release_asset_content_type(name):
+    explicit = {
+        ".json": "application/json",
+        ".md": "text/markdown; charset=utf-8",
+        ".zip": "application/zip",
+    }
+    if name == "SHA256SUMS":
+        return "text/plain; charset=utf-8"
+    return explicit.get(Path(name).suffix.lower(),
+                        mimetypes.guess_type(name)[0] or "application/octet-stream")
+
+
+class GitHubReleaseUploader:
+    """Upload explicitly named assets while reading only retained descriptors."""
+    retryable_statuses = {429, 500, 502, 503, 504}
+
+    def __init__(self, repository, release_id, token, *, attempts=3,
+                 connection_factory=http.client.HTTPSConnection, sleeper=time.sleep):
+        if (not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository)
+                or not str(release_id).isdigit() or int(release_id) <= 0 or not token
+                or attempts < 1):
+            raise BuildError("Invalid GitHub release upload configuration")
+        self.repository = repository
+        self.release_id = str(release_id)
+        self.token = token
+        self.attempts = attempts
+        self.connection_factory = connection_factory
+        self.sleeper = sleeper
+
+    def upload(self, name, content_type, descriptor, expected_digest, expected_size):
+        if Path(name).name != name or not name or "\0" in name:
+            raise BuildError("Invalid release asset name")
+        if (not re.fullmatch(r"[a-f0-9]{64}", expected_digest)
+                or not isinstance(expected_size, int) or expected_size < 0):
+            raise BuildError("Invalid bound release asset identity")
+        info = os.fstat(descriptor)
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or info.st_size != expected_size):
+            raise BuildError("Release upload source is not a bound regular file")
+        endpoint = (f"/repos/{self.repository}/releases/{self.release_id}/assets?"
+                    + urlencode({"name": name}, quote_via=quote))
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {self.token}",
+            "Content-Length": str(expected_size),
+            "Content-Type": content_type,
+            "User-Agent": "harbor-release-pipeline",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        last_error = None
+        try:
+            for attempt in range(self.attempts):
+                connection = None
+                try:
+                    info = os.fstat(descriptor)
+                    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                            or info.st_size != expected_size):
+                        raise BuildError("Release upload source changed")
+                    body = tempfile.SpooledTemporaryFile(max_size=8 * 1_048_576, mode="w+b")
+                    digest, offset = hashlib.sha256(), 0
+                    while block := os.pread(descriptor, 1_048_576, offset):
+                        body.write(block)
+                        digest.update(block)
+                        offset += len(block)
+                    if offset != expected_size or digest.hexdigest() != expected_digest:
+                        body.close()
+                        raise BuildError("Release upload source content changed")
+                    body.seek(0)
+                    connection = self.connection_factory("uploads.github.com", timeout=120)
+                    with body:
+                        connection.request("POST", endpoint, body=body, headers=headers)
+                    response = connection.getresponse()
+                    response_body = response.read(65_537)
+                    if 200 <= response.status < 300 and len(response_body) <= 65_536:
+                        return
+                    if response.status not in self.retryable_statuses:
+                        raise BuildError(f"GitHub rejected release asset {name} ({response.status})")
+                    last_error = f"HTTP {response.status}"
+                except BuildError:
+                    raise
+                except (OSError, http.client.HTTPException) as exc:
+                    last_error = type(exc).__name__
+                finally:
+                    if connection is not None:
+                        connection.close()
+                if attempt + 1 < self.attempts:
+                    self.sleeper(min(2 ** attempt, 8))
+        finally:
+            pass
+        raise BuildError(f"GitHub release asset upload failed after retries: {name} ({last_error})")
+
+
+def verify_artifacts(destination, bound_assets=None, *, publication_asset_set=False):
+    if bound_assets is None:
+        with BoundReleaseAssets(destination) as assets:
+            return verify_artifacts(destination, bound_assets=assets,
+                                    publication_asset_set=publication_asset_set)
+    destination = Path(destination)
+    assets = bound_assets
+    if assets.destination != destination.resolve(strict=True):
+        raise BuildError("Verified release assets belong to a different directory")
+    qa_markers = (b"harbor-managed-summary-qa-v1", b"Harbor Summary QA",
+                  b"com.harbor.app.summary-qa", b"com.harbor.summary-qa.inference")
+    artifact_root = destination.resolve(strict=True)
+    for path in destination.rglob("*"):
+        try:
+            info = path.lstat()
+        except OSError as exc:
+            raise BuildError("Could not inspect candidate filesystem entries") from exc
+        if stat.S_ISLNK(info.st_mode):
+            try:
+                target_text = os.readlink(path)
+                target = path.resolve(strict=True)
+            except OSError as exc:
+                raise BuildError("Artifact symlink is dangling or unreadable") from exc
+            if (os.path.isabs(target_text) or not target.is_relative_to(artifact_root)):
+                raise BuildError("Artifact symlink escapes the verified directory")
+            if ("Summary QA" in path.name
+                    or any(marker in os.fsencode(target_text) for marker in qa_markers)):
+                raise BuildError("Managed-live QA identity is excluded from production verification")
+            if target.is_file():
+                try:
+                    from managed_live_qa.staging import contains_marker
+                    contains_qa = contains_marker(target, qa_markers)
+                except OSError as exc:
+                    raise BuildError("Could not inspect candidate for QA identity") from exc
+                if contains_qa:
+                    raise BuildError("Managed-live QA content is excluded from production verification")
+            elif not target.is_dir():
+                raise BuildError("Artifact symlink target is unsupported")
+            continue
+        if not stat.S_ISREG(info.st_mode):
+            continue
+        if "Summary QA" in path.name:
+            raise BuildError("Managed-live QA identity is excluded from production verification")
+        try:
+            from managed_live_qa.staging import contains_marker
+            contains_qa = (assets.contains_markers(path.name, qa_markers)
+                           if path.parent == destination and path.name in assets.descriptors
+                           else contains_marker(path, qa_markers))
+        except OSError as exc:
+            raise BuildError("Could not inspect candidate for QA identity") from exc
+        if contains_qa:
+            raise BuildError("Managed-live QA content is excluded from production verification")
+    marker = destination / "artifact-kind.json"
+    if "artifact-kind.json" in assets.descriptors:
+        value = json.loads(assets.read_text("artifact-kind.json"))
+        if value.get("artifact_kind") == "harbor-managed-summary-qa-v1":
+            raise BuildError("Managed-live QA artifacts are excluded from production verification")
+    assets.validate_checksums(allow_unpublished_notes=publication_asset_set)
+    provenance = json.loads(assets.read_text("provenance.json"))
+    meta = provenance["source"]
+    if meta.get("preview") or provenance.get("preview"):
+        raise BuildError("Preview builds skip Simulation QA and are never release eligible")
+    if assets.digests.get("simulation-qa.json") != provenance.get("simulation_sha256"):
+        raise BuildError("Missing or mismatched Simulation QA evidence")
+    validate_simulation(json.loads(assets.read_text("simulation-qa.json")), meta["commit"],
+                        allow_dirty=meta["dirty"])
+    bundle = destination / "Harbor.app"
+    validate_structure(bundle, meta)
+    if inventory(bundle) != json.loads(assets.read_text("bundle-manifest.json")):
+        raise BuildError("Bundle contents differ from the verified manifest")
+    signature = provenance.get("signature")
+    if signature == "ad-hoc" and provenance.get("notarized") is not False:
+        raise BuildError("Ad-hoc candidates must not claim notarization")
+    scan_host_paths(bundle)
+    verify_bundle_signature(bundle, signature)
+
+
+def main():
+    if sys.version_info < (3, 9):
+        print("Harbor build driver requires Python 3.9 or newer", file=sys.stderr)
+        return 2
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("command", nargs="?", default="all", choices=("all", "doctor", "lock", "bootstrap", "test", "swift", "verify", "release", "release-ad-hoc", "qa-assemble", "preview"))
+    p.add_argument("--dry-run", action="store_true", help="Print plan without downloads, writes or external release calls")
+    p.add_argument("--offline", action="store_true")
+    p.add_argument("--allow-dirty", action="store_true", help="Local preview only; never eligible for publication")
+    # `preview` = fast local install: full build/sign/validate/smoke, no QA gates, never publishable.
+    p.add_argument("--strict-toolchain", action="store_true")
+    p.add_argument("--build-number")
+    p.add_argument("--jobs", type=int, help="Concurrent Simulation QA gates (default: one per CPU; 1 = sequential)")
+    p.add_argument("--output", type=Path)
+    p.add_argument("--engine-app", type=Path,
+                   help="Genuine, signed oMLX.app whose pruned server is bundled as Contents/Resources/engine "
+                        "(opt-in; release builds must match build-support/engine.lock.json)")
+    p.add_argument("--fetch-engine", action="store_true",
+                   help="Download the oMLX release pinned in build-support/engine-source.json (size and SHA-256 "
+                        "checked, mounted read-only) and bundle its engine; same as --engine-app for that release")
+    p.add_argument("--google-oauth-client", type=Path,
+                   help="Local JSON file with the built-in Google OAuth client ({client_id, client_secret}); "
+                        "otherwise $HARBOR_GOOGLE_OAUTH_CLIENT; without either the app ships no built-in client")
+    p.add_argument("--no-uv", action="store_true",
+                   help="Build without the bundled uv/uvx (Google tools then need uv on the Mac); "
+                        "otherwise a missing or mismatched pinned uv release fails the build")
+    p.add_argument("--test-python", type=Path, help="Existing interpreter for test/swift auditing only")
+    p.add_argument("--qa-runtime", type=Path,
+                   help="Closed Python runtime tree for the separate managed-QA artifact")
+    p.add_argument("--qa-runtime-inventory-sha256",
+                   help="Independently reviewed canonical inventory digest for --qa-runtime")
+    p.add_argument("--production-sha",
+                   help="Exact production candidate SHA qualified by managed QA")
+    args = p.parse_args()
+    if args.jobs is not None and args.jobs < 1:
+        p.error("--jobs must be at least 1")
+    if args.fetch_engine and args.engine_app:
+        p.error("--fetch-engine and --engine-app are mutually exclusive")
+    if args.dry_run:
+        print(json.dumps({"command": args.command, "toolchain": CONFIG, "stages": ["preflight and lock validation", "pinned runtime and hash-checked binary dependencies", "pipeline contracts + isolated Python suites + Swift contracts" if args.command != "preview" else "SKIPPED for preview: Simulation QA, native/browser peer gates, benchmark contracts, distribution evidence", "Swift release build and icon generation", "tracked source + relocatable runtime assembly", "ad-hoc sealed native/resource/relocation verification", "normalized ZIP, checksums, dependency inventory, provenance, release notes"],
+                          "external_release": "release requires protected CI, an exact version tag, credentials, and explicit dispatch", "installs_app": False, "offline": args.offline}, indent=2))
+        return 0
+    if args.command == "qa-assemble":
+        if args.allow_dirty:
+            print("BUILD FAILED: managed QA requires clean committed source", file=sys.stderr)
+            return 1
+        if not args.output:
+            print("BUILD FAILED: qa-assemble requires --output", file=sys.stderr)
+            return 1
+        if not args.qa_runtime or not args.qa_runtime_inventory_sha256 or not args.production_sha:
+            print("BUILD FAILED: qa-assemble requires --qa-runtime, "
+                  "--qa-runtime-inventory-sha256, and --production-sha",
+                  file=sys.stderr)
+            return 1
+        try:
+            from managed_live_qa.staging import build as build_managed_qa
+            output = args.output.resolve()
+            if not output.is_relative_to((ROOT / "dist").resolve()):
+                raise BuildError("QA output must be below this checkout's dist/")
+            meta = metadata(False, args.build_number)
+            source_start = source_fingerprint()
+            build_managed_qa(ROOT, output, meta["commit"], args.production_sha,
+                             runtime_source=args.qa_runtime,
+                             runtime_inventory_sha256=args.qa_runtime_inventory_sha256)
+            if (git("rev-parse", "HEAD") != meta["commit"]
+                    or git("status", "--porcelain", "--untracked-files=all")
+                    or source_fingerprint() != source_start):
+                raise BuildError("QA source changed while sealing the artifact")
+            print(f"Built separate managed QA application: {output / 'Harbor Summary QA.app'}")
+            return 0
+        except (BuildError, OSError, ValueError) as exc:
+            print(f"BUILD FAILED: {exc}", file=sys.stderr)
+            return 1
+    runner = Runner()
+    try:
+        if args.command == "verify":
+            if not args.output:
+                raise BuildError("verify requires --output <artifact-directory>")
+            verify_artifacts(args.output.resolve())
+            return 0
+        if args.command == "release-ad-hoc":
+            from release import release_ad_hoc
+            release_ad_hoc(runner, args)
+            return 0
+        if args.command == "release":
+            from release import release
+            release(runner, args)
+            return 0
+        if args.command in ("all", "bootstrap", "preview") or (args.command == "test" and not args.test_python):
+            check_locks()
+        toolchain = doctor(runner, args.strict_toolchain, args.offline)
+        if args.command == "doctor":
+            check_locks()
+        elif args.command == "lock":
+            lock(runner, args.offline)
+        elif args.command == "swift":
+            python = args.test_python.absolute() if args.test_python else bootstrap(runner, args.offline)
+            simulation_tests(runner, python, allow_dirty=args.allow_dirty, native_only=True, jobs=args.jobs)
+            build_swift(runner)
+        else:
+            if args.test_python and args.command != "test":
+                raise BuildError("--test-python is only allowed for test auditing, never packaging")
+            packaging = args.command in ("all", "preview")
+            preview = args.command == "preview"
+            meta = metadata(args.allow_dirty, args.build_number, preview) if packaging else None
+            # Settled before any test or build step, so a taken or misplaced directory fails at once.
+            output = packaging_output(args.output, meta, preview) if packaging else None
+            # Read (and drop from the environment) before any test or build step runs.
+            google_client = google_oauth_client(args.google_oauth_client) if packaging else None
+            if packaging and google_client is None:
+                print("WARNING: no Google OAuth client was given (--google-oauth-client or "
+                      f"${GOOGLE_OAUTH_CLIENT_ENV}), so this build has no built-in Google sign-in. "
+                      "Do not publish it.", file=sys.stderr)
+            # Fetched and verified before any test runs, so a bad pin fails fast.
+            uv_archive = None
+            if packaging and not args.no_uv:
+                try:
+                    uv_archive = uv_tool.verified_archive(STATE / "uv-tool-cache", offline=args.offline)
+                except uv_tool.UVToolError as exc:
+                    raise BuildError(f"{exc}. Pass --no-uv to build without the bundled uv.") from None
+            source_start = source_fingerprint() if meta else None
+            if meta:
+                meta["tracked_source_sha256"] = source_start
+            with contextlib.ExitStack() as mounted:
+                # The engine source is opened and checked before any test runs too: a bad pin, a failed
+                # download or the wrong oMLX release stops here. A fetched image stays mounted until
+                # the engine has been staged.
+                engine_app = None
+                if packaging and (args.fetch_engine or args.engine_app):
+                    if args.fetch_engine:
+                        try:
+                            engine_app = mounted.enter_context(
+                                engine_build.fetched_app(STATE / "engine-cache", offline=args.offline))
+                        except engine_build.EngineBuildError as exc:
+                            raise BuildError(str(exc)) from None
+                    else:
+                        engine_app = args.engine_app.resolve()
+                    check_engine_source(engine_app)
+                python = args.test_python.absolute() if args.test_python else bootstrap(runner, args.offline)
+                if args.command == "bootstrap":
+                    return 0
+                if not preview:
+                    simulation_tests(runner, python, allow_dirty=args.allow_dirty, jobs=args.jobs)
+                if packaging:
+                    binary = build_swift(runner)
+                    output.mkdir(parents=True, exist_ok=False)
+                    try:
+                        bundle = assemble(runner, binary, output, meta, args.offline, engine_app,
+                                          google_client=google_client, uv_archive=uv_archive)
+                        mounted.close()
+                        validate_structure(bundle, meta)
+                        prepare_native_for_signing(runner, bundle)
+                        validate_native(runner, bundle, meta)
+                        sign_adhoc(runner, bundle)
+                        relocation_smoke(runner, bundle)
+                        if git("rev-parse", "HEAD") != meta["commit"] or source_fingerprint() != source_start:
+                            raise BuildError("Source changed during build; discard candidate and rerun from a stable checkout")
+                        finalize(runner, bundle, output, meta, toolchain)
+                    except (BuildError, OSError, subprocess.CalledProcessError):
+                        # This run created the directory (mkdir above refuses an existing one), so a
+                        # failed build takes it away again and the same commit can be rebuilt.
+                        shutil.rmtree(output, ignore_errors=True)
+                        if not output.exists():
+                            print(f"Removed the incomplete output directory: {output}", file=sys.stderr)
+                        raise
+                    if preview:
+                        print(f"Built PREVIEW (not release eligible, QA gates skipped): {output}")
+                    else:
+                        verify_artifacts(output)
+                        print(f"Verified candidate: {output}")
+        print(f"Diagnostics: {runner.logs}")
+        return 0
+    except (BuildError, OSError, subprocess.CalledProcessError) as exc:
+        print(f"BUILD FAILED: {exc}\nDiagnostics: {runner.logs}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    # The release extension imports this module; keep one BuildError/type identity.
+    sys.modules["pipeline"] = sys.modules[__name__]
+    raise SystemExit(main())

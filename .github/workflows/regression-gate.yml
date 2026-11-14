@@ -1,0 +1,43 @@
+name: Regression gate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  python-regressions:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2; same as strict artifact CI
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify exact candidate checkout
+        env:
+          CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: build-support/requirements-test.lock
+      - name: Install test dependencies
+        run: |
+          python -m pip install --require-hashes --only-binary=:all: -r build-support/requirements-test.lock
+      # Pull requests: Simulation QA (harbor-build.yml) already runs every module of
+      # its full profile under the OS sandbox on this exact head, so this required
+      # check runs only the modules that profile does not run (normally none) and
+      # never repeats that work. Pushes to main keep the complete run outside the
+      # sandbox as a cross-check. Both run one module per runner CPU at a time.
+      - name: Run regression modules outside Simulation QA
+        if: github.event_name == 'pull_request'
+        run: python scripts/test_replay_failure_fixes.py --only-outside-simulation-qa
+      - name: Run complete regression gate
+        if: github.event_name != 'pull_request'
+        run: python scripts/test_replay_failure_fixes.py
