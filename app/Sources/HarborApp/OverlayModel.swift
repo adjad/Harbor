@@ -1,0 +1,3110 @@
+import Combine
+import SwiftUI
+
+@MainActor
+final class OverlayModel: ObservableObject {
+    enum Phase { case idle, routing, working, streaming, confirming, done, error }
+
+    struct Pending: Identifiable {
+        let id = UUID()
+        let sessionId: String
+        let actionId: String
+        // The /agent request that raised this card. Action ids are not unique across
+        // overlapping requests, so the answer names the request too and the backend
+        // routes it to exactly that one. Empty from a backend that predates this.
+        var requestId: String = ""
+        let tool: String
+        let reason: String
+        // False for actions the backend refuses to ever pre-approve (sending
+        // mail/messages — see service/safety/grants.py). The card hides its
+        // "Always allow" button in that case rather than offering one that
+        // would silently do nothing.
+        var grantable: Bool = true
+        // What an "always" answer would cover: a directory, a hostname, a
+        // program name. Empty means the grant applies to the whole tool.
+        var scopeHint: String = ""
+        // For create_tool: the exact code about to be written to disk. The
+        // args alone ({"name": "..."}) say nothing about what the tool DOES,
+        // and this is the moment the user authorizes it — so the card shows
+        // the real thing rather than asking them to trust a summary.
+        var preview: String = ""
+    }
+
+    struct MessageDraft: Identifiable {
+        let id = UUID()
+        var to: String
+        var text: String
+        var isEditing = false
+        var isSending = false
+        var sent = false
+        var status = ""
+    }
+
+    // One tool invocation within an assistant turn — the structured record
+    // behind the human-readable `activity` log line, kept for debug export.
+    // A debug_capture record a tool recorded about its OWN internals while it
+    // ran — e.g. summarize_emails/summarize_messages record the raw source
+    // lines fed to their own internal model call ("source") plus that call's
+    // exact request/response ("model_call"); create_tool's prepare_draft
+    // records its own code-generation call's request/response. See
+    // service/debug_capture.py. Kept as one
+    // pretty-JSON blob per record (like argsJSON below) rather than a typed
+    // breakdown, since the shape genuinely varies by kind.
+    struct ToolDebugRecord: Identifiable, Sendable {
+        let id = UUID()
+        var kind: String = ""     // "source" | "model_call"
+        var json: String = ""
+    }
+
+    struct ToolCallRecord: Identifiable, Sendable {
+        let id = UUID()
+        var callId: String = ""       // correlates the tool_call/tool_result SSE pair
+        var name: String = ""
+        var argsJSON: String = ""     // raw args, pretty-printed JSON
+        var decision: String = ""     // "allow" | "confirm" | "deny"
+        var decisionReason: String = ""
+        var result: String = ""
+        var debugRecords: [ToolDebugRecord] = []
+    }
+
+    // Exactly what was sent to and returned by the model for one completion
+    // call (`raw_model_io` SSE event) — a turn can carry several of these,
+    // one per agent-loop step/attempt. Request includes the full messages
+    // array (system prompt + history) and tool schemas; response is either
+    // the real wire response (non-streaming reasoning path) or the
+    // reassembled content/reasoning_content/tool_calls (streamed paths).
+    struct RawModelIO: Identifiable, Sendable {
+        let id = UUID()
+        var model: String = ""
+        var requestJSON: String = ""
+        var responseJSON: String = ""
+    }
+
+    // One exchange in the conversation.
+    struct Turn: Identifiable, Sendable {
+        let id = UUID()
+        let role: String   // "user" or "assistant"
+        var text: String
+        var activity: [String] = []   // tool-call log for this turn, shown above its answer
+        var isError: Bool = false
+        // Raw exception text behind an error turn (see service/errors.py) —
+        // never shown as the headline, only folded into the debug export so
+        // a real diagnosis doesn't require reproducing the failure.
+        var traceID: String? = nil
+        var errorDetail: String? = nil
+        var nodeResultID: String? = nil
+        /// What a tool in this reply needed and wasn't allowed ("calendar_access", …),
+        /// from its own result (AskAccess), for the fix button under the reply.
+        var needsAccess: [String] = []
+
+        // Debug metadata — populated on assistant turns only (see handle()'s
+        // "done"/"error" cases). Everything a debug-mode export needs to
+        // reconstruct exactly what happened for this exchange.
+        var model: String? = nil
+        var routeRole: String? = nil        // router's role classification: fast/agent/general/coding/reasoning
+        var routeReason: String? = nil      // WHY the router picked that role/model
+        var routeSource: String? = nil      // rules/fallback/default
+        var neededTools: Bool? = nil
+        var tokPerSec: Int? = nil
+        var startedAt: Date? = nil          // when this turn's request was sent
+        var firstTokenAt: Date? = nil       // first delta/reasoning/text token received
+        var finishedAt: Date? = nil         // when "done"/"error" arrived
+        var timeToFirstTokenSec: Double? {
+            guard let s = startedAt, let f = firstTokenAt else { return nil }
+            return f.timeIntervalSince(s)
+        }
+        var durationSec: Double? {
+            guard let s = startedAt, let f = finishedAt else { return nil }
+            return f.timeIntervalSince(s)
+        }
+        var heartbeatCount: Int = 0
+        var reasoningText: String = ""
+        var toolCalls: [ToolCallRecord] = []
+        var rawIO: [RawModelIO] = []
+    }
+
+    @Published var corpusBusy = false
+    @Published var showingCorpus = false
+    var onCorpusCommand: ((String) -> Void)?
+    var onHideCorpus: () -> Void = {}
+    var onResetCorpus: () -> Void = {}
+    var onOpenCorpus: () -> Void = {}
+
+    /// /resetharbor's confirmation card (ResetHarbor.swift), nil when closed.
+    @Published var resetCard: ResetCardState?
+    /// Runs the reset after the Reset Harbor click (AppDelegate.performHarborReset).
+    /// Returns why it stopped before erasing anything; on success Harbor relaunches.
+    var onResetHarbor: (() async -> String)?
+
+    @Published var input = ""
+    @Published var answer = ""
+    @Published var reasoning = ""
+    @Published var showReasoning = false
+    @Published var role = ""
+    @Published var modelAbbrev = ""
+    @Published var routeSource = ""
+    @Published var tokPerSec = 0
+    @Published var phase: Phase = .idle
+    // Human-readable "what's actually happening right now" (e.g. "Loading
+    // Agents-A1-4B… (3s)" during a cold model swap) — see the backend's
+    // `status` SSE event (OMLXClient.ensure_only). Overrides the generic
+    // phase-based processingLabel below while non-empty, so a long silent
+    // stretch names the real cause instead of just sitting on "Thinking…".
+    @Published var statusText = ""
+    @Published var activity: [String] = []
+    @Published var pending: Pending?
+    @Published var messageDraft: MessageDraft?
+    @Published private(set) var attachedImageName: String?
+    // The pending attachment's preview and kind, for the chip. Memory only.
+    @Published private(set) var attachedThumbnail: NSImage?
+    @Published private(set) var attachedLabel = ""
+    /// What a screen capture shows ("Safari — Pricing"), for the "Harbor saw:" chip
+    /// and the reading. Nil for a whole-screen capture or any other attachment.
+    @Published private(set) var attachedScreenLabel: String?
+    // The panel's tab. App-scoped, so it survives collapse.
+    @Published var tab: NotchTab = .ask {
+        didSet {
+            guard tab != oldValue else { return }
+            // A research plan holds the prompt queue only while it is on screen.
+            // Leaving the tab lets a question asked in Ask, or a brief, run.
+            if oldValue == .research { releaseResearchDispatch() }
+            // Any way off Ask (⌘1-5, a deep link, a notification) ends the
+            // questionnaire; its answers so far are already saved.
+            if tab != .ask { leaveKnowYou(); voice.cancel() }
+            closePermissionPage()
+            showingQuickSettings = false
+            onResize()
+        }
+    }
+    private var tabMemory = NotchTabMemory()
+    // The next prompt opens an editable research plan. This is the Research tab.
+    var researchMode: Bool {
+        get { tab == .research }
+        set {
+            if newValue { tab = .research } else if tab == .research { tab = .ask }
+        }
+    }
+    // Once a research question is submitted, its plan, progress, sources, and
+    // report replace the prompt on the Research tab. Research is a mode of
+    // Harbor, not a separate destination window.
+    @Published var showingResearch = false
+    // The gear's short list of settings, shown in place of the tab's content.
+    @Published var showingQuickSettings = false {
+        didSet {
+            // Every way out of the settings (a command, voice, a tab) is a way
+            // out of the page over them too, even with settings already closed.
+            if !keepingPermissionPage { closePermissionPage() }
+            guard showingQuickSettings != oldValue else { return }
+            // The gear during Getting to know you: step out of the flow (its
+            // answers so far are saved) rather than open settings behind it.
+            if showingQuickSettings { leaveKnowYou() }
+            onResize()
+        }
+    }
+    // The permission page, shown in place of the tab's content and over quick
+    // settings, so Done returns to whichever it opened from. Unlike quick settings
+    // it stays through a close made for its own action (permissionPage), which
+    // shows it again once macOS has an answer.
+    @Published private(set) var showingPermissions = false {
+        didSet {
+            guard showingPermissions != oldValue else { return }
+            if showingPermissions { leaveKnowYou() } else { permissionPage.closed() }
+            syncPermissionPoll()
+            onResize()
+        }
+    }
+    let permissionPage = NotchPermissionPageModel()
+    private var keepingPermissionPage = false
+
+    /// Opens the page, on one permission or (nil) the whole list, and the panel
+    /// if it is closed.
+    func openPermissionPage(_ item: FirstRunPermissions.Item?) {
+        permissionPage.opened(focus: item)
+        showingPermissions = true
+        onResize()
+        if collapsed { requestExpand() }
+    }
+
+    func closePermissionPage() { showingPermissions = false }
+
+    /// What fills the panel under its header now. OverlayView animates every
+    /// change of it the same way (Theme.Motion), however it was made: a tab
+    /// click, ⌘1 to ⌘5, a deep link, a notification, the gear, Done or Esc.
+    var page: NotchPage {
+        NotchPage.shown(tab: tab, settings: showingQuickSettings, permissions: showingPermissions,
+                        reset: resetCard != nil, knowYou: knowYou != nil)
+    }
+
+    /// Its states are read only while it can be seen. Opening the panel reads
+    /// them again at once, so coming back from System Settings shows the answer.
+    private func syncPermissionPoll() {
+        if showingPermissions && !collapsed { permissionPage.access.start() } else { permissionPage.access.stop() }
+    }
+
+    @Published private(set) var freeingMemory = false
+    /// Quick settings' Model memory row: what the engine has resident, nil when unknown.
+    @Published private(set) var modelMemory: ModelMemory?
+    // First-run setup at the top of Ask. Its readiness lives on the app's one
+    // SetupGuideModel, which Settings › Models › Setup shares.
+    @Published var setupCard: NotchSetupCard = .hidden { didSet { if setupCard != oldValue { onResize() } } }
+    // Whether Harbor's own service answers (BackendManager's reachability watch).
+    // False shows "Harbor service isn't running" with Retry instead of a green dot.
+    @Published var serviceReachable = true {
+        didSet {
+            if serviceReachable { serviceStartFailure = nil }
+            if serviceReachable != oldValue { onResize(); sendHeldForStartup() }
+        }
+    }
+    // The service is coming up (a cold first launch, or after Retry): a neutral
+    // "Starting Harbor…" line, never the red down card. True from launch until the
+    // first reachability probe answers, so a question typed in the first seconds
+    // is held, not sent into a service that isn't listening yet.
+    @Published var serviceStarting = true {
+        didSet { if serviceStarting != oldValue { onResize(); sendHeldForStartup() } }
+    }
+    /// Why the service's last start failed (BackendManager posts
+    /// .harborBackendStartFailed: exit status and the log's last line). A recorded
+    /// failure ends the "Starting Harbor…" hold at once: the down card shows the
+    /// cause with Retry and Report instead of minutes of "Starting".
+    @Published private(set) var serviceStartFailure: String? { didSet { if serviceStartFailure != oldValue { onResize() } } }
+    var serviceDown: Bool { !serviceReachable && (!serviceStarting || serviceStartFailure != nil) }
+    // Set by the app delegate: ask the backend manager to start the service again.
+    var onRetryService: () -> Void = {}
+    private var startFailureObserver: NSObjectProtocol?
+    private var archiveForgetObserver: NSObjectProtocol?
+
+    /// Retry from the service-down card or status line: forget the recorded
+    /// failure (a new start may fix it) and start the service again.
+    func retryService() {
+        serviceStartFailure = nil
+        onRetryService()
+    }
+
+    /// Prompts typed while the service was still starting. Sent, in order, as
+    /// soon as it answers; the line beside the box says they are waiting.
+    private var heldForStartup: [QueuedPrompt] = []
+
+    private func sendHeldForStartup() {
+        guard serviceReachable, !serviceStarting, !heldForStartup.isEmpty else { return }
+        let held = heldForStartup
+        heldForStartup = []
+        for prompt in held {
+            if let dispatch = submissionState.submit(prompt) { start(dispatch) }
+        }
+        syncQueue()
+    }
+    // The one problem report open in the notch, unfolded under the reply it is
+    // about (or at the top of Ask when it isn't about a reply on screen).
+    let report = ReportDraft()
+    private var reportObserver: AnyCancellable?
+    /// Ask by voice: the mic in the Ask bar, the Brief/Day header mic and ⌥⇧Space.
+    let voice = VoiceInput()
+    /// Reads answers aloud (VoiceReplyMode), on this Mac.
+    let speaker = AnswerSpeaker()
+    private var voiceObservers: [AnyCancellable] = []
+    /// Questions sent from voice and not yet answered, so their answers are spoken.
+    private var voicePrompts: [String] = []
+
+    init(loadDebugMode: () -> Bool = { UserDefaults.standard.bool(forKey: "harbor.debugMode") },
+         saveDebugMode: @escaping (Bool) -> Void = { UserDefaults.standard.set($0, forKey: "harbor.debugMode") },
+         recentChatsLoader: ((Int) async -> [[String: Any]]?)? = nil) {
+        self.saveDebugMode = saveDebugMode
+        self.recentChatsLoader = recentChatsLoader
+        _debugMode = Published(initialValue: loadDebugMode())
+        // Rows that show the report read it through this model, so redraw with it.
+        reportObserver = report.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }
+        voiceObservers = [
+            voice.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() },
+            speaker.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() },
+            // The listening line and a failure change the panel's height.
+            voice.$state.removeDuplicates().sink { [weak self] _ in
+                DispatchQueue.main.async { self?.onResize() }
+            },
+        ]
+        voice.onTranscript = { [weak self] text in self?.askByVoice(text) }
+        startFailureObserver = NotificationCenter.default.addObserver(
+            forName: .harborBackendStartFailed, object: nil, queue: .main) { [weak self] note in
+            let reason = note.userInfo?["reason"] as? String ?? ""
+            MainActor.assumeIsolated {
+                guard let self, !self.serviceReachable || self.serviceStarting else { return }
+                // On a cold launch reachability is still its optimistic `true`
+                // (no probe has answered yet), which would hide the down card.
+                // A start that provably died means the service is not reachable;
+                // the next probe that answers sets it back and clears the failure.
+                self.serviceReachable = false
+                self.serviceStartFailure = reason.isEmpty ? "Harbor's service stopped while starting." : reason
+            }
+        }
+        archiveForgetObserver = NotificationCenter.default.addObserver(
+            forName: .harborForgetChatDebugArchive, object: nil, queue: .main) { [weak self] note in
+            let id = note.userInfo?["session_id"] as? String
+            MainActor.assumeIsolated { self?.forgetArchivedChats(sessionId: id) }
+        }
+    }
+
+    /// A deleted chat (by id) or a forget with no one chat to match (nil): the
+    /// debug log's memory of it goes, the open chat's included when it matches.
+    /// The chat open here stays on screen.
+    func forgetArchivedChats(sessionId: String?) {
+        if let sessionId {
+            chatArchive.remove(sessionId: sessionId)
+            if !sessionId.isEmpty && sessionId == self.sessionId { liveChatForgotten = true }
+        } else {
+            chatArchive.removeAll()
+            liveChatForgotten = true
+        }
+    }
+    /// True while the panel's content is hidden behind its surface: at the
+    /// start of a close it fades out, so the shrinking shape never slices live
+    /// text, and at the start of an open it stays out until the shape has
+    /// grown, then fades in. Cleared when the bar takes over or the open is
+    /// under way.
+    @Published var contentVeiled = false
+
+    @Published var collapsed = false {
+        didSet {
+            if collapsed && !oldValue {
+                tabMemory.panelClosed(at: Date())
+                keepingPermissionPage = permissionPage.keepsThroughClose
+                showingQuickSettings = false
+                keepingPermissionPage = false
+                voice.cancel()
+            } else if !collapsed && oldValue {
+                permissionPage.panelOpened()
+            }
+            syncPermissionPoll()
+            onCollapsedChanged()
+        }
+    }
+    @Published var turns: [Turn] = []      // conversation history
+    // Keepalive pings since the answer last moved (a long think, a stall): a
+    // delta, text, reasoning or a cleared answer starts the count again.
+    @Published var heartbeats = 0
+    // Every ping this turn, for the turn's record.
+    private var turnHeartbeats = 0
+    // Current-source reads, including a sync that outlives a tool/summary's
+    // bounded wait. Kept visible after "still syncing" until readers finish.
+    @Published var dailySyncProgress: Double?
+    @Published var dailySyncLabel = ""
+    @Published var sourceSyncStatuses: [HarborClient.SourceSyncStatus] = []
+    @Published private(set) var queuedPromptCount = 0
+    /// The line beside the box while prompts wait: what they wait on, never silent.
+    @Published private(set) var queueLabel = ""
+    private var sourceSyncTask: Task<Void, Never>?
+    private var sourceSyncID = UUID()
+    private var trackedSyncSources: [String] = []
+    private var dailySummaryRunning = false
+    private var dailySummaryID = UUID()
+    private var submissionState = PromptSubmissionState()
+    private var researchDispatchID: UInt64?
+
+    // Debug mode: shows a per-reply metadata line (model, route reason, tok/s,
+    // timing, tool calls) inline in the transcript, and unlocks exporting the
+    // full session as JSON/text from the menu bar. Persisted across launches.
+    private let saveDebugMode: (Bool) -> Void
+    private let recentChatsLoader: ((Int) async -> [[String: Any]]?)?
+    @Published var debugMode = false {
+        didSet { saveDebugMode(debugMode) }
+    }
+
+    // --- assistant layer (calendar/reminders) ---
+    // Upcoming commitments themselves surface as system notifications (see
+    // Notifications.swift / handleAssistantEvent's "reminder" case) rather
+    // than a live in-panel list.
+    // The latest Daily Summary brief, shown on the Brief tab: the scheduled one
+    // from the service, or one composed with Refresh. It belongs to Today, not
+    // to the chat, so New chat keeps it.
+    struct DailyBrief: Equatable {
+        let text: String
+        let receivedAt: Date
+        let traceID: String?
+        // The saved chat the service recorded this brief in, so a follow-up can
+        // continue from it. Empty for a scheduled brief, which is not recorded.
+        let sessionId: String
+    }
+    @Published private(set) var brief: DailyBrief?
+    @Published private(set) var briefComposing = false
+    // The Day tab's unsent inline task. Kept here so it survives collapse.
+    @Published var todayTaskTitle = ""
+    // Behavior-engine nudges shown as cards at the top of the panel (newest
+    // first, see NudgeViews.swift). Each also arrives as a notification.
+    @Published var nudges: [BehaviorNudge] = []
+    @Published var transientNotice: String?
+    @Published private(set) var transientNoticeIsInfo = false
+    // Getting to know you (KnowYouView.swift), replacing the tab content while
+    // it runs. Nil when the flow is not on screen.
+    @Published private(set) var knowYou: KnowYouModel?
+    // The service said tonight's check-in is due; Today's card refreshes on it.
+    @Published var checkInDue = false
+    // Keep the panel open: no auto-collapse when the pointer leaves or focus
+    // moves to another app. Cleared by any explicit collapse (see AppDelegate).
+    @Published var pinned = false
+    // Recent saved chats for the notch's chat switcher, newest first, without
+    // the one open here. Refreshed each time the panel opens.
+    @Published private(set) var recentChats: [ChatSummary] = []
+    // The saved title of a chat reopened from the switcher; nil for a chat
+    // started here, which is named after its first prompt.
+    @Published private(set) var reopenedChatTitle: String?
+    private var assistantTask: Task<Void, Never>?
+    private var transientNoticeTask: Task<Void, Never>?
+    // Scheduled briefs already shown on the Brief tab, by hub event id. The SSE
+    // stream is re-subscribed after any drop, so the same brief can arrive twice.
+    private var appliedBriefEvents: Set<String> = []
+
+    /// Whether a scheduled brief event replaces the Brief tab's brief: not when
+    /// it was already applied, and not when the brief shown is newer than it.
+    static func appliesBrief(eventID: String, created: Date?, applied: Set<String>, current: DailyBrief?) -> Bool {
+        if !eventID.isEmpty && applied.contains(eventID) { return false }
+        if let created, let current, current.receivedAt > created { return false }
+        return true
+    }
+
+    var onResize: () -> Void = {}
+    /// Fit the window now, in this run-loop turn (onResize waits one turn).
+    /// For a change whose animation starts on the next frame, so a grow lands
+    /// before the first frame instead of after it.
+    var onResizeNow: () -> Void = {}
+    // Collapse/expand resizes animate; streaming resizes (onResize) are instant.
+    var onCollapsedChanged: () -> Void = {}
+    // Set by the app delegate: expand / collapse WITH the drop animation.
+    // The view calls these instead of flipping `collapsed` directly, so the
+    // delegate can roll the panel up before swapping to the bar.
+    var requestExpand: () -> Void = {}
+    var requestCollapse: () -> Void = {}
+
+    // True while the attach-file dialog is up — it takes key focus from the
+    // panel, which must not be mistaken for "the user switched apps".
+    var pickingFile = false
+    /// The attach dialog while it is open. It runs beside the notch, not as an
+    /// app-modal dialog, so a second click on the paperclip brings it forward.
+    var filePicker: NSOpenPanel?
+
+    // True while auto-collapse must hold off: the panel is pinned, a file
+    // dialog it opened is up, there is an edit the person hasn't finished
+    // (typed input, a message draft being edited, a reply being written in the
+    // Brief), the setup card is open, or an answer is being written (the person
+    // is waiting for it, and said so).
+    var holdsOpen: Bool { answerInFlight || holdsOpenBesidesAnswer }
+
+    /// Everything in `holdsOpen` but an Ask turn in flight: what the person is
+    /// doing, which no time limit lets the notch close over.
+    var holdsOpenBesidesAnswer: Bool {
+        pinned || pickingFile || !input.trimmingCharacters(in: .whitespaces).isEmpty || messageDraft?.isEditing == true
+            || voice.isActive || speaker.speaking
+            || (tab == .day && !todayTaskTitle.trimmingCharacters(in: .whitespaces).isEmpty)
+            || (tab == .brief && ProactiveActions.shared.replyInProgress)
+            || studyHoldsOpen
+            || knowYou != nil
+            || setupCard == .open || report.isOpen || (tab == .day && todayReport?.isOpen == true)
+    }
+
+    /// The Study tab holds the panel while a field has focus or while the
+    /// person waits on a read or a new material; a load or a save does not.
+    private var studyHoldsOpen: Bool {
+        guard tab == .study else { return false }
+        let study = StudyModel.shared
+        if study.editing { return true }
+        switch study.busy {
+        case .reading?, .making?: return true
+        case .loading?, .saving?, nil: return false
+        }
+    }
+
+    /// Today's report, owned by the shared TodayModel. While it is open on the
+    /// Day tab the panel stays open, like any other edit in progress.
+    weak var todayReport: ReportDraft?
+
+    /// Saves a report from the notch. The save panel takes focus from the
+    /// panel, which must not read as the person leaving, and opens above it.
+    func saveReport(_ draft: ReportDraft) {
+        pickingFile = true
+        draft.chooseLocationAndSave(above: DisplayGeometry.shared.layout.windowLevel) { [weak self] in
+            guard let self else { return }
+            // The attach dialog can be up beside it, and marks the same flag.
+            self.pickingFile = self.filePicker != nil
+        }
+    }
+
+    /// Which report a reply's "Report a problem" opens: its trace (or, for a
+    /// reply without one, its row), so a rebuilt row finds the same draft.
+    static func reportKey(for turn: Turn) -> String { "chat:" + (turn.traceID ?? turn.id.uuidString) }
+
+    /// The open report isn't about any reply on screen (the last dropped turn,
+    /// no reply yet, or a reply the chat no longer shows): show it at the top of Ask.
+    var reportIsUnattached: Bool {
+        guard let key = report.snapshot?.key, key.hasPrefix("chat:") else { return false }
+        return !turns.contains { Self.reportKey(for: $0) == key }
+    }
+
+    /// Open Getting to know you in the panel (first launch, /about, the menu
+    /// bar, About you's Revisit). Picks up where the person left off.
+    func startKnowYou() {
+        if knowYou == nil {
+            let flow = KnowYouModel(client: client)
+            flow.onClose = { [weak self, weak flow] notice in
+                guard let self, let flow, self.knowYou === flow else { return }
+                self.endKnowYou(notice: notice)
+            }
+            flow.onShowBrief = { [weak self, weak flow] in
+                guard let self, let flow, self.knowYou === flow else { return }
+                self.endKnowYou(notice: nil)
+                self.runDailySummary()
+            }
+            knowYou = flow
+        }
+        showingQuickSettings = false
+        tab = .ask
+        requestExpand()
+        onResize()
+    }
+
+    private func endKnowYou(notice: String?) {
+        knowYou = nil
+        onResize()
+        if let notice { showTransientNotice(notice, duration: 8, info: true) }
+    }
+
+    /// The person moved on (a tab) before Done. The flow saves after every
+    /// step, so nothing is lost; the service counts it as Later.
+    func leaveKnowYou() {
+        guard let flow = knowYou else { return }
+        // Drop it now so a second gesture finds nothing to leave; tell the
+        // service in the background.
+        knowYou = nil
+        onResize()
+        Task { await flow.leave() }
+    }
+
+    /// Pick the tab for an opening panel: Ask, or for a hover soon after the
+    /// panel closed, the tab it closed on. An open setup card keeps it on Ask.
+    func prepareTab(byHover: Bool, at date: Date = Date()) {
+        // A page set aside for System Settings is what hovering comes back to; ⌥Space means Ask.
+        if !byHover || !permissionPage.stillWaiting(at: date) { closePermissionPage() }
+        tab = setupCard.tabForOpening(tabMemory.tabForOpening(current: tab, byHover: byHover, at: date))
+    }
+
+    /// An answer is on its way, or waiting on the person's confirmation.
+    var answerInFlight: Bool { Self.inFlight(phase) }
+    static func inFlight(_ phase: Phase) -> Bool { [Phase.routing, .working, .streaming, .confirming].contains(phase) }
+
+    /// Harbor is writing something the person is waiting to read in the panel: an
+    /// Ask turn (thinking, running tools, streaming, or a card waiting for their
+    /// answer) or the Brief being composed. The notch's automatic close waits for
+    /// it (AppDelegate.scheduleCollapse). Both end on their own: done, an error,
+    /// a dropped stream, or the request's timeout.
+    var generating: Bool { answerInFlight || briefComposing }
+
+    #if HARBOR_MOTION_APP_DELEGATE_CHECKS
+    func qaSetBriefComposing(_ on: Bool) { briefComposing = on }
+    #endif
+
+    /// False while a turn is in flight. The Harbor window and the chat switcher
+    /// read the saved history, which the service writes only at the end of a turn.
+    var conversationSettled: Bool {
+        !corpusBusy && ![Phase.routing, .working, .streaming, .confirming].contains(phase)
+    }
+
+    /// What the chat switcher calls the conversation open here.
+    var chatTitle: String {
+        if let reopenedChatTitle { return reopenedChatTitle }
+        if let first = turns.first(where: { $0.role == "user" }) { return ChatTitle.make(from: first.text, limit: 40) }
+        return "New chat"
+    }
+
+    /// Slash commands the Ask field's text could still become. /corpus only in Debug Mode.
+    var commandSuggestions: [NotchCommand] {
+        // Nothing typed starts with "/" on almost every update: answer that
+        // without asking macOS about Screen Recording (screenCommandAvailable),
+        // a privacy-service call the panel made on every redraw.
+        guard input.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("/") else { return [] }
+        return NotchCommand.suggestions(for: input, includeCorpus: debugMode, includeScreen: screenCommandAvailable)
+    }
+
+    /// Sources Harbor can't read right now ("calendar", "email"), refreshed each
+    /// time the panel opens, so a starter never asks about a denied source. Nil
+    /// until the service has said, so the first open shows no source starter.
+    @Published private(set) var unreadableSources: Set<String>?
+    /// What makes a starter the person's own, from what the app already holds.
+    @Published private(set) var starterPersonal = AskStarters.Personal()
+    /// The name from Getting to know you, for the greeting over the starters.
+    @Published private(set) var starterName = ""
+    /// The profile's first goal, kept between opens so a reopened panel shows
+    /// its starter at once while the profile is read again.
+    private var profileGoal = ""
+    /// Whether a cloud model may get Ask's prompt (Super Model or a cloud role),
+    /// asked again on every open. The goal starter waits for a false.
+    private var cloudUse = StarterCloudUse()
+
+    // The tappable questions under an empty Ask: ones a fresh install can
+    // answer, even before any source is allowed (AgentSend.swift's AskStarters).
+    var suggestions: [String] { AskStarters.prompts(unreadable: unreadableSources, personal: starterPersonal) }
+
+    /// Starters not yet asked in this chat (derived from its user turns, so New chat resets them).
+    var remainingSuggestions: [String] {
+        AskStarters.remaining(suggestions, askedTexts: turns.filter { $0.role == "user" }.map(\.text))
+    }
+
+    /// The compact "Try another" row under a conversation: only while Ask is at rest
+    /// (a finished reply is the last turn; nothing streaming, queued, typed, awaiting
+    /// approval, drafted or being reported) and some starter is still unasked.
+    var offersTryAnother: Bool {
+        guard phase == .idle || phase == .done, turns.last?.role == "assistant",
+              !isProcessing, !willQueuePrompt, answer.isEmpty,
+              input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              pending == nil, messageDraft == nil, report.snapshot == nil
+        else { return false }
+        return !remainingSuggestions.isEmpty
+    }
+
+    /// Reads which sources the starters may use, and makes some of them the
+    /// person's own from what the app already holds: the Brief's upcoming
+    /// calendar and waiting mail and texts (`today`), and the profile's name and
+    /// first goal. No model is asked; each read lands on its own, so a slow one
+    /// never holds the starters back.
+    func refreshStarters(today: TodayModel) {
+        // Cloud may have been turned on since the last open: no goal starter
+        // on the old answer while /inference/cloud is read again.
+        let cloudRequest = cloudUse.opened()
+        updatePersonalStarters(today: today)
+        Task { [weak self] in
+            await StarterAccess.shared.refresh()
+            guard let self, let unreadable = StarterAccess.shared.unreadable else { return }
+            if self.unreadableSources != unreadable { self.unreadableSources = unreadable }
+        }
+        Task { [weak self] in
+            guard let self, let envelope = await self.client.profile() else { return }
+            self.profileGoal = envelope.profile.goals.first { !$0.trimmingCharacters(in: .whitespaces).isEmpty } ?? ""
+            self.starterName = envelope.profile.name
+            let personal = Self.withGoal(self.starterPersonal, self.profileGoal, cloudInUse: self.cloudUse.inUse)
+            if personal != self.starterPersonal { self.starterPersonal = personal }
+        }
+        Task { [weak self] in
+            guard let self else { return }
+            let inUse = ChatCloudUse.active(from: await self.client.cloudInference())
+            self.cloudUse.answered(inUse, for: cloudRequest)
+            let personal = Self.withGoal(self.starterPersonal, self.profileGoal, cloudInUse: self.cloudUse.inUse)
+            if personal != self.starterPersonal { self.starterPersonal = personal }
+        }
+    }
+
+    /// The Brief's calendar and mail can land after the panel opened; the
+    /// starters pick them up then instead of waiting for the next open.
+    func updatePersonalStarters(today: TodayModel) {
+        let personal = Self.withGoal(AskStarters.Personal(today: today), profileGoal, cloudInUse: cloudUse.inUse)
+        if personal != starterPersonal { starterPersonal = personal }
+    }
+
+    private static func withGoal(_ personal: AskStarters.Personal, _ goal: String,
+                                 cloudInUse: Bool?) -> AskStarters.Personal {
+        var personal = personal
+        personal.goal = AskStarters.goalStarterAllowed(cloudInUse: cloudInUse) ? goal : ""
+        return personal
+    }
+
+    private let client = HarborClient()
+    private var sessionId = ""
+    /// Every chat left since Harbor opened, full detail, for Export Chat Debug Log….
+    /// Memory only (ChatDebugArchive).
+    private(set) var chatArchive = ChatDebugArchive<Turn>()
+    /// The chat open here was deleted or forgotten: it stays on screen, but is
+    /// neither archived nor exported. A new chat starts clear (reset).
+    private(set) var liveChatForgotten = false
+    // Each attachment kind warms the encoder that will read it (prewarmVision).
+    private var attachedImage: String? {
+        didSet { if attachedImage != nil { client.prewarmEncoder(.vision) } }
+    }
+    private var attachedVideo: QueuedVideo? {
+        didSet {
+            guard let attachedVideo else { return }
+            client.prewarmEncoder(.vision)
+            if attachedVideo.audio != nil { client.prewarmEncoder(.audio) }
+        }
+    }
+    private var attachedDocument: QueuedDocument? {
+        didSet { if attachedDocument?.pages.isEmpty == false { client.prewarmEncoder(.vision) } }
+    }
+    private var attachedSource: String?
+    private var attachmentReadTask: Task<Void, Never>?
+    private var attachmentReadID = UUID()
+    private var streamStart: Date?
+    private var streamChars = 0
+    // Coalesces rapid delta chunks into ~60ms visual updates instead of
+    // publishing `answer` (and triggering a full MarkdownView re-parse +
+    // re-render) on every single raw SSE token. Individual model token
+    // chunks can arrive many times a second; batching them is what makes
+    // text feel like it's flowing in smoothly rather than jittering token by
+    // token. Never delays more than one tick — see flushPendingDelta().
+    private var pendingDelta = ""
+    private var flushScheduled = false
+
+    // Debug metadata for the turn currently in flight — folded into a Turn
+    // record on "done"/"error" (see handle()). Reset in submit().
+    private var lastDroppedReport: [String: Any]?
+    /// Dropped prompts the server may have started on (their stream had begun),
+    /// set aside because the user had typed something else meanwhile. Never
+    /// sent by itself: Return on an empty box only puts the latest back in the box.
+    private var setAside = SetAsidePrompts()
+    private var lastDroppedReportKey: String?
+    private var turnTraceID: String?
+    private var turnStartedAt: Date?
+    private var turnFirstTokenAt: Date?
+    private var turnModel: String?
+    private var turnRouteRole: String?
+    private var turnRouteReason: String?
+    private var turnNeededTools: Bool?
+    private var turnToolCalls: [ToolCallRecord] = []
+    private var turnRawIO: [RawModelIO] = []
+    private var turnNeedsAccess: [String] = []
+
+    var healthy: Bool { phase != .error }
+    var willQueuePrompt: Bool { submissionState.isActive }
+
+    // True between submit and the first visible ANSWER token — drives the
+    // "working" indicator. Keyed on `answer` alone (not `reasoning`): reasoning
+    // starting doesn't mean the model is about to answer — there's often a
+    // long silent gap between reasoning finishing and the answer starting to
+    // stream. Previously isProcessing flipped false as soon as reasoning had
+    // any text, which hid the ONLY status indicator right during that gap —
+    // the reasoning disclosure is collapsed by default, so the UI looked like
+    // a dead void with nothing visibly happening.
+    var isProcessing: Bool {
+        if corpusBusy { return true }
+        switch phase {
+        case .routing, .working: return true
+        case .streaming: return answer.isEmpty
+        default: return false
+        }
+    }
+
+    var processingLabel: String {
+        if !statusText.isEmpty { return statusText }
+        switch phase {
+        case .routing: return "Routing…"
+        case .working:
+            let base = activity.isEmpty ? "Working…" : "Running tools…"
+            // A slow tool (e.g. a screen capture) can run silent for 30-40s+ with
+            // no new activity line — show elapsed time so it doesn't look frozen.
+            // Agent-loop heartbeats fire every ~1.5s (loop.py's _run_step).
+            let elapsed = Self.heartbeatSeconds(heartbeats, fromLoop: true)
+            return heartbeats > 0 ? "\(base) (\(elapsed)s)" : base
+        default:
+            // The model's name is a detail for Debug Mode, not a first-time user.
+            let base = modelAbbrev.isEmpty || !debugMode ? "Thinking…" : "Thinking with \(modelAbbrev)…"
+            // Hard reasoning prompts can run silent for a while; heartbeats prove
+            // it's still working rather than stuck.
+            return heartbeats > 0 ? "\(base) (\(stallSeconds)s)" : base
+        }
+    }
+
+    /// What one `heartbeat` stands for, by who sends it. The agent loop (a turn
+    /// routed with tools) sends one about every 1.5 s while the model thinks
+    /// (loop.py's _run_step). Plain chat sends one after each 8 s with nothing
+    /// from the model (service/inference/heartbeat.py).
+    static let loopHeartbeatSeconds = 1.5
+    static let silenceHeartbeatSeconds = 8.0
+
+    static func heartbeatSeconds(_ count: Int, fromLoop: Bool) -> Int {
+        Int(Double(count) * (fromLoop ? loopHeartbeatSeconds : silenceHeartbeatSeconds))
+    }
+
+    /// Seconds since the answer last moved, as far as the heartbeats can tell.
+    var stallSeconds: Int { Self.heartbeatSeconds(heartbeats, fromLoop: turnNeededTools == true) }
+
+    /// Real content arrived, so the stall count starts again. Only written
+    /// when it changes: this runs for every streamed token.
+    private func answerMoved() {
+        if heartbeats != 0 { heartbeats = 0 }
+    }
+
+    var routeLabel: String {
+        switch routeSource {
+        case "air_router": return "Air router"
+        case "local_router": return "Local router"
+        case "fallback": return "Local fallback"
+        case "rules": return "Local rules"
+        case "default": return "Direct to OSS"
+        default: return ""
+        }
+    }
+
+    /// The mic, from any tab: Brief and Day hand over to Ask, which listens.
+    /// While an answer is being read aloud the same press stops the voice.
+    func toggleVoice() {
+        if speaker.speaking && voice.state != .listening {
+            speaker.stop()
+            return
+        }
+        if tab != .ask { leaveKnowYou(); tab = .ask }
+        showingQuickSettings = false
+        voice.toggle()
+    }
+
+    /// A spoken question arrives like a typed one. Into an empty box it is sent
+    /// at once, as Siri does; next to words already typed it is added for the
+    /// person to finish and send.
+    func askByVoice(_ text: String) {
+        let typed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Voice asks, never researches: anywhere but Ask the words wait in the box.
+        guard typed.isEmpty, tab == .ask else {
+            input = typed.isEmpty ? text : typed + " " + text
+            return
+        }
+        input = text
+        voicePrompts.append(text)
+        if voicePrompts.count > 8 { voicePrompts.removeFirst() }
+        submit()
+        // A slash command or a held prompt never became an Ask turn.
+        if input == text { voicePrompts.removeAll { $0 == text } }
+    }
+
+    /// After an answer: read it aloud when the person wants that, and tell
+    /// VoiceOver either way, so a reply never arrives silently.
+    private func answered(_ text: String, question: String?, isError: Bool) {
+        var byVoice = false
+        if let question, let i = voicePrompts.firstIndex(of: question) {
+            voicePrompts.remove(at: i)
+            byVoice = true
+        }
+        if !isError, VoiceReplyMode.current.speaks(askedByVoice: byVoice) {
+            speaker.speak(text)
+        } else {
+            announceForVoiceOver((isError ? "Harbor couldn't answer: " : "Harbor: ") + SpokenText.plain(text))
+        }
+    }
+
+    /// Says a line to VoiceOver, for what appears without focus moving: the
+    /// panel never activates Harbor, so a reply, an approval card or a notice
+    /// would otherwise arrive silently. The line is only built, and only said,
+    /// while VoiceOver is on.
+    private func announceForVoiceOver(_ line: @autoclosure () -> String,
+                                      priority: NSAccessibilityPriorityLevel = .high) {
+        guard NSWorkspace.shared.isVoiceOverEnabled else { return }
+        let text = line()
+        guard !text.isEmpty else { return }
+        NSAccessibility.post(element: NSApp as Any, notification: .announcementRequested,
+                             userInfo: [.announcement: text, .priority: priority.rawValue])
+    }
+
+    /// What VoiceOver hears when an approval card appears: the card's own
+    /// sentence, then the buttons it shows, in their order. "Always allow" is
+    /// named only when the card has that button. The preview stays on the card;
+    /// it can be a long script.
+    nonisolated static func approvalAnnouncement(reason: String, grantable: Bool) -> String {
+        var why = reason.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        while let last = why.last, ".:;,".contains(last) { why.removeLast() }
+        if let last = why.last, !"?!".contains(last) { why += "." }
+        let ask = why.isEmpty ? "Harbor needs your approval." : "Harbor needs your approval: \(why)"
+        return ask + (grantable ? " Choices: Deny, Always allow, Allow once." : " Choices: Deny, Allow once.")
+    }
+
+    /// What "Always allow" on an approval card would cover, shown whenever the
+    /// card has that button: the folder, site or command the rule is limited
+    /// to, or, when the service names no limit (an empty scope hint), every
+    /// action of that tool.
+    nonisolated static func alwaysAllowLine(tool: String, scopeHint: String) -> String {
+        scopeHint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "Always allow applies to every \(tool) action"
+            : "Always allow applies to \(tool) on \(scopeHint)"
+    }
+
+    func submit() {
+        var prompt = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        if prompt.isEmpty, let defaultPrompt = attachmentDefaultPrompt { prompt = defaultPrompt }
+        guard !prompt.isEmpty else {
+            // Return on an empty box first brings back a prompt set aside after
+            // a drop (to read, not to send), then sends on prompts held behind it.
+            if let back = setAside.restore() {
+                cancelAttachmentRead()
+                input = back.text
+                restoreAttachment(from: back)
+                researchMode = back.researchMode
+            } else if !corpusBusy, let next = submissionState.resume() { syncQueue(); start(next) }
+            return
+        }
+        cancelAttachmentRead()
+        if debugMode, NotchCommand.isCorpusRequest(prompt) {
+            startCorpusCommand(prompt)
+            return
+        }
+        if let command = NotchCommand.match(prompt, includeCorpus: debugMode, includeScreen: screenCommandAvailable) {
+            input = ""
+            run(command)
+            return
+        }
+        // Part of a command that could still be one of several ("/re"): keep the
+        // list showing rather than sending a fragment to the model.
+        if !NotchCommand.suggestions(for: prompt, includeCorpus: debugMode, includeScreen: screenCommandAvailable).isEmpty { return }
+        guard !corpusBusy else {
+            showTransientNotice("Stop the corpus run before asking another question.")
+            return
+        }
+        let submission = QueuedPrompt(text: prompt, image: attachedImage,
+                                      imageName: attachedImageName, researchMode: researchMode,
+                                      video: attachedVideo, imageSource: attachedSource,
+                                      document: attachedDocument, imageLabel: attachedScreenLabel)
+        input = ""
+        removeAttachment()
+        if serviceStarting && !submission.researchMode {
+            // Nothing is listening yet: hold it and send it the moment Harbor is up.
+            heldForStartup.append(submission)
+            syncQueue()
+            showTransientNotice("Harbor is still starting… I'll send this as soon as it's ready.", duration: 8, info: true)
+            onResize()
+            return
+        }
+        let dispatch = submissionState.submit(submission)
+        syncQueue()
+        if let dispatch { start(dispatch) } else {
+            // Queued behind something slow: say so, rather than a silent "1 queued".
+            switch submissionState.held ? nil : submissionState.waiting {
+            case .summary: showTransientNotice("Waiting for the daily summary to finish. Your message sends right after it.", duration: 6)
+            case .research: showTransientNotice("Research is open. Your message sends when you go back to chat.", duration: 6)
+            default: break
+            }
+            onResize()
+        }
+    }
+
+    private func syncQueue() {
+        queuedPromptCount = submissionState.queuedCount + heldForStartup.count
+        let count = submissionState.queuedCount
+        if !heldForStartup.isEmpty {
+            queueLabel = "\(heldForStartup.count) waiting for Harbor to start"
+            return
+        }
+        switch submissionState.waiting {
+        case .summary: queueLabel = "\(count) waiting for the summary"
+        case .research: queueLabel = "\(count) waiting for research"
+        case .resend: queueLabel = "\(count) waiting for your message"
+        case .reply: queueLabel = "\(count) queued"
+        case nil: queueLabel = ""
+        }
+    }
+
+    func canStartCorpusCommand() -> Bool {
+        guard !submissionState.isActive, !briefComposing, !freeingMemory,
+              ![Phase.routing, .working, .streaming, .confirming].contains(phase) else {
+            showTransientNotice("Wait for the current request to finish before opening the corpus.")
+            return false
+        }
+        guard !hasAttachment else {
+            showTransientNotice("Remove the attachment before starting the corpus runner.")
+            return false
+        }
+        return true
+    }
+
+    private func startCorpusCommand(_ command: String) {
+        guard canStartCorpusCommand() else { return }
+        guard let onCorpusCommand else {
+            showTransientNotice("The corpus runner is unavailable in this build.")
+            return
+        }
+        input = ""
+        leaveKnowYou()
+        showingQuickSettings = false
+        tab = .ask
+        onCorpusCommand(command)
+        onResize()
+    }
+
+    private func start(_ dispatch: PromptDispatch) {
+        guard case .prompt(let submission) = dispatch.work else { return }
+        // Includes empty-Return recovery and queued dispatches, not just typed
+        // prompts: their answers must not render behind the corpus surface.
+        onHideCorpus()
+        stopSyncProgress()
+        if submission.researchMode {
+            researchDispatchID = dispatch.id
+            showingResearch = true
+            if let onStartResearch { onStartResearch(submission.text) }
+            else { completeSubmission(dispatch.id) }
+            return
+        }
+        let prompt = submission.text
+        speaker.stop()
+        // Only a marker of the attachment is kept in the visible/saved turn.
+        turns.append(Turn(role: "user", text: submission.historyMarker.map { prompt + " " + $0 } ?? prompt))
+        answer = ""; reasoning = ""; showReasoning = false; activity = []
+        role = ""; modelAbbrev = ""; routeSource = ""; statusText = ""
+        tokPerSec = 0; pending = nil; messageDraft = nil
+        streamStart = nil; streamChars = 0; heartbeats = 0; turnHeartbeats = 0
+        pendingDelta = ""; flushScheduled = false
+        lastDroppedReport = nil
+        lastDroppedReportKey = nil
+        turnTraceID = nil
+        turnStartedAt = Date(); turnFirstTokenAt = nil
+        turnModel = nil; turnRouteRole = nil; turnRouteReason = nil; turnNeededTools = nil
+        turnToolCalls = []
+        turnRawIO = []
+        turnNeedsAccess = []
+        phase = .routing
+        let image = submission.image
+        let imageSource = submission.imageSource
+        let imageLabel = submission.imageLabel
+        let video = submission.video?.wire
+        let document = submission.document?.wire
+        let sid = sessionId   // continue the same conversation (empty -> server starts one)
+        let wantsDebug = debugMode
+        streamTask?.cancel()
+        streamTask = Task { [weak self] in
+            await self?.client.runAgent(prompt: prompt, image: image, imageSource: imageSource,
+                                        imageLabel: imageLabel,
+                                        video: video, document: document, sessionId: sid,
+                                        debug: wantsDebug) { ev in
+                Task { @MainActor in self?.handle(ev, dispatchID: dispatch.id) }
+            }
+        }
+    }
+
+    // The stream of the turn in flight, retained so New Chat can stop it instead of
+    // leaving a detached request running (and, if it is waiting on a confirmation
+    // card, waiting up to five minutes for an answer nobody can give any more).
+    private var streamTask: Task<Void, Never>?
+
+    // Start a brand-new conversation: drop the session so the server opens a fresh one.
+    // A confirmation card that is still open belongs to the conversation being left:
+    // it is DENIED explicitly (never left to time out, never approved by omission).
+    func newChat() {
+        if let abandoned = pending {
+            Task { [client] in
+                await client.approve(sessionId: abandoned.sessionId, actionId: abandoned.actionId,
+                                     approved: false, scope: "once", requestId: abandoned.requestId)
+            }
+        }
+        archiveCurrentChat()
+        sessionId = ""
+        reset()
+        // The chat just left belongs in the switcher now.
+        refreshRecentChats()
+    }
+
+    /// Keep the chat being left, with every turn's debug detail, for the export.
+    private func archiveCurrentChat() {
+        guard !liveChatForgotten else { return }
+        chatArchive.archive(sessionId: sessionId, startedAt: turns.compactMap(\.startedAt).min(),
+                            turns: turns, bytes: Self.debugBytes(turns))
+    }
+
+    /// Take a chat left earlier back out of the archive to continue it here, its
+    /// turns as they were. False when it was never left in this launch.
+    private func restoreArchivedChat(_ id: String) -> Bool {
+        guard let kept = chatArchive.take(sessionId: id) else { return false }
+        turns = kept.turns
+        return true
+    }
+
+    /// Roughly what a turn holds in memory, for the archive's size limit.
+    static func debugBytes(_ turns: [Turn]) -> Int {
+        var total = 0
+        for t in turns {
+            total += t.text.utf8.count + t.reasoningText.utf8.count
+            total += t.errorDetail?.utf8.count ?? 0
+            for line in t.activity { total += line.utf8.count }
+            for tc in t.toolCalls {
+                total += tc.argsJSON.utf8.count + tc.result.utf8.count
+                for record in tc.debugRecords { total += record.json.utf8.count }
+            }
+            for io in t.rawIO { total += io.requestJSON.utf8.count + io.responseJSON.utf8.count }
+        }
+        return total
+    }
+
+    /// Saved history around a chat's archived turns (and any asked while it
+    /// loaded): each saved turn the archive still has is kept in its full detail,
+    /// in order, and saved turns it lacks (asked in the Chat window, say) come in
+    /// where they fall. Turns only kept here go before the next one matched.
+    static func merging(history: [Turn], into local: [Turn]) -> [Turn] {
+        var merged: [Turn] = []
+        var next = 0
+        for saved in history {
+            if let match = local[next...].firstIndex(where: { $0.role == saved.role && $0.text == saved.text }) {
+                merged += local[next...match]
+                next = match + 1
+            } else {
+                merged.append(saved)
+            }
+        }
+        return merged + local[next...]
+    }
+
+    /// Saved history followed by the turns asked here while it loaded. A load that
+    /// finished after one of those turns was saved already ends with it, so the
+    /// overlap is kept once.
+    static func joining(history: [Turn], before local: [Turn]) -> [Turn] {
+        var overlap = min(history.count, local.count)
+        while overlap > 0 {
+            let tail = history.suffix(overlap), head = local.prefix(overlap)
+            if zip(tail, head).allSatisfy({ $0.role == $1.role && $0.text == $1.text }) { break }
+            overlap -= 1
+        }
+        return Array(history.dropLast(overlap)) + local
+    }
+
+    func run(_ command: NotchCommand) {
+        switch command {
+        case .corpus: startCorpusCommand("/corpus list")
+        case .today: tab = .day
+        case .memory: HarborRouter.shared.open(.memory(.facts))
+        case .research: tab = .research
+        case .settings: showingQuickSettings = true
+        case .report: reportCurrentProblem()
+        case .window: openTabInWindow()
+        case .new: newChat()
+        case .about: startKnowYou()
+        case .resetharbor: openResetCard()
+        case .screen: captureScreenForPreview()
+        }
+    }
+
+    /// /resetharbor typed in Ask: the confirmation card, never the reset itself.
+    func openResetCard() {
+        // A reset already under way keeps its card; typing the command again changes nothing.
+        guard resetCard != .running else { return }
+        if let refusal = HarborReset.refusal(corpusBusy: corpusBusy, replying: !conversationSettled) {
+            showTransientNotice(refusal)
+            return
+        }
+        showingQuickSettings = false
+        tab = .ask
+        resetCard = .confirm
+        onResize()
+    }
+
+    /// The card's Reset Harbor button, and only it.
+    func confirmReset() {
+        guard resetCard == .confirm, let onResetHarbor else { return }
+        // Something may have started since the card opened (a reply, a corpus run).
+        if let refusal = HarborReset.refusal(corpusBusy: corpusBusy, replying: !conversationSettled) {
+            resetCard = .failed(refusal)
+            onResize()
+            return
+        }
+        resetCard = .running
+        onResize()
+        Task { [weak self] in
+            let stopped = await onResetHarbor()
+            guard let self else { return }
+            self.resetCard = .failed(stopped)
+            self.onResize()
+        }
+    }
+
+    func cancelReset() {
+        guard resetCard != .running else { return }
+        resetCard = nil
+        onResize()
+    }
+
+    /// Quick settings' Model memory: unload the models now. Harbor reloads them on
+    /// the next ask. Not while a reply is being written, which needs its model.
+    /// The row is read again either way; "unloaded" is said only when the
+    /// service answered that it was done.
+    func freeUpMemory() {
+        guard conversationSettled, !briefComposing, !freeingMemory else { return }
+        freeingMemory = true
+        Task { [weak self] in
+            guard let self else { return }
+            let unloaded = await self.client.unloadAll()
+            self.modelMemory = ModelMemory.parse(await self.client.modelMemoryReply())
+            self.freeingMemory = false
+            if unloaded {
+                self.showTransientNotice("Models unloaded. Harbor reloads them on the next ask.", info: true)
+            } else {
+                self.showTransientNotice("Couldn't unload the models. Try again in a moment.")
+            }
+        }
+    }
+
+    #if HARBOR_NOTCH_QA
+    func qaShow(modelMemory: ModelMemory?) { self.modelMemory = modelMemory }
+    #endif
+
+    #if HARBOR_NOTCH_QA
+    func qaShow(brief text: String) { brief = DailyBrief(text: text, receivedAt: Date(), traceID: nil, sessionId: "") }
+    #endif
+
+    func refreshModelMemory() async {
+        guard !freeingMemory else { return }
+        let read = ModelMemory.parse(await client.modelMemoryReply())
+        if !freeingMemory { modelMemory = read }
+    }
+
+    /// ⤢, ⌘O and /window: open what this tab shows in the Harbor window.
+    func openTabInWindow() {
+        if tab == .ask && showingCorpus { onOpenCorpus(); return }
+        switch tab {
+        case .ask:
+            if conversationSettled { openInChat() }
+            else { showTransientNotice("Harbor is still answering. Open the window when it finishes.") }
+        case .brief, .day: HarborRouter.shared.open(.today(focus: .plan))
+        case .research: HarborRouter.shared.open(.research)
+        case .meet: HarborRouter.shared.open(.today(focus: .plan))
+        case .study: HarborRouter.shared.open(.today(focus: .plan))
+        }
+    }
+
+    /// Continue from the brief in Ask, in the saved chat it was recorded in.
+    func askAboutBrief() {
+        guard let brief, !brief.sessionId.isEmpty, conversationSettled else { return }
+        newChat()
+        sessionId = brief.sessionId
+        reopenedChatTitle = "Daily summary"
+        if !restoreArchivedChat(brief.sessionId) {
+            turns = [Turn(role: "user", text: "Daily summary"), Turn(role: "assistant", text: brief.text)]
+        }
+        tab = .ask
+        onResize()
+    }
+
+    /// Open Ask with a request already typed, for the person to finish and send
+    /// (the check-in's Move and Cancel). Nothing is sent here.
+    func askAbout(_ text: String) {
+        input = text
+        tab = .ask
+        onResize()
+    }
+
+    /// Ask Harbor about something Today says needs you: Ask opens with it quoted.
+    func askAbout(_ title: String, reference: String) {
+        let quoted = "About “\(title)”" + (reference.isEmpty ? "" : " (\(reference))") + ": "
+        input = quoted
+        tab = .ask
+    }
+
+    // Refreshes overlap (panel open, New chat, a finished turn); only the newest
+    // request's answer is used, so a slow older one cannot replace a newer list.
+    private var recentChatsGeneration = 0
+
+    func refreshRecentChats() {
+        recentChatsGeneration += 1
+        let generation = recentChatsGeneration
+        Task { [weak self] in
+            guard let self else { return }
+            let loaded: [[String: Any]]?
+            if let loader = self.recentChatsLoader { loaded = await loader(9) }
+            else { loaded = await self.client.chatList(limit: 9) }
+            guard let rows = loaded,
+                  generation == self.recentChatsGeneration else { return }
+            let current = self.sessionId
+            self.recentChats = Array(rows.compactMap(ChatSummary.parse).filter { $0.id != current }.prefix(8))
+        }
+    }
+
+    /// Continue a saved chat here. Like New chat, an open confirmation card in the
+    /// conversation being left is denied, never left to time out.
+    func reopenChat(_ summary: ChatSummary) {
+        guard conversationSettled, summary.id != sessionId else { return }
+        let target = summary.id
+        newChat()
+        sessionId = target
+        reopenedChatTitle = summary.title
+        recentChats.removeAll { $0.id == target }
+        // Left earlier in this launch: it comes back whole, tool results and all.
+        let restored = restoreArchivedChat(target)
+        if restored { onResize() }
+        Task { [weak self] in
+            guard let self else { return }
+            let rows = await self.client.chatTurns(id: target)
+            // Another chat was opened meanwhile; this history is not for it.
+            guard self.sessionId == target else { return }
+            guard let rows else {
+                self.showTransientNotice("Couldn't load that chat. New messages still continue it.")
+                return
+            }
+            // The saved history keeps which tools an answer used, not their results.
+            // It goes before anything already asked here while it loaded, which
+            // continued the same session.
+            let history = ChatHistory.messages(from: rows).map { message in
+                Turn(role: message.role == .user ? "user" : "assistant", text: message.text,
+                     activity: message.tools.map { "\($0.name) — used" })
+            }
+            self.turns = restored ? Self.merging(history: history, into: self.turns)
+                                  : Self.joining(history: history, before: self.turns)
+            self.onResize()
+        }
+    }
+
+    /// A starter question was tapped: ask it, exactly as if typed.
+    func pick(_ s: String) {
+        // A starter comes from the service, not the person's typing: never the reset.
+        guard !NotchCommand.isReset(s) else { return }
+        input = s
+        submit()
+    }
+
+    // `scope`: "once" answers just this call; "always"/"never" also record a
+    // standing grant so Harbor stops asking about this tool and target.
+    func resolve(_ approved: Bool, scope: String = "once") {
+        guard let p = pending else { return }
+        pending = nil
+        phase = .working
+        Task {
+            await client.approve(sessionId: p.sessionId, actionId: p.actionId,
+                                 approved: approved, scope: scope, requestId: p.requestId)
+        }
+    }
+
+    func setDraftText(_ text: String) {
+        messageDraft?.text = text
+    }
+
+    func toggleDraftEditing() {
+        guard messageDraft?.sent != true, messageDraft?.isSending != true else { return }
+        messageDraft?.isEditing.toggle()
+    }
+
+    func discardMessageDraft() {
+        guard messageDraft?.isSending != true else { return }
+        messageDraft = nil
+        onResize()
+    }
+
+    func sendMessageDraft() {
+        guard var draft = messageDraft, !draft.isSending, !draft.sent else { return }
+        guard !draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            messageDraft?.status = "The message is empty."
+            return
+        }
+        draft.isEditing = false
+        draft.isSending = true
+        draft.status = "Sending…"
+        messageDraft = draft
+        let draftID = draft.id
+        Task { [weak self] in
+            guard let self else { return }
+            let outcome = await client.sendMessageDraft(to: draft.to, text: draft.text)
+            guard self.messageDraft?.id == draftID else { return }
+            self.messageDraft?.isSending = false
+            self.messageDraft?.sent = outcome.ok
+            self.messageDraft?.status = outcome.ok ? "Sent" : outcome.result
+            self.onResize()
+        }
+    }
+
+    /// A read belongs to this composer generation. Cancellation is advisory for
+    /// file I/O; the identity check also rejects a reader that finishes late.
+    @discardableResult
+    func loadAttachment(name: String, read: @escaping @Sendable () async -> MediaAttachment.Pending?) -> Task<Void, Never> {
+        cancelAttachmentRead()
+        let id = attachmentReadID
+        let task = Task { [weak self] in
+            let media = await read()
+            guard let self, self.attachmentReadID == id, !Task.isCancelled else { return }
+            self.attachmentReadTask = nil
+            guard let media else {
+                if !self.hasAttachment { self.attachedLabel = ""; self.attachedImageName = nil }
+                return
+            }
+            self.setAttachment(media, name: name)
+        }
+        attachmentReadTask = task
+        return task
+    }
+
+    /// A picked or dropped file: an image is downscaled to JPEG, a movie is
+    /// sampled into frames + audio. Everything stays in memory.
+    func loadAttachment(url: URL, source: MediaAttachment.Source = .file) {
+        let kind = MediaAttachment.kind(of: url)
+        if kind != .other { prewarmVision() }     // before the read, not after it
+        if kind == .movie { client.prewarmEncoder(.audio) }
+        guard kind != .other else {
+            switch DocumentAttachment.kind(of: url) {
+            case .legacyOffice:
+                showTransientNotice(DocumentAttachment.legacyMessage)
+            case .other:
+                showTransientNotice(DocumentAttachment.otherFileMessage)
+            case .document:
+                loadDocument(url: url)
+            }
+            return
+        }
+        // Only on an empty chip. An attachment already there keeps its own label
+        // until the new one is read (setAttachment), so a clip that can't be read
+        // never leaves "Reading clip…" beside the old one.
+        if kind == .movie && !hasAttachment { attachedLabel = "Reading clip…" }
+        loadAttachment(name: url.lastPathComponent) { [weak self] in
+            let reader = Task.detached(priority: .userInitiated) { () -> MediaAttachment.Pending? in
+                guard !Task.isCancelled else { return nil }
+                if kind == .image {
+                    // Size first, then let ImageIO stream the file: it is never read whole.
+                    if let bytes = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize,
+                       MediaAttachment.tooLarge(bytes: bytes) {
+                        await self?.showTransientNotice(MediaAttachment.tooLargeMessage)
+                        return nil
+                    }
+                    guard !Task.isCancelled,
+                          let jpeg = MediaAttachment.detailJPEG(contentsOf: url) else {
+                        await self?.showTransientNotice("Harbor couldn't read that image.")
+                        return nil
+                    }
+                    return .image(jpeg: jpeg, source: source)
+                }
+                do {
+                    return .video(try await VideoSampler.sample(url: url))
+                } catch let error as VideoSampleError {
+                    await self?.showTransientNotice(error.message)
+                    return nil
+                } catch {
+                    return nil
+                }
+            }
+            return await withTaskCancellationHandler {
+                await reader.value
+            } onCancel: {
+                reader.cancel()
+            }
+        }
+    }
+
+    /// A picked, dropped or pasted document: size-checked, then read in memory.
+    private func loadDocument(url: URL) {
+        // Only on an empty chip, as for a clip (loadAttachment(url:)).
+        if !hasAttachment { attachedLabel = "Reading document…" }
+        loadAttachment(name: url.lastPathComponent) { [weak self] in
+            let reader = Task.detached(priority: .userInitiated) { () -> MediaAttachment.Pending? in
+                guard !Task.isCancelled else { return nil }
+                switch DocumentAttachment.load(url: url) {
+                case .attached(let pending):
+                    return pending
+                case .refused(let message):
+                    await self?.showTransientNotice(message)
+                    return nil
+                }
+            }
+            return await withTaskCancellationHandler {
+                await reader.value
+            } onCancel: {
+                reader.cancel()
+            }
+        }
+    }
+
+    /// An image pasted or dragged in as pixels (no file).
+    func attachPasted(imageData: Data, source: MediaAttachment.Source) {
+        cancelAttachmentRead()
+        guard let jpeg = MediaAttachment.detailJPEG(imageData) else {
+            showTransientNotice("Harbor couldn't read that image.")
+            return
+        }
+        setAttachment(.image(jpeg: jpeg, source: source), name: "Image")
+    }
+
+    /// Start loading the vision encoder now, as a picture, clip or scanned document
+    /// starts loading (loadAttachment). A screen capture warms it when it lands, through
+    /// `attachedImage`. Throttled and fire-and-forget.
+    func prewarmVision() {
+        client.prewarmEncoder(.vision)
+    }
+
+    func cancelAttachmentRead() {
+        attachmentReadID = UUID()
+        attachmentReadTask?.cancel()
+        attachmentReadTask = nil
+    }
+
+    func removeAttachment() {
+        cancelAttachmentRead()
+        clearAttachmentState()
+    }
+
+    /// True while the pending attachment is a `/screen` capture (shown large to check).
+    var attachmentIsScreen: Bool { attachedImage != nil && attachedSource == "screen" }
+
+    var hasAttachment: Bool { attachedImage != nil || attachedVideo != nil || attachedDocument != nil }
+
+    /// The question to send when the person typed nothing.
+    private var attachmentDefaultPrompt: String? {
+        if attachedVideo != nil { return "What happens in this clip?" }
+        if attachedDocument != nil { return "Summarize this document." }
+        guard attachedImage != nil else { return nil }
+        return attachedSource == "screen" ? "Explain what's on my screen." : "What's in this image?"
+    }
+
+    private func clearAttachmentState() {
+        attachedImage = nil; attachedVideo = nil; attachedDocument = nil; attachedSource = nil
+        attachedImageName = nil; attachedThumbnail = nil; attachedLabel = ""; attachedScreenLabel = nil
+    }
+
+    private func setAttachment(_ media: MediaAttachment.Pending, name: String, screenLabel: String? = nil) {
+        clearAttachmentState()
+        attachedImageName = name
+        attachedScreenLabel = media.isScreen ? screenLabel : nil
+        attachedLabel = MediaAttachment.chipLabel(for: media)
+        switch media {
+        case .image(let jpeg, let source):
+            attachedImage = MediaAttachment.dataURL(jpeg: jpeg)
+            attachedSource = source == .screen ? "screen" : nil
+            attachedThumbnail = NSImage(data: jpeg)
+        case .video(let clip):
+            let fields = media.bodyFields()["video"] as? [String: Any]
+            attachedVideo = QueuedVideo(
+                frames: fields?["frames"] as? [String] ?? [],
+                seconds: clip.seconds,
+                audio: clip.wav?.base64EncodedString())
+            attachedThumbnail = clip.frames.first.flatMap { NSImage(data: $0) }
+        case .document(let docName, _, let pages):
+            let fields = media.bodyFields()["document"] as? [String: Any]
+            attachedDocument = QueuedDocument(
+                name: docName,
+                data: fields?["data"] as? String,
+                pages: fields?["pages"] as? [String] ?? [])
+            attachedThumbnail = pages.first.flatMap { NSImage(data: $0) }
+        }
+        onResize()
+    }
+
+    private func restoreAttachment(from prompt: QueuedPrompt) {
+        clearAttachmentState()
+        attachedImage = prompt.image
+        attachedVideo = prompt.video
+        attachedDocument = prompt.document
+        attachedSource = prompt.imageSource
+        attachedScreenLabel = prompt.imageLabel
+        attachedImageName = prompt.imageName
+        attachedLabel = prompt.video.map { "Clip · \(Int($0.seconds.rounded())) s — reads sampled frames + audio, not motion" }
+            ?? prompt.document.map { DocumentAttachment.chipLabel(name: $0.name, scannedPages: $0.pages.count) }
+            ?? (prompt.imageSource == "screen" ? "Screen" : "Image")
+        let thumb = prompt.image ?? prompt.video?.frames.first ?? prompt.document?.pages.first
+        if let thumb, let comma = thumb.firstIndex(of: ","),
+           let data = Data(base64Encoded: String(thumb[thumb.index(after: comma)...])) {
+            attachedThumbnail = NSImage(data: data)
+        }
+    }
+
+    /// "Explain my screen": only with Screen Recording already granted (never
+    /// requested here). The capture becomes a pending preview; nothing is sent
+    /// until the person presses send.
+    var screenCommandAvailable: Bool { CGPreflightScreenCaptureAccess() }
+
+    func captureScreenForPreview() {
+        guard CGPreflightScreenCaptureAccess() else {
+            showTransientNotice("Screen Recording isn't on for Harbor. Turn it on in Settings › Privacy to use this.")
+            return
+        }
+        cancelAttachmentRead()
+        let display = CGDisplayBounds(CGMainDisplayID())
+        look { accepted in ScreenSnapshot.lookAtRegion(display, label: nil, accepted: accepted) }
+    }
+
+    // MARK: - Look
+
+    /// A browser is in the capture (ScreenLook.browserVerdict): this warning shows
+    /// with Look anyway / Cancel, and nothing is captured until Look anyway.
+    @Published private(set) var lookWarning: String?
+    private var lookWarningAction: (() -> Void)?
+
+    /// One Look attempt off the main thread. `attempt` checks and captures in the
+    /// same step (ScreenSnapshot.lookAtWindow / lookAtRegion), so the verdict is
+    /// always the one from right before the capture: a window raised while the
+    /// warning was up is caught then. A warning the person hasn't seen yet shows,
+    /// and Look anyway runs the attempt again with that warning accepted.
+    private func look(accepted: ScreenLook.Verdict? = nil,
+                      _ attempt: @escaping @Sendable (ScreenLook.Verdict?) -> ScreenLook.Outcome) {
+        lookWarning = nil; lookWarningAction = nil
+        Task { [weak self] in
+            let outcome = await Task.detached(priority: .userInitiated) { attempt(accepted) }.value
+            guard let self else { return }
+            switch outcome {
+            case .captured(let jpeg, let label, let leftOut):
+                self.setAttachment(.image(jpeg: jpeg, source: .screen), name: "Screen", screenLabel: label)
+                if let notice = ScreenLook.leftOutNotice(leftOut) { self.showTransientNotice(notice, duration: 6) }
+            case .refused(let message):
+                self.showTransientNotice(message, duration: 6)
+            case .failed(let message):
+                self.showTransientNotice(message)
+            case .ask(let message):
+                self.lookWarning = message
+                self.lookWarningAction = { [weak self] in self?.look(accepted: .confirm(message), attempt) }
+                self.onResize()
+            }
+        }
+    }
+
+    func confirmLookWarning() {
+        let action = lookWarningAction
+        lookWarning = nil; lookWarningAction = nil
+        onResize()
+        action?()
+    }
+
+    func cancelLookWarning() {
+        lookWarning = nil; lookWarningAction = nil
+        onResize()
+    }
+
+    /// "Look" without Screen Recording: say how to turn it on and open the notch's
+    /// permission page, whose Screen Recording button asks macOS. Harbor never shows
+    /// macOS's question itself from here (only a click on that row does; see
+    /// tests/test_onboarding_window.py). Nothing is captured. True when it is on.
+    private func screenRecordingReadyForLook() -> Bool {
+        if CGPreflightScreenCaptureAccess() { return true }
+        showTransientNotice(ScreenLook.deniedNotice, duration: 8)
+        openPermissionPage(.screenRecording)
+        return false
+    }
+
+    /// The notch's eye button or ⌥⇧L: capture the window the person is looking
+    /// at as a pending preview with a "Harbor saw:" chip. `frontPID` is the app in
+    /// front before Harbor's panel opened. Nothing is sent until they press send.
+    func lookAtFrontWindow(frontPID: pid_t? = NSWorkspace.shared.frontmostApplication?.processIdentifier) {
+        guard screenRecordingReadyForLook() else { return }
+        cancelAttachmentRead()
+        Task { [weak self] in
+            let number = await Task.detached(priority: .userInitiated) {
+                ScreenSnapshot.frontWindow(frontPID: frontPID)?.number
+            }.value
+            guard let self else { return }
+            guard let number else {
+                self.showTransientNotice("Harbor couldn't find a window to look at.")
+                return
+            }
+            self.look { accepted in ScreenSnapshot.lookAtWindow(number, accepted: accepted) }
+        }
+    }
+
+    /// The eye button's "Drag over part of the screen": the region picker, then
+    /// the same pending preview. Password managers and detectably private windows
+    /// are left out; any other browser window in the region needs the extra tap.
+    /// Esc or a click cancels without a capture.
+    func lookAtRegion() {
+        guard screenRecordingReadyForLook() else { return }
+        cancelAttachmentRead()
+        let front = NSWorkspace.shared.frontmostApplication
+        let app = front?.processIdentifier == ProcessInfo.processInfo.processIdentifier ? nil : front?.localizedName
+        let label = ScreenLook.regionLabel(app: app)
+        RegionPicker.pick { [weak self] rect in
+            guard let rect else { return }
+            self?.look { accepted in ScreenSnapshot.lookAtRegion(rect, label: label, accepted: accepted) }
+        }
+    }
+
+    func attach(name: String, dataURL: String) {
+        cancelAttachmentRead()
+        clearAttachmentState()
+        attachedImageName = name
+        attachedImage = dataURL
+        attachedLabel = "Image"
+    }
+
+    func reset() {
+        removeAttachment()
+        onResetCorpus()
+        // A report belongs to the conversation being left.
+        report.close()
+        streamTask?.cancel()
+        streamTask = nil
+        pending = nil
+        dailySummaryID = UUID()
+        dailySummaryRunning = false
+        briefComposing = false
+        submissionState.reset()
+        setAside.reset()
+        heldForStartup = []
+        notReadyRetry?.cancel(); notReadyRetry = nil
+        researchDispatchID = nil
+        syncQueue()
+        stopSyncProgress()
+        input = ""; answer = ""; reasoning = ""; activity = []
+        routeSource = ""; statusText = ""
+        clearAttachmentState(); messageDraft = nil; phase = .idle
+        collapsed = false; turns = []
+        reopenedChatTitle = nil
+        liveChatForgotten = false
+    }
+
+    /// Leave the inline Research surface without cancelling its persisted job.
+    /// The backend run may continue; starting a new research prompt returns to
+    /// this same in-panel workflow.
+    func returnToChat() {
+        showingResearch = false
+        researchMode = false
+        releaseResearchDispatch()
+    }
+
+    private func releaseResearchDispatch() {
+        guard let dispatchID = researchDispatchID else { return }
+        researchDispatchID = nil
+        completeSubmission(dispatchID)
+    }
+
+    // Writes every chat since Harbor opened (the archive, then the open one) —
+    // every turn's text, model, route decision, timing, token rate, tool
+    // calls, and any errors — to disk as both a complete JSON file and a human-readable companion transcript.
+    // Debug metadata is tracked unconditionally (see applyDebugFields), not
+    // just while Debug Mode is on, so this captures the whole session even if
+    // Debug Mode was only switched on partway through. Returns the JSON file's
+    // URL (nil if there's nothing to export yet) so the caller can reveal it
+    // in Finder.
+    func reportCurrentProblem() {
+        tab = .ask
+        showingQuickSettings = false
+        if var metadata = lastDroppedReport {
+            let traceID = metadata["trace_id"] as? String
+            if let journal = DiagnosticReport.journal(traceID: traceID) {
+                metadata["trace"] = journal
+                metadata["journal_available"] = true
+            }
+            // Each dropped turn has its own key (set when it dropped), so a later drop never
+            // reuses an older snapshot and reopening this one keeps its note.
+            report.open(key: lastDroppedReportKey ?? "chat:dropped:" + (traceID ?? UUID().uuidString), metadata: metadata)
+        } else if let turn = turns.last(where: { $0.role == "assistant" }) {
+            reportProblem(for: turn)
+        } else {
+            report.open(key: "chat:none",
+                        metadata: ["surface": "chat", "client_outcome": "no_completed_reply", "journal_available": false])
+        }
+    }
+
+    func reportProblem(for turn: Turn) {
+        var metadata: [String: Any] = ["surface": "chat", "client_outcome": turn.isError ? "error" : "completed",
+                                      "journal_available": false]
+        if let traceID = turn.traceID {
+            metadata["trace_id"] = traceID
+            if let journal = DiagnosticReport.journal(traceID: traceID) {
+                metadata["trace"] = journal
+                metadata["journal_available"] = true
+            }
+        }
+        if let duration = turn.durationSec { metadata["client_duration_seconds"] = duration }
+        if let first = turn.timeToFirstTokenSec { metadata["client_first_token_seconds"] = first }
+        var details: [String: Any] = ["answer": turn.text, "activity": turn.activity,
+                                      "reasoning": turn.reasoningText,
+                                      "tool_calls": turn.toolCalls.map { ["name": $0.name, "args": Self.parsedJSON($0.argsJSON), "result": $0.result, "decision": $0.decision,
+                                                                          "debug": $0.debugRecords.map { Self.parsedJSON($0.json) }] },
+                                      "model_io": turn.rawIO.map { ["model": $0.model, "request": Self.parsedJSON($0.requestJSON), "response": Self.parsedJSON($0.responseJSON)] }]
+        if let index = turns.firstIndex(where: { $0.id == turn.id }), index > 0, turns[index - 1].role == "user" {
+            details["prompt"] = turns[index - 1].text
+        }
+        if let error = turn.errorDetail { details["error_detail"] = error }
+        report.open(key: Self.reportKey(for: turn), metadata: metadata, details: details)
+    }
+
+    enum DebugLogExport: Sendable {
+        case nothing
+        case saved(URL)
+        case failed(String)
+    }
+
+    /// The chats one export covers, copied on the main actor at the click, so
+    /// building and writing the files (raw model I/O can run to many megabytes)
+    /// never holds up the notch.
+    struct DebugLogSnapshot: Sendable {
+        struct Chat: Sendable {
+            let sessionId: String
+            let startedAt: Date?
+            let turns: [Turn]
+            let current: Bool
+        }
+        let chats: [Chat]
+        let currentSessionId: String
+        let droppedChats: Int
+        let droppedTurns: Int
+        let exportedAt: Date
+    }
+
+    /// Writes the export to Downloads, off the main actor.
+    func exportDebugLog(to directory: URL? = nil) async -> DebugLogExport {
+        guard let snapshot = debugLogSnapshot() else { return .nothing }
+        return await Task.detached(priority: .userInitiated) {
+            OverlayModel.writeDebugLog(snapshot, to: directory)
+        }.value
+    }
+
+    /// The export's files, readable only by this user. A failed write removes what
+    /// it wrote and says why; it never reports a file as saved.
+    nonisolated static func writeDebugLog(_ snapshot: DebugLogSnapshot, to directory: URL?) -> DebugLogExport {
+        guard let export = debugExportFiles(snapshot) else { return .nothing }
+        let dir = directory ?? FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser
+        // Milliseconds and a short random suffix: two exports in one second never collide.
+        let stamp = DateFormatter(); stamp.dateFormat = "yyyy-MM-dd_HH-mm-ss-SSS"
+        let base = "harbor-debug-\(stamp.string(from: Date()))-\(UUID().uuidString.prefix(6).lowercased())"
+        let jsonURL = dir.appendingPathComponent("\(base).json")
+        let textURL = dir.appendingPathComponent("\(base).txt")
+        var created: [URL] = []
+        do {
+            try writePrivate(export.json, to: jsonURL); created.append(jsonURL)
+            try writePrivate(Data(export.text.utf8), to: textURL); created.append(textURL)
+        } catch {
+            // Only what this export created; a file already there was never opened.
+            for url in created { try? FileManager.default.removeItem(at: url) }
+            return .failed(error.localizedDescription)
+        }
+        return .saved(jsonURL)
+    }
+
+    /// A new file with mode 0600, never one already there.
+    nonisolated static func writePrivate(_ data: Data, to url: URL) throws {
+        let fd = open(url.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+        guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        do {
+            try handle.write(contentsOf: data)
+            try handle.synchronize()
+        } catch {
+            // This call created it, so a half-written file is this call's to remove.
+            try? FileManager.default.removeItem(at: url)
+            throw error
+        }
+    }
+
+    /// Every chat left since Harbor opened (the archive, oldest first), then the open
+    /// chat. Nil when there is nothing to export yet.
+    func debugLogSnapshot(now: Date = Date()) -> DebugLogSnapshot? {
+        var chats = chatArchive.chats.map {
+            DebugLogSnapshot.Chat(sessionId: $0.sessionId, startedAt: $0.startedAt, turns: $0.turns, current: false)
+        }
+        if !turns.isEmpty && !liveChatForgotten {
+            chats.append(DebugLogSnapshot.Chat(sessionId: sessionId, startedAt: turns.compactMap(\.startedAt).min(),
+                                               turns: turns, current: true))
+        }
+        guard !chats.isEmpty else { return nil }
+        return DebugLogSnapshot(chats: chats, currentSessionId: liveChatForgotten ? "" : sessionId,
+                                droppedChats: chatArchive.droppedChats, droppedTurns: chatArchive.droppedTurns,
+                                exportedAt: now)
+    }
+
+    /// The export's .json and .txt as of now. Nil when there is nothing to export yet.
+    func debugExport(now: Date = Date()) -> (json: Data, text: String)? {
+        debugLogSnapshot(now: now).flatMap { Self.debugExportFiles($0) }
+    }
+
+    /// The export's .json and .txt for a snapshot.
+    nonisolated static func debugExportFiles(_ snapshot: DebugLogSnapshot) -> (json: Data, text: String)? {
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let clock = DateFormatter(); clock.dateFormat = "HH:mm:ss"
+        let chats = snapshot.chats.map {
+            ChatDebugExport.Chat(sessionId: $0.sessionId, startedAt: $0.startedAt, current: $0.current,
+                                 turns: $0.turns.map { debugJSON($0, iso: iso) },
+                                 transcript: debugTranscript($0.turns, clock: clock))
+        }
+        let payload = ChatDebugExport.payload(chats: chats, currentSessionId: snapshot.currentSessionId,
+                                              droppedChats: snapshot.droppedChats,
+                                              droppedTurns: snapshot.droppedTurns, exportedAt: snapshot.exportedAt, iso: iso)
+        guard JSONSerialization.isValidJSONObject(payload), let jsonData = try? JSONSerialization.data(
+            withJSONObject: payload, options: [.prettyPrinted, .sortedKeys]) else { return nil }
+        // Human-readable companion — same data, laid out to actually read, one section per chat.
+        let text = ChatDebugExport.text(chats: chats, droppedChats: snapshot.droppedChats,
+                                        droppedTurns: snapshot.droppedTurns, exportedAt: snapshot.exportedAt, iso: iso)
+        return (jsonData, text)
+    }
+
+    private nonisolated static func debugJSON(_ t: Turn, iso: ISO8601DateFormatter) -> [String: Any] {
+        func rounded(_ v: Double) -> Double { (v * 100).rounded() / 100 }
+        var d: [String: Any] = ["role": t.role, "text": t.text]
+        if let traceID = t.traceID { d["trace_id"] = traceID }
+        if t.isError { d["is_error"] = true }
+        if let detail = t.errorDetail { d["error_detail"] = detail }
+        if !t.activity.isEmpty { d["activity_log"] = t.activity }
+        if let m = t.model { d["model"] = m }
+        if let r = t.routeRole { d["route_role"] = r }
+        if let r = t.routeReason { d["route_reason"] = r }
+        if let r = t.routeSource { d["route_source"] = r }
+        if let n = t.neededTools { d["needed_tools"] = n }
+        if let tps = t.tokPerSec { d["tok_per_sec"] = tps }
+        if let s = t.startedAt { d["started_at"] = iso.string(from: s) }
+        if let f = t.firstTokenAt { d["first_token_at"] = iso.string(from: f) }
+        if let fin = t.finishedAt { d["finished_at"] = iso.string(from: fin) }
+        if let ttft = t.timeToFirstTokenSec { d["time_to_first_token_sec"] = rounded(ttft) }
+        if let dur = t.durationSec { d["duration_sec"] = rounded(dur) }
+        if t.heartbeatCount > 0 { d["heartbeats"] = t.heartbeatCount }
+        if !t.reasoningText.isEmpty { d["reasoning"] = t.reasoningText }
+        if !t.toolCalls.isEmpty {
+            d["tool_calls"] = t.toolCalls.map { tc -> [String: Any] in
+                var td: [String: Any] = ["name": tc.name, "args": tc.argsJSON, "decision": tc.decision,
+                                         "decision_reason": tc.decisionReason, "result": tc.result]
+                if !tc.debugRecords.isEmpty {
+                    // What the tool itself saw/sent internally — e.g. the
+                    // real emails/messages fed to summarize_emails's own
+                    // synthesis call, or create_tool's own code-generation
+                    // request. See service/debug_capture.py.
+                    td["debug"] = tc.debugRecords.map { Self.parsedJSON($0.json) }
+                }
+                return td
+            }
+        }
+        if !t.rawIO.isEmpty {
+            // Parsed back into real JSON objects (not left as strings) so
+            // the exported .json is directly queryable/greppable, e.g.
+            // with jq — mirrors how every other field here is native JSON.
+            d["raw_model_io"] = t.rawIO.map { io -> [String: Any] in
+                ["model": io.model,
+                 "request": Self.parsedJSON(io.requestJSON),
+                 "response": Self.parsedJSON(io.responseJSON)]
+            }
+        }
+        return d
+    }
+
+    /// One chat's turns as the export's readable text (its header is ChatDebugExport's).
+    private nonisolated static func debugTranscript(_ turns: [Turn], clock: DateFormatter) -> String {
+        var text = ""
+        for t in turns {
+            if t.role == "user" {
+                let ts = t.startedAt.map { "[\(clock.string(from: $0))] " } ?? ""
+                text += "── USER \(ts)──\n\(t.text)\n\n"
+                continue
+            }
+            var header = t.isError ? "── ERROR" : "── ASSISTANT"
+            if let m = t.model { header += " — \(m)" }
+            if let r = t.routeRole {
+                header += " (\(r)" + (t.routeSource.map { " · \($0)" } ?? "") + ")"
+            }
+            text += header + " ──\n"
+            if let reason = t.routeReason { text += "route reason: \(reason)\n" }
+            if let detail = t.errorDetail { text += "raw: \(detail)\n" }
+            var metrics: [String] = []
+            if let d = t.durationSec { metrics.append(String(format: "%.1fs total", d)) }
+            if let ttft = t.timeToFirstTokenSec { metrics.append(String(format: "%.1fs to first token", ttft)) }
+            if let tps = t.tokPerSec { metrics.append("\(tps) tok/s") }
+            if t.heartbeatCount > 0 { metrics.append("\(t.heartbeatCount) heartbeats") }
+            if !metrics.isEmpty { text += metrics.joined(separator: " · ") + "\n" }
+            for tc in t.toolCalls {
+                text += "  tool: \(tc.name) [\(tc.decision)]"
+                if !tc.decisionReason.isEmpty { text += " — \(tc.decisionReason)" }
+                text += "\n"
+                if tc.argsJSON != "{}" { text += "    args: \(tc.argsJSON)\n" }
+                if !tc.result.isEmpty { text += "    result: \(tc.result.prefix(300))\n" }
+                for rec in tc.debugRecords {
+                    let label = rec.kind.isEmpty ? "debug" : rec.kind
+                    text += "    ── \(label) ──\n"
+                    text += rec.json.split(separator: "\n").map { "      \($0)" }.joined(separator: "\n") + "\n"
+                }
+            }
+            if !t.reasoningText.isEmpty { text += "  reasoning: \(t.reasoningText)\n" }
+            for (i, io) in t.rawIO.enumerated() {
+                text += "  ── raw model I/O #\(i + 1)"
+                if !io.model.isEmpty { text += " (\(io.model))" }
+                text += " ──\n"
+                text += "  request:\n" + io.requestJSON.split(separator: "\n").map { "    \($0)" }.joined(separator: "\n") + "\n"
+                text += "  response:\n" + io.responseJSON.split(separator: "\n").map { "    \($0)" }.joined(separator: "\n") + "\n"
+            }
+            text += "\n\(t.text)\n\n"
+        }
+        return text
+    }
+
+    private func handle(_ ev: HarborClient.Event, dispatchID: UInt64) {
+        guard submissionState.isCurrent(dispatchID) else { return }
+        if let traceID = ev.payload["trace_id"] as? String { turnTraceID = traceID }
+        // Any event other than another `status` means whatever it was
+        // narrating (a model load/swap — see ensure_only) is over or was
+        // superseded by real progress; clear it so processingLabel falls
+        // back to the normal phase-based text instead of going stale.
+        if ev.type != "status" { statusText = "" }
+        var completedDispatch = false
+        switch ev.type {
+        case "session": sessionId = ev.str("id")
+        case "status": statusText = ev.str("text")
+        case "routed":
+            role = ev.str("role")
+            modelAbbrev = Self.abbrev(ev.str("model"))
+            routeSource = ev.str("route_source")
+            turnModel = ev.str("model")
+            turnRouteRole = ev.str("role")
+            turnRouteReason = ev.str("reason")
+            turnNeededTools = ev.bool("needs_tools")
+            if routeSource == "air_router" {
+                activity.append("Air router - \(role)")
+            } else if routeSource == "fallback" {
+                activity.append("Air router unavailable - local fallback")
+            }
+            phase = ev.bool("needs_tools") ? .working : .streaming
+        case "tool_call":
+            let mark = ["allow": "ok", "confirm": "needs ok", "deny": "blocked"][ev.str("decision")] ?? ""
+            activity.append("\(ev.str("name")) — \(mark)")
+            var rec = ToolCallRecord()
+            rec.callId = ev.str("id")
+            rec.name = ev.str("name")
+            rec.argsJSON = Self.prettyJSON(ev.payload["args"])
+            rec.decision = ev.str("decision")
+            rec.decisionReason = ev.str("reason")
+            turnToolCalls.append(rec)
+            if turnFirstTokenAt == nil { turnFirstTokenAt = Date() }
+        case "tool_rejected":
+            // Refused before it ran, so no tool_call came and none is shown. Debug
+            // Mode keeps its name and arguments; the tool_result fills in the refusal.
+            var rec = ToolCallRecord()
+            rec.callId = ev.str("id")
+            rec.name = ev.str("name")
+            rec.argsJSON = Self.prettyJSON(ev.payload["args"])
+            rec.decision = "rejected"
+            turnToolCalls.append(rec)
+        case "raw_model_io":
+            // Exactly what was sent to and returned by the model for this
+            // completion call — see loop.py's _run_step / main.py's reasoning
+            // and general/fast/coding branches. Tracked unconditionally
+            // (like the rest of debug metadata), surfaced only in the
+            // Debug Mode export (see exportDebugLog).
+            var io = RawModelIO()
+            io.model = ev.str("model")
+            io.requestJSON = Self.prettyJSON(ev.payload["request"])
+            io.responseJSON = Self.prettyJSON(ev.payload["response"])
+            turnRawIO.append(io)
+        case "clear_answer":
+            // The backend detected that the model streamed some preamble
+            // content before deciding to call a tool (e.g. "let me check
+            // that..." right before the actual tool_call) — that text isn't
+            // the real answer, so discard whatever got rendered from it
+            // before the tool result (or the next step's narration) lands.
+            // Also resets the timing/rate metrics that stream was skewing —
+            // they'll be recomputed fresh from the genuine answer.
+            answer = ""; pendingDelta = ""; flushScheduled = false
+            streamStart = nil; streamChars = 0; tokPerSec = 0
+            turnFirstTokenAt = nil
+            answerMoved()
+        case "confirm":
+            let card = Pending(sessionId: sessionId, actionId: ev.str("id"),
+                               requestId: ev.str("request_id"),
+                               tool: ev.str("tool"), reason: ev.str("reason"),
+                               // Older backends don't send `grantable`; default
+                               // to hiding the button rather than showing one
+                               // whose answer wouldn't be recorded.
+                               grantable: ev.payload["grantable"] as? Bool ?? false,
+                               scopeHint: ev.str("scope_hint"),
+                               preview: ev.str("preview"))
+            pending = card
+            phase = .confirming
+            // Focus never moves to the card, so VoiceOver is told it is waiting.
+            announceForVoiceOver(Self.approvalAnnouncement(reason: card.reason, grantable: card.grantable))
+        case "message_draft":
+            messageDraft = MessageDraft(to: ev.str("to"), text: ev.str("text"))
+            phase = .streaming
+        case "confirm_timeout":
+            // Backend gave up waiting (see approver.py) and auto-denied so the
+            // turn — and the daily brief / profile rotation gated behind it —
+            // isn't stuck forever. If the card for this exact action is still
+            // showing, clear it rather than leaving it answering into the void.
+            if pending?.actionId == ev.str("id") {
+                pending = nil
+                activity.append("⏱ Confirmation timed out — denied automatically")
+            }
+        case "tool_result":
+            // An `internal` result is a note to the model about its own mis-call.
+            if !ev.bool("internal") { activity.append("→ \(ev.str("result").prefix(60))") }
+            for kind in AskAccess.kinds(ev.payload["needs_access"]) where !turnNeedsAccess.contains(kind) {
+                turnNeedsAccess.append(kind)
+            }
+            let cid = ev.str("id")
+            if let idx = turnToolCalls.lastIndex(where: { $0.callId == cid }) {
+                turnToolCalls[idx].result = ev.str("result")
+                // Only present when the tool itself recorded something about
+                // its own internals (debug_capture.record) — most tools never
+                // set this. Each entry is {"kind": "source"|"model_call", ...}.
+                if let debug = ev.payload["debug"] as? [[String: Any]] {
+                    turnToolCalls[idx].debugRecords = debug.map { rec in
+                        ToolDebugRecord(kind: rec["kind"] as? String ?? "",
+                                        json: Self.prettyJSON(rec))
+                    }
+                }
+                // Ask's own forget removed something: the debug log's memory of
+                // every chat goes too, this one's included, as Memory › Forget
+                // does. The fact may have been read back in any of them. The
+                // chat stays on screen; a forget that removed nothing changes
+                // nothing here.
+                if ForgetToolResult.removedSomething(tool: turnToolCalls[idx].name, result: ev.str("result"),
+                                                     isInternal: ev.bool("internal")) {
+                    forgetArchivedChats(sessionId: nil)
+                }
+            }
+        case "heartbeat":
+            heartbeats += 1
+            turnHeartbeats += 1
+        case "reasoning":
+            reasoning = ev.str("text"); phase = .streaming
+            if turnFirstTokenAt == nil { turnFirstTokenAt = Date() }
+            answerMoved()
+        case "delta":
+            if streamStart == nil { streamStart = Date() }
+            if turnFirstTokenAt == nil { turnFirstTokenAt = Date() }
+            let t = ev.str("text"); streamChars += t.count
+            if let s = streamStart {
+                let el = Date().timeIntervalSince(s)
+                if el > 0.3 { tokPerSec = Int(Double(streamChars) / 4.0 / el) }
+            }
+            pendingDelta += t
+            scheduleFlush()
+            phase = .streaming
+            answerMoved()
+            // Return early instead of falling through to the trailing
+            // onResize() below: `answer` didn't actually change yet (it's
+            // buffered — see scheduleFlush), so resizing now would repeat the
+            // same native panel resize on every raw token instead of once per
+            // visual update. flushPendingDelta() calls onResize() itself at
+            // the point content actually changes.
+            return
+        case "text":
+            // Flush first: preserves ordering if any throttled delta text is
+            // still buffered (defensive — the backend doesn't currently mix
+            // delta and text events in one turn, but this keeps it correct
+            // regardless).
+            flushPendingDelta()
+            if turnFirstTokenAt == nil { turnFirstTokenAt = Date() }
+            answer += ev.str("text"); phase = .streaming
+            answerMoved()
+        case "error":
+            // A "dropped" error that arrived before ANY reply content (no route,
+            // no tokens, no tool activity): put the prompt back and remove the
+            // dead user bubble so a single Return re-sends it, and say so. Only
+            // runAgent resends by itself, and only a prompt the server provably
+            // never ran ("unsent"); a tool command ("delete …") may already have
+            // run when the stream had begun.
+            flushPendingDelta()
+            let gotNothing = answer.isEmpty && activity.isEmpty && role.isEmpty
+            let notReady = AskNotReady.classify(code: ev.str("code"), message: ev.str("message"))
+            if let notReady, answer.isEmpty, activity.isEmpty,
+               input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               let back = submissionState.dropForRetry(dispatchID) {
+                // The model isn't ready and nothing ran: not an error. The question
+                // goes back in the box, the user bubble goes, and Ask says plainly
+                // what happens next. A still-starting engine gets one automatic retry.
+                cancelAttachmentRead()
+                input = back.text
+                restoreAttachment(from: back)
+                researchMode = back.researchMode
+                if turns.last?.role == "user" { turns.removeLast() }
+                phase = .idle
+                syncQueue()
+                let willRetry = notReady == .starting && !notReadyRetried.contains(back.text)
+                if notReady == .setup { setupCard = .open }
+                if willRetry { scheduleNotReadyRetry(back.text) }
+                showTransientNotice(notReady.notice(willRetry: willRetry), duration: 10, info: true)
+            } else if ev.bool("dropped") && gotNothing {
+                lastDroppedReport = ["surface": "chat", "client_outcome": "connection_dropped", "journal_available": false]
+                if let id = turnTraceID { lastDroppedReport?["trace_id"] = id }
+                // One key per dropped turn, so reopening its report keeps the note.
+                lastDroppedReportKey = "chat:dropped:" + (turnTraceID ?? UUID().uuidString)
+                // Text typed meanwhile stays in the box. A prompt the server never
+                // ran then waits first in line; one whose stream had begun (a tool
+                // may have run) is only set aside, never queued to send again.
+                let typed = !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                let unsent = ev.bool("unsent")
+                var place = AgentSend.Place.box
+                if typed && unsent {
+                    _ = submissionState.dropToQueue(dispatchID)
+                    place = .queued
+                } else if typed {
+                    setAside.push(submissionState.dropForRetry(dispatchID))
+                    place = .setAside
+                } else if let retry = submissionState.dropForRetry(dispatchID) {
+                    cancelAttachmentRead()
+                    input = retry.text
+                    restoreAttachment(from: retry)
+                    researchMode = retry.researchMode
+                }
+                syncQueue()
+                if turns.last?.role == "user" {
+                    turns.removeLast()
+                }
+                phase = .idle
+                // Never silent: say what happened and how to send it again.
+                showTransientNotice(AgentSend.notice(message: ev.str("message"), unsent: unsent,
+                                                     queued: submissionState.queuedCount, place: place,
+                                                     setAside: setAside.count),
+                                    duration: 12)
+            } else {
+                let msg = ev.str("message").isEmpty ? "Something went wrong." : ev.str("message")
+                phase = .error
+                // Persist into history immediately (previously the error only
+                // lived in the transient `answer` binding and was silently lost
+                // the moment the next message was sent) — debug export needs
+                // to see exactly what failed, when, and under which route/model.
+                var t = Turn(role: "assistant", text: msg, activity: activity, isError: true)
+                let detail = ev.str("detail")
+                t.errorDetail = detail.isEmpty ? nil : detail
+                applyDebugFields(to: &t)
+                turns.append(t)
+                answered(msg, question: turns.dropLast().last(where: { $0.role == "user" })?.text, isError: true)
+                answer = ""; activity = []
+                completedDispatch = true
+            }
+        case "done":
+            // Flush BEFORE finalizing — without this, any text still sitting
+            // in the throttle buffer (up to ~60ms worth) would be silently
+            // dropped instead of appearing in the finished reply.
+            flushPendingDelta()
+            // Move the finished reply into the conversation history so the next
+            // turn renders below it. Carry this turn's tool-call activity along
+            // with it (and clear the live copy) — previously `activity` was
+            // never reset here, so it lingered and rendered as dangling,
+            // unattributed text below the NEXT turn instead of being shown,
+            // correctly ordered, above the turn it actually belongs to.
+            if !answer.isEmpty {
+                var t = Turn(role: "assistant", text: answer, activity: activity)
+                applyDebugFields(to: &t)
+                turns.append(t)
+                answered(answer, question: turns.dropLast().last(where: { $0.role == "user" })?.text, isError: false)
+                answer = ""
+            } else if let draft = messageDraft {
+                // A draft turn ends on its card with no prose. Without a turn
+                // here the request read as unanswered once the next message
+                // cleared the card, and Debug exports dropped it (2026-11-04).
+                let who = draft.to.isEmpty ? "the recipient" : draft.to
+                var t = Turn(role: "assistant",
+                             text: "Drafted a text to \(who). It goes only when you tap Send.",
+                             activity: activity)
+                applyDebugFields(to: &t)
+                turns.append(t)
+            }
+            activity = []
+            phase = .done
+            completedDispatch = true
+        default: break
+        }
+        onResize()
+        if completedDispatch { completeSubmission(dispatchID) }
+    }
+
+    /// Questions already retried once after "still starting", so a model that
+    /// never comes up can't loop.
+    private var notReadyRetried: Set<String> = []
+    private var notReadyRetry: Task<Void, Never>?
+
+    /// Send `text` again once, after a short wait, if it is still the only thing
+    /// in the box and nothing else is running. Typing or sending anything first
+    /// cancels it.
+    private func scheduleNotReadyRetry(_ text: String) {
+        notReadyRetried.insert(text)
+        notReadyRetry?.cancel()
+        notReadyRetry = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: AskNotReady.retryDelay)
+            guard !Task.isCancelled, let self, self.input == text, self.conversationSettled,
+                  !self.submissionState.isActive, !self.serviceDown else { return }
+            self.submit()
+        }
+    }
+
+    /// Whether Try again belongs under this reply: an error that ran nothing,
+    /// last in a settled chat, right after the question that led to it. Not
+    /// when that question went with a picture, screen, clip or document: the
+    /// transcript keeps only its marker ("What's this? [image]"), so sending
+    /// the line again would ask about something the model never gets.
+    func offersTryAgain(_ turn: Turn) -> Bool {
+        guard turn.isError, turn.activity.isEmpty, conversationSettled,
+              turns.count >= 2, turn.id == turns[turns.count - 1].id else { return false }
+        let question = turns[turns.count - 2]
+        return question.role == "user" && !QueuedPrompt.endsWithHistoryMarker(question.text)
+    }
+
+    /// Try again on an error reply that ran nothing: the question that led to it
+    /// goes back in the box and is sent again. Whatever is already in the box
+    /// is the person's: it is never replaced or sent along with the old question.
+    func tryAgain(_ turn: Turn) {
+        guard offersTryAgain(turn) else { return }
+        guard input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !hasAttachment else {
+            showTransientNotice("Send or clear what's in the box first, then try again.")
+            return
+        }
+        let index = turns.count - 1
+        let question = turns[index - 1].text
+        turns.removeSubrange((index - 1)...index)
+        input = question
+        submit()
+    }
+
+    private func completeSubmission(_ dispatchID: UInt64) {
+        let next = submissionState.complete(dispatchID)
+        syncQueue()
+        if let next { start(next) } else { refreshRecentChats() }
+    }
+
+    // Folds this turn's tracked debug metadata into the Turn being finalized.
+    private func applyDebugFields(to turn: inout Turn) {
+        turn.traceID = turnTraceID
+        turn.model = turnModel
+        turn.routeRole = turnRouteRole
+        turn.routeReason = turnRouteReason
+        turn.routeSource = routeSource.isEmpty ? nil : routeSource
+        turn.neededTools = turnNeededTools
+        turn.tokPerSec = tokPerSec > 0 ? tokPerSec : nil
+        turn.startedAt = turnStartedAt
+        turn.firstTokenAt = turnFirstTokenAt
+        turn.finishedAt = Date()
+        turn.heartbeatCount = turnHeartbeats
+        turn.reasoningText = reasoning
+        turn.toolCalls = turnToolCalls
+        turn.rawIO = turnRawIO
+        // Not debug-only: the reply's fix button (OverlayView.accessFixes).
+        turn.needsAccess = turnNeedsAccess
+    }
+
+    // Pretty-prints a tool call's `args` payload (an arbitrary JSON-ish `Any`
+    // from the SSE event) for the debug log — falls back to a plain string
+    // description if it isn't valid JSON-serializable data.
+    private static func prettyJSON(_ value: Any?) -> String {
+        guard let value else { return "{}" }
+        guard JSONSerialization.isValidJSONObject(value),
+              let data = try? JSONSerialization.data(withJSONObject: value, options: [.prettyPrinted, .sortedKeys]),
+              let s = String(data: data, encoding: .utf8)
+        else { return "\(value)" }
+        return s
+    }
+
+    // Reverses prettyJSON for the .json export: re-parses a pretty-printed
+    // JSON string back into a native object/array so raw_model_io round-trips
+    // as real JSON rather than a doubly-encoded string. Falls back to the raw
+    // string if it somehow isn't parseable (shouldn't happen — it came from
+    // prettyJSON itself — but the export must not crash over a debug field).
+    private nonisolated static func parsedJSON(_ s: String) -> Any {
+        guard let data = s.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+        else { return s }
+        // "-1e999" parses to -inf, which JSONSerialization cannot write back and
+        // reports as an uncatchable exception; neutralize before it is exported.
+        return DiagnosticReport.finiteJSON(obj)
+    }
+
+    // Throttle: at most one `answer` mutation (and the MarkdownView re-parse +
+    // re-render it triggers) per ~60ms, no matter how many raw delta chunks
+    // arrive in that window. 60ms is short enough that streaming still reads
+    // as immediate, but long enough to coalesce a burst of same-tick token
+    // chunks into one visual update instead of many — this plus the stable
+    // block IDs in MarkdownView are what make streamed text look like it's
+    // flowing in smoothly rather than jittering token by token.
+    private func scheduleFlush() {
+        guard !flushScheduled else { return }
+        flushScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
+            self?.flushPendingDelta()
+        }
+    }
+
+    private func flushPendingDelta() {
+        flushScheduled = false
+        guard !pendingDelta.isEmpty else { return }
+        answer += pendingDelta
+        pendingDelta = ""
+        onResize()
+    }
+
+    // --- assistant layer -------------------------------------------------
+    // Called once at launch: do a first fetch and subscribe to the reminder
+    // stream (auto-reconnecting). Reminders fire as system notifications —
+    // see handleAssistantEvent's "reminder" case.
+    private let assistantDelivery = AssistantDelivery()
+
+    func startAssistant() {
+        // Nudge notification buttons (Useful / Not now / Wrong / Undo / Do it)
+        // route back here on the main actor.
+        Notifications.onNudgeResponse = { [weak self] nudgeID, action, info in
+            guard let self, let response = NudgeResponse.from(notificationAction: action, info: info)
+            else { return }
+            self.respondToNudge(nudgeID, response, fallbackPrompt: info["prompt"] ?? "",
+                                fromNotification: true)
+        }
+        Notifications.registerNudgeCategories()
+        assistantTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                await self.client.assistantEvents { [weak self] ev in
+                    guard let self else { return false }
+                    return await self.assistantDelivery.handle(ev, client: self.client,
+                        perform: { await self.handleAssistantEvent($0) },
+                        calendar: { await self.handleCalendarAction($0) },
+                        reconcileReminder: { await self.reconcileReminderAction($0) })
+                }
+                // Stream ended (routine server rotation or backend restart) —
+                // back off, then re-subscribe. Backend actions wait out this gap.
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+            }
+        }
+    }
+
+    /// `info`: a plain status ("Thank you, Sam.", "Harbor is still starting…"),
+    /// drawn quietly; otherwise a problem, drawn in the error color.
+    func showTransientNotice(_ message: String, duration: TimeInterval = 4, info: Bool = false) {
+        transientNoticeTask?.cancel()
+        // The line appears without focus moving, so VoiceOver is told. One
+        // already showing (shown again only to change how long it stays) is
+        // not said twice.
+        if transientNotice != message {
+            announceForVoiceOver(message, priority: info ? .medium : .high)
+        }
+        transientNoticeIsInfo = info
+        transientNotice = message
+        transientNoticeTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(max(0, duration) * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            self?.transientNotice = nil
+        }
+    }
+
+    // Refresh on the Brief tab (and the menu bar's Daily Summary): compose the
+    // combined calendar, email and messages brief now and show it on Brief.
+    // It waits its turn with prompts, so it never reads the sources while a
+    // reply is being written. A prompt sent meanwhile is queued behind it.
+    func runDailySummary() {
+        guard !corpusBusy else {
+            showTransientNotice("Stop the corpus run before refreshing the brief.")
+            return
+        }
+        tab = .brief
+        guard !briefComposing else { return }
+        guard let dispatch = submissionState.beginDailySummary() else {
+            showTransientNotice("Harbor is answering. Refresh the brief when it finishes.")
+            return
+        }
+        requestExpand()
+        briefComposing = true
+        dailySummaryRunning = true
+        let summaryID = UUID()
+        dailySummaryID = summaryID
+        startSyncProgress(sources: ["calendar", "reminders", "email", "messages"])
+        onResize()
+        Task { [weak self] in
+            guard let self else { return }
+            // No session: the service records the brief in a new saved chat, so
+            // Ask about this continues from it without joining the open chat.
+            let result = await self.client.dailySummary()
+            guard self.dailySummaryID == summaryID,
+                  self.submissionState.isCurrent(dispatch.id) else { return }
+            self.dailySummaryRunning = false
+            self.briefComposing = false
+            // A failed compose must not leave the 1 Hz sync poll running.
+            if result.text == nil { self.stopSyncProgress() }
+            // Do not stop source polling here. A "still syncing" response is
+            // a bounded wait, not completion of the background sync itself.
+            if let text = result.text {
+                self.brief = DailyBrief(text: text, receivedAt: Date(), traceID: nil, sessionId: result.sessionId)
+            } else {
+                self.showTransientNotice("Couldn't build a summary right now.")
+            }
+            self.onResize()
+            self.completeSubmission(dispatch.id)
+        }
+    }
+
+    private func stopSyncProgress() {
+        sourceSyncTask?.cancel()
+        sourceSyncTask = nil
+        sourceSyncID = UUID()
+        trackedSyncSources = []
+        dailySyncProgress = nil
+        dailySyncLabel = ""
+        sourceSyncStatuses = []
+    }
+
+    private func startSyncProgress(sources: [String]) {
+        // Several tools can request reads concurrently for an aggregate task.
+        // Keep every pending source in the same bar, not just the last event.
+        var wanted = (!dailySummaryRunning && (dailySyncProgress ?? 1) < 1)
+            ? trackedSyncSources : []
+        for source in sources where !wanted.contains(source) { wanted.append(source) }
+        stopSyncProgress()
+        trackedSyncSources = wanted
+        let syncID = sourceSyncID
+        dailySyncProgress = 0
+        dailySyncLabel = "Checking synced data…"
+        sourceSyncTask = Task { [weak self] in
+            // Bounded: 10 minutes overall (a local brief can take minutes), or
+            // 5 unanswered polls in a row. A downed service must not be polled
+            // at 1 Hz for the rest of the session.
+            let deadline = Date().addingTimeInterval(600)
+            var misses = 0
+            while !Task.isCancelled {
+                guard let self else { return }
+                let status = await self.client.assistantSyncStatus(sources: wanted)
+                guard !Task.isCancelled, self.sourceSyncID == syncID else { return }
+                if status == nil { misses += 1 } else { misses = 0 }
+                if misses >= 5 || Date() > deadline {
+                    self.stopSyncProgress()
+                    self.onResize()
+                    return
+                }
+                if let status {
+                    self.sourceSyncStatuses = status.sources
+                    self.dailySyncProgress = status.progress
+                    self.dailySyncLabel = status.label
+                    if status.pendingLabels.isEmpty {
+                        if self.isProcessing {
+                            // Keep the compact sync tip current while the
+                            // summary is generated, including local-cache caveats.
+                            if self.dailySummaryRunning {
+                                self.statusText = "Building your daily summary…"
+                            }
+                        } else {
+                            self.onResize()
+                            return
+                        }
+                        // Keep checking during generation: a requested Mail
+                        // refresh can replace a local-only snapshot and its
+                        // warning after the first terminal status was shown.
+                    }
+                } else {
+                    // Preserve the last measured fraction, not a fake 100%.
+                    self.dailySyncLabel = "Reconnecting to check sync…"
+                }
+                self.onResize()
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
+    }
+
+    // Set by the app delegate: create/remove real macOS Calendar events (the app
+    // holds the Calendar grant; the backend can't touch Calendar directly).
+    var onCreateCalendarEvent: ((_ title: String, _ startTs: Double,
+                                 _ durationMin: Int, _ location: String) -> [String: Any])?
+    var onCreateAllDayCalendarEvent: ((_ title: String, _ day: String,
+                                       _ timezone: String, _ location: String) -> [String: Any])?
+    var onDeleteCalendarEvent: ((_ identifier: String, _ occurrenceTs: Double?) -> [String: Any])?
+    /// Calendar's deep link to one synced occurrence, for the check-in card's
+    /// "Decline in Calendar" / "Open in Calendar"; nil when it is gone.
+    var showCalendarEventURL: ((_ identifier: String, _ startTs: Double) -> URL?)?
+    /// Verified cancel of one occurrence (CalendarReader.cancelEvent).
+    var onCancelCalendarEvent: ((_ identifier: String, _ expectedTitle: String, _ expectedStart: Double,
+                                 _ expectedInvitees: Int) -> [String: Any])?
+    /// Verified move of one occurrence (CalendarReader.moveEvent). nil duration keeps its length.
+    var onMoveCalendarEvent: ((_ identifier: String, _ expectedTitle: String, _ expectedStart: Double,
+                               _ newStart: Double, _ durationMin: Int?, _ expectedInvitees: Int) -> [String: Any])?
+    var onVerifiedReminderAction: ((_ kind: String, _ actionID: String, _ sourceID: String,
+                                    _ expectedTitle: String, _ expectedDueTs: Double?,
+                                    _ title: String, _ dueTs: Double,
+                                    _ commitmentKind: String, _ dueDate: String, _ expectedDueDate: String) -> [String: Any])?
+    var onReconcileReminderAction: ((_ kind: String, _ actionID: String, _ sourceID: String,
+                                     _ title: String, _ dueTs: Double,
+                                     _ commitmentKind: String, _ dueDate: String) async -> [String: Any])?
+    var onStartResearch: ((_ prompt: String) -> Void)?
+    /// Opens this conversation in the Chat window. Called with the service
+    /// session id, which is empty until the first reply of a new chat.
+    var onOpenChat: ((_ sessionId: String) -> Void)?
+    func openInChat() { onOpenChat?(sessionId) }
+    // Backend asks (via the assistant event stream) for an immediate Mail
+    // re-sync when an email query hits a cold cache — beats waiting on the
+    // MailReader's 5-min timer so the FIRST "check my emails" works.
+    var onSyncEmails: (() -> Void)?
+    // The backend can be restarted independently of the app, so its in-memory
+    // readiness resets even when the readers already ran. This callback lets a
+    // summary/tool request current source reads immediately instead of waiting
+    // for the next 1-5 minute timer.
+    var onSyncAssistantSources: (([String]) -> Void)?
+    // The mail-memory queue (service/mail_memory) asks for one Mail index window
+    // or one message body at a time; the reader answers by POST (MailMemoryReader).
+    var onMailMemoryRead: (([String: Any]) -> Bool)?
+
+    private func handleCalendarAction(_ ev: HarborClient.Event) async -> [String: Any] {
+        if ["create_reminder", "update_reminder", "complete_reminder", "delete_reminder"].contains(ev.type) {
+            guard let action = onVerifiedReminderAction else {
+                return ["ok": false, "status": "failed", "error": "Reminders handler unavailable"]
+            }
+            // JSON null means "no due date" (an undated delete); anything that is not a
+            // number becomes NaN, which the writer rejects, never a stand-in value.
+            let rawDue = ev.payload["expected_due_ts"]
+            let expectedDue: Double? = rawDue is NSNull ? nil : (rawDue as? Double ?? .nan)
+            return action(ev.type, ev.str("action_id"), ev.str("source_id"),
+                          ev.str("expected_title"), expectedDue,
+                          ev.str("title"), ev.payload["due_ts"] as? Double ?? 0,
+                          ev.str("commitment_kind"), ev.str("due_date"), ev.str("expected_due_date"))
+        }
+        if ev.type == "cancel_calendar_event" {
+            guard !ev.str("source_id").isEmpty, !ev.str("expected_title").isEmpty,
+                  let expected = ev.payload["expected_start_ts"] as? Double, expected.isFinite, expected > 0,
+                  let invitees = ev.payload["invitee_count"] as? Int, invitees >= 0,
+                  let cancel = onCancelCalendarEvent else {
+                return ["ok": false, "error": "Calendar cancel identity or handler is unavailable"]
+            }
+            return cancel(ev.str("source_id"), ev.str("expected_title"), expected, invitees)
+        }
+        guard let ts = ev.payload["when_ts"] as? Double, ts.isFinite, ts > 0 else {
+            return ["ok": false, "error": "Calendar time is invalid"]
+        }
+        if ev.type == "move_calendar_event" {
+            guard !ev.str("source_id").isEmpty, !ev.str("expected_title").isEmpty,
+                  let expected = ev.payload["expected_start_ts"] as? Double, expected.isFinite, expected > 0,
+                  let invitees = ev.payload["invitee_count"] as? Int, invitees >= 0,
+                  let move = onMoveCalendarEvent else {
+                return ["ok": false, "error": "Calendar move identity or handler is unavailable"]
+            }
+            // JSON null keeps the event's own length; anything else must be a whole minute count.
+            let rawDuration = ev.payload["duration_min"]
+            var duration: Int?
+            if !(rawDuration is NSNull) {
+                guard let minutes = rawDuration as? Int, (1...10080).contains(minutes) else {
+                    return ["ok": false, "error": "Calendar move length is invalid"]
+                }
+                duration = minutes
+            }
+            return move(ev.str("source_id"), ev.str("expected_title"), expected, ts, duration, invitees)
+        }
+        if ev.type == "create_calendar_event" {
+            if ev.payload["all_day"] != nil {
+                guard AssistantDelivery.jsonBoolean(ev.payload["all_day"]) == true,
+                      let bounds = AssistantDelivery.allDayCalendarBounds(day: ev.str("due_date"), timezone: ev.str("timezone")),
+                      abs(bounds.start - ts) < 1,
+                      ev.payload["duration_min"] as? Int == bounds.minutes,
+                      !ev.str("title").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      let create = onCreateAllDayCalendarEvent else {
+                    return ["ok": false, "error": "All-day Calendar creation payload or handler is unavailable"]
+                }
+                return create(ev.str("title"), ev.str("due_date"), ev.str("timezone"), ev.str("location"))
+            }
+            guard !ev.str("title").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  let duration = ev.payload["duration_min"] as? Int, (1...10080).contains(duration),
+                  let create = onCreateCalendarEvent else {
+                return ["ok": false, "error": "Calendar creation payload or handler is unavailable"]
+            }
+            return create(ev.str("title"), ts, duration, ev.str("location"))
+        }
+        guard !ev.str("source_id").isEmpty, let delete = onDeleteCalendarEvent else {
+            return ["ok": false, "error": "Calendar deletion identity or handler is unavailable"]
+        }
+        return delete(ev.str("source_id"), ts)
+    }
+
+    private func reconcileReminderAction(_ ev: HarborClient.Event) async -> [String: Any] {
+        guard let reconcile = onReconcileReminderAction else {
+            return ["ok": false, "status": "unknown", "error": "Readback handler unavailable"]
+        }
+        return await reconcile(ev.type, ev.str("action_id"), ev.str("source_id"),
+                               ev.str("title"), ev.payload["due_ts"] as? Double ?? 0,
+                               ev.str("commitment_kind"), ev.str("due_date"))
+    }
+
+    private func handleAssistantEvent(_ ev: HarborClient.Event) async -> Bool {
+        var notificationOK = true
+        func post(title: String, body: String) async {
+            let identity = ev.str("event_id")
+            let ok = await Notifications.deliver(id: identity.isEmpty ? "" : identity + ":" + title,
+                                                title: title, body: body)
+            notificationOK = notificationOK && ok
+        }
+        // Durable Calendar actions only execute through the claimed bridge.
+        switch ev.type {
+        case "hello", "heartbeat": return true
+        case "changed": NotificationCenter.default.post(name: .harborAssistantChanged, object: nil)
+        case "calendar_action_unknown":
+            return await Notifications.deliver(id: ev.str("event_id") + ":unknown",
+                title: "Calendar outcome unknown", body: ev.str("error"))
+        case "reminder_action_unknown":
+            return await Notifications.deliver(id: ev.str("event_id") + ":unknown",
+                title: "Reminders outcome unknown", body: ev.str("error"))
+        case "reminder":
+            guard !ev.str("title").isEmpty, !ev.str("commitment_id").isEmpty,
+                  !ev.str("stage").isEmpty, ev.payload["when_ts"] as? Double != nil else { return false }
+            let sub = [ev.str("context"), ev.str("when_label")].filter { !$0.isEmpty }.joined(separator: " · ")
+            return await Notifications.deliver(id: ev.str("event_id"), title: ev.str("title"), body: sub)
+        case "nudge":
+            // Behavior engine (service/behavior, Nudge.to_event()). Auto
+            // actions were already performed by the backend; the card and the
+            // notification say so and offer Undo. Acked like "reminder".
+            var payload = ev.payload
+            if (payload["evidence_version"] as? Int) != 2,
+               ["habit_missed", "habit_conflict", "cancel_likely", "day_preview", "contact_window"].contains(payload["kind"] as? String ?? "") {
+                let contact = payload["kind"] as? String == "contact_window"
+                payload["title"] = contact ? "Review an older routine suggestion" : "Review an older calendar suggestion"
+                payload["body"] = contact ? "Source details for this older contact suggestion are unavailable; actual communication is unknown." : "This suggestion used calendar plans. Whether the activity happened is unknown."
+                payload["because"] = contact ? "Source details unavailable" : "Calendar evidence; completion unknown"
+                payload["actions"] = [[String: Any]]()
+            }
+            guard let nudge = BehaviorNudge.parse(payload) else { return false }
+            // A replay that outlived its moment is acknowledged silently.
+            if nudge.isExpired() { return true }
+            showNudge(nudge)
+            return await Notifications.deliver(id: nudge.notificationID, title: nudge.title,
+                                               body: nudge.notificationBody,
+                                               subtitle: nudge.notificationSubtitle,
+                                               category: nudge.notificationCategory,
+                                               userInfo: nudge.notificationInfo)
+        case "attention_added":
+            // The attention runner added a reminder for a plan stated in a text that was on
+            // neither Calendar nor Reminders. Say what was added and quote the source; Undo
+            // lives in Today's "Caught for you" section.
+            let title = ev.str("title")
+            guard !title.isEmpty, !ev.str("source_id").isEmpty else { return false }
+            let quote = ev.str("quote")
+            let body = [ev.str("when_label"), quote.isEmpty ? "" : "“\(quote)”"]
+                .filter { !$0.isEmpty }.joined(separator: "\n")
+            return await Notifications.deliver(id: "attention:" + ev.str("source_id"),
+                                               title: "Added a reminder: \(title)", body: body)
+        case "harbor_did":
+            // Harbor did something by itself behind "Let Harbor act for me" (service/proactive/acting.py,
+            // announce): it is already done and recorded. Say what, so the person sees it happen;
+            // the card with Undo is in the Brief. Nothing here acts.
+            let title = ev.str("title")
+            guard !title.isEmpty, !ev.str("record").isEmpty else { return false }
+            return await Notifications.deliver(id: "harbordid:" + ev.str("record"), title: "Harbor did this",
+                                               body: [title, ev.str("detail")].filter { !$0.isEmpty }.joined(separator: "\n"))
+        case "create_apple_reminder":
+            return false
+        case "update_apple_reminder":
+            return false
+        case "delete_apple_reminder":
+            return false
+        case "sync_emails_now":
+            if !dailySummaryRunning { startSyncProgress(sources: ["email"]) }
+            guard let sync = onSyncEmails else { return false }
+            sync()
+        case "mail_memory_read":
+            guard let read = onMailMemoryRead, read(ev.payload) else { return false }
+        case "sync_assistant_sources_now":
+            let sources = ev.payload["sources"] as? [String] ?? []
+            if !dailySummaryRunning { startSyncProgress(sources: sources) }
+            guard !sources.isEmpty, let sync = onSyncAssistantSources else { return false }
+            sync(sources)
+        case "send_email":
+            // The user already approved this on a confirmation card; the
+            // backend is blocked awaiting the result (see OutboundSender).
+            OutboundSender.sendEmail(
+                actionId: ev.str("action_id"),
+                to: ev.payload["to"] as? [String] ?? [],
+                cc: ev.payload["cc"] as? [String] ?? [],
+                subject: ev.str("subject"), body: ev.str("body"))
+        case "send_message":
+            OutboundSender.sendMessage(
+                actionId: ev.str("action_id"),
+                to: ev.str("to"), text: ev.str("text"))
+        case "scheduled_send_result":
+            // A send the user approved earlier just fired on its own. They
+            // weren't necessarily watching, so this is a notification rather
+            // than a transcript line — especially on failure, where silence
+            // would leave them believing it went out.
+            let who = ev.str("display")
+            let kind = ev.str("channel") == "email" ? "Email" : "Text"
+            if ev.payload["ok"] as? Bool ?? false {
+                await post(title: "✅ \(kind) sent", body: "Your scheduled \(kind.lowercased()) to \(who) went out.")
+            } else {
+                await post(title: "⚠️ Scheduled \(kind.lowercased()) failed",
+                                   body: "Couldn't send to \(who): \(ev.str("error"))")
+            }
+        case "scheduled_send_missed":
+            // Came due while Harbor wasn't running and is now too late to send
+            // (see outbound_queue). Never delivered late and never dropped
+            // silently — the user decides whether it still makes sense.
+            let who = ev.str("display")
+            let kind = ev.str("channel") == "email" ? "email" : "text"
+            await post(title: "⏰ Scheduled \(kind) missed",
+                               body: "Harbor wasn't running when your \(kind) to \(who) was due, so it wasn't sent.")
+        case "scheduled_send_unknown":
+            guard !ev.str("notice_id").isEmpty, !ev.str("display").isEmpty else { return false }
+            let kind = ev.str("channel") == "email" ? "email" : "text"
+            guard await Notifications.deliver(id: ev.str("event_id"),
+                title: "❓ Scheduled \(kind) outcome unknown",
+                body: "Harbor was interrupted while sending your \(kind) to \(ev.str("display")). It wasn't sent again — check whether it arrived.") else { return false }
+            if ev.str("event_id").isEmpty { return await client.ackScheduledSendNotice(ev.str("notice_id")) }
+        case "prepare_email_reply":
+            OutboundSender.prepareEmailReply(
+                actionId: ev.str("action_id"), messageId: ev.str("message_id"),
+                body: ev.str("body"), replyAll: ev.payload["reply_all"] as? Bool ?? false,
+                account: ev.str("account"), accountID: ev.str("account_id"))
+        case "reply_to_email":
+            OutboundSender.replyToEmail(
+                actionId: ev.str("action_id"),
+                messageId: ev.str("message_id"), body: ev.str("body"),
+                replyAll: ev.payload["reply_all"] as? Bool ?? false,
+                account: ev.str("account"),
+                expected: ev.payload["expected_reply"] as? [String: Any] ?? [:])
+        case "draft_email":
+            // No confirmation card for drafts — nothing is sent, and the
+            // user's own click in Mail is the real gate (see policy.py).
+            OutboundSender.draftEmail(
+                actionId: ev.str("action_id"),
+                to: ev.payload["to"] as? [String] ?? [],
+                cc: ev.payload["cc"] as? [String] ?? [],
+                subject: ev.str("subject"), body: ev.str("body"))
+        case "draft_message":
+            OutboundSender.draftMessage(
+                actionId: ev.str("action_id"),
+                to: ev.str("to"), text: ev.str("text"))
+        case "mark_email_read":
+            OutboundSender.markEmailRead(
+                actionId: ev.str("action_id"),
+                messageId: ev.str("message_id"),
+                read: ev.payload["read"] as? Bool ?? true)
+        case "archive_email":
+            OutboundSender.archiveEmail(
+                actionId: ev.str("action_id"),
+                messageId: ev.str("message_id"))
+        case "forward_email":
+            OutboundSender.forwardEmail(
+                actionId: ev.str("action_id"),
+                messageId: ev.str("message_id"),
+                to: ev.payload["to"] as? [String] ?? [],
+                body: ev.str("body"))
+        case "flag_email":
+            OutboundSender.flagEmail(
+                actionId: ev.str("action_id"),
+                messageId: ev.str("message_id"),
+                flagged: ev.payload["flagged"] as? Bool ?? true)
+        case "email_summary":
+            await post(title: "📧 Morning email summary", body: ev.str("summary"))
+        case "node_result":
+            guard let presentation = NodePresentation(ev.payload) else { return false }
+            if !turns.contains(where: { $0.nodeResultID == presentation.eventID }) {
+                turns.append(Turn(role: "assistant", text: presentation.literalText, nodeResultID: presentation.eventID))
+            }
+            // A failed notification must retry even when its transcript exists.
+            await post(title: presentation.title, body: Self.notificationBody(from: presentation.body))
+        case "codex_task_update":
+            let kind = ev.str("kind")
+            let task = ev.str("title")
+            let latest = ev.str("latest_update")
+            let title: String
+            switch kind {
+            case "completed": title = "✅ Codex task finished"
+            case "failed": title = "⚠️ Codex task needs attention"
+            default: title = "⏳ Codex task may be stalled"
+            }
+            await post(title: title,
+                               body: latest.isEmpty ? task : "\(task)\n\(latest)")
+        case "checkin":
+            // The evening check-in is due (service/assistant/scheduler._checkin_tick):
+            // one notification; the card itself loads on the Day tab.
+            let text = ev.str("text")
+            guard !text.isEmpty else { return false }
+            checkInDue = true
+            await post(title: "🌙 Evening check-in", body: text)
+        case "daily_brief":
+            // Scheduled 8am/8pm brief: content-ful notifications (calendar+email,
+            // messages) plus the full write-up in the transcript for when the app
+            // is opened.
+            //
+            // Every card here says something the user can act on without opening
+            // Harbor, and NONE of them is posted twice for one brief. The old
+            // fallback card — "Your daily summary is ready in Harbor." with no
+            // content — fired whenever the backend couldn't split the brief,
+            // which included the case where there was no brief to split because
+            // the sources were still syncing. The backend no longer publishes
+            // that (see brief.run_scheduled_brief). AssistantDelivery receipts
+            // suppress replays across reconnects and app restarts.
+            let briefText = ev.str("text")
+            guard !briefText.isEmpty else { return false }
+            let today = ev.str("today_summary")
+            let messages = ev.str("messages_summary")
+            // A day-one rebuild of a summary already announced (sources that
+            // finished reading, or Getting to know you answered) updates the
+            // Brief tab quietly: no second "ready" banner.
+            let recomposed = ev.bool("recomposed")
+            if !recomposed, !today.isEmpty { await post(title: "📅 Today", body: today) }
+            if !recomposed, !messages.isEmpty { await post(title: "💬 Messages", body: messages) }
+            if !recomposed && today.isEmpty && messages.isEmpty {
+                // No split available: notify with the brief's own opening lines
+                // rather than announcing that something is ready elsewhere.
+                let part = ev.str("part_of_day") == "evening" ? "Evening" : "Morning"
+                await post(title: "🗞️ \(part) brief",
+                                   body: Self.notificationBody(from: briefText))
+            }
+            // The full write-up replaces the brief on the Brief tab, which shows
+            // when it arrived, so an older one never reads as current. A replay
+            // of a brief already applied (the stream re-subscribes after any
+            // drop) changes nothing: not the text, not its time, not the chat a
+            // refreshed brief was recorded in.
+            let eventID = ev.str("event_id")
+            let created = (ev.payload["created_at"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) }
+            if Self.appliesBrief(eventID: eventID, created: created, applied: appliedBriefEvents, current: brief) {
+                if !eventID.isEmpty { appliedBriefEvents.insert(eventID) }
+                brief = DailyBrief(text: briefText, receivedAt: created ?? Date(),
+                                   traceID: ev.payload["trace_id"] as? String, sessionId: "")
+            }
+        case "google_signin_expired":
+            // A Testing-mode Google sign-in ended after 7 days
+            // (gmail_source._announce_expired): one durable event per expiry,
+            // so one notification. Settings ▸ Google shows Reconnect.
+            let account = ev.str("account")
+            guard !account.isEmpty else { return false }
+            return await Notifications.deliver(
+                id: "google-signin-expired:\(account):\(ev.payload["expired_at"] as? Int ?? 0)",
+                title: "Google sign-in expired", body: "Reconnect in Settings ▸ Google.",
+                subtitle: account)
+        default:
+            return false
+        }
+        return notificationOK
+    }
+
+    // --- behavior nudges ---------------------------------------------------
+
+    private func showNudge(_ nudge: BehaviorNudge) {
+        if let i = nudges.firstIndex(where: { $0.id == nudge.id }) {
+            let old = nudges[i]
+            if !nudge.eventID.isEmpty, !old.eventID.isEmpty, nudge.eventID != old.eventID {
+                // Same id from a NEW hub event: it re-fired (e.g. after a state
+                // reset), so the card starts fresh; Notifications.deliver
+                // replaces the old banner the same way.
+                nudges[i] = nudge
+            } else {
+                // Same deterministic id re-delivered: keep the card's local state.
+                var merged = nudge
+                merged.status = old.status
+                merged.undone = old.undone
+                merged.performed = old.performed
+                nudges[i] = merged
+            }
+        } else {
+            nudges.insert(nudge, at: 0)
+            if nudges.count > 3 { nudges.removeLast(nudges.count - 3) }
+        }
+        onResize()
+    }
+
+    func dismissNudge(_ nudgeID: String) {
+        nudges.removeAll { $0.id == nudgeID }
+        onResize()
+    }
+
+    private func setNudge(_ nudgeID: String, status: String? = nil, busy: Bool? = nil,
+                          undone: Bool? = nil, performed: Bool? = nil) {
+        guard let i = nudges.firstIndex(where: { $0.id == nudgeID }) else { return }
+        if let status { nudges[i].status = status }
+        if let busy { nudges[i].busy = busy }
+        if let undone { nudges[i].undone = undone }
+        if let performed { nudges[i].performed = performed }
+        onResize()
+    }
+
+    /// One handler for card buttons and notification actions. Feedback and
+    /// undo go to the backend; an open_prompt action asks the backend for the
+    /// prompt and prefills the composer WITHOUT sending it; an offered
+    /// add_reminder/add_hold is created by the backend (and can be undone).
+    func respondToNudge(_ nudgeID: String, _ response: NudgeResponse,
+                        fallbackPrompt: String = "", fromNotification: Bool = false) {
+        let onCard = nudges.contains { $0.id == nudgeID }
+        if !fromNotification { Notifications.removeDelivered(id: "harbor-nudge:" + nudgeID) }
+        switch response {
+        case .open:
+            requestExpand()
+        case .feedback(let verdict):
+            guard NudgeResponse.verdicts.contains(verdict) else { return }
+            setNudge(nudgeID, status: "Saving…", busy: true)
+            Task { [weak self] in
+                guard let self else { return }
+                let ok = await self.client.behaviorFeedback(nudgeID: nudgeID, verdict: verdict)
+                if ok {
+                    self.dismissNudge(nudgeID)
+                } else {
+                    self.setNudge(nudgeID, status: "Couldn't reach Harbor. Try again.", busy: false)
+                    if fromNotification && !onCard {
+                        Notifications.post(title: "Harbor couldn't save that", body: "Feedback wasn't recorded.")
+                    }
+                }
+            }
+        case .undo:
+            setNudge(nudgeID, status: "Undoing…", busy: true)
+            Task { [weak self] in
+                guard let self else { return }
+                let ok = await self.client.behaviorUndo(nudgeID: nudgeID)
+                self.setNudge(nudgeID, status: ok ? "Undone. Harbor removed what it added." :
+                                                    "Couldn't undo. Check Harbor's schedule.",
+                              busy: false, undone: ok ? true : nil)
+                if fromNotification && !onCard {
+                    Notifications.post(title: ok ? "Undone" : "Couldn't undo",
+                                       body: ok ? "Harbor removed what it added." :
+                                                  "Harbor couldn't reach its backend. Open Harbor to try again.")
+                }
+            }
+        case .act(let index):
+            setNudge(nudgeID, status: "Working…", busy: true)
+            let action = nudges.first(where: { $0.id == nudgeID })?.actions.first(where: { $0.index == index })
+            // Notification "Do it" only exists for open_prompt actions; its
+            // userInfo carries the prompt as a fallback.
+            let isPrompt = action?.isPrompt ?? !fallbackPrompt.isEmpty
+            let localPrompt = action?.prompt ?? fallbackPrompt
+            Task { [weak self] in
+                guard let self else { return }
+                let reply = await self.client.behaviorAct(nudgeID: nudgeID, actionIndex: index)
+                let served = (reply?["prompt"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                if isPrompt || !served.isEmpty {
+                    let prompt = served.isEmpty ? localPrompt : served
+                    guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                        self.setNudge(nudgeID, status: "Couldn't prepare that request.", busy: false)
+                        return
+                    }
+                    // Prefill only: the user reviews and presses Return themselves.
+                    let draft = self.input.trimmingCharacters(in: .whitespacesAndNewlines)
+                    self.input = draft.isEmpty ? prompt : self.input + "\n\n" + prompt
+                    self.setNudge(nudgeID, status: "Drafted in the composer. Review it, then press Return.",
+                                  busy: false)
+                    self.requestExpand()
+                    return
+                }
+                if let reply, reply["ok"] as? Bool == true {
+                    let created = reply["created"] as? [String: Any]
+                    let title = created?["title"] as? String ?? action?.title ?? ""
+                    self.setNudge(nudgeID, status: title.isEmpty ? "Added to Harbor's schedule." :
+                                    "Added “\(title)” to Harbor's schedule.", busy: false, performed: true)
+                } else {
+                    let detail = reply?["detail"] as? String ?? "Couldn't reach Harbor. Try again."
+                    self.setNudge(nudgeID, status: detail, busy: false)
+                }
+            }
+        }
+    }
+
+    /// The first few content lines of a rendered brief, as plain text.
+    ///
+    /// A notification renders no Markdown and fits a few lines, so the bold
+    /// section headers, bullets and sign-off are stripped rather than shown as
+    /// literal asterisks.
+    static func notificationBody(from brief: String, maxLines: Int = 4) -> String {
+        var lines: [String] = []
+        for raw in brief.split(separator: "\n", omittingEmptySubsequences: true) {
+            var line = raw.trimmingCharacters(in: .whitespaces)
+            guard !line.isEmpty else { continue }
+            if line.hasPrefix("- ") { line = String(line.dropFirst(2)) }
+            line = line.replacingOccurrences(of: "**", with: "")
+                       .replacingOccurrences(of: "•", with: "")
+                       .trimmingCharacters(in: .whitespaces)
+            guard !line.isEmpty, !line.hasPrefix("Let me know") else { continue }
+            lines.append(line)
+            if lines.count == maxLines { break }
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    static func abbrev(_ model: String) -> String {
+        // Short badges for the routing chip. Unlisted models fall through to
+        // their full id, which is correct but wide — add an entry when a model
+        // becomes part of the standing roster.
+        let map = [
+            "Agents-A1-4B-oQe6": "A1-4B",
+            "gemma-4-E4B-it-qat-4bit": "G4-E4B",
+            "gemma-4-E4B-it-oQ4e-mtp": "G4-E4B",
+            "Gemma-Wisp": "G-Harbor",
+            "gemma-4-E4B-it-r5-step-01800-oQ4e-mtp": "G-Harbor",
+            "Qwen3.6-27B-oQ3": "Q3.6-27B",
+            "LFM2.5-2.6B-MLX-6bit": "LFM-2.6B",
+        ]
+        return map[model] ?? model
+    }
+}
+
+/// Which sources the starters may ask about, shared by the notch's Ask and the
+/// chat window. Nil until the service has said, so no starter offers a source
+/// Harbor may not be allowed to read; a failed read keeps what was known.
+@MainActor
+final class StarterAccess: ObservableObject {
+    static let shared = StarterAccess()
+    @Published private(set) var unreadable: Set<String>?
+    private let client = HarborClient()
+
+    func refresh() async {
+        guard let status = await client.assistantSyncStatus(sources: AskStarters.sources) else { return }
+        let value = AskStarters.unreadable(
+            states: Dictionary(status.sources.map { ($0.id, $0.state) }, uniquingKeysWith: { first, _ in first }))
+        if unreadable != value { unreadable = value }
+    }
+}
+
+extension AskStarters.Personal {
+    /// The next calendar event and the first person waiting on mail or texts,
+    /// from what the Brief already read: its upcoming list and today's plan.
+    /// Nothing from a plan for another day, and nothing a Brief would hide
+    /// (placeholders, newsletters, withheld subjects).
+    @MainActor init(today: TodayModel) {
+        self.init()
+        let events = (UpcomingItem.parseList(today.upcomingReply) ?? [])
+            .filter { $0.source == "calendar" && !$0.isReminder && !DayTimeline.isPlaceholderEvent($0.title) }
+            .map { (title: $0.title, start: $0.when, allDay: $0.allDay, own: !$0.readOnlyCalendar) }
+        nextEvent = AskStarters.nextEvent(events, now: today.now.timeIntervalSince1970)
+        let attention = today.isShowingCurrentDay ? today.plan?.workspace?.attention ?? [] : []
+        let needs = attention
+            .filter { ($0.source == "email" || $0.source == "messages")
+                      && !DayTimeline.isBulkMail($0.title) && !BriefMail.isPrivate($0.title) }
+            .map { (sender: BriefMail.displayName($0.sender ?? ""), source: $0.source,
+                    person: $0.person ?? false, replied: $0.replied ?? false) }
+        if let waiting = AskStarters.waitingSender(needs) {
+            sender = waiting.name
+            senderSource = waiting.source
+        }
+    }
+}

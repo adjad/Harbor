@@ -1,0 +1,514 @@
+import SwiftUI
+
+/// The colors and body size MarkdownView draws with. The default is the notch
+/// panel's monochrome look; other surfaces (the Chat window) set their own
+/// through the environment instead of forking the renderer.
+struct MarkdownPalette {
+    var text: Color
+    var secondary: Color
+    var muted: Color
+    var chipFill: Color
+    var chipStroke: Color
+    var hairline: Color
+    var codeFill: Color
+    var tableFill: Color
+    var bodySize: CGFloat = 14
+    /// Multiplier for the renderer's fixed sizes (code, tables, chips), so a
+    /// surface's palette can follow the Text size setting.
+    var fontScale: CGFloat = 1
+    /// The typeface of running text (paragraphs and list items). Answers read in
+    /// a rounded face; code, tables and chips keep their own designs.
+    var design: Font.Design = .default
+
+    /// Computed so the colors and sizes follow Increase Contrast and the
+    /// Text size setting at the moment the view is built.
+    static var notch: MarkdownPalette {
+        var p = MarkdownPalette(
+            text: Theme.textPrimary, secondary: Theme.textSecondary, muted: Theme.textMuted,
+            chipFill: Theme.chipFill, chipStroke: Theme.chipStroke, hairline: Theme.hairline,
+            codeFill: Color.white.opacity(0.06), tableFill: Color.white.opacity(0.04))
+        p.fontScale = Theme.textScale
+        p.bodySize = 14 * Theme.textScale
+        p.design = .rounded
+        return p
+    }
+
+    /// A fixed-size font scaled for this palette's surface.
+    func font(_ size: CGFloat, weight: Font.Weight = .regular, design: Font.Design = .default) -> Font {
+        .system(size: size * fontScale, weight: weight, design: design)
+    }
+}
+
+private struct MarkdownPaletteKey: EnvironmentKey {
+    static var defaultValue: MarkdownPalette { MarkdownPalette.notch }
+}
+
+extension EnvironmentValues {
+    var markdownPalette: MarkdownPalette {
+        get { self[MarkdownPaletteKey.self] }
+        set { self[MarkdownPaletteKey.self] = newValue }
+    }
+}
+
+/// Which links in an answer stay clickable. An answer can repeat text Harbor read
+/// (an email, a web page, a file), and a click shows only the label, so a link
+/// may open a web page and nothing else: never a Shortcut, a file, a call or a
+/// share (`shortcuts:`, `file:`, `tel:`, `smb:` …), which Harbor itself would
+/// only do behind a confirmation. A label that reads as one site's address
+/// while the link opens another is not a link either. The label always stays,
+/// as plain text.
+enum MarkdownLinks {
+    /// http or https with a host; nothing else opens from an answer.
+    static func mayOpen(_ url: URL) -> Bool {
+        guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return false }
+        return !(url.host ?? "").isEmpty
+    }
+
+    /// `text` with the link taken off every label that may not open. Untouched
+    /// (the same value) when every link is fine.
+    static func safe(_ text: AttributedString) -> AttributedString {
+        // One link can span several runs (bold inside its label): judge the whole label.
+        var links: [(url: URL, label: String, range: Range<AttributedString.Index>)] = []
+        for run in text.runs {
+            guard let url = run.link else { continue }
+            let piece = String(text[run.range].characters)
+            if let last = links.last, last.url == url, last.range.upperBound == run.range.lowerBound {
+                links[links.count - 1] = (url: url, label: last.label + piece,
+                                          range: last.range.lowerBound..<run.range.upperBound)
+            } else {
+                links.append((url: url, label: piece, range: run.range))
+            }
+        }
+        let refused = links.filter { !mayOpen($0.url) || labelNamesAnotherSite($0.label, destination: $0.url) }
+        guard !refused.isEmpty else { return text }
+        var out = AttributedString()
+        for run in text.runs {
+            var piece = AttributedString(text[run.range])
+            if refused.contains(where: { $0.range.lowerBound <= run.range.lowerBound && run.range.upperBound <= $0.range.upperBound }) {
+                piece.link = nil
+            }
+            out.append(piece)
+        }
+        return out
+    }
+
+    /// True when the label reads as a web address on a different site than the
+    /// link opens: an address spelled out anywhere in it ("https://…", "www.…"),
+    /// or a label that is nothing but a domain name ("accounts.example.com").
+    /// A subdomain of the site shown is the same site. An ordinary label
+    /// ("Open in Maps", a page title) never counts.
+    static func labelNamesAnotherSite(_ label: String, destination: URL) -> Bool {
+        let actual = site(destination.host ?? "")
+        let words = label.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        for word in words {
+            guard let shown = shownSite(word, bareDomain: words.count == 1) else { continue }
+            if shown.isEmpty || !(actual == shown || actual.hasSuffix("." + shown)) { return true }
+        }
+        return false
+    }
+
+    /// The site a word names when it reads as a web address; nil when it does
+    /// not read as one; "" when it reads as one but names no plain host. A word
+    /// with no "http://", "https://" or "www." counts only when `bareDomain`.
+    static func shownSite(_ word: String, bareDomain: Bool) -> String? {
+        var rest = word.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "()[]{}<>\"'“”‘’.,;:!?…"))
+        var explicit = false
+        if rest.hasPrefix("https://") { rest.removeFirst(8); explicit = true }
+        else if rest.hasPrefix("http://") { rest.removeFirst(7); explicit = true }
+        var host = String(rest.prefix(while: { $0 != "/" && $0 != "?" && $0 != "#" }))
+        // "name@host" without a scheme is an email address, not a web address.
+        if host.contains("@") { return explicit ? "" : nil }
+        if let colon = host.lastIndex(of: ":") {
+            let port = host[host.index(after: colon)...]
+            if !port.isEmpty && port.allSatisfy({ $0.isASCII && $0.isNumber }) { host = String(host[..<colon]) }
+        }
+        while host.hasSuffix(".") { host.removeLast() }
+        if host.hasPrefix("www.") { explicit = true }
+        if !explicit {
+            guard bareDomain else { return nil }
+            // A bare word: only something shaped like a domain name, and not a file name.
+            let parts = host.split(separator: ".", omittingEmptySubsequences: false)
+            guard parts.count >= 2, let last = parts.last,
+                  parts.allSatisfy({ part in !part.isEmpty && part.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "-" }) }),
+                  (2...24).contains(last.count), last.allSatisfy({ $0.isLetter }),
+                  !fileEndings.contains(String(last))
+            else { return nil }
+        }
+        return site(host)
+    }
+
+    private static func site(_ host: String) -> String {
+        var out = host.lowercased()
+        while out.hasSuffix(".") { out.removeLast() }
+        if out.hasPrefix("www.") { out.removeFirst(4) }
+        return out
+    }
+
+    /// Endings that make a bare word a file name ("README.md", "report.pdf"),
+    /// which a link may be labelled with wherever it goes.
+    private static let fileEndings: Set<String> = [
+        "md", "txt", "rtf", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "pages", "numbers", "key", "csv", "json",
+        "xml", "yml", "yaml", "toml", "plist", "log", "html", "htm", "css", "js", "ts", "py", "rb", "go", "rs", "sh",
+        "swift", "java", "cpp", "png", "jpg", "jpeg", "gif", "heic", "svg", "mov", "mp4", "mp3", "wav", "zip", "dmg",
+        "pkg", "exe", "app",
+    ]
+}
+
+/// What a streaming answer shows while it is still being written.
+enum StreamingMarkdown {
+    /// A streaming answer without a bold marker still waiting for its pair:
+    /// "is **Worksheet 3 for" showed the raw asterisks until the closing pair
+    /// arrived, then flipped to bold. The words show plain until it does.
+    /// Markers inside `inline code` don't count, and neither do asterisks with
+    /// a space on both sides ("2 ** 3"), which can't open or close bold. Left
+    /// alone with a code fence in it, where ** can be code (**kwargs).
+    static func withoutOpenBold(_ text: String) -> String {
+        guard !text.contains("```") else { return text }
+        var inCode = false
+        var markers: [Range<String.Index>] = []
+        var i = text.startIndex
+        while i < text.endIndex {
+            let next = text.index(after: i)
+            if text[i] == "`" {
+                inCode.toggle()
+            } else if !inCode, text[i] == "*", next < text.endIndex, text[next] == "*" {
+                let end = text.index(after: next)
+                let spaceBefore = i == text.startIndex || text[text.index(before: i)].isWhitespace
+                let spaceAfter = end < text.endIndex && text[end].isWhitespace
+                if !(spaceBefore && spaceAfter) { markers.append(i..<end) }
+                i = end
+                continue
+            }
+            i = next
+        }
+        // An odd marker with a space after it closes nothing and opens nothing.
+        guard markers.count % 2 == 1, let last = markers.last,
+              last.upperBound == text.endIndex || !text[last.upperBound].isWhitespace else { return text }
+        return text.replacingCharacters(in: last, with: "")
+    }
+}
+
+// Markdown renderer with real block-level parsing: fenced code blocks become
+// monospaced cards, GFM tables render as an actual grid, lists get proper
+// bullets/numbers, and prose renders inline markdown (bold, italic, inline
+// code, links). `<br>` tags (common in LLM-generated table cells) become real
+// line breaks instead of literal text.
+struct MarkdownView: View {
+    let text: String
+    @Environment(\.markdownPalette) private var palette
+
+    enum Kind { case code, table, list, paragraph }
+
+    // NOT Identifiable via UUID on purpose: during streaming, `text` grows on
+    // every token and `blocks()` re-parses the WHOLE thing from scratch each
+    // time. A fresh UUID() per block per parse meant SwiftUI could never
+    // recognize "the paragraph I'm already showing" across renders — it saw
+    // an entirely new set of blocks every token and tore down/rebuilt the
+    // whole tree, which is what made streaming look flickery/janky instead of
+    // text just growing in place. The ForEach below keys on array position
+    // instead (blocks only ever get APPENDED to as text streams in, so a
+    // block's position is stable even as its own content keeps growing) —
+    // that lets SwiftUI diff a block's Text content in place like any normal
+    // growing string, the same trick already used for table rows/list items
+    // below (`id: \.offset`).
+    struct Block {
+        let kind: Kind
+        let lang: String = ""
+        var body: String = ""          // code / paragraph
+        var tableRows: [[String]] = [] // table: first row is the header
+        var listItems: [(marker: String, text: String)] = []
+        var codeLang: String = ""
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ForEach(Array(cachedBlocks().enumerated()), id: \.offset) { _, b in
+                switch b.kind {
+                case .code:
+                    codeCard(b)
+                case .table:
+                    tableGrid(b.tableRows)
+                case .list:
+                    listView(b.listItems)
+                case .paragraph:
+                    Text(inline(b.body))
+                        .font(.system(size: palette.bodySize, design: palette.design))
+                        .foregroundStyle(palette.text)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        }
+        // Behind the link rule in `inline`: nothing but a web page opens from here.
+        .environment(\.openURL, OpenURLAction { url in
+            MarkdownLinks.mayOpen(url) ? .systemAction : .discarded
+        })
+    }
+
+    // MARK: - Block rendering
+
+    private func codeCard(_ b: Block) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 10) {
+                if !b.codeLang.isEmpty {
+                    Text(b.codeLang).font(palette.font(10, weight: .medium))
+                        .foregroundStyle(palette.muted)
+                }
+                Spacer(minLength: 8)
+                codeActionButton(icon: "doc.on.doc", label: "Copy") {
+                    ScriptRunner.copy(b.body)
+                }
+                // Untagged blocks (no ```lang```) land on Pages as plain
+                // content; most languages with no sensible single-file "run"
+                // (json/css/swift/…) get no run button at all — just Copy.
+                if let target = ScriptRunner.runTarget(forLang: b.codeLang) {
+                    codeActionButton(icon: target.icon, label: target.label) {
+                        ScriptRunner.perform(target, code: b.body)
+                    }
+                }
+            }
+            Text(b.body)
+                .font(palette.font(12.5, design: .monospaced))
+                .foregroundStyle(palette.text)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 8).fill(palette.codeFill))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(palette.chipStroke, lineWidth: 1))
+    }
+
+    private func codeActionButton(icon: String, label: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                Image(systemName: icon).font(palette.font(9))
+                Text(label).font(palette.font(10, weight: .medium))
+            }
+            .foregroundStyle(palette.secondary)
+            .padding(.horizontal, 7).padding(.vertical, 3)
+            .background(Capsule().fill(palette.chipFill))
+            .overlay(Capsule().stroke(palette.chipStroke, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .help(label)
+    }
+
+    // A real grid instead of literal "| a | b |" text — the header row is bold
+    // with a bottom rule; every column left-aligns and wraps rather than
+    // overflowing the panel width.
+    private func tableGrid(_ rows: [[String]]) -> some View {
+        let colCount = rows.map(\.count).max() ?? 0
+        return Grid(alignment: .topLeading, horizontalSpacing: 14, verticalSpacing: 7) {
+            ForEach(Array(rows.enumerated()), id: \.offset) { rowIdx, row in
+                GridRow {
+                    ForEach(0..<colCount, id: \.self) { col in
+                        let cell = col < row.count ? row[col] : ""
+                        Text(inline(cell))
+                            .font(palette.font(13, weight: rowIdx == 0 ? .semibold : .regular))
+                            .foregroundStyle(rowIdx == 0 ? palette.text : palette.text.opacity(0.9))
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+                if rowIdx == 0 {
+                    Divider().overlay(palette.hairline).gridCellColumns(colCount)
+                }
+            }
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 8).fill(palette.tableFill))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(palette.chipStroke, lineWidth: 1))
+    }
+
+    private func listView(_ items: [(marker: String, text: String)]) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            ForEach(Array(items.enumerated()), id: \.offset) { _, item in
+                HStack(alignment: .top, spacing: 7) {
+                    Text(item.marker)
+                        .font(palette.font(13)).foregroundStyle(palette.muted)
+                        .frame(minWidth: 14, alignment: .trailing)
+                    Text(inline(item.text))
+                        .font(.system(size: palette.bodySize, design: palette.design))
+                        .foregroundStyle(palette.text)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        }
+    }
+
+    // MARK: - Parsing
+
+    private static let tableRowRE = try! NSRegularExpression(pattern: #"^\s*\|.*\|\s*$"#)
+    private static let tableSepRE = try! NSRegularExpression(pattern: #"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$"#)
+    private static let bulletRE = try! NSRegularExpression(pattern: #"^\s*[-*•]\s+(.*)$"#)
+    private static let numberedRE = try! NSRegularExpression(pattern: #"^\s*(\d+)[.)]\s+(.*)$"#)
+
+    private func matches(_ re: NSRegularExpression, _ s: String) -> Bool {
+        re.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)) != nil
+    }
+
+    /// Parsed blocks, remembered by text. A surface re-renders every reply
+    /// it shows whenever any of its state changes (each streamed token, for
+    /// one), and parsing is the expensive part. A text is kept only once it is
+    /// asked for a second time unchanged: a finished reply is, while a reply
+    /// still streaming is new on nearly every token, so it rarely reaches the
+    /// long-lived cache and can't churn finished replies out of it.
+    private final class ParsedBlocks {
+        let blocks: [Block]
+        init(_ blocks: [Block]) { self.blocks = blocks }
+    }
+    private static let parsed: NSCache<NSString, ParsedBlocks> = {
+        let cache = NSCache<NSString, ParsedBlocks>()
+        cache.countLimit = 256
+        cache.totalCostLimit = 8_000_000   // characters of source text
+        return cache
+    }()
+    private static let seenOnce: NSCache<NSString, ParsedBlocks> = {
+        let cache = NSCache<NSString, ParsedBlocks>()
+        cache.countLimit = 32
+        return cache
+    }()
+
+    func cachedBlocks() -> [Block] {
+        let key = text as NSString
+        if let hit = Self.parsed.object(forKey: key) { return hit.blocks }
+        if let second = Self.seenOnce.object(forKey: key) {
+            Self.seenOnce.removeObject(forKey: key)
+            Self.parsed.setObject(second, forKey: key, cost: key.length)
+            return second.blocks
+        }
+        let fresh = blocks()
+        Self.seenOnce.setObject(ParsedBlocks(fresh), forKey: key)
+        return fresh
+    }
+
+    func blocks() -> [Block] {
+        var out: [Block] = []
+        let segs = text.components(separatedBy: "```")
+        for (i, seg) in segs.enumerated() {
+            if i % 2 == 1 {
+                var lang = ""
+                var code = seg
+                if let nl = code.firstIndex(of: "\n") {
+                    let first = code[code.startIndex..<nl].trimmingCharacters(in: .whitespaces)
+                    if !first.contains(" ") && first.count < 16 {
+                        lang = first
+                        code = String(code[code.index(after: nl)...])
+                    }
+                }
+                var b = Block(kind: .code)
+                b.body = code.trimmingCharacters(in: .newlines)
+                b.codeLang = lang
+                out.append(b)
+            } else {
+                out.append(contentsOf: parseProse(seg))
+            }
+        }
+        return out
+    }
+
+    // Splits a non-code segment into table / list / paragraph blocks by
+    // scanning line-by-line and grouping consecutive lines of the same kind.
+    private func parseProse(_ seg: String) -> [Block] {
+        // Math first, so a formula reads the same in a paragraph, a list item or a
+        // table cell, and a `$$…$$` written across several lines is one line here.
+        let lines = prettifyMath(seg).components(separatedBy: "\n")
+        var out: [Block] = []
+        var para: [String] = []
+        var tableLines: [String] = []
+        var listItems: [(String, String)] = []
+
+        func flushPara() {
+            let joined = para.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !joined.isEmpty {
+                var b = Block(kind: .paragraph)
+                b.body = deHTML(joined)
+                out.append(b)
+            }
+            para.removeAll()
+        }
+        func flushTable() {
+            guard tableLines.count >= 2, matches(Self.tableSepRE, tableLines[1]) else {
+                para.append(contentsOf: tableLines)
+                tableLines.removeAll()
+                flushPara()
+                return
+            }
+            let rows = tableLines.enumerated().compactMap { idx, line -> [String]? in
+                if idx == 1 && matches(Self.tableSepRE, line) { return nil }  // drop the |---|---| rule
+                var trimmed = line.trimmingCharacters(in: .whitespaces)
+                if trimmed.hasPrefix("|") { trimmed.removeFirst() }
+                if trimmed.hasSuffix("|") { trimmed.removeLast() }
+                return trimmed.components(separatedBy: "|").map { deHTML($0.trimmingCharacters(in: .whitespaces)) }
+            }
+            if rows.count >= 1 {
+                var b = Block(kind: .table)
+                b.tableRows = rows
+                out.append(b)
+            }
+            tableLines.removeAll()
+        }
+        func flushList() {
+            guard !listItems.isEmpty else { return }
+            var b = Block(kind: .list)
+            b.listItems = listItems.map { (marker: $0.0, text: deHTML($0.1)) }
+            out.append(b)
+            listItems.removeAll()
+        }
+
+        for line in lines {
+            if matches(Self.tableRowRE, line) {
+                flushPara(); flushList()
+                tableLines.append(line)
+                continue
+            } else if !tableLines.isEmpty {
+                flushTable()
+            }
+
+            if let m = firstMatch(Self.bulletRE, line) {
+                flushPara()
+                listItems.append(("•", m))
+                continue
+            }
+            if let m = firstMatchPair(Self.numberedRE, line) {
+                flushPara()
+                listItems.append(("\(m.0).", m.1))
+                continue
+            }
+            if !listItems.isEmpty { flushList() }
+
+            para.append(line)
+        }
+        flushTable(); flushList(); flushPara()
+        return out
+    }
+
+    private func firstMatch(_ re: NSRegularExpression, _ s: String) -> String? {
+        guard let m = re.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)),
+              let r = Range(m.range(at: 1), in: s) else { return nil }
+        return String(s[r])
+    }
+
+    private func firstMatchPair(_ re: NSRegularExpression, _ s: String) -> (String, String)? {
+        guard let m = re.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)),
+              let r1 = Range(m.range(at: 1), in: s), let r2 = Range(m.range(at: 2), in: s) else { return nil }
+        return (String(s[r1]), String(s[r2]))
+    }
+
+    // LLM output (esp. inside table cells) sometimes uses HTML line breaks —
+    // turn them into real newlines so SwiftUI Text wraps them instead of
+    // showing "<br>" as literal characters.
+    private func deHTML(_ s: String) -> String {
+        s.replacingOccurrences(of: "<br/>", with: "\n", options: .caseInsensitive)
+         .replacingOccurrences(of: "<br>", with: "\n", options: .caseInsensitive)
+    }
+
+    private func inline(_ s: String) -> AttributedString {
+        let opts = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        guard let parsed = try? AttributedString(markdown: s, options: opts) else { return AttributedString(s) }
+        // Paragraphs, list items and table cells all come through here.
+        return MarkdownLinks.safe(parsed)
+    }
+}

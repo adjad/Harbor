@@ -1,0 +1,569 @@
+import Foundation
+
+// Pure data and logic for the Harbor Chat window. Foundation only, so the
+// reducer and the history mapping can be compiled and checked on their own
+// (tests/ChatChecks.swift) without the app, a window, or a backend.
+
+/// One decoded server-sent event from /agent. A plain value so this file does
+/// not depend on HarborClient.
+struct ChatEvent {
+    let type: String
+    let payload: [String: Any]
+
+    func str(_ key: String) -> String { payload[key] as? String ?? "" }
+    func bool(_ key: String) -> Bool { payload[key] as? Bool ?? false }
+}
+
+// MARK: - Tools
+
+/// What kind of app or capability a tool call touched, for the tool rows shown
+/// above an answer. Derived from the tool's name, which is stable and ours.
+enum ChatToolKind: Equatable {
+    case mail, messages, calendar, reminders, notes, files, web, memory, other
+
+    static func from(toolName name: String) -> ChatToolKind {
+        let n = name.lowercased()
+        if n.contains("email") || n.contains("mail") { return .mail }
+        if n.contains("message") || n.contains("imessage") { return .messages }
+        if n.contains("remind") { return .reminders }
+        if n.contains("calendar") || n.contains("upcoming") || n.contains("event") || n.contains("schedule") { return .calendar }
+        if n.contains("note") { return .notes }
+        if n.contains("memory") || n.contains("remember") || n.contains("fact") { return .memory }
+        if n.contains("browse") || n.contains("web") || n.contains("page") || n.contains("url") { return .web }
+        if n.contains("file") || n.contains("dir") || n.contains("folder") || n.contains("find") || n.contains("move") || n.contains("document") { return .files }
+        return .other
+    }
+
+    var label: String {
+        switch self {
+        case .mail: return "Mail"
+        case .messages: return "Messages"
+        case .calendar: return "Calendar"
+        case .reminders: return "Reminders"
+        case .notes: return "Notes"
+        case .files: return "Files"
+        case .web: return "Web"
+        case .memory: return "Memory"
+        case .other: return "Tool"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .mail: return "envelope"
+        case .messages: return "message"
+        case .calendar: return "calendar"
+        case .reminders: return "bell"
+        case .notes: return "note.text"
+        case .files: return "doc"
+        case .web: return "globe"
+        case .memory: return "brain"
+        case .other: return "wrench.and.screwdriver"
+        }
+    }
+}
+
+/// Source evidence is retained only for host-created live corpus messages.
+/// UTF-8 byte limits bound even a single enormous composed Character. Ordinary
+/// chat continues keeping only its small, owned first-line preview.
+struct ChatCorpusSourceEvidence: Equatable {
+    static let perResultByteLimit = 64 * 1024
+    static let perCaseByteLimit = 256 * 1024
+    let text: String
+    let sourceByteCount: Int
+    var retainedByteCount: Int { text.utf8.count }
+    var isTruncated: Bool { retainedByteCount < sourceByteCount }
+
+    init(_ source: String, byteLimit: Int) {
+        sourceByteCount = source.utf8.count
+        var bytes = Array(source.utf8.prefix(max(0, byteLimit)))
+        // A bounded prefix may end inside one UTF-8 scalar. Drop only that
+        // incomplete scalar, preserving valid text without replacement bytes.
+        while !bytes.isEmpty && String(bytes: bytes, encoding: .utf8) == nil { bytes.removeLast() }
+        text = String(bytes: bytes, encoding: .utf8) ?? ""
+    }
+}
+
+struct ChatToolRow: Identifiable, Equatable {
+    let id: String              // the server's call id; a unique value when absent
+    var name: String
+    var decision: String        // "allow" | "confirm" | "deny"
+    private var resultPreview: String
+    var result: String {
+        get { resultPreview }
+        set { resultPreview = Self.preview(newValue) }
+    }
+    var finished = false
+    /// The reply ended (Stop, or an error) before this call came back. Not
+    /// `finished`: there is no result to show.
+    var interrupted = false
+    var isTestPlan = false
+    private(set) var corpusSourceEvidence: ChatCorpusSourceEvidence?
+
+    init(id: String, name: String, decision: String, result: String = "", finished: Bool = false,
+         isTestPlan: Bool = false) {
+        self.id = id
+        self.name = name
+        self.decision = decision
+        self.resultPreview = Self.preview(result)
+        self.finished = finished
+        self.isTestPlan = isTestPlan
+    }
+
+    mutating func retainCorpusSource(_ source: String, byteLimit: Int) {
+        corpusSourceEvidence = ChatCorpusSourceEvidence(source, byteLimit: byteLimit)
+    }
+
+    mutating func clearCorpusSource() { corpusSourceEvidence = nil }
+
+    /// These rows only display the first nonempty line. Keep one extra
+    /// character to preserve the 60-character detail's ellipsis, and copy it
+    /// into owned storage so a substring cannot retain a large tool response.
+    /// A Character can contain multiple Unicode scalars; this is not a byte cap.
+    private static func preview(_ text: String) -> String {
+        String(text.drop(while: { $0.isNewline }).prefix(61).prefix(while: { !$0.isNewline }))
+    }
+
+    var kind: ChatToolKind { ChatToolKind.from(toolName: name) }
+
+    /// "Mail · summarize emails": the app first, then the tool in plain words.
+    var title: String {
+        let words = name.replacingOccurrences(of: "_", with: " ")
+        return kind == .other ? words.capitalizedFirst : "\(kind.label) · \(words)"
+    }
+
+    /// One short line of what came back, or what is still happening.
+    var detail: String {
+        if decision == "deny" { return "blocked" }
+        if isTestPlan { return "dry run · not executed" }
+        if !finished && interrupted { return "stopped" }
+        if !finished { return decision == "confirm" ? "waiting for you" : "running" }
+        let flat = result.split(whereSeparator: { $0.isNewline }).first.map(String.init) ?? ""
+        return flat.count > 60 ? String(flat.prefix(60)) + "…" : flat
+    }
+}
+
+private extension String {
+    var capitalizedFirst: String { prefix(1).uppercased() + dropFirst() }
+}
+
+// MARK: - Approvals and drafts
+
+/// A confirmation the backend is waiting on (an action Harbor will not take
+/// without a yes). Mirrors the notch's card so both surfaces mean the same thing.
+struct ChatApproval: Equatable {
+    enum State: Equatable { case pending, allowed, denied, timedOut }
+    var actionId: String
+    var requestId: String
+    var tool: String
+    var reason: String
+    var grantable: Bool
+    var scopeHint: String
+    var preview: String
+    var state: State = .pending
+}
+
+/// A message Harbor has written but not sent. Sending stays the user's decision.
+struct ChatDraft: Equatable {
+    var to: String
+    var text: String
+    var isEditing = false
+    var isSending = false
+    var sent = false
+    var discarded = false
+    var status = ""
+}
+
+/// The model's planned tool path and the rubric shown for a live corpus dry run.
+/// Behavior checks remain for a human to review; the client only compares tools.
+struct ChatCorpusEvaluation: Equatable {
+    let caseID: String
+    let split: String
+    let category: String
+    let expectedTools: [String]
+    let behavior: [String]
+    var usesLiveData = false
+    var modelCalls = 0
+    var modelAttempts = 0
+    var modelName = ""
+    var observedTools: [String] = []
+    var completed = false
+    var stopped = false
+    /// Run through the ordinary Ask path (/corpus … normal), not the bounded scope.
+    var normalMode = false
+
+    var toolPathMatches: Bool? {
+        guard completed, !stopped, !usesLiveData else { return nil }
+        return expectedTools == observedTools
+    }
+}
+
+// MARK: - Where answers run
+
+/// Whether this launch may send a turn to a cloud provider, from the service's
+/// GET /inference/cloud. The window says "all local" only when this is false.
+enum ChatCloudUse {
+    /// nil when the reply can't be read, so the window says nothing rather
+    /// than claiming local.
+    static func active(from object: [String: Any]?) -> Bool? {
+        guard let object, let enabled = object["enabled"] as? Bool else { return nil }
+        let everything = object["everything"] as? Bool ?? false
+        let restartRequired = object["restart_required"] as? Bool ?? false
+        // "Everything in the cloud" is a launch profile: it takes effect, or
+        // stops, only after a restart, so the running launch is the opposite
+        // of the saved flag while a restart is pending.
+        if everything != restartRequired { return true }
+        // Saved but not yet running: the reply lists only "everything", which
+        // hides any role this launch still sends to the cloud. Unknown.
+        if everything { return nil }
+        let roles = (object["roles"] as? [String] ?? []).filter { $0 != "everything" }
+        let superModel = object["super_model_enabled"] as? Bool ?? false
+        return enabled && (!roles.isEmpty || superModel)
+    }
+
+    /// The Details panel's "Ran on" line. The flag is about this launch, not
+    /// one answer, so with a cloud provider on it names both and never claims
+    /// either; it says "This Mac" alone only on a confirmed local launch.
+    static func ranOn(_ cloudInUse: Bool?) -> String {
+        switch cloudInUse {
+        case .some(false): return "This Mac"
+        case .some(true): return "This Mac or your cloud provider"
+        case .none: return "—"
+        }
+    }
+}
+
+// MARK: - Metadata
+
+struct ChatMeta: Equatable {
+    var model = ""
+    var role = ""
+    var routeReason = ""
+    var routeSource = ""
+    var needsTools = false
+    var tokensPerSecond = 0
+    var startedAt: Date?
+    var firstTokenAt: Date?
+    var finishedAt: Date?
+    var heartbeats = 0
+
+    var duration: Double? {
+        guard let s = startedAt, let f = finishedAt else { return nil }
+        return f.timeIntervalSince(s)
+    }
+
+    /// "Ling-3.0-tiny-oQ6e" -> "Ling-3.0-tiny": the quantization suffix is noise.
+    var shortModel: String {
+        var out = model
+        if let slash = out.lastIndex(of: "/") { out = String(out[out.index(after: slash)...]) }
+        for suffix in ["-oQ6e", "-oQ4e", "-4bit", "-3bit", "-2bit", "-6bit", "-8bit", "-nvfp4", "-MLX"] {
+            if out.hasSuffix(suffix) { out = String(out.dropLast(suffix.count)) }
+        }
+        return out
+    }
+
+    /// The route in one friendly word, for the line under an answer.
+    var roleLabel: String {
+        switch role {
+        case "coding": return "Coding"
+        case "reasoning": return "Reasoning"
+        case "vision": return "Vision"
+        case "agent": return "Tools"
+        case "fast": return "Quick"
+        case "": return ""
+        default: return "General"
+        }
+    }
+}
+
+// MARK: - Messages
+
+struct ChatMessage: Identifiable, Equatable {
+    enum Role: Equatable { case user, assistant }
+    enum Phase: Equatable { case waiting, working, streaming, done, failed }
+
+    let id: UUID
+    var role: Role
+    var text: String
+    var reasoning = ""
+    var tools: [ChatToolRow] = []
+    var approval: ChatApproval?
+    var draft: ChatDraft?
+    var meta: ChatMeta?
+    var status = ""
+    var phase: Phase = .done
+    var isError = false
+    var errorDetail = ""
+    var attachmentName: String?
+    var corpusEvaluation: ChatCorpusEvaluation?
+    /// Sources a tool in this reply couldn't read for lack of access, as the
+    /// kinds on its tool_result's `needs_access` (AskAccess), for the reply's
+    /// Allow button. Never set on a corpus reply.
+    var needsAccess: [String] = []
+    /// The user pressed Stop on this reply.
+    var stoppedByUser = false
+
+    init(id: UUID = UUID(), role: Role, text: String = "", phase: Phase = .done) {
+        self.id = id; self.role = role; self.text = text; self.phase = phase
+    }
+
+    var isLive: Bool { phase == .waiting || phase == .working || phase == .streaming }
+
+    /// The reply ended (Stop, or an error) with calls still out: their rows
+    /// stop saying "running". A blocked call keeps saying so.
+    mutating func interruptOpenTools() {
+        for index in tools.indices where !tools[index].finished && tools[index].decision != "deny" {
+            tools[index].interrupted = true
+        }
+    }
+
+    /// The tool trace's heading: "Working with…" only while the reply is live.
+    var traceTitle: String {
+        let n = tools.count
+        let running = isLive && tools.contains { !$0.finished && $0.decision != "deny" }
+        if tools.contains(where: \.isTestPlan) {
+            return running ? "Planning \(n) tool\(n == 1 ? "" : "s")…" : "Planned \(n) tool\(n == 1 ? "" : "s") · dry run"
+        }
+        if running { return "Working with \(n) tool\(n == 1 ? "" : "s")…" }
+        return "Used \(n) tool\(n == 1 ? "" : "s")"
+    }
+
+    /// A reply the user stopped before anything arrived: the row says
+    /// "Stopped" rather than sitting blank.
+    var showsStopped: Bool {
+        role == .assistant && stoppedByUser && phase == .done && text.isEmpty && tools.isEmpty
+            && approval == nil && draft == nil && corpusEvaluation == nil
+    }
+}
+
+// MARK: - The reducer
+
+/// Folds the /agent event stream into one assistant message. The same event
+/// vocabulary the notch panel handles (OverlayModel.handle), reduced to the
+/// parts a conversation needs.
+enum ChatTurnReducer {
+    enum Outcome: Equatable {
+        case none
+        case session(String)
+        case finished
+        /// The request dropped before anything arrived; the caller should
+        /// offer the prompt again instead of showing an error.
+        case droppedEmpty
+        case failed
+    }
+
+    static func apply(_ ev: ChatEvent, to msg: inout ChatMessage, now: Date = Date()) -> Outcome {
+        if msg.corpusEvaluation?.usesLiveData != true {
+            for index in msg.tools.indices where msg.tools[index].corpusSourceEvidence != nil {
+                msg.tools[index].clearCorpusSource()
+            }
+        }
+        if ev.type != "status" { msg.status = "" }
+        var meta = msg.meta ?? ChatMeta()
+        defer { msg.meta = meta }
+        switch ev.type {
+        case "corpus_model":
+            msg.corpusEvaluation?.modelCalls = ev.payload["completed"] as? Int ?? 0
+            msg.corpusEvaluation?.modelAttempts = ev.payload["started"] as? Int ?? 0
+            msg.corpusEvaluation?.modelName = ev.str("model")
+            msg.phase = .working
+        case "session":
+            return .session(ev.str("id"))
+        case "status":
+            msg.status = ev.str("text")
+        case "routed":
+            meta.model = ev.str("model")
+            meta.role = ev.str("role")
+            meta.routeReason = ev.str("reason")
+            meta.routeSource = ev.str("route_source")
+            meta.needsTools = ev.bool("needs_tools")
+            msg.phase = meta.needsTools ? .working : .streaming
+        case "tool_call":
+            let row = ChatToolRow(id: ev.str("id").isEmpty ? UUID().uuidString : ev.str("id"),
+                                  name: ev.str("name"), decision: ev.str("decision"),
+                                  isTestPlan: ev.bool("test_mode"))
+            msg.tools.append(row)
+            if meta.firstTokenAt == nil { meta.firstTokenAt = now }
+            msg.phase = .working
+        case "tool_result":
+            if let i = msg.tools.lastIndex(where: { $0.id == ev.str("id") }) {
+                let source = ev.str("result")
+                msg.tools[i].result = source
+                if msg.corpusEvaluation?.usesLiveData == true {
+                    let retainedElsewhere = msg.tools.enumerated().reduce(0) { count, row in
+                        count + (row.offset == i ? 0 : (row.element.corpusSourceEvidence?.retainedByteCount ?? 0))
+                    }
+                    let available = max(0, ChatCorpusSourceEvidence.perCaseByteLimit - retainedElsewhere)
+                    msg.tools[i].retainCorpusSource(source,
+                        byteLimit: min(ChatCorpusSourceEvidence.perResultByteLimit, available))
+                } else {
+                    msg.tools[i].clearCorpusSource()
+                }
+                msg.tools[i].finished = true
+            }
+        case "clear_answer":
+            // Preamble text streamed before a tool call is not the answer.
+            msg.text = ""
+            meta.firstTokenAt = nil
+        case "confirm":
+            msg.approval = ChatApproval(
+                actionId: ev.str("id"), requestId: ev.str("request_id"),
+                tool: ev.str("tool"), reason: ev.str("reason"),
+                grantable: ev.payload["grantable"] as? Bool ?? false,
+                scopeHint: ev.str("scope_hint"), preview: ev.str("preview"))
+        case "confirm_timeout":
+            if msg.approval?.actionId == ev.str("id") { msg.approval?.state = .timedOut }
+        case "message_draft":
+            msg.draft = ChatDraft(to: ev.str("to"), text: ev.str("text"))
+            msg.phase = .streaming
+        case "heartbeat":
+            meta.heartbeats += 1
+        case "reasoning":
+            msg.reasoning = ev.str("text")
+            if meta.firstTokenAt == nil { meta.firstTokenAt = now }
+        case "delta", "text":
+            if meta.firstTokenAt == nil { meta.firstTokenAt = now }
+            msg.text += ev.str("text")
+            msg.phase = .streaming
+        case "error":
+            let gotNothing = msg.text.isEmpty && msg.tools.isEmpty && meta.model.isEmpty
+                && msg.approval == nil && msg.draft == nil
+            if ev.bool("dropped") && gotNothing { return .droppedEmpty }
+            msg.text = ev.str("message").isEmpty ? "Something went wrong." : ev.str("message")
+            msg.errorDetail = ev.str("detail")
+            msg.isError = true
+            msg.interruptOpenTools()
+            msg.phase = .failed
+            meta.finishedAt = now
+            return .failed
+        case "done":
+            msg.phase = .done
+            meta.finishedAt = now
+            return .finished
+        default:
+            break
+        }
+        return .none
+    }
+
+    /// Streamed characters per second, as the notch estimates it: about four
+    /// characters to a token, ignored until a third of a second has passed.
+    static func tokensPerSecond(chars: Int, since start: Date, now: Date = Date()) -> Int {
+        let elapsed = now.timeIntervalSince(start)
+        guard elapsed > 0.3 else { return 0 }
+        return Int(Double(chars) / 4.0 / elapsed)
+    }
+}
+
+/// What the Chat window says when a prompt didn't go through and went back to
+/// the composer: why (when the service never ran it) and how to send it again.
+/// The notch says the same for the same event (AgentSend.notice).
+enum ChatSendNotice {
+    static func text(message: String, unsent: Bool) -> String {
+        let why = unsent && !message.isEmpty ? message : "Harbor didn't answer."
+        return why + " Your message is back in the box. Press Return to send it again."
+    }
+}
+
+// MARK: - VoiceOver
+
+/// What VoiceOver is told about a reply in the Chat window. Focus stays in the
+/// composer while an answer, an error or a card is added above it, so without
+/// a line each would arrive silently. The notch says the same for its own
+/// answers (OverlayModel.answered). Streamed text is never announced: only the
+/// end of a reply, and a card that is waiting.
+enum ChatAnnouncement {
+    /// A reply that has just ended. `plain` turns its Markdown into words to
+    /// speak. nil for a corpus case, and when there is nothing to say.
+    static func reply(_ message: ChatMessage, plain: (String) -> String) -> String? {
+        guard message.role == .assistant, message.corpusEvaluation == nil else { return nil }
+        var spoken = plain(message.text).trimmingCharacters(in: .whitespacesAndNewlines)
+        if message.isError {
+            return "Harbor couldn't answer: " + (spoken.isEmpty ? "Something went wrong." : spoken)
+        }
+        if let draft = message.draft, !draft.sent, !draft.discarded {
+            spoken += (spoken.isEmpty ? "" : " ") + "There is a message draft, not sent yet."
+        }
+        return spoken.isEmpty ? nil : "Harbor: " + spoken
+    }
+
+    /// A card that is waiting for a yes. nil once it is answered, and for a
+    /// corpus case, whose cards are declined without being offered.
+    static func approval(_ message: ChatMessage) -> String? {
+        guard message.role == .assistant, message.corpusEvaluation == nil,
+              let approval = message.approval, approval.state == .pending else { return nil }
+        let reason = approval.reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        return reason.isEmpty ? "Harbor needs your OK to go on." : "Harbor needs your OK: " + reason
+    }
+}
+
+// MARK: - The conversation list
+
+struct ChatSummary: Identifiable, Equatable {
+    let id: String              // the backend session id
+    var title: String
+    var preview: String
+    var lastUsed: Date
+    var turnCount: Int
+
+    static func parse(_ row: [String: Any]) -> ChatSummary? {
+        guard let id = row["id"] as? String, !id.isEmpty else { return nil }
+        let used = (row["last_used"] as? Double) ?? Double(row["last_used"] as? Int ?? 0)
+        let title = (row["title"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return ChatSummary(id: id, title: title.isEmpty ? "New chat" : title,
+                           preview: row["preview"] as? String ?? "",
+                           lastUsed: Date(timeIntervalSince1970: used),
+                           turnCount: row["turn_count"] as? Int ?? 0)
+    }
+}
+
+enum ChatTitle {
+    /// A chat's name from its first prompt: one line, at most 60 characters.
+    static func make(from prompt: String, limit: Int = 60) -> String {
+        let flat = prompt.split(whereSeparator: { $0.isWhitespace || $0.isNewline }).joined(separator: " ")
+        if flat.isEmpty { return "New chat" }
+        return flat.count > limit ? String(flat.prefix(limit - 1)) + "…" : flat
+    }
+}
+
+enum ChatGrouping {
+    /// The sidebar section a chat belongs in.
+    static func section(for date: Date, now: Date = Date(), calendar: Calendar = .current) -> String {
+        if calendar.isDate(date, inSameDayAs: now) { return "Today" }
+        if let y = calendar.date(byAdding: .day, value: -1, to: now), calendar.isDate(date, inSameDayAs: y) { return "Yesterday" }
+        if let week = calendar.date(byAdding: .day, value: -7, to: now), date > week { return "Previous 7 days" }
+        return "Earlier"
+    }
+
+    static let order = ["Today", "Yesterday", "Previous 7 days", "Earlier"]
+}
+
+/// Maps the rows of GET /sessions/{id} (role, content, tool_digest) back into
+/// messages for a saved chat. The saved history keeps which tools an answer
+/// used but not their results or timing, so reloaded rows show the tool only.
+enum ChatHistory {
+    static func messages(from turns: [[String: Any]]) -> [ChatMessage] {
+        var out: [ChatMessage] = []
+        for turn in turns {
+            let role = turn["role"] as? String ?? ""
+            let text = (turn["content"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard (role == "user" || role == "assistant"), !text.isEmpty else { continue }
+            var message = ChatMessage(role: role == "user" ? .user : .assistant, text: text)
+            if role == "assistant", let digest = turn["tool_digest"] as? String, !digest.isEmpty {
+                message.tools = digest.split(separator: ",").map { part in
+                    ChatToolRow(id: UUID().uuidString, name: part.trimmingCharacters(in: .whitespaces),
+                                decision: "allow", finished: true)
+                }
+            }
+            out.append(message)
+        }
+        return out
+    }
+}
+
+extension Notification.Name {
+    /// Drop chats from the debug log's memory (OverlayModel.chatArchive and the chat
+    /// open in the notch): userInfo["session_id"] names one deleted chat; without it,
+    /// a forget whose scope is not one chat, all of them.
+    static let harborForgetChatDebugArchive = Notification.Name("HarborForgetChatDebugArchive")
+}

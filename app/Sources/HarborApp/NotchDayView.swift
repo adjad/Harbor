@@ -1,0 +1,1397 @@
+import SwiftUI
+import AppKit
+
+/// The notch's Day tab: the rest of today on one clock. Calendar events, your
+/// planned tasks, Harbor's suggestions, learned "usually busy" windows, plans
+/// caught in your texts and "Needs you" reminders share one agenda in time
+/// order, from now to the end of the day, under a two-line blurb.
+///
+/// Nothing reaches the plan on its own: a suggestion needs Keep or Move, a
+/// caught plan needs Add, and "Not today" only sets aside a learned window for
+/// this day (the planner's existing one-day ignore). Everything lands in Harbor's
+/// planner, never in Calendar.
+///
+/// The full planner (task editor, pins, working hours, the daily email) stays
+/// in the Harbor window, because this non-activating panel can't host sheets.
+/// The app keeps the plan current in the background, so opening either tab
+/// shows the latest loaded day immediately.
+struct NotchDayView: View {
+    @ObservedObject var model: OverlayModel
+    @ObservedObject var today: TodayModel
+    // Plans caught in texts and the stale-reminder questions come from shared
+    // models (DayCards) that outlive a tab switch and load in the background
+    // with the plan, so the Day tab's first frame already holds every card.
+    @ObservedObject private var attention = DayCards.attention
+    @State private var minutes = 45
+    @State private var addingTask = false
+    @FocusState private var taskFieldFocused: Bool
+    @State private var ignoredCaught = IgnoredCaught.load()
+    // Evening check-in and weekly goal pulse (CheckInView.swift): one tap per
+    // task at the end of the day, so tomorrow's plan starts honest.
+    @ObservedObject private var checkIn = CheckInModel.shared
+    /// The Calendar block whose Move sub-panel is open from the timeline's ⋯ menu.
+    @State private var movingEvent: CheckInEvent?
+    /// The old-reminder questions show three until the person asks for all.
+    @State private var showAllStale = false
+    // Old undated reminders to keep or delete (StaleReminders.swift).
+    @ObservedObject private var staleReminders = DayCards.staleReminders
+    // The offer to move an event outside working hours (UserHoursView.swift).
+    @ObservedObject private var hoursOffer = DayCards.hoursOffer
+    // To-dos the proactive engine found (ProactiveCards.swift): check-offs and
+    // Add to Day are shared with the Brief.
+    @ObservedObject private var proactive = ProactiveActions.shared
+
+    /// The agenda's time column. It grows with the Text size setting so
+    /// "12:30 PM" keeps its room.
+    private var timeColumn: CGFloat { 62 * Theme.textScale }
+    /// From a row's bar to its title.
+    private static let barInset: CGFloat = 12
+    /// Things the agenda shows before Show more, so the tab fits the notch.
+    private static let agendaRows = 8
+    @State private var showWholeAgenda = false
+    /// What ended in the last two hours, opened from its one-line summary.
+    @State private var showEarlier = false
+    /// The last Remove, while its Undo bar shows: the ids it sent, so Undo brings
+    /// a grouped review back as one action.
+    @State private var lastRemoved: (ids: [String], notice: String)?
+    @State private var lastRemovedTask: Task<Void, Never>?
+    /// How long the Undo bar stays after Remove.
+    private static let removeUndoSeconds: UInt64 = 8
+
+    @Environment(\.accessibilityReduceMotion) private var systemReduceMotion
+    @Environment(\.reduceMotionOverride) private var reduceMotionOverride
+    private var reduceMotion: Bool { reduceMotionOverride ?? systemReduceMotion }
+
+    /// Which optional pieces of the tab are showing. Only these flags drive the
+    /// fade, never the plan's data, so a routine refresh doesn't animate.
+    private struct Showing: Equatable {
+        var notice, error, stale, removed, otherDay, loading, earlier, wholeAgenda, addRow: Bool
+    }
+
+    private var showing: Showing {
+        Showing(notice: model.transientNotice != nil, error: !today.error.isEmpty,
+                stale: today.staleNotice != nil, removed: lastRemoved != nil,
+                otherDay: !today.followsToday, loading: plan == nil,
+                earlier: showEarlier, wholeAgenda: showWholeAgenda,
+                addRow: addingTask || !model.todayTaskTitle.isEmpty)
+    }
+
+    init(model: OverlayModel, today: TodayModel) {
+        self.model = model
+        self.today = today
+    }
+
+    private var plan: TodayPlan? { today.currentPlan }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if let notice = model.transientNotice { NotchChrome.notice(notice).transition(.opacity) }
+            if !today.error.isEmpty {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    NotchChrome.notice(today.error)
+                    NotchChrome.chip("Try again", icon: "arrow.clockwise", help: "Reload your day") {
+                        Task { await today.refresh() }
+                    }
+                    .disabled(today.busy)
+                }
+                .transition(.opacity)
+            }
+            if let stale = today.staleNotice {
+                // Reads keep failing: say how old the day on screen is, and hold
+                // back the buttons that would change it.
+                Text(stale).font(.harbor(size: 11.5)).foregroundStyle(Theme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .transition(.opacity)
+            }
+            if let removed = lastRemoved { removedRow(removed).transition(.opacity) }
+            if !today.followsToday { otherDayRow.transition(.opacity) }
+            if today.isShowingCurrentDay {
+                CheckInSection(model: checkIn, day: today.day, timezone: today.timezone,
+                               clock: today.clock,
+                               onAsk: { model.askAbout($0) },
+                               onOpenEvent: openInCalendar,
+                               onChanged: { Task { await today.refresh(); model.onResize() } })
+                GoalPulseSection(model: checkIn)
+            }
+            if let plan {
+                dayContent(plan)
+                    .disabled(today.planIsStale)
+                    .transition(.opacity)
+            } else if today.error.isEmpty {
+                ProcessingRow(label: NotchBriefView.loadingLabel(today: today, starting: model.serviceStarting))
+                    .transition(.opacity)
+            }
+            ReportDraftCard(draft: today.report, title: "Report a problem with this plan",
+                            detailsLabel: "Include planner details", save: { model.saveReport(today.report) })
+            footer
+        }
+        // Content fades in while the panel's height follows the same spring.
+        .animation(Theme.Motion.panel(reduceMotion: reduceMotion), value: showing)
+        .environment(\.timeZone, today.timezone)
+        .modifier(DayRefreshLoop(model: model, today: today))
+        // A change anywhere (a sync, an answer from another place) refreshes the
+        // stale-reminder questions now instead of at the next minute.
+        .onReceive(NotificationCenter.default.publisher(for: .harborAssistantChanged)) { _ in
+            Task { await DayCards.refresh(force: true); model.onResize() }
+        }
+        .onChange(of: model.checkInDue) { _, due in
+            guard due, today.isShowingCurrentDay else { return }
+            Task { await checkIn.load(day: today.day, timezone: today.timezone.identifier); model.onResize() }
+        }
+        // A fresh plan for the shown day: a timeline cancel whose block changed or
+        // left is dropped before it is sent, and a Move panel for such a block is
+        // closed. No plan (a failed refresh, a day change) proves nothing and
+        // changes nothing.
+        .onChange(of: plan?.generated_at) { _, _ in
+            guard let plan else { return }
+            let events = plan.displayBlocks.compactMap(\.calendarEvent)
+            checkIn.reconcileTimelineCancels(events)
+            if let movingEvent, !events.contains(where: { CheckInModel.sameOccurrence($0, movingEvent) }) { closeMove() }
+        }
+        // A cancel the service answered: the plan is read again, so a cancelled
+        // block goes and a refused one shows the fresh facts the service now has.
+        .onChange(of: checkIn.cancelling) { before, now in
+            guard !before.isSubset(of: now) else { return }
+            Task { await today.refresh(afterMutation: true); model.onResize() }
+        }
+    }
+
+    /// The exact occurrence when Calendar still has it; else Calendar itself.
+    private func openInCalendar(_ event: CheckInEvent) {
+        let url = event.sourceId.flatMap { id in
+            event.whenTs.flatMap { model.showCalendarEventURL?(id, $0) }
+        } ?? URL(string: "ical://")!
+        NSWorkspace.shared.open(url)
+    }
+
+    /// The Calendar block behind a timeline item, as the check-in card sees an
+    /// event; nil for other blocks and when the service didn't describe it.
+    private func calendarEvent(for item: DayItem) -> CheckInEvent? {
+        guard item.style == .calendar, let id = item.blockID else { return nil }
+        return plan?.displayBlocks.first { $0.id == id }?.calendarEvent
+    }
+
+    private func openMove(_ event: CheckInEvent) {
+        movingEvent = event
+        model.onResize()
+    }
+
+    private func closeMove() {
+        guard movingEvent != nil else { return }
+        movingEvent = nil
+        model.onResize()
+    }
+
+    /// Old undated reminders: keep or delete, one quiet row each. Delete runs only
+    /// on its own click and goes through Reminders' verified delete.
+    private var staleSection: some View {
+        let asks = staleReminders.asks
+        let shown = showAllStale ? asks : Array(asks.prefix(3))
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("Old reminders").font(.harbor(size: 11.5)).foregroundStyle(Theme.textMuted)
+                    .accessibilityAddTraits(.isHeader)
+                Spacer(minLength: 8)
+                if asks.count > 1 {
+                    NotchChrome.small("Keep all") { Task { await staleReminders.keepAll(); model.onResize() } }
+                        .disabled(staleReminders.answering != nil)
+                        .help("Keep every reminder listed here; Harbor won't ask about them again. Nothing changes in Reminders.")
+                }
+            }
+            Text(StaleRemindersModel.explanation).font(.harbor(size: 11)).foregroundStyle(Theme.textMuted)
+                .fixedSize(horizontal: false, vertical: true)
+            ForEach(shown) { ask in staleRow(ask) }
+            if asks.count > 3 {
+                Button(showAllStale ? "Show fewer" : "Show \(asks.count - 3) more") {
+                    showAllStale.toggle()
+                    model.onResize()
+                }
+                .buttonStyle(.plain).font(.harbor(size: 11.5, weight: .medium)).foregroundStyle(Theme.textSecondary)
+            }
+        }
+        .padding(.top, 2)
+        .accessibilityElement(children: .contain)
+    }
+
+    private func staleRow(_ ask: StaleReminderAsk) -> some View {
+        let busy = staleReminders.answering != nil
+        return VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(ask.title).font(.harbor(size: 13)).foregroundStyle(Theme.textPrimary)
+                        .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                        .help(ask.title)
+                    Text(ask.detail).font(.harbor(size: 11)).foregroundStyle(Theme.textMuted).lineLimit(1)
+                }
+                Spacer(minLength: 8)
+                if staleReminders.answering == ask.sourceID {
+                    ProgressView().controlSize(.small)
+                } else {
+                    NotchChrome.small("Keep") { Task { await staleReminders.keep(ask); model.onResize() } }
+                        .disabled(busy)
+                        .help("Keep this reminder; Harbor won't ask about it again")
+                        .accessibilityLabel("Keep \(ask.title)")
+                    if !staleReminders.deleteBlocked.contains(ask.sourceID) {
+                        NotchChrome.small("Delete") { Task { await staleReminders.delete(ask); model.onResize() } }
+                            .disabled(busy)
+                            .help("Delete this reminder from Reminders")
+                            .accessibilityLabel("Delete \(ask.title) from Reminders")
+                    }
+                }
+            }
+            if let failure = staleReminders.failures[ask.sourceID] {
+                Text(failure).font(.harbor(size: 11)).foregroundStyle(Theme.bad)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(ask.title), \(ask.detail)")
+    }
+
+    /// Calendar and Reminders when Harbor can't read them, and Contacts when macOS
+    /// turned it down (on today): why, and the setting that fixes it. Nothing
+    /// for a source that is fine.
+    private func unreadAccess(_ plan: TodayPlan) -> [SourceAccess] {
+        ["calendar", "reminders"].compactMap { plan.access($0) }.filter { !$0.readable }
+            + [today.isShowingCurrentDay ? BriefFix.contactsAccess() : nil].compactMap { $0 }
+    }
+
+    private func accessRow(_ access: SourceAccess) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: access.symbol).font(.harbor(size: 10.5))
+                .foregroundStyle(Theme.textMuted).frame(width: 15)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(access.headline).font(.harbor(size: 12.5, weight: .medium)).foregroundStyle(Theme.textPrimary)
+                Text(access.detail).font(.harbor(size: 11)).foregroundStyle(Theme.textMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 6)
+            // Day's rows are System Settings pages (Calendars, Reminders, Contacts).
+            if let fix = access.fixLink, let url = URL(string: fix.url) {
+                NotchChrome.small(Permissions.fixLabel(fix)) { Permissions.openFix(url) }
+            }
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    @ViewBuilder private func dayContent(_ plan: TodayPlan) -> some View {
+        let timeline = timeline(plan)
+        let unread = unreadAccess(plan)
+        ForEach(unread, id: \.source) { accessRow($0) }
+        Text(DayTimeline.blurb(timeline, needs: plan.dayNeeds, isToday: today.isShowingCurrentDay,
+                               endOfDay: today.dayInterval.end.timeIntervalSince1970, clock: today.clock,
+                               dayStart: today.dayInterval.start.timeIntervalSince1970,
+                               calendarRead: !unread.contains { $0.source == "calendar" }))
+            .font(.harbor(size: 13.5)).foregroundStyle(Theme.textPrimary)
+            .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+            .padding(.leading, 10)
+            .overlay(alignment: .leading) { Rectangle().fill(Theme.chipStroke).frame(width: 2) }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        if !timeline.allDay.isEmpty { allDayStrip(timeline.allDay, booked: bookedTimes(plan)) }
+        if let warning = warningLine(plan, unread: unread) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(warning).font(.harbor(size: 11.5)).foregroundStyle(Theme.textSecondary)
+                    .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 6)
+                if plan.displayWarnings.contains(where: { $0.hasPrefix("All-day calendar events may reserve this day") }) {
+                    // The way out: plan this day anyway (a per-day preference).
+                    NotchChrome.small("Plan my day anyway") {
+                        Task { await today.replan(start: plan.preferences.start_minute, end: plan.preferences.end_minute,
+                                                  planAllDay: true) }
+                    }
+                    .disabled(today.busy)
+                    .help("Place your tasks around today's timed events anyway")
+                }
+            }
+        }
+        if let hours = afterHours(plan) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(hours).font(.harbor(size: 11.5)).foregroundStyle(Theme.textSecondary)
+                    .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 6)
+                NotchChrome.small("Plan tonight") {
+                    Task { await today.replan(start: plan.preferences.start_minute, end: 24 * 60) }
+                }
+                .disabled(today.busy)
+                .help("Stretch today's working hours to midnight and place your tasks")
+            }
+        }
+        if today.isShowingCurrentDay, let offer = hoursOffer.offer {
+            HoursOfferRow(offer: offer, timezone: today.timezone, clock: today.clock,
+                          isToday: { today.dayInterval.contains(Date(timeIntervalSince1970: $0)) },
+                          onMove: { request in
+                              model.askAbout(request)
+                              Task { await hoursOffer.taken(); model.onResize() }
+                          },
+                          onKeep: { Task { await hoursOffer.keep(); model.onResize() } })
+                .transaction { $0.animation = nil }
+        }
+        if let movingEvent {
+            // The check-in card's Move sub-panel, for a block picked on the timeline.
+            CheckInMovePanel(model: checkIn, event: movingEvent, day: today.day, timezone: today.timezone,
+                             clock: today.clock, backHelp: "Back to the timeline (Esc)",
+                             onAsk: { model.askAbout($0) }, onClose: closeMove)
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(RoundedRectangle(cornerRadius: 12).fill(Theme.chipFill))
+                .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.chipStroke, lineWidth: 1))
+                .onExitCommand { closeMove() }
+                .transaction { $0.animation = nil }
+        }
+        agenda(timeline)
+        if today.isShowingCurrentDay && !staleReminders.asks.isEmpty {
+            // A question that arrives after the first frame never animates the panel's height.
+            staleSection.transaction { $0.animation = nil }
+        }
+        let fit = stillToFit(plan)
+        if !fit.isEmpty { fitSection(fit) }
+        let school = schoolThisWeek(plan)
+        if !school.isEmpty { schoolSection(school) }
+        if addingTask || !model.todayTaskTitle.isEmpty { addTaskRow.transition(.opacity) }
+    }
+
+    // MARK: Building the timeline
+
+    private func timeline(_ plan: TodayPlan) -> DayTimeline {
+        let bounds = today.dayInterval
+        let dayStart = bounds.start.timeIntervalSince1970
+        let blocks = plan.displayBlocks.map {
+            DayBlockInput(id: $0.id, title: $0.title, start: $0.start, end: $0.end, kind: $0.kind,
+                          taskID: $0.task_id, patternID: $0.pattern_id, evidenceID: $0.evidence_id,
+                          members: ($0.members ?? []).map { DayMember(title: $0.title, evidenceID: $0.evidence_id) })
+        }
+        let caught = attention.items.filter { !ignoredCaught.contains($0.source_id) }.map {
+            DayCaughtInput(id: $0.source_id, title: $0.title ?? "", when: $0.event_ts ?? $0.due_ts, state: $0.state)
+        }
+        return DayTimeline.build(
+            blocks: blocks, allDay: plan.all_day.map(\.title), needs: plan.dayNeeds + plan.studyNeeds, caught: caught,
+            now: today.now.timeIntervalSince1970, dayStart: dayStart, dayEnd: bounds.end.timeIntervalSince1970,
+            workStart: dayStart + Double(plan.preferences.start_minute * 60),
+            workEnd: dayStart + Double(plan.preferences.end_minute * 60),
+            isToday: today.isShowingCurrentDay, clock: today.clock,
+            dayClock: { NotchChrome.dayClock($0, zone: today.timezone, locale: today.clockLocale) },
+            todos: dayTodos(plan))
+    }
+
+    /// The proactive engine's to-dos, with this Mac's confirmed check-offs. They
+    /// are about today, so another day shows none.
+    private func dayTodos(_ plan: TodayPlan) -> [DayTodoInput] {
+        guard today.isShowingCurrentDay else { return [] }
+        return (plan.workspace?.proactive?.todos ?? []).map { todo in
+            var input = todo.dayInput
+            input.done = proactive.isDone(todo)
+            return input
+        }
+    }
+
+    private func stillToFit(_ plan: TodayPlan) -> [DayFitRow] {
+        let bounds = today.dayInterval
+        let blocks = plan.displayBlocks.map { DayBlockInput(id: $0.id, title: $0.title, start: $0.start, end: $0.end, kind: $0.kind,
+                                                            evidenceID: $0.evidence_id) }
+        return DayTimeline.stillToFit(
+            todos: dayTodos(plan),
+            unscheduled: plan.displayUnscheduled.map { (id: $0.task_id, title: $0.title, reason: $0.reason) },
+            blocks: blocks, needs: plan.dayNeeds, now: today.now.timeIntervalSince1970,
+            dayStart: bounds.start.timeIntervalSince1970,
+            dayEnd: bounds.end.timeIntervalSince1970, isToday: today.isShowingCurrentDay,
+            dayClock: { NotchChrome.dayClock($0, zone: today.timezone, locale: today.clockLocale) })
+    }
+
+    private func proactiveTodo(_ id: String?) -> ProactiveTodo? {
+        id.flatMap { id in plan?.workspace?.proactive?.todos.first { $0.id == id } }
+    }
+
+    /// "Still to fit": what the planner couldn't place and to-dos with no time
+    /// today, each with where it came from.
+    private func fitSection(_ rows: [DayFitRow]) -> some View {
+        let shown = Array(rows.prefix(5))
+        return VStack(alignment: .leading, spacing: 5) {
+            Text("STILL TO FIT").font(.harbor(size: 10, design: .monospaced)).foregroundStyle(Theme.textMuted)
+                .accessibilityAddTraits(.isHeader)
+            ForEach(shown) { row in fitRow(row) }
+            if rows.count > shown.count {
+                Text("+\(rows.count - shown.count) more in the Brief").font(.harbor(size: 11)).foregroundStyle(Theme.textMuted)
+                    .padding(.leading, 24)
+            }
+        }
+        .padding(.top, 2)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Still to fit")
+    }
+
+    /// Today only: school work due later this week, for reference. What is due
+    /// today is already in the agenda as its deadlines, so it isn't repeated.
+    private func schoolThisWeek(_ plan: TodayPlan) -> StudyUpcomingRows {
+        guard today.isShowingCurrentDay, let study = plan.study else { return StudyUpcomingRows() }
+        let bounds = today.dayInterval
+        return study.dayUpcoming(dayStart: bounds.start.timeIntervalSince1970, dayEnd: bounds.end.timeIntervalSince1970,
+                                 shownIDs: StudyDaySummary.deadlineIDs(plan.studyNeeds.map(\.id)))
+    }
+
+    /// "SCHOOL THIS WEEK": one line an assignment, then "+N more in Study ›".
+    /// All of it opens Study.
+    private func schoolSection(_ rows: StudyUpcomingRows) -> some View {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = today.timezone
+        return Button { model.tab = .study } label: {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text("SCHOOL THIS WEEK").font(.harbor(size: 10, design: .monospaced)).foregroundStyle(Theme.textMuted)
+                    Spacer(minLength: 8)
+                    HStack(spacing: 2) {
+                        Text(rows.moreLine ?? "Study")
+                        Image(systemName: "chevron.right").font(.harbor(size: 8, weight: .bold))
+                    }
+                    .font(.harbor(size: 11.5, weight: .medium)).foregroundStyle(Theme.textSecondary).fixedSize()
+                }
+                ForEach(Array(rows.items.enumerated()), id: \.offset) { _, item in
+                    schoolRow(item, calendar: calendar)
+                }
+            }
+            .frame(minHeight: 24)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(.top, 2)
+        .help("Your school work (⌘5)")
+        .accessibilityLabel("School this week: " + StudyText.upcomingSpoken(rows, now: today.now, calendar: calendar))
+        .accessibilityHint("Opens Study")
+    }
+
+    private func schoolRow(_ item: StudyDaySummary.Due, calendar: Calendar) -> some View {
+        let assignment = item.assignment
+        return HStack(alignment: .firstTextBaseline, spacing: 9) {
+            Image(systemName: assignment.symbol).font(.harbor(size: 11)).foregroundStyle(Theme.textMuted).frame(width: 15)
+            Text(assignment.title).font(.harbor(size: 13)).foregroundStyle(Theme.textPrimary)
+                .lineLimit(1).layoutPriority(1)
+            Text(item.course).font(.harbor(size: 11)).foregroundStyle(Theme.textMuted).lineLimit(1)
+            Spacer(minLength: 8)
+            Text(StudyText.dueShort(assignment, now: today.now, calendar: calendar))
+                .font(.harbor(size: 11.5)).monospacedDigit().foregroundStyle(Theme.textSecondary)
+                .lineLimit(1).fixedSize()
+        }
+    }
+
+    private func fitRow(_ row: DayFitRow) -> some View {
+        let todo = proactiveTodo(row.todoID)
+        let busy = row.todoID.map { proactive.todoBusy.contains($0) } ?? false
+        return HStack(alignment: .center, spacing: 9) {
+            Image(systemName: row.symbol).font(.harbor(size: 11)).foregroundStyle(Theme.textMuted).frame(width: 15)
+            Text(row.title).font(.harbor(size: 13)).foregroundStyle(Theme.textPrimary)
+                .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                .help(row.title)
+            if !row.detail.isEmpty {
+                Text(row.detail).font(.harbor(size: 11)).foregroundStyle(Theme.textMuted).lineLimit(1)
+            }
+            Spacer(minLength: 6)
+            if let todo {
+                if busy {
+                    ProgressView().controlSize(.small)
+                } else {
+                    if todo.canAddToDay {
+                        if proactive.addedToDay.contains(todo.id) {
+                            Text("ADDED ✓").font(.harbor(size: 9.5, design: .monospaced)).foregroundStyle(Theme.textMuted)
+                        } else {
+                            NotchChrome.small("Add to Day") { Task { await proactive.addToDay(todo, today: today) } }
+                                .disabled(today.busy)
+                                .help("Fit it into today's plan")
+                        }
+                    }
+                    NotchChrome.small("Done") { Task { await proactive.toggleDone(todo, today: today) } }
+                        .help("Check it off")
+                        .accessibilityLabel("Check off \(todo.title)")
+                }
+            }
+        }
+        .accessibilityElement(children: .contain)
+    }
+
+    /// The day's first planner warning, in plain words. A source Harbor can't
+    /// read already has its own row; its "not current" warning isn't repeated.
+    /// Placement warnings only matter while there are tasks to place.
+    private func warningLine(_ plan: TodayPlan, unread: [SourceAccess] = []) -> String? {
+        let hidden = unread.compactMap { ["calendar": "Calendar is not current", "reminders": "Reminders are not current"][$0.source] }
+        let placing = !plan.displayUnscheduled.isEmpty
+        return plan.displayWarnings.lazy
+            .filter { w in !hidden.contains { w.hasPrefix($0) } }
+            .filter { w in placing || !(w.hasPrefix("All-day calendar events") || w.hasPrefix("Calendar is not current")) }
+            .compactMap(DayTimeline.plainWarning).first
+    }
+
+    /// "It's after your working hours (9 AM–6 PM)." when the planner held tasks
+    /// back because the working day is over.
+    private func afterHours(_ plan: TodayPlan) -> String? {
+        guard today.isShowingCurrentDay, plan.displayUnscheduled.contains(where: { $0.reason.hasPrefix("It's after your working hours") })
+        else { return nil }
+        return DayTimeline.afterHoursLine(start: plan.preferences.start_minute, end: plan.preferences.end_minute,
+                                          locale: today.clockLocale)
+    }
+
+    // MARK: Pieces of the day
+
+    private var otherDayRow: some View {
+        HStack(spacing: 8) {
+            Text(today.selectedDate, format: .dateTime.weekday(.wide).month(.abbreviated).day())
+                .font(.harbor(size: 13, weight: .semibold)).foregroundStyle(Theme.textPrimary)
+            NotchChrome.chip("Back to today", icon: "calendar", help: "Show today instead of the day picked in the planner") {
+                today.returnToToday()
+                Task { await today.refresh() }
+            }
+            .disabled(today.busy)
+        }
+    }
+
+    /// Timed Harbor blocks keyed by a loose title, so an all-day assignment that
+    /// already has time held for it ("Week 4 Reading: Recursion [CMP-22-04]" and
+    /// the block "Week 4 Reading: Recursion for CMP 22") reads as booked.
+    private func bookedTimes(_ plan: TodayPlan) -> [String: String] {
+        var booked: [String: String] = [:]
+        for block in plan.displayBlocks where block.task_id != nil {
+            let key = Self.looseTitle(block.title)
+            if !key.isEmpty, booked[key] == nil {
+                booked[key] = NotchChrome.dayClock(block.start, zone: today.timezone, locale: today.clockLocale)
+            }
+        }
+        return booked
+    }
+
+    static func looseTitle(_ title: String) -> String {
+        var t = title.lowercased()
+        if let bracket = t.firstIndex(of: "[") { t = String(t[..<bracket]) }
+        if let range = t.range(of: " for ", options: .backwards) { t = String(t[..<range.lowerBound]) }
+        return t.trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
+    }
+
+    private func allDayStrip(_ titles: [String], booked: [String: String] = [:]) -> some View {
+        HStack(spacing: 8) {
+            Text("All day").font(.harbor(.footnote)).foregroundStyle(Theme.textMuted)
+                .frame(width: timeColumn + 2, alignment: .leading)
+            ForEach(Array(titles.prefix(3).enumerated()), id: \.offset) { _, title in
+                let held = booked[Self.looseTitle(title)]
+                Text(held.map { "\(title)  ✓ \($0)" } ?? title)
+                    .font(.harbor(size: 12, weight: .semibold))
+                    .foregroundStyle(held == nil ? Theme.textPrimary : Theme.textSecondary)
+                    .lineLimit(1)
+                    .padding(.horizontal, 8).padding(.vertical, 2)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(DayInk.calendarFill))
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(DayInk.calendarStroke, lineWidth: 1))
+            }
+            if titles.count > 3 {
+                Text("+\(titles.count - 3)").font(.harbor(size: 11.5)).foregroundStyle(Theme.textMuted)
+            }
+        }
+    }
+
+    // MARK: The agenda
+
+    /// The day's calendar as a list: one dim line for what just ended, the now
+    /// line, then each thing on its own full-width row in time order, with the
+    /// free stretches between. A long day shows its first rows and Show more.
+    @ViewBuilder private func agenda(_ timeline: DayTimeline) -> some View {
+        let now = today.now.timeIntervalSince1970
+        let isToday = today.isShowingCurrentDay
+        let agenda = timeline.agenda(now: now, isToday: isToday)
+        // A cancel still in its Undo window keeps an ended event live, on its own row.
+        let over = agenda.earlier.filter { $0.isOver(cancelActive: cancelActive($0)) }
+        let live = agenda.earlier.filter { !$0.isOver(cancelActive: cancelActive($0)) }
+        let ahead = showWholeAgenda ? agenda.ahead : agenda.firstRows(holding: Self.agendaRows)
+        // An empty day has nothing to list; the blurb above already says so.
+        if !agenda.earlier.isEmpty || !agenda.ahead.isEmpty {
+            VStack(alignment: .leading, spacing: 2) {
+                if !over.isEmpty {
+                    earlierRow(over)
+                    if showEarlier { ForEach(over) { agendaRow($0).transition(.opacity) } }
+                }
+                ForEach(live) { agendaRow($0) }
+                if isToday { nowRow(now) }
+                ForEach(ahead) { row in
+                    switch row {
+                    case .item(let item): agendaRow(item)
+                    case .free(let start, let end): freeRow(start, end)
+                    }
+                }
+                .transition(.opacity)
+                if agenda.thingsAhead > Self.agendaRows {
+                    Button(showWholeAgenda ? "Show fewer" : "Show \(agenda.thingsAhead - Self.agendaRows) more") {
+                        showWholeAgenda.toggle()
+                        model.onResize()
+                    }
+                    .buttonStyle(.plain).font(.harbor(.footnote, weight: .medium)).foregroundStyle(Theme.textSecondary)
+                    .padding(.leading, timeColumn + 10 + Self.barInset).padding(.top, 2)
+                }
+            }
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Agenda")
+        }
+    }
+
+    /// What ended in the last two hours, as one dim line that opens into rows.
+    private func earlierRow(_ items: [DayItem]) -> some View {
+        Button {
+            showEarlier.toggle()
+            model.onResize()
+        } label: {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                HStack(spacing: 4) {
+                    Text("Earlier")
+                    Image(systemName: showEarlier ? "chevron.down" : "chevron.right").font(.harbor(size: 8, weight: .semibold))
+                }
+                .frame(width: timeColumn, alignment: .leading)
+                if !showEarlier {
+                    Text(DayTimeline.earlierLine(items)).lineLimit(1).padding(.leading, Self.barInset)
+                }
+                Spacer(minLength: 0)
+            }
+            .font(.harbor(.footnote)).foregroundStyle(Theme.textMuted)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(.bottom, 2)
+        .help(showEarlier ? "Hide what's over" : "Show what's over")
+        .accessibilityLabel(showEarlier ? "Hide what's over" : "Earlier: " + DayTimeline.earlierLine(items))
+    }
+
+    /// Now, as a line across the agenda between what's over and what's next.
+    private func nowRow(_ now: Double) -> some View {
+        HStack(spacing: 10) {
+            Text(today.clock(now)).font(.harbor(.footnote, weight: .semibold)).monospacedDigit()
+                .foregroundStyle(DayInk.now)
+                .frame(width: timeColumn, alignment: .leading)
+            HStack(spacing: 0) {
+                Circle().fill(DayInk.now).frame(width: 7, height: 7)
+                Rectangle().fill(DayInk.now).frame(height: 1.5)
+            }
+            .padding(.leading, -2)
+        }
+        .padding(.vertical, 3)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Now, \(today.clock(now))")
+    }
+
+    /// Time nothing holds, before the next thing that does.
+    private func freeRow(_ start: Double, _ end: Double) -> some View {
+        HStack(spacing: 10) {
+            Color.clear.frame(width: timeColumn, height: 1)
+            Text(DayTimeline.freeLine(start: start, end: end,
+                                      startsNow: today.isShowingCurrentDay && start <= today.now.timeIntervalSince1970,
+                                      clock: today.clock))
+                .font(.harbor(.footnote)).foregroundStyle(Theme.textMuted)
+                .padding(.leading, Self.barInset)
+                .overlay(alignment: .leading) { DayInk.freeBar.frame(width: 3) }
+        }
+        .padding(.vertical, 3)
+    }
+
+    /// One thing on the agenda: when, a bar in its style's ink, the title on up
+    /// to two lines, what it is, and its actions. Nothing shares its width, so
+    /// the title always shows.
+    private func agendaRow(_ item: DayItem) -> some View {
+        let over = item.isOver(cancelActive: cancelActive(item))
+        let status = cancelStatus(item)
+        let time = DayTimeline.gutter(item, clock: today.clock)
+        return HStack(alignment: .top, spacing: 10) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(time.top).font(.harbor(.body, weight: .semibold))
+                    .foregroundStyle(item.style == .overdue ? DayInk.now : Theme.textPrimary)
+                if !time.bottom.isEmpty {
+                    Text(time.bottom).font(.harbor(.footnote)).foregroundStyle(Theme.textMuted)
+                }
+            }
+            .monospacedDigit()
+            .padding(.top, 1)
+            .frame(width: timeColumn, alignment: .leading)
+            HStack(alignment: .top, spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(alignment: .firstTextBaseline, spacing: 5) {
+                        if !item.source.isEmpty {
+                            Image(systemName: DayTimeline.sourceSymbol(item.source)).font(.harbor(size: 10))
+                                .foregroundStyle(Theme.textSecondary)
+                        }
+                        Text(item.title).font(.harbor(.callout, weight: .semibold))
+                            .foregroundStyle(item.style == .usual ? Theme.textSecondary : Theme.textPrimary)
+                            .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                            .strikethrough(status != nil && !status!.failed)
+                    }
+                    Text(detail(item)).font(.harbor(.footnote))
+                        .foregroundStyle(status?.failed == true ? Theme.bad : DayInk.detail(item.style))
+                        .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                // What's over has nothing left to act on; a cancel still in its Undo
+                // window (or in flight) keeps the row live until it settles.
+                if !over { trailing(item) }
+            }
+            .padding(.leading, Self.barInset)
+            .overlay(alignment: .leading) { DayInk.bar(item.style).frame(width: 3) }
+        }
+        .padding(.vertical, 5)
+        .opacity(over ? 0.45 : 1)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel([item.title, spokenTime(item), detail(item)].filter { !$0.isEmpty }.joined(separator: ", ")
+                            + (item.members.count > 1 ? ", covers " + item.members.map(\.title).joined(separator: "; ") : "")
+                            + (item.past ? ", already over" : ""))
+    }
+
+    /// The time column in words, for VoiceOver.
+    private func spokenTime(_ item: DayItem) -> String {
+        if item.style == .overdue { return "overdue" }
+        if let due = item.due {
+            // A date-only reminder has no time to read out.
+            return item.allDay ? (today.isShowingCurrentDay ? "due today" : "due that day") : "due " + today.clock(due)
+        }
+        let begins = today.clock(item.begins ?? item.start)
+        return item.ends.map { "\(begins) to \(today.clock($0))" } ?? "at " + begins
+    }
+
+    /// A cancel of this block that is still in its Undo window or being sent.
+    private func cancelActive(_ item: DayItem) -> Bool {
+        guard let event = calendarEvent(for: item) else { return false }
+        return checkIn.pendingCancels[event.id] != nil || checkIn.cancelling.contains(event.id)
+    }
+
+    /// Where a timeline cancel of this block stands, for the detail line: the
+    /// Undo bar's words while it can be undone, then what the service said.
+    private func cancelStatus(_ item: DayItem) -> (text: String, failed: Bool)? {
+        guard let event = calendarEvent(for: item) else { return nil }
+        if let pending = checkIn.pendingCancels[event.id] {
+            return (CheckInCancel.undoLabel(inviteeCount: pending.event.inviteeCount ?? 0), false)
+        }
+        if checkIn.cancelling.contains(event.id) { return ("Cancelling…", false) }
+        if let done = checkIn.cancelled[event.id] { return (done, false) }
+        if let failed = checkIn.cancelFailures[event.id] {
+            return (failed.failure.isUncertain ? "Check Calendar: " + failed.failure.message : failed.failure.message, true)
+        }
+        return nil
+    }
+
+    /// A row's detail: where a cancel stands, its planner warning in plain
+    /// words, or what it is.
+    private func detail(_ item: DayItem) -> String {
+        if let status = cancelStatus(item) { return status.text }
+        guard let id = item.blockID,
+              let block = plan?.displayBlocks.first(where: { $0.id == id }),
+              let warning = block.warnings.lazy.compactMap(DayTimeline.plainWarning).first else {
+            return DayTimeline.agendaDetail(item, now: today.now.timeIntervalSince1970,
+                                            isToday: today.isShowingCurrentDay, clock: today.clock)
+        }
+        return warning
+    }
+
+    // MARK: Actions
+
+    /// The block's actions, or where its timeline cancel stands: Undo while it
+    /// can still be undone, a spinner while the service works, nothing once it
+    /// is cancelled (the block leaves with the next plan).
+    @ViewBuilder private func trailing(_ item: DayItem) -> some View {
+        if let event = calendarEvent(for: item), let pending = checkIn.pendingCancels[event.id] {
+            NotchChrome.small("Undo") { checkIn.undoCancel(pending.event) }
+                .help("Keeps the event; nothing has been sent yet")
+                .accessibilityLabel("Undo cancelling “\(CheckInSection.plainTitle(event.title))”; 5 seconds")
+        } else if let event = calendarEvent(for: item), checkIn.cancelling.contains(event.id) {
+            ProgressView().controlSize(.small)
+        } else if let event = calendarEvent(for: item), checkIn.cancelled[event.id] != nil {
+            EmptyView()
+        } else {
+            actions(item)
+        }
+    }
+
+    /// The block's main action as a button, and everything else in one ⋯ menu.
+    @ViewBuilder private func actions(_ item: DayItem) -> some View {
+        HStack(spacing: 4) {
+            switch item.style {
+            case .suggested:
+                NotchChrome.small("Keep") { keep(item, laterBy: 0) }.disabled(today.busy)
+            case .usual:
+                NotchChrome.small("Not today") { notToday(item) }.disabled(today.busy || item.patternID == nil)
+                    .help(item.kind == "behavior_away" ? "Ignore this possible time away for today"
+                          : "Ignore this usually-busy time for today")
+            case .caught:
+                if attention.items.first(where: { $0.source_id == item.caughtID })?.state == "shadow" {
+                    NotchChrome.small("Add") { addCaught(item) }.disabled(today.busy)
+                }
+            case .needsYou, .overdue, .todo:
+                if let todo = proactiveTodo(item.todoID) {
+                    if proactive.todoBusy.contains(todo.id) {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        NotchChrome.small("Done") { Task { await proactive.toggleDone(todo, today: today) } }
+                            .help("Check it off")
+                            .accessibilityLabel("Check off \(todo.title)")
+                    }
+                } else if let need = need(for: item), !planned(need) {
+                    NotchChrome.small("Plan time") { planTime(item) }.disabled(today.busy)
+                }
+            case .calendar, .task:
+                EmptyView()
+            }
+            moreMenu(item)
+        }
+    }
+
+    private func moreMenu(_ item: DayItem) -> some View {
+        Menu {
+            switch item.style {
+            case .suggested:
+                // Only later times that still end today.
+                ForEach([(30, "Keep 30 minutes later"), (60, "Keep 1 hour later"), (120, "Keep 2 hours later")]
+                    .filter { item.end + Double($0.0 * 60) <= today.dayInterval.end.timeIntervalSince1970 }, id: \.0) { later in
+                    Button(later.1) { keep(item, laterBy: later.0) }
+                }
+                // A grouped review: what it covers, each one askable on its own.
+                if item.members.count > 1 {
+                    Section("In this block") {
+                        ForEach(Array(item.members.enumerated()), id: \.offset) { _, member in
+                            Button(member.title) {
+                                let reference = plan?.workspace?.attention.first { $0.id == member.evidenceID }?.reference ?? ""
+                                model.askAbout(member.title, reference: reference)
+                            }
+                            .help("Ask Harbor about this one")
+                        }
+                    }
+                }
+                if !DayTimeline.removalIDs(item).isEmpty {
+                    Button("Remove") { remove(item) }
+                        .help("Takes it off your day and Harbor won't suggest it again. The email or reminder stays.")
+                }
+            case .task:
+                if let task = task(for: item) {
+                    Button("15 minutes shorter") {
+                        Task { await today.edit(task, values: ["duration_minutes": max(1, task.duration_minutes - 15)]) }
+                    }
+                    Button("15 minutes longer") {
+                        Task { await today.edit(task, values: ["duration_minutes": min(1440, task.duration_minutes + 15)]) }
+                    }
+                }
+            case .caught:
+                if let record = attention.items.first(where: { $0.source_id == item.caughtID }),
+                   record.state == "created", record.undoable == true {
+                    Button("Remove the reminder Harbor added") { Task { await attention.undo(record) } }
+                }
+                Button("Ignore") { ignore(item) }
+            case .calendar:
+                if let event = calendarEvent(for: item) {
+                    eventEntries(item, event)
+                } else {
+                    Button("Open Calendar") { NotchChrome.open(.calendar) }
+                }
+            case .needsYou, .overdue, .todo:
+                if let todo = proactiveTodo(item.todoID) {
+                    if todo.canAddToDay && !proactive.addedToDay.contains(todo.id) {
+                        Button("Plan time for it") { Task { await proactive.addToDay(todo, today: today) } }
+                    }
+                    if todo.source == "reminders" { Button("Open Reminders") { NotchChrome.open(.reminders) } }
+                    if todo.source == "mail" { Button("Open Mail") { NotchChrome.open(.mail) } }
+                    if todo.source == "messages" { Button("Open Messages") { NotchChrome.open(.messages) } }
+                } else if let need = need(for: item), need.source == "reminders" {
+                    Button("Open Reminders") { NotchChrome.open(.reminders) }
+                }
+            case .usual:
+                EmptyView()
+            }
+            Button("Ask Harbor about this") { model.askAbout(item.title, reference: need(for: item)?.reference ?? "") }
+        } label: {
+            Image(systemName: "ellipsis").font(.harbor(size: 10, weight: .bold)).foregroundStyle(Theme.textSecondary)
+                .frame(width: 20, height: 16).contentShape(Rectangle())
+        }
+        .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
+        .disabled(today.busy)
+        .help("More")
+        .accessibilityLabel("More actions for \(item.title)")
+    }
+
+    /// Cancel, Move and their stand-ins for a Calendar block, by the check-in
+    /// card's rules (CheckInCancel.menuEntries). Cancel starts the same 5-second
+    /// Undo on the shared queue; Undo is on the block itself. After a cancel
+    /// the service couldn't confirm, nothing here may send another: only Open.
+    @ViewBuilder private func eventEntries(_ item: DayItem, _ event: CheckInEvent) -> some View {
+        let failure = checkIn.cancelFailures[event.id]?.failure
+        let entries: [CheckInCancel.MenuEntry] = failure?.isUncertain == true
+            ? [.reason(failure!.message), .open]
+            : CheckInCancel.menuEntries(described: true, canCancel: event.canCancel, canMove: event.canMove,
+                                        calendarWritable: event.calendarWritable, organizerIsUser: event.organizerIsUser,
+                                        cancelReason: event.cancelBlocked, isPast: item.past)
+        ForEach(Array(entries.enumerated()), id: \.offset) { _, entry in
+            switch entry {
+            case .cancel:
+                Button(CheckInCancel.cancelLabel(inviteeCount: event.inviteeCount, retry: failure?.canRetry == true)) {
+                    if movingEvent?.id == event.id { closeMove() }   // not moving what is being cancelled
+                    checkIn.beginCancel(event, timezone: today.timezone.identifier, fromCard: false)
+                }
+                .help("Removes it from your Calendar after a 5-second Undo; Calendar tells its invitees")
+            case .move:
+                Button("Move…") { openMove(event) }
+                    .help("Pick another time; Harbor finds free ones")
+            case .reason(let text):
+                Text(text)
+            case .decline:
+                Button("Decline in Calendar ↗") { openInCalendar(event) }
+                    .help(event.cancelReason)
+            case .open:
+                Button("Open in Calendar ↗") { openInCalendar(event) }
+            }
+        }
+    }
+
+    private func task(for item: DayItem) -> TodayTask? {
+        item.taskID.flatMap { id in plan?.tasks.first { $0.id == id } }
+    }
+
+    private func need(for item: DayItem) -> DailyAttentionItem? {
+        let id = item.needID ?? item.evidenceID
+        return id.flatMap { id in plan?.workspace?.attention.first { $0.id == id } }
+    }
+
+    /// Keep a suggestion: it becomes your task, pinned at its time (or later).
+    private func keep(_ item: DayItem, laterBy minutes: Int) {
+        let source = need(for: item)
+        let start = max(item.start + Double(minutes * 60), NotchChrome.nextFiveMinutes(after: today.now))
+        let length = max(5, Int(((item.end - item.start) / 60).rounded()))
+        let now = today.now.timeIntervalSince1970
+        Task {
+            _ = await today.add(title: item.title, kind: source?.task_kind ?? "task", minutes: length,
+                                priority: source?.priority ?? 2,
+                                due: source?.due_ts.flatMap { $0 > now ? Date(timeIntervalSince1970: $0) : nil },
+                                pinned: Date(timeIntervalSince1970: start),
+                                covers: DayTimeline.removalIDs(item))
+        }
+    }
+
+    /// Plan time for a reminder: it joins the plan as a task the planner fits in.
+    /// The task keeps the reminder's due time as its origin, so an old reminder
+    /// planned today still ages out of the carry-forward (checkin.task_origin).
+    private func planTime(_ item: DayItem) {
+        guard let need = need(for: item), !planned(need) else { return }
+        let now = today.now.timeIntervalSince1970
+        Task {
+            _ = await today.add(title: DayTimeline.plannedTitle(need.title, review: need.needs_review && need.ownership != "user"),
+                                kind: need.task_kind ?? "task", minutes: need.suggested_minutes, priority: need.priority,
+                                due: need.due_ts.flatMap { $0 > now ? Date(timeIntervalSince1970: $0) : nil },
+                                origin: DayTimeline.planOrigin(due: need.due_ts, now: now))
+        }
+    }
+
+    /// The day already has an active task for this need, so Plan time would add it twice.
+    private func planned(_ need: DailyAttentionItem) -> Bool {
+        DayTimeline.alreadyPlanned(need.title, tasks: (plan?.tasks ?? []).map { (title: $0.title, active: $0.status == "active") })
+    }
+
+    /// Add a plan caught in your texts to your day, at the time the text gave.
+    private func addCaught(_ item: DayItem) {
+        let start = max(item.start, NotchChrome.nextFiveMinutes(after: today.now))
+        Task {
+            if await today.add(title: item.title, kind: "task", minutes: 60, priority: 2, due: nil,
+                               pinned: Date(timeIntervalSince1970: start)) {
+                ignore(item)
+            }
+        }
+    }
+
+    private func ignore(_ item: DayItem) {
+        guard let id = item.caughtID else { return }
+        ignoredCaught.insert(id)
+        IgnoredCaught.add(id)
+    }
+
+    /// Remove a suggestion: its items are never suggested again (by Replan or a
+    /// later plan). Only Harbor's record changes; the source stays in Needs you.
+    private func remove(_ item: DayItem) {
+        let ids = DayTimeline.removalIDs(item)
+        guard !ids.isEmpty else { return }
+        let notice = DayTimeline.removedNotice(item)
+        Task {
+            guard await today.mutate("/assistant/today/workspace/suggestions/remove", method: "POST",
+                                     body: ["evidence_ids": ids]) else { return }
+            showUndo((ids, notice))
+        }
+    }
+
+    /// The Undo bar for a Remove, for removeUndoSeconds.
+    private func showUndo(_ removed: (ids: [String], notice: String)) {
+        lastRemoved = removed
+        lastRemovedTask?.cancel()
+        lastRemovedTask = Task {
+            try? await Task.sleep(nanoseconds: Self.removeUndoSeconds * 1_000_000_000)
+            guard !Task.isCancelled else { return }
+            lastRemoved = nil
+            model.onResize()
+        }
+        model.onResize()
+    }
+
+    /// Undo the last Remove: the same items, in one call, back into the plan.
+    /// The bar stays until the service says yes; if it doesn't, the bar comes
+    /// back for another try, under the day's error line.
+    private func undoRemove(_ removed: (ids: [String], notice: String)) {
+        lastRemovedTask?.cancel()
+        Task {
+            let restored = await today.mutate("/assistant/today/workspace/suggestions/restore", method: "POST",
+                                              body: ["evidence_ids": removed.ids])
+            if restored {
+                if lastRemoved?.ids == removed.ids { lastRemoved = nil }
+                model.onResize()
+            } else {
+                // A newer Remove's bar stays; only this Remove's own bar comes back.
+                let stillShowing = lastRemoved?.ids == removed.ids
+                if today.error.isEmpty { today.error = DayTimeline.undoFailedNotice(stillShowing: stillShowing) }
+                if stillShowing { showUndo(removed) }
+            }
+        }
+    }
+
+    /// Today's removed suggestions may be suggested again (only today's: the
+    /// ids the plan listed, never another day's).
+    private func bringBackRemoved(_ ids: [String]) {
+        lastRemovedTask?.cancel()
+        lastRemoved = nil
+        Task {
+            let restored = await today.mutate("/assistant/today/workspace/suggestions/restore", method: "POST",
+                                              body: ["evidence_ids": ids])
+            if !restored && today.error.isEmpty { today.error = "Couldn't bring them back just now. Try again." }
+        }
+    }
+
+    private func removedRow(_ removed: (ids: [String], notice: String)) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(removed.notice).font(.harbor(size: 11.5)).foregroundStyle(Theme.textSecondary)
+                .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            NotchChrome.small("Undo") { undoRemove(removed) }
+                .disabled(today.busy)
+                .help("Puts it back on your day")
+                .accessibilityLabel("Undo: \(removed.notice)")
+        }
+    }
+
+    private func notToday(_ item: DayItem) {
+        guard let pattern = item.patternID else { return }
+        Task {
+            _ = await today.mutate("/assistant/today/workspace/availability", method: "POST",
+                                   body: ["day": today.day, "timezone": today.timezone.identifier,
+                                          "window": pattern, "ignored": true])
+        }
+    }
+
+    // MARK: Adding, footer
+
+    private var canAdd: Bool {
+        !model.todayTaskTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !today.busy
+    }
+
+    // An inline row, because the notch panel can't host the planner's sheet.
+    // While it holds text the panel stays open.
+    private var addTaskRow: some View {
+        HStack(spacing: 8) {
+            TextField("Make time for something…", text: $model.todayTaskTitle)
+                .textFieldStyle(.plain)
+                .font(.harbor(size: 13)).foregroundStyle(Theme.textPrimary)
+                .padding(.horizontal, 10).padding(.vertical, 6)
+                .background(RoundedRectangle(cornerRadius: 10).fill(Theme.chipFill))
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.chipStroke, lineWidth: 1))
+                .focused($taskFieldFocused)
+                .onSubmit(addTask)
+                .onAppear { taskFieldFocused = true }
+            Menu {
+                ForEach([15, 30, 45, 60, 90, 120], id: \.self) { value in
+                    Button("\(value) min") { minutes = value }
+                }
+            } label: {
+                Text("\(minutes) min").font(.harbor(size: 11.5, weight: .medium)).foregroundStyle(Theme.textSecondary)
+                    .padding(.horizontal, 9).padding(.vertical, 5)
+                    .background(Capsule().fill(Theme.chipFill))
+                    .overlay(Capsule().stroke(Theme.chipStroke, lineWidth: 1))
+            }
+            .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
+            .help("Your estimate for how long it takes")
+            NotchChrome.small("Add to day", action: addTask).disabled(!canAdd)
+        }
+        .disabled(plan == nil)
+    }
+
+    private func addTask() {
+        guard canAdd else { return }
+        let title = model.todayTaskTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        Task {
+            if await today.add(title: title, kind: "task", minutes: minutes, priority: 2, due: nil),
+               model.todayTaskTitle.trimmingCharacters(in: .whitespacesAndNewlines) == title {
+                model.todayTaskTitle = ""
+                addingTask = false
+            }
+        }
+    }
+
+    /// "Running late" only means something once your own tasks have times.
+    private var hasTimedTasksAhead: Bool {
+        guard today.isShowingCurrentDay, let plan else { return false }
+        let now = today.now.timeIntervalSince1970
+        return plan.displayBlocks.contains { $0.task_id != nil && ($0.end ?? $0.start) > now }
+    }
+
+    private var footer: some View {
+        HStack(spacing: 8) {
+            NotchChrome.chip("Make time for…", icon: "plus", help: "Add something to fit into your day") {
+                addingTask.toggle()
+                model.onResize()
+            }
+            .disabled(plan == nil)
+            if let plan {
+                NotchChrome.chip("Replan", icon: "arrow.triangle.2.circlepath",
+                                 help: "Fit your day again within your working hours") {
+                    Task { await today.replan(start: plan.preferences.start_minute, end: plan.preferences.end_minute) }
+                }
+                .disabled(today.busy)
+            }
+            Spacer()
+            Menu {
+                if hasTimedTasksAhead, let plan {
+                    Button("Running 15 minutes late") {
+                        Task {
+                            await today.replan(start: plan.preferences.start_minute, end: plan.preferences.end_minute,
+                                               delayMinutes: 15)
+                        }
+                    }
+                }
+                if let workspace = plan?.workspace,
+                   let label = DayTimeline.bringBackLabel(blocks: workspace.removed_suggestion_blocks) {
+                    Button(label) { bringBackRemoved(workspace.removed_suggestions) }
+                        .help("Harbor may suggest them again, from this plan on")
+                }
+                Button("Report a problem with this plan") { today.reportProblem() }
+            } label: {
+                Image(systemName: "ellipsis").font(.harbor(size: 10, weight: .bold)).foregroundStyle(Theme.textSecondary)
+                    .frame(width: 26, height: 20)
+                    .background(Capsule().fill(Theme.chipFill))
+                    .overlay(Capsule().stroke(Theme.chipStroke, lineWidth: 1))
+            }
+            .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
+            .disabled(today.busy)
+            .help("More")
+            .accessibilityLabel("More day actions")
+            NotchChrome.chip("Plan in window ↗", icon: nil,
+                             help: "Tasks, pins, working hours and the daily email, in the Harbor window (⌘O)") {
+                HarborRouter.shared.open(.today(focus: .plan))
+            }
+        }
+    }
+}
+
+// MARK: - Shared by Brief and Day
+
+extension TodayModel {
+    /// The plan, only when it is for the day and time zone shown.
+    var currentPlan: TodayPlan? {
+        guard let plan, plan.day == day, plan.timezone == timezone.identifier else { return nil }
+        return plan
+    }
+}
+
+extension TodayPlan {
+    /// The workspace's "Needs you" items, for the timeline and the badge.
+    var dayNeeds: [DayNeedInput] {
+        (workspace?.attention ?? []).map {
+            DayNeedInput(id: $0.id, title: $0.title, source: $0.source, due: $0.due_ts, allDay: $0.all_day == true)
+        }
+    }
+
+    /// School work due that day (deadlines from service/study/day_hook.py), for
+    /// the agenda only: "Due 11:59 PM". Not counted in the badge.
+    var studyNeeds: [DayNeedInput] {
+        deadlines.filter { $0.source == "study" }.map {
+            DayNeedInput(id: $0.id, title: $0.title, source: "study", due: $0.due_ts, allDay: $0.all_day == true)
+        }
+    }
+}
+
+/// Data refresh belongs to the app. These views only size the panel when the
+/// shared plan changes; their disappearance never cancels a network request.
+struct DayRefreshLoop: ViewModifier {
+    let model: OverlayModel
+    @ObservedObject var today: TodayModel
+
+    func body(content: Content) -> some View {
+        content.onReceive(today.$plan) { _ in
+            model.onResize()
+        }
+    }
+}
+
+/// The Day tab's card sources: plans caught in texts and the stale-reminder
+/// questions. One instance each for the whole app, so switching tabs keeps
+/// what was loaded instead of starting empty and refetching. The app refreshes
+/// them with the plan even while the notch is collapsed.
+@MainActor
+enum DayCards {
+    static var attention = AttentionModel()
+    static var staleReminders = StaleRemindersModel(baseURL: HarborClient.baseURL)
+    static let hoursOffer = HoursOfferModel()
+    private static var refreshedAt: Date?
+
+    /// At most once a minute (the old per-tab cadence) unless forced: the loop
+    /// ticks every 30 s, and a tab switch restarts it.
+    static func refresh(force: Bool = false, now: Date = Date()) async {
+        if !force, let last = refreshedAt, now.timeIntervalSince(last) < 60 { return }
+        refreshedAt = now
+        await attention.refresh()
+        await staleReminders.refresh()
+        #if !HARBOR_NOTCH_QA
+        await hoursOffer.refresh()
+        #endif
+    }
+
+    #if HARBOR_NOTCH_QA
+    static func qaUse(attention: AttentionModel, staleReminders: StaleRemindersModel) {
+        self.attention = attention
+        self.staleReminders = staleReminders
+        refreshedAt = nil
+    }
+    #endif
+}
+
+/// Plans caught in texts that the person chose to ignore here. Kept on this Mac
+/// only, oldest first, and only the newest 200.
+enum IgnoredCaught {
+    private static let key = "HarborIgnoredCaughtPlans"
+
+    static func load() -> Set<String> {
+        Set(UserDefaults.standard.stringArray(forKey: key) ?? [])
+    }
+
+    static func add(_ id: String) {
+        var ids = (UserDefaults.standard.stringArray(forKey: key) ?? []).filter { $0 != id }
+        ids.append(id)
+        UserDefaults.standard.set(Array(ids.suffix(200)), forKey: key)
+    }
+}
+
+/// The Day's few colors, taken from HarborInk. Everything else is the notch's monochrome Theme.
+enum DayInk {
+    static let calendarFill = Color(white: 0.11)
+    static let calendarStroke = Color(white: 0.24)
+    static let suggested = Color(nsColor: HarborInk.rgb(HarborInk.blue.dark))
+    static let caught = Theme.warn
+    static let now = Theme.bad
+
+    /// A row's mark in the agenda: its style's ink as a 3-point bar, dashed for
+    /// a suggestion and dotted for a reminder due later.
+    @ViewBuilder static func bar(_ style: DayStyle) -> some View {
+        switch style {
+        case .calendar: Capsule().fill(Theme.textPrimary)
+        case .task: Capsule().fill(Color(white: 0.6))
+        case .suggested: Rule().stroke(suggested, style: StrokeStyle(lineWidth: 3, lineCap: .round, dash: [4, 4]))
+        case .usual: Capsule().fill(Color(white: 0.3))
+        case .caught: Capsule().fill(caught)
+        case .needsYou: Rule().stroke(Color.white.opacity(0.55), style: StrokeStyle(lineWidth: 3, lineCap: .round, dash: [0, 5]))
+        case .overdue: Capsule().fill(now)
+        case .todo: Capsule().fill(Color.white.opacity(0.45))
+        }
+    }
+
+    /// A free stretch's mark: a faint dotted bar.
+    static var freeBar: some View {
+        Rule().stroke(Theme.textMuted.opacity(0.6), style: StrokeStyle(lineWidth: 2, lineCap: .round, dash: [0, 4]))
+    }
+
+    static func detail(_ style: DayStyle) -> Color {
+        switch style {
+        case .suggested: return suggested
+        case .caught: return caught
+        case .overdue: return now
+        default: return Theme.textMuted
+        }
+    }
+
+    /// A vertical line down the middle of its frame, inset for round caps.
+    struct Rule: Shape {
+        func path(in rect: CGRect) -> Path {
+            var path = Path()
+            path.move(to: CGPoint(x: rect.midX, y: rect.minY + 1.5))
+            path.addLine(to: CGPoint(x: rect.midX, y: max(rect.minY + 1.5, rect.maxY - 1.5)))
+            return path
+        }
+    }
+}
+
+/// Small controls shared by the notch's Brief and Day tabs.
+enum NotchChrome {
+    static func notice(_ text: String) -> some View {
+        Text(text).font(.harbor(size: 11)).foregroundStyle(Theme.bad)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .textSelection(.enabled)
+    }
+
+    static func small(_ title: String, action: @escaping () -> Void) -> some View {
+        Button(title, action: action)
+            .buttonStyle(.plain)
+            .font(.harbor(size: 10.5, weight: .medium)).foregroundStyle(Theme.textSecondary)
+            .padding(.horizontal, 7).padding(.vertical, 2)
+            .background(Capsule().fill(Color.black.opacity(0.35)))
+            .overlay(Capsule().stroke(Theme.chipStroke, lineWidth: 1))
+            .fixedSize()
+    }
+
+    static func chip(_ title: String, icon: String?, help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                if let icon { Image(systemName: icon).font(.harbor(size: 10)) }
+                Text(title).font(.harbor(size: 11.5, weight: .medium))
+            }
+            .foregroundStyle(Theme.textSecondary)
+            .padding(.horizontal, 10).padding(.vertical, 4)
+            .background(Capsule().fill(Theme.chipFill))
+            .overlay(Capsule().stroke(Theme.chipStroke, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .help(help)
+        .fixedSize()
+    }
+
+    static func iconButton(_ icon: String, help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon).font(.harbor(size: 9, weight: .bold)).foregroundStyle(Theme.textSecondary)
+                .frame(width: 19, height: 19)
+                .background(Circle().fill(Theme.chipFill))
+                .overlay(Circle().stroke(Theme.chipStroke, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .help(help)
+        .accessibilityLabel(help)
+    }
+
+    /// The next whole five minutes, so a kept block never starts in the past.
+    static func nextFiveMinutes(after date: Date) -> Double {
+        (date.timeIntervalSince1970 / 300).rounded(.up) * 300
+    }
+
+    /// "Wed 6 PM" style (or "Wed 18:00"), for a time on another day.
+    static func dayClock(_ timestamp: Double, zone: TimeZone, locale: Locale = HarborClock.fixedLocale) -> String {
+        let formatter = DateFormatter()
+        let h24 = HarborClock.uses24Hour(locale)
+        formatter.locale = Locale(identifier: h24 ? "en_GB" : "en_US_POSIX")
+        formatter.timeZone = zone
+        formatter.dateFormat = h24 ? "EEE HH:mm" : "EEE h:mm a"
+        return formatter.string(from: Date(timeIntervalSince1970: timestamp))
+            .replacingOccurrences(of: ":00 ", with: " ")
+    }
+
+    static func appName(_ source: DayTimeline.BriefSource) -> String {
+        switch source {
+        case .calendar: return "Calendar"
+        case .mail: return "Mail"
+        case .messages: return "Messages"
+        case .reminders: return "Reminders"
+        }
+    }
+
+    /// Opens the app a Brief line or a block came from.
+    static func open(_ source: DayTimeline.BriefSource) {
+        let id: String
+        switch source {
+        case .calendar: id = "com.apple.iCal"
+        case .mail: id = "com.apple.mail"
+        case .messages: id = "com.apple.MobileSMS"
+        case .reminders: id = "com.apple.reminders"
+        }
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) else { return }
+        NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
+    }
+}

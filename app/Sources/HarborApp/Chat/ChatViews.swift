@@ -1,0 +1,1352 @@
+import SwiftUI
+import AppKit
+
+/// What the sidebar's shortcuts open, through HarborRouter (AppDelegate), which
+/// lands each on its section of this window or in the notch.
+struct ChatLaunchers {
+    var today: () -> Void = {}
+    var research: () -> Void = {}
+    /// The Research section's actions: show a saved job, or start a new plan.
+    /// Both happen in the notch's Research tab.
+    var openResearchJob: (String) -> Void = { _ in }
+    var newResearch: () -> Void = {}
+    var memory: () -> Void = {}
+    var settings: () -> Void = {}
+}
+
+// MARK: - Root
+
+struct ChatRootView: View {
+    @ObservedObject var store: ChatStore
+    let launchers: ChatLaunchers
+    @ObservedObject var navigation: HarborWindowNavigation
+    @State private var sidebarVisible = true
+    @FocusState private var searchFocused: Bool
+    @AppStorage(Theme.textSizeKey) private var textSize: Double = 1.0
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        HStack(spacing: 0) {
+            if sidebarVisible {
+                ChatSidebar(store: store, launchers: launchers, navigation: navigation, searchFocused: $searchFocused)
+                    .frame(width: 268)
+                    .transition(reduceMotion ? .opacity : .move(edge: .leading).combined(with: .opacity))
+                Rectangle().fill(ChatTheme.line).frame(width: 1)
+            }
+            // A ZStack so the old and new section overlap while they crossfade, not sit side by side.
+            ZStack {
+            switch navigation.section {
+            case .chats:
+                ChatMainColumn(store: store, sidebarVisible: $sidebarVisible).transition(.opacity)
+            case .today:
+                if let today = navigation.today {
+                    TodayHomeView(today: today, initialTab: navigation.todayTab, sidebarVisible: $sidebarVisible)
+                        .transition(.opacity)
+                }
+            case .memory:
+                MemoryHomeView(navigation: navigation, sidebarVisible: $sidebarVisible).transition(.opacity)
+            case .research:
+                if let library = navigation.researchLibrary {
+                    ResearchHomeView(library: library, launchers: launchers, sidebarVisible: $sidebarVisible)
+                        .transition(.opacity)
+                }
+            case .settings:
+                if let loader = navigation.settings {
+                    SettingsHomeView(loader: loader, setup: navigation.setup,
+                                     setupStandsInForWelcome: navigation.setupStandsInForWelcome,
+                                     sidebarVisible: $sidebarVisible)
+                        .transition(.opacity)
+                }
+            }
+            }
+            .animation(Theme.Motion.panel(reduceMotion: reduceMotion), value: navigation.section)
+            if store.showInspector && navigation.section == .chats {
+                Rectangle().fill(ChatTheme.line).frame(width: 1)
+                ChatInspector(store: store)
+                    .frame(width: 300)
+                    .transition(reduceMotion ? .opacity : .move(edge: .trailing).combined(with: .opacity))
+            }
+        }
+        .id(textSize)   // a Text size change rebuilds the content once, as the notch does
+        .background(ChatAurora())
+        .animation(Theme.Motion.panel(reduceMotion: reduceMotion), value: sidebarVisible)
+        .animation(Theme.Motion.panel(reduceMotion: reduceMotion), value: store.showInspector)
+        .background(shortcuts)
+        // VoiceOver hears a reply as words, not Markdown: the notch's own cleanup.
+        .onAppear { store.spokenText = SpokenText.plain }
+        .task { await store.refreshWhenReady() }
+        // Coming back from Settings (or any window) re-reads whether answers may
+        // go to the cloud, so the Local label is never older than the last switch.
+        // Settings is a section of this same window, so a model change there and
+        // the switch back to Chats re-read it too: no window becomes key for those.
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
+            Task { await store.refreshCloudUse() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .harborInferenceConfigurationChanged)) { _ in
+            Task { await store.refreshCloudUse() }
+        }
+        .onChange(of: navigation.section) { _, section in
+            if section == .chats { Task { await store.refreshCloudUse() } }
+        }
+    }
+
+    /// Window-wide shortcuts, as invisible buttons so they work wherever focus is.
+    private var shortcuts: some View {
+        ZStack {
+            Button("") { store.newChat(); navigation.section = .chats }.keyboardShortcut("n", modifiers: .command)
+            Button("") { if navigation.section == .chats { store.showInspector.toggle() } }
+                .keyboardShortcut("i", modifiers: .command)
+            Button("") { sidebarVisible.toggle() }.keyboardShortcut("b", modifiers: .command)
+            Button("") { sidebarVisible = true; searchFocused = true }.keyboardShortcut("k", modifiers: .command)
+        }
+        .opacity(0)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+}
+
+// MARK: - Sidebar
+
+struct ChatSidebar: View {
+    @ObservedObject var store: ChatStore
+    let launchers: ChatLaunchers
+    @ObservedObject var navigation: HarborWindowNavigation
+    var searchFocused: FocusState<Bool>.Binding
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 10) {
+                ChatOrb(size: 22)
+                Text("Harbor").font(.harbor(.reading, on: .window, weight: .medium)).foregroundStyle(ChatTheme.text)
+            }
+            .padding(.top, 44).padding(.horizontal, 20).padding(.bottom, 14)
+
+            Button { store.newChat(); navigation.section = .chats } label: {
+                HStack(spacing: 9) {
+                    Image(systemName: "plus").font(.harbor(size: 12, weight: .semibold))
+                    Text("New chat").font(.harbor(.body, on: .window, weight: .medium))
+                    Spacer()
+                    Text("⌘N").font(.harbor(.caption, on: .window, design: .monospaced)).foregroundStyle(ChatTheme.text3)
+                }
+                .foregroundStyle(ChatTheme.text)
+                .padding(.horizontal, 12).padding(.vertical, 8)
+                .background(RoundedRectangle(cornerRadius: 10).fill(ChatTheme.glass2))
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(ChatTheme.line, lineWidth: 1))
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 12).padding(.bottom, 8)
+
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass").font(.harbor(size: 12)).foregroundStyle(ChatTheme.text3)
+                TextField("Search chats", text: $store.search)
+                    .textFieldStyle(.plain).font(.harbor(.body, on: .window))
+                    .foregroundStyle(ChatTheme.text)
+                    .focused(searchFocused)
+                if !store.search.isEmpty {
+                    Button { store.search = "" } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(ChatTheme.text3) }
+                        .buttonStyle(.plain).accessibilityLabel("Clear search")
+                }
+            }
+            .padding(.horizontal, 12).padding(.vertical, 7)
+            .background(RoundedRectangle(cornerRadius: 10).fill(ChatTheme.glass))
+            .overlay(RoundedRectangle(cornerRadius: 10).stroke(ChatTheme.line, lineWidth: 1))
+            .padding(.horizontal, 12).padding(.bottom, 10)
+
+            VStack(spacing: 2) {
+                ChatNavRow(symbol: "sun.max", title: "Today", selected: navigation.section == .today,
+                           action: launchers.today)
+                ChatNavRow(symbol: "books.vertical", title: "Research", selected: navigation.section == .research,
+                           action: launchers.research)
+                ChatNavRow(symbol: "brain", title: "Memory", selected: navigation.section == .memory,
+                           action: launchers.memory)
+                // Smart Search (⇧⌘F) reads the app in front, which from here is Harbor
+                // itself, so it has no row: ⌘K searches chats.
+                ChatNavRow(symbol: "gearshape", title: "Settings", selected: navigation.section == .settings,
+                           action: launchers.settings)
+            }
+            .padding(.horizontal, 8)
+
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 1, pinnedViews: []) {
+                    if store.sections.isEmpty {
+                        Text(store.search.isEmpty ? (store.reachable ? "No chats yet." : "Harbor isn't running.") : "No matches.")
+                            .font(.harbor(.footnote, on: .window)).foregroundStyle(ChatTheme.text3)
+                            .padding(.horizontal, 12).padding(.top, 14)
+                    }
+                    ForEach(store.sections, id: \.title) { section in
+                        Text(section.title.uppercased())
+                            .font(.harbor(.caption, on: .window, weight: .medium)).tracking(1.0)
+                            .foregroundStyle(ChatTheme.text3)
+                            .padding(.horizontal, 12).padding(.top, 14).padding(.bottom, 4)
+                        ForEach(section.items) { conversation in
+                            ChatHistoryRow(conversation: conversation,
+                                           isSelected: navigation.section == .chats && store.selected === conversation,
+                                           select: { store.select(conversation); navigation.section = .chats },
+                                           delete: { store.delete(conversation) })
+                        }
+                    }
+                }
+                .padding(.horizontal, 8).padding(.top, 6).padding(.bottom, 12)
+            }
+
+            Rectangle().fill(ChatTheme.line).frame(height: 1)
+            ChatSidebarFooter(store: store, launchers: launchers)
+        }
+        .background(ChatTheme.sidebar)
+    }
+}
+
+private struct ChatNavRow: View {
+    let symbol: String
+    let title: String
+    var hint: String? = nil
+    var selected = false
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Image(systemName: symbol).font(.harbor(size: 13)).frame(width: 18)
+                Text(title).font(.harbor(.body, on: .window))
+                Spacer()
+                if let hint { Text(hint).font(.harbor(.caption, on: .window, design: .monospaced)).foregroundStyle(ChatTheme.text3) }
+            }
+            .foregroundStyle(selected ? ChatTheme.text : ChatTheme.text2)
+            .padding(.horizontal, 10).padding(.vertical, 6)
+            .background(RoundedRectangle(cornerRadius: 8).fill(selected || hovering ? ChatTheme.glass2 : .clear))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+}
+
+private struct ChatHistoryRow: View {
+    @ObservedObject var conversation: ChatConversation
+    let isSelected: Bool
+    let select: () -> Void
+    let delete: () -> Void
+    @State private var hovering = false
+    @State private var confirmDelete = false
+
+    var body: some View {
+        Button(action: select) {
+            HStack(spacing: 8) {
+                Text(conversation.title)
+                    .font(.harbor(.body, on: .window)).lineLimit(1)
+                    .foregroundStyle(isSelected ? ChatTheme.text : ChatTheme.text2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                // A card in this chat is waiting for a yes, wherever the reader is now.
+                if conversation.hasPendingApproval {
+                    Circle().fill(ChatTheme.amber).frame(width: 7, height: 7)
+                        .help("Waiting for your OK")
+                        .accessibilityHidden(true)
+                }
+            }
+            .padding(.horizontal, 10).padding(.vertical, 6)
+            .background(RoundedRectangle(cornerRadius: 8).fill(isSelected ? ChatTheme.glass2 : (hovering ? ChatTheme.glass : .clear)))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .contextMenu { Button("Delete chat…", role: .destructive) { confirmDelete = true } }
+        .confirmationDialog("Delete this chat?", isPresented: $confirmDelete, titleVisibility: .visible) {
+            Button("Delete chat", role: .destructive, action: delete)
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("\"\(conversation.title)\" and its history will be removed from this Mac.")
+        }
+        .accessibilityLabel(conversation.title)
+        .accessibilityValue(conversation.hasPendingApproval ? "Waiting for your OK" : "")
+    }
+}
+
+private struct ChatSidebarFooter: View {
+    @ObservedObject var store: ChatStore
+    let launchers: ChatLaunchers
+
+    var body: some View {
+        HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 7) {
+                    Circle().fill(store.reachable ? ChatTheme.ok : ChatTheme.amber).frame(width: 7, height: 7)
+                    Text(store.reachable ? status : "Harbor isn't running")
+                        .font(.harbor(.footnote, on: .window, design: .monospaced)).foregroundStyle(ChatTheme.text2).lineLimit(1)
+                }
+                Text(store.reachable ? machineLine : "Start Harbor from the menu bar")
+                    .font(.harbor(.footnote, on: .window, design: .monospaced)).foregroundStyle(ChatTheme.text3)
+            }
+            Spacer()
+            Button(action: launchers.settings) { Image(systemName: "slider.horizontal.3") }
+                .buttonStyle(ChatIconButtonStyle()).help("Settings").accessibilityLabel("Settings")
+        }
+        .padding(.horizontal, 16).padding(.vertical, 11)
+    }
+
+    private var machineLine: String {
+        switch store.cloudInUse {
+        case .some(false): return "This Mac · all local"
+        case .some(true): return "This Mac · cloud on"
+        case .none: return "This Mac"
+        }
+    }
+
+    private var status: String {
+        guard let meta = store.selected?.latestAssistant?.meta, !meta.model.isEmpty else { return "Ready" }
+        let speed = meta.tokensPerSecond > 0 ? " · \(meta.tokensPerSecond) tok/s" : ""
+        return meta.shortModel + speed
+    }
+}
+
+struct ChatIconButtonStyle: ButtonStyle {
+    var active = false
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.harbor(size: 13))
+            .foregroundStyle(active ? ChatTheme.teal : ChatTheme.text2)
+            .frame(width: 30, height: 30)
+            .background(RoundedRectangle(cornerRadius: 8).fill(active ? ChatTheme.tealWash : (configuration.isPressed ? ChatTheme.glass2 : .clear)))
+            .contentShape(Rectangle())
+    }
+}
+
+// MARK: - Main column
+
+struct ChatMainColumn: View {
+    @ObservedObject var store: ChatStore
+    @Binding var sidebarVisible: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        VStack(spacing: 0) {
+            topBar
+            Rectangle().fill(ChatTheme.line).frame(height: 1)
+            // A ZStack so the old and new chat crossfade in place. Keyed on the
+            // selected id alone: nothing inside a chat (streaming) re-animates.
+            ZStack {
+                if let conversation = store.selected {
+                    ChatConversationView(store: store, conversation: conversation)
+                        .id(conversation.id)
+                        .transition(.opacity)
+                } else {
+                    ChatWelcome(store: store)
+                        .transition(.opacity)
+                }
+            }
+            .animation(Theme.Motion.panel(reduceMotion: reduceMotion), value: store.selected?.id)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var topBar: some View {
+        HStack(spacing: 8) {
+            if !sidebarVisible { Spacer().frame(width: 62) }   // clear the window's traffic lights
+            Button { sidebarVisible.toggle() } label: { Image(systemName: "sidebar.left") }
+                .buttonStyle(ChatIconButtonStyle()).help("Show or hide the sidebar (⌘B)").accessibilityLabel("Toggle sidebar")
+            ChatTitleLabel(store: store)
+            Spacer()
+            if store.cloudInUse == false {
+                ChatPill(text: "Local", tinted: true).help("Everything runs on this Mac")
+            } else if store.cloudInUse == true {
+                ChatPill(text: "Local + cloud").help("Some answers can go to your cloud provider (Settings › Models)")
+            }
+            Button { store.showInspector.toggle() } label: { Image(systemName: "sidebar.right") }
+                .buttonStyle(ChatIconButtonStyle(active: store.showInspector))
+                .help("Details about the answer (⌘I)").accessibilityLabel("Toggle details")
+        }
+        .padding(.leading, 14).padding(.trailing, 16)
+        .frame(height: 52)
+        .padding(.top, 0)
+    }
+}
+
+private struct ChatTitleLabel: View {
+    @ObservedObject var store: ChatStore
+    var body: some View {
+        if let conversation = store.selected {
+            TitleText(conversation: conversation)
+        } else {
+            Text("New chat").font(.harbor(.callout, on: .window, weight: .medium)).foregroundStyle(ChatTheme.text3)
+        }
+    }
+    private struct TitleText: View {
+        @ObservedObject var conversation: ChatConversation
+        var body: some View {
+            Text(conversation.isEmpty ? "New chat" : conversation.title)
+                .font(.harbor(.callout, on: .window, weight: .medium))
+                .foregroundStyle(conversation.isEmpty ? ChatTheme.text3 : ChatTheme.text)
+                .lineLimit(1)
+        }
+    }
+}
+
+struct ChatPill: View {
+    let text: String
+    var tinted = false
+    var body: some View {
+        Text(text)
+            .font(.harbor(.footnote, on: .window, weight: .medium, design: .monospaced))
+            .foregroundStyle(tinted ? ChatTheme.teal : ChatTheme.text2)
+            .padding(.horizontal, 10).padding(.vertical, 4)
+            .background(Capsule().fill(tinted ? ChatTheme.tealWash : ChatTheme.glass))
+            .overlay(Capsule().stroke(tinted ? ChatTheme.tealLine : ChatTheme.line, lineWidth: 1))
+    }
+}
+
+// MARK: - Welcome
+
+struct ChatWelcome: View {
+    @ObservedObject var store: ChatStore
+    var body: some View {
+        VStack(spacing: 0) {
+            ChatEmptyState { store.newChat(); store.submit($0) }
+            ChatComposer(store: store, draft: store.welcomeDraft, busy: false, loading: false,
+                         restoredInput: .constant(nil), notice: .constant(nil), stop: {})
+        }
+    }
+}
+
+struct ChatEmptyState: View {
+    let ask: (String) -> Void
+    /// Starters about a source only once Harbor knows it may read it (StarterAccess).
+    @ObservedObject private var access = StarterAccess.shared
+    private var suggestions: [String] { AskStarters.chatStarters(unreadable: access.unreadable) }
+    var body: some View {
+        VStack(spacing: 18) {
+            Spacer(minLength: 24)
+            ChatOrb(size: 76)
+            Text("What are we working on?")
+                .font(.harbor(size: 34, weight: .regular, design: .serif)).foregroundStyle(ChatTheme.text)
+            Text("Harbor's AI runs on this Mac. Web lookups, and any cloud model you turn on, go online.")
+                .font(.harbor(.callout, on: .window)).foregroundStyle(ChatTheme.text2).multilineTextAlignment(.center)
+            ChatFlowLayout(spacing: 8) {
+                ForEach(suggestions, id: \.self) { s in
+                    Button { ask(s) } label: {
+                        Text(s).font(.harbor(.body, on: .window)).foregroundStyle(ChatTheme.text2)
+                            .padding(.horizontal, 14).padding(.vertical, 7)
+                            .background(Capsule().fill(ChatTheme.glass))
+                            .overlay(Capsule().stroke(ChatTheme.line2, lineWidth: 1))
+                    }.buttonStyle(.plain)
+                }
+            }
+            .frame(maxWidth: 560)
+            Spacer(minLength: 24)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 24)
+        .task { await access.refresh() }
+    }
+}
+
+/// Wrapping row of chips.
+struct ChatFlowLayout: Layout {
+    var spacing: CGFloat = 8
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        arrange(proposal.width ?? 600, subviews).size
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let result = arrange(bounds.width, subviews)
+        for (i, frame) in result.frames.enumerated() {
+            subviews[i].place(at: CGPoint(x: bounds.minX + frame.minX, y: bounds.minY + frame.minY),
+                              proposal: ProposedViewSize(frame.size))
+        }
+    }
+
+    private func arrange(_ width: CGFloat, _ subviews: Subviews) -> (size: CGSize, frames: [CGRect]) {
+        var rows: [[(Int, CGSize)]] = [[]]
+        var x: CGFloat = 0
+        for (i, sub) in subviews.enumerated() {
+            let size = sub.sizeThatFits(.unspecified)
+            if x + size.width > width, !rows[rows.count - 1].isEmpty { rows.append([]); x = 0 }
+            rows[rows.count - 1].append((i, size))
+            x += size.width + spacing
+        }
+        var frames = [CGRect](repeating: .zero, count: subviews.count)
+        var y: CGFloat = 0
+        var maxWidth: CGFloat = 0
+        for row in rows {
+            let rowWidth = row.reduce(0) { $0 + $1.1.width } + spacing * CGFloat(max(0, row.count - 1))
+            var cursor = (width - rowWidth) / 2      // chips are centered
+            let height = row.map(\.1.height).max() ?? 0
+            for (i, size) in row {
+                frames[i] = CGRect(x: cursor, y: y, width: size.width, height: size.height)
+                cursor += size.width + spacing
+            }
+            maxWidth = max(maxWidth, rowWidth)
+            y += height + spacing
+        }
+        return (CGSize(width: max(maxWidth, 0), height: max(0, y - spacing)), frames)
+    }
+}
+
+// MARK: - Conversation
+
+struct ChatConversationView: View {
+    @ObservedObject var store: ChatStore
+    @ObservedObject var conversation: ChatConversation
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if conversation.messages.isEmpty {
+                if conversation.loading {
+                    VStack { Spacer(); ProgressView().controlSize(.small); Spacer() }.frame(maxWidth: .infinity)
+                } else {
+                    ChatEmptyState { store.submit($0) }
+                }
+            } else {
+                ChatThread(store: store, conversation: conversation)
+            }
+            ChatComposer(store: store, draft: conversation.composerDraft,
+                         busy: conversation.busy || conversation.corpusRunning, loading: conversation.loading,
+                         restoredInput: Binding(get: { conversation.restoredInput }, set: { conversation.restoredInput = $0 }),
+                         notice: Binding(get: { conversation.notice }, set: { conversation.notice = $0 }),
+                         stop: { store.stop(conversation) })
+        }
+    }
+}
+
+struct ChatThread: View {
+    @ObservedObject var store: ChatStore
+    @ObservedObject var conversation: ChatConversation
+    /// Whether the reader is at the bottom of the thread. The thread follows a growing
+    /// answer only while this is true, so scrolling up to read is never pulled back down.
+    @State private var followsBottom = true
+    /// Until this time a settling scroll is our own (the animated jump to the bottom),
+    /// so the reader has not moved away and following must not be switched off.
+    @State private var ownScrollUntil = Date.distantPast
+    /// Which sources "Try another" may ask about (StarterAccess).
+    @ObservedObject private var access = StarterAccess.shared
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 24) {
+                    ForEach(conversation.messages) { message in
+                        ChatMessageRow(store: store, conversation: conversation, message: message)
+                            .id(message.id)
+                            .transition(.opacity)
+                    }
+                    if offersTryAnother { tryAnotherRow }
+                    Color.clear.frame(height: 1).id("bottom")
+                }
+                // Keyed on the count, never the text: a new row fades in, a streaming reply does not re-animate.
+                .animation(Theme.Motion.panel(reduceMotion: reduceMotion), value: conversation.messages.count)
+                .frame(maxWidth: 740)
+                .padding(.horizontal, 24).padding(.top, 26).padding(.bottom, 12)
+                .frame(maxWidth: .infinity)
+            }
+            .modifier(ChatScrollBehavior(followsBottom: $followsBottom, ownScrollUntil: ownScrollUntil))
+            .onChange(of: conversation.messages.count) { _, _ in
+                // A new exchange (the reader sent something, or a chat just loaded) shows the bottom.
+                followsBottom = true
+                ownScrollUntil = Date().addingTimeInterval(0.6)
+                withAnimation(Theme.Motion.panel(reduceMotion: reduceMotion)) { proxy.scrollTo("bottom", anchor: .bottom) }
+            }
+            .onChange(of: conversation.messages.last?.text) { _, _ in follow(proxy) }
+            .onChange(of: conversation.messages.last?.tools.count) { _, _ in follow(proxy) }
+            .onChange(of: conversation.messages.last?.phase) { _, _ in follow(proxy) }
+            .onChange(of: conversation.messages.last?.approval) { _, _ in follow(proxy) }
+            .onChange(of: conversation.messages.last?.draft) { _, _ in follow(proxy) }
+        }
+        .task { await access.refresh() }
+    }
+
+    /// Starters not yet asked in this chat, from its user messages, none about a
+    /// source Harbor can't read.
+    private var remainingStarters: [String] {
+        AskStarters.remaining(AskStarters.chatStarters(unreadable: access.unreadable),
+                              askedTexts: conversation.messages.filter { $0.role == .user }.map(\.text))
+    }
+
+    /// Only once the last reply has finished, with nothing awaiting approval or a draft.
+    private var offersTryAnother: Bool {
+        guard !conversation.busy, !conversation.loading, let last = conversation.messages.last,
+              last.role == .assistant, !last.isLive, last.approval == nil, last.draft == nil
+        else { return false }
+        return !remainingStarters.isEmpty
+    }
+
+    private var tryAnotherRow: some View {
+        ChatFlowLayout(spacing: 8) {
+            ForEach(remainingStarters, id: \.self) { s in
+                Button { store.submit(s) } label: {
+                    Text(s).font(.harbor(.footnote, on: .window)).foregroundStyle(ChatTheme.text2)
+                        .padding(.horizontal, 12).padding(.vertical, 5)
+                        .background(Capsule().fill(ChatTheme.glass))
+                        .overlay(Capsule().stroke(ChatTheme.line2, lineWidth: 1))
+                }.buttonStyle(.plain).focusable(false)
+            }
+        }
+        .accessibilityLabel("Try another")
+    }
+
+    private func follow(_ proxy: ScrollViewProxy) {
+        if followsBottom { proxy.scrollTo("bottom", anchor: .bottom) }
+    }
+}
+
+/// Starts the thread at the bottom and tracks whether the reader is still there.
+/// Content growth alone never moves a reader who has scrolled up: from macOS 15 the
+/// size-change anchoring is off and the thread follows only while `followsBottom`.
+/// On macOS 14 the thread keeps the system's bottom anchoring and follows always.
+private struct ChatScrollBehavior: ViewModifier {
+    @Binding var followsBottom: Bool
+    let ownScrollUntil: Date
+
+    func body(content: Content) -> some View {
+        if #available(macOS 15.0, *) {
+            content
+                .defaultScrollAnchor(.bottom, for: .initialOffset)
+                .onScrollPhaseChange { _, newPhase, context in
+                    switch newPhase {
+                    case .tracking, .interacting, .decelerating:
+                        followsBottom = false      // the reader is scrolling: stop following
+                    case .idle:
+                        // Settled after our own jump to the bottom: keep following.
+                        if Date() < ownScrollUntil { followsBottom = true; break }
+                        let g = context.geometry   // otherwise follow again only if back at the bottom
+                        followsBottom = g.visibleRect.maxY >= g.contentSize.height - 48
+                    default:
+                        break                      // our own animated scroll
+                    }
+                }
+        } else {
+            content.defaultScrollAnchor(.bottom)
+        }
+    }
+}
+
+struct ChatMessageRow: View {
+    @ObservedObject var store: ChatStore
+    @ObservedObject var conversation: ChatConversation
+    let message: ChatMessage
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        switch message.role {
+        case .user: userBubble
+        case .assistant: assistant
+        }
+    }
+
+    private var userBubble: some View {
+        HStack {
+            Spacer(minLength: 80)
+            VStack(alignment: .trailing, spacing: 4) {
+                if let name = message.attachmentName {
+                    Label(name, systemImage: "photo").font(.harbor(.footnote, on: .window, design: .monospaced)).foregroundStyle(ChatTheme.text2)
+                }
+                Text(message.text)
+                    .font(.harbor(.reading, on: .window)).foregroundStyle(ChatTheme.text)
+                    .textSelection(.enabled)
+            }
+            .padding(.horizontal, 15).padding(.vertical, 9)
+            .background(UnevenRoundedRectangle(topLeadingRadius: 18, bottomLeadingRadius: 18, bottomTrailingRadius: 5, topTrailingRadius: 18).fill(ChatTheme.bubble))
+            .overlay(UnevenRoundedRectangle(topLeadingRadius: 18, bottomLeadingRadius: 18, bottomTrailingRadius: 5, topTrailingRadius: 18).stroke(ChatTheme.line, lineWidth: 1))
+        }
+    }
+
+    private var showsThinking: Bool {
+        message.isLive && message.text.isEmpty && message.tools.isEmpty && message.approval == nil && message.draft == nil
+    }
+
+    private var assistant: some View {
+        HStack(alignment: .top, spacing: 14) {
+            ChatOrb(size: 20, thinking: message.isLive).padding(.top, 2)
+            VStack(alignment: .leading, spacing: 12) {
+                if showsThinking {
+                    ChatThinkingRow(label: message.status.isEmpty ? "Thinking…" : message.status)
+                        .transition(.opacity)
+                }
+                if message.showsStopped {
+                    Text("Stopped").font(.harbor(.footnote, on: .window)).foregroundStyle(ChatTheme.text3)
+                }
+                if !message.tools.isEmpty { ChatTraceView(message: message) }
+                if !message.reasoning.isEmpty { ChatReasoningView(text: message.reasoning) }
+                if !message.text.isEmpty {
+                    if message.isError {
+                        Text(message.text).font(.harbor(.callout, on: .window)).foregroundStyle(ChatTheme.danger)
+                            .textSelection(.enabled)
+                    } else {
+                        MarkdownView(text: message.text)
+                            .environment(\.markdownPalette, ChatTheme.markdown)
+                    }
+                }
+                if !message.isLive, !message.needsAccess.isEmpty { accessFixes(message.needsAccess) }
+                if let evaluation = message.corpusEvaluation {
+                    ChatCorpusEvaluationCard(evaluation: evaluation, failed: message.isError, tools: message.tools)
+                }
+                if let approval = message.approval {
+                    ChatApprovalCard(approval: approval) { approved, scope in
+                        store.resolve(conversation, messageID: message.id, approved: approved, scope: scope)
+                    }
+                }
+                if message.draft != nil {
+                    ChatDraftCard(message: message, store: store, conversation: conversation)
+                }
+                if message.phase == .streaming && message.status.isEmpty == false {
+                    Text(message.status).font(.harbor(.footnote, on: .window)).foregroundStyle(ChatTheme.text3)
+                }
+                if message.phase == .done || message.phase == .failed, let meta = message.meta, !meta.model.isEmpty {
+                    ChatMetaLine(meta: meta, selected: store.inspectedMessage == message.id) {
+                        store.inspectedMessage = message.id
+                        store.showInspector = true
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            // Keyed on the row's presence, not the streaming text.
+            .animation(Theme.Motion.panel(reduceMotion: reduceMotion), value: showsThinking)
+        }
+    }
+
+    /// The fix for each source a tool in this reply wasn't allowed to read: the
+    /// notch's own buttons (OverlayView.accessFixes), gone once macOS says yes.
+    @ViewBuilder private func accessFixes(_ kinds: [String]) -> some View {
+        let fixes = Permissions.askFixes(kinds)
+        if !fixes.isEmpty {
+            HStack(spacing: 8) {
+                ForEach(fixes, id: \.url) { fix in
+                    if let url = URL(string: fix.url) {
+                        ChatCardButton(title: Permissions.fixLabel(fix)) { Permissions.openFix(url) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct ChatThinkingRow: View {
+    let label: String
+    var body: some View {
+        HStack(spacing: 8) {
+            ProgressView().controlSize(.small)
+            Text(label).font(.harbor(.body, on: .window)).foregroundStyle(ChatTheme.text3)
+        }
+    }
+}
+
+private struct ChatCorpusEvaluationCard: View {
+    let evaluation: ChatCorpusEvaluation
+    let failed: Bool
+    let tools: [ChatToolRow]
+
+    private var heading: String {
+        if evaluation.stopped { return "Stopped · \(evaluation.caseID)" }
+        if failed { return "Run failed · \(evaluation.caseID)" }
+        if evaluation.usesLiveData { return "\(evaluation.completed ? "Review live answer" : "Reading live data") · \(evaluation.caseID)" }
+        guard let matches = evaluation.toolPathMatches else { return "Checking · \(evaluation.caseID)" }
+        return matches ? "Tool path matched · \(evaluation.caseID)" : "Review tool path · \(evaluation.caseID)"
+    }
+
+    private var headingColor: Color {
+        guard let matches = evaluation.toolPathMatches else { return ChatTheme.amber }
+        return matches ? ChatTheme.ok : ChatTheme.amber
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 7) {
+                Image(systemName: evaluation.toolPathMatches == true ? "checkmark.circle" : "list.bullet.clipboard")
+                Text(heading).font(.harbor(.footnote, on: .window, weight: .medium))
+                Spacer()
+                Text("\(evaluation.split) · \(evaluation.category)")
+                    .font(.harbor(.caption, on: .window, design: .monospaced)).foregroundStyle(ChatTheme.text3)
+            }
+            .foregroundStyle(headingColor)
+
+            HStack(alignment: .top, spacing: 8) {
+                Text(evaluation.usesLiveData ? "Relevant reads" : "Expected").foregroundStyle(ChatTheme.text3)
+                Text(toolList(evaluation.expectedTools)).foregroundStyle(ChatTheme.text2)
+            }
+            .font(.harbor(.footnote, on: .window, design: .monospaced))
+            if evaluation.completed || evaluation.stopped {
+                HStack(alignment: .top, spacing: 8) {
+                    Text("Observed").foregroundStyle(ChatTheme.text3)
+                    Text(toolList(evaluation.observedTools)).foregroundStyle(ChatTheme.text2)
+                }
+                .font(.harbor(.footnote, on: .window, design: .monospaced))
+            }
+
+            if evaluation.usesLiveData {
+                Text("Model: \(evaluation.modelName.isEmpty ? "awaiting inference" : evaluation.modelName) · \(evaluation.modelCalls) completed call\(evaluation.modelCalls == 1 ? "" : "s") / \(evaluation.modelAttempts) started")
+                    .font(.harbor(.footnote, on: .window, design: .monospaced)).foregroundStyle(ChatTheme.text2)
+                DisclosureGroup("Source results (\(tools.count))") {
+                    ForEach(tools) { tool in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("\(tool.name) · \(tool.decision)").font(.harbor(.footnote, on: .window, weight: .medium))
+                            if let evidence = tool.corpusSourceEvidence {
+                                Text(evidence.text.isEmpty ? "No source text retained." : evidence.text)
+                                    .font(.harbor(.footnote, on: .window)).textSelection(.enabled)
+                                if evidence.isTruncated {
+                                    Text("Source evidence truncated for display: \(evidence.retainedByteCount) of \(evidence.sourceByteCount) UTF-8 bytes retained. The answer may refer to omitted text; review with this coverage limit.")
+                                        .font(.harbor(.caption, on: .window)).foregroundStyle(ChatTheme.amber)
+                                }
+                            } else {
+                                Text(tool.finished ? "No corpus source evidence retained for this result." : "Awaiting source result")
+                                    .font(.harbor(.footnote, on: .window)).foregroundStyle(ChatTheme.text3)
+                            }
+                        }.frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 5)
+                    }
+                }.foregroundStyle(ChatTheme.text2)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Behavior rubric · review the response")
+                    .font(.harbor(.footnote, on: .window, weight: .medium)).foregroundStyle(ChatTheme.text2)
+                ForEach(Array(evaluation.behavior.indices), id: \.self) { index in
+                    Text("• \(evaluation.behavior[index])").font(.harbor(.footnote, on: .window)).foregroundStyle(ChatTheme.text3)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Text(evaluation.usesLiveData ? "Real source reads · writes and sends blocked · review answers manually" : "Tool plan only · no action was executed")
+                .font(.harbor(.caption, on: .window, design: .monospaced)).foregroundStyle(ChatTheme.text3)
+        }
+        .padding(11)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 12).fill(ChatTheme.glass))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(ChatTheme.line, lineWidth: 1))
+    }
+
+    private func toolList(_ tools: [String]) -> String { tools.isEmpty ? "none" : tools.joined(separator: " → ") }
+}
+
+private struct ChatMetaLine: View {
+    let meta: ChatMeta
+    let selected: Bool
+    let action: () -> Void
+
+    private var text: String {
+        var parts: [String] = []
+        if !meta.roleLabel.isEmpty { parts.append(meta.roleLabel) }
+        parts.append(meta.shortModel)
+        if let d = meta.duration { parts.append(String(format: "%.1f s", d)) }
+        return parts.joined(separator: " · ")
+    }
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Text(text).font(.harbor(.footnote, on: .window, weight: .medium, design: .monospaced))
+                Image(systemName: "info.circle").font(.harbor(size: 10.5))
+            }
+            .foregroundStyle(selected ? ChatTheme.teal : ChatTheme.text3)
+        }
+        .buttonStyle(.plain)
+        .help("Show details for this answer")
+    }
+}
+
+// MARK: - Tool trace
+
+struct ChatTraceView: View {
+    let message: ChatMessage
+    @State private var expanded = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var isOpen: Bool { expanded || message.isLive }
+    private var title: String { message.traceTitle }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Button { expanded.toggle() } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "sparkle").font(.harbor(size: 12))
+                    Text(title).font(.harbor(.body, on: .window))
+                    Spacer()
+                    if let d = message.meta?.duration, !message.isLive {
+                        Text(String(format: "%.1f s", d)).font(.harbor(.footnote, on: .window, design: .monospaced)).foregroundStyle(ChatTheme.text3)
+                    }
+                    Image(systemName: "chevron.right").font(.harbor(size: 10, weight: .semibold))
+                        .rotationEffect(.degrees(isOpen ? 90 : 0)).foregroundStyle(ChatTheme.text3)
+                }
+                .foregroundStyle(ChatTheme.text2)
+                .padding(.horizontal, 12).padding(.vertical, 8)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            if isOpen {
+                ForEach(message.tools) { tool in
+                    Rectangle().fill(ChatTheme.line).frame(height: 1)
+                    HStack(spacing: 10) {
+                        Image(systemName: tool.kind.symbol).font(.harbor(size: 12)).foregroundStyle(ChatTheme.blue).frame(width: 16)
+                        Text(tool.title).font(.harbor(.body, on: .window)).foregroundStyle(ChatTheme.text2).lineLimit(1)
+                        Spacer(minLength: 8)
+                        Text(tool.detail).font(.harbor(.footnote, on: .window, design: .monospaced))
+                            .foregroundStyle(tool.decision == "deny" ? ChatTheme.danger : ChatTheme.text3).lineLimit(1)
+                    }
+                    .padding(.horizontal, 12).padding(.vertical, 8)
+                }
+            }
+        }
+        .background(RoundedRectangle(cornerRadius: 12).fill(ChatTheme.glass))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(ChatTheme.line, lineWidth: 1))
+        .animation(Theme.Motion.panel(reduceMotion: reduceMotion), value: isOpen)
+    }
+}
+
+private struct ChatReasoningView: View {
+    let text: String
+    @State private var open = false
+    var body: some View {
+        DisclosureGroup(isExpanded: $open) {
+            ScrollView {
+                Text(text).font(.harbor(.footnote, on: .window)).foregroundStyle(ChatTheme.text3)
+                    .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxHeight: 180)
+        } label: {
+            Text("Show reasoning").font(.harbor(.footnote, on: .window)).foregroundStyle(ChatTheme.text2)
+        }
+        .tint(ChatTheme.text2)
+    }
+}
+
+// MARK: - Approvals and drafts
+
+struct ChatApprovalCard: View {
+    let approval: ChatApproval
+    let resolve: (_ approved: Bool, _ scope: String) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: header.symbol)
+                Text(header.text).font(.harbor(.body, on: .window, weight: .medium)).fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+            }
+            .foregroundStyle(header.color)
+            .padding(.horizontal, 14).padding(.vertical, 10)
+            Rectangle().fill(border).frame(height: 1)
+            if !approval.preview.isEmpty {
+                ScrollView {
+                    Text(approval.preview).font(.harbor(.footnote, on: .window, design: .monospaced)).foregroundStyle(ChatTheme.text)
+                        .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading).padding(10)
+                }
+                .frame(maxHeight: 220)
+                .background(RoundedRectangle(cornerRadius: 8).fill(ChatTheme.glass2))
+                .padding(12)
+            }
+            if approval.state == .pending {
+                // Said whenever the button is offered, so a rule is never wider
+                // than the card let on.
+                if approval.grantable {
+                    Text(alwaysAllowLine)
+                        .font(.harbor(.footnote, on: .window)).foregroundStyle(ChatTheme.text2).padding(.horizontal, 14).padding(.top, approval.preview.isEmpty ? 12 : 0)
+                }
+                HStack(spacing: 8) {
+                    Spacer()
+                    ChatCardButton(title: "Deny") { resolve(false, "once") }
+                    if approval.grantable { ChatCardButton(title: "Always allow") { resolve(true, "always") } }
+                    ChatCardButton(title: "Allow once", primary: true) { resolve(true, "once") }
+                }
+                .padding(12)
+            }
+        }
+        .background(RoundedRectangle(cornerRadius: 14).fill(approval.state == .pending ? ChatTheme.amberWash : ChatTheme.glass))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(border, lineWidth: 1))
+        .opacity(approval.state == .denied || approval.state == .timedOut ? 0.7 : 1)
+        // One named group for VoiceOver: what is asked, then its buttons.
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(approval.state == .pending ? "Harbor needs your OK" : "Harbor asked for your OK")
+    }
+
+    /// What "Always allow" would cover: the folder or site when the rule is
+    /// limited to one, and plainly every action of that tool when it is not.
+    private var alwaysAllowLine: String {
+        approval.scopeHint.isEmpty
+            ? "Always allow applies to every \(approval.tool) action"
+            : "Always allow applies to \(approval.tool) on \(approval.scopeHint)"
+    }
+
+    private var border: Color { approval.state == .pending ? ChatTheme.amberLine : ChatTheme.line }
+    private var header: (symbol: String, text: String, color: Color) {
+        switch approval.state {
+        case .pending: return ("exclamationmark.shield", approval.reason, ChatTheme.amber)
+        case .allowed: return ("checkmark.circle", "Allowed · \(approval.reason)", ChatTheme.ok)
+        case .denied: return ("xmark.circle", "Denied · nothing was changed", ChatTheme.text3)
+        case .timedOut: return ("clock", "Timed out · denied automatically", ChatTheme.text3)
+        }
+    }
+}
+
+struct ChatCardButton: View {
+    let title: String
+    var primary = false
+    var enabled = true
+    let action: () -> Void
+    var body: some View {
+        Button(action: action) {
+            Text(title).font(.harbor(.body, on: .window, weight: primary ? .semibold : .medium))
+                .foregroundStyle(primary ? Color(nsColor: ChatTheme.amberButtonText) : ChatTheme.text2)
+                .padding(.horizontal, 14).padding(.vertical, 6)
+                .background(Capsule().fill(primary ? ChatTheme.amberButton : ChatTheme.glass))
+                .overlay(Capsule().stroke(primary ? Color.clear : ChatTheme.line2, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+        .opacity(enabled ? 1 : 0.5)
+    }
+}
+
+struct ChatDraftCard: View {
+    let message: ChatMessage
+    @ObservedObject var store: ChatStore
+    @ObservedObject var conversation: ChatConversation
+
+    private var draft: ChatDraft { message.draft ?? ChatDraft(to: "", text: "") }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: draft.sent ? "checkmark.circle" : "bubble.left")
+                Text(draft.sent ? "Message sent" : "Message draft, not sent yet").font(.harbor(.body, on: .window, weight: .medium))
+                Spacer()
+                Text("To: \(draft.to)").font(.harbor(.footnote, on: .window, design: .monospaced)).foregroundStyle(ChatTheme.text2)
+            }
+            .foregroundStyle(draft.sent ? ChatTheme.ok : ChatTheme.amber)
+            .padding(.horizontal, 14).padding(.vertical, 10)
+            Rectangle().fill(border).frame(height: 1)
+            Group {
+                if draft.isEditing {
+                    TextEditor(text: Binding(get: { draft.text },
+                                             set: { new in store.updateDraft(conversation, messageID: message.id) { $0.text = new } }))
+                        .font(.harbor(.callout, on: .window)).foregroundStyle(ChatTheme.text)
+                        .scrollContentBackground(.hidden)
+                        .frame(minHeight: 96, maxHeight: 220)
+                } else {
+                    Text(draft.text).font(.harbor(.callout, on: .window)).foregroundStyle(ChatTheme.text)
+                        .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .padding(14)
+            if !draft.status.isEmpty {
+                Text(draft.status).font(.harbor(.footnote, on: .window))
+                    .foregroundStyle(draft.sent || draft.isSending ? ChatTheme.text2 : ChatTheme.danger)
+                    .padding(.horizontal, 14).padding(.bottom, 10)
+            }
+            if !draft.sent && !draft.discarded {
+                HStack(spacing: 8) {
+                    Spacer()
+                    ChatCardButton(title: "Discard", enabled: !draft.isSending) {
+                        store.updateDraft(conversation, messageID: message.id) { $0.discarded = true; $0.status = "Discarded" }
+                    }
+                    ChatCardButton(title: draft.isEditing ? "Done" : "Edit", enabled: !draft.isSending) {
+                        store.updateDraft(conversation, messageID: message.id) { $0.isEditing.toggle() }
+                    }
+                    ChatCardButton(title: draft.isSending ? "Sending…" : "Send", primary: true,
+                                   enabled: !draft.isSending && !draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) {
+                        store.sendDraft(conversation, messageID: message.id)
+                    }
+                }
+                .padding(12)
+                .background(ChatTheme.glass2)
+            }
+        }
+        .background(RoundedRectangle(cornerRadius: 14).fill(draft.sent || draft.discarded ? ChatTheme.glass : ChatTheme.amberWash))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(border, lineWidth: 1))
+        .opacity(draft.discarded ? 0.6 : 1)
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+    }
+
+    private var border: Color { draft.sent || draft.discarded ? ChatTheme.line : ChatTheme.amberLine }
+}
+
+// MARK: - Composer
+
+struct ChatComposer: View {
+    @ObservedObject var store: ChatStore
+    /// Where what is typed is kept, so it is still here after this view is
+    /// rebuilt: another chat or section was opened, or the Text size changed.
+    let draft: ChatComposerDraft
+    let busy: Bool
+    let loading: Bool
+    @Binding var restoredInput: String?
+    /// Why the last message came back, shown above the field until the next send or edit.
+    @Binding var notice: String?
+    let stop: () -> Void
+    @State private var text = ""
+    @State private var image: (name: String, dataURL: String)?
+    @State private var attachNote = ""
+    @FocusState private var focused: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var canSend: Bool { !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !busy && !loading }
+
+    var body: some View {
+        VStack(spacing: 8) {
+            if let notice, !notice.isEmpty {
+                Text(notice)
+                    .font(.harbor(.footnote, on: .window)).foregroundStyle(ChatTheme.amber)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 4)
+                    .frame(maxWidth: 740, alignment: .leading)
+                    .transition(.opacity)
+            }
+            VStack(alignment: .leading, spacing: 8) {
+                if let image {
+                    HStack(spacing: 8) {
+                        Image(systemName: "photo").font(.harbor(size: 12))
+                        Text(image.name).font(.harbor(.footnote, on: .window, design: .monospaced)).lineLimit(1)
+                        Button { self.image = nil; attachNote = "" } label: { Image(systemName: "xmark").font(.harbor(size: 10, weight: .semibold)) }
+                            .buttonStyle(.plain).accessibilityLabel("Remove image")
+                    }
+                    .foregroundStyle(ChatTheme.text2)
+                    .padding(.horizontal, 10).padding(.vertical, 5)
+                    .background(RoundedRectangle(cornerRadius: 9).fill(ChatTheme.glass))
+                    .overlay(RoundedRectangle(cornerRadius: 9).stroke(ChatTheme.line, lineWidth: 1))
+                }
+                TextField("Message Harbor", text: $text, axis: .vertical)
+                    .textFieldStyle(.plain)
+                    .font(.harbor(.reading, on: .window))
+                    .foregroundStyle(ChatTheme.text)
+                    .lineLimit(1...8)
+                    .focused($focused)
+                    .onSubmit(send)
+                HStack(spacing: 6) {
+                    if store.debugMode {
+                        Button(action: pickImage) { Image(systemName: "paperclip") }
+                            .buttonStyle(ChatIconButtonStyle()).help("Attach an image (Debug Mode: Harbor can't look at images yet)").accessibilityLabel("Attach an image")
+                    }
+                    Menu {
+                        Button { store.setFullAccess(false) } label: { Label("Ask before acting", systemImage: store.fullAccessKnown && !store.fullAccess ? "checkmark" : "") }
+                        Button { store.setFullAccess(true) } label: { Label("Full access", systemImage: store.fullAccessKnown && store.fullAccess ? "checkmark" : "") }
+                        // Applied but not saved: it lasts until Harbor restarts.
+                        if let problem = store.fullAccessSaveProblem {
+                            Divider()
+                            Text(problem)
+                        }
+                    } label: {
+                        ChatPill(text: (!store.fullAccessKnown ? "Access unconfirmed"
+                                        : store.fullAccess ? "Full access" : "Ask before acting")
+                                 + (store.fullAccessKnown && store.fullAccessSaveProblem != nil ? " · not saved" : ""))
+                    }
+                    .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                    .help(store.fullAccessSaveProblem
+                          ?? "Whether Harbor asks before it acts. Sending and bulk deletes always ask.")
+                    Spacer()
+                    if busy {
+                        Button(action: stop) {
+                            Image(systemName: "stop.fill").font(.harbor(size: 11))
+                                .foregroundStyle(ChatTheme.sendIcon).frame(width: 32, height: 32)
+                                .background(Circle().fill(ChatTheme.sendFill))
+                        }
+                        .buttonStyle(.plain).help("Stop").accessibilityLabel("Stop")
+                    } else {
+                        Button(action: send) {
+                            Image(systemName: "arrow.up").font(.harbor(size: 13, weight: .bold))
+                                .foregroundStyle(canSend ? ChatTheme.sendIcon : ChatTheme.text3)
+                                .frame(width: 32, height: 32)
+                                .background(Circle().fill(canSend ? ChatTheme.sendFill : ChatTheme.glass2))
+                        }
+                        .buttonStyle(.plain).disabled(!canSend).accessibilityLabel("Send")
+                    }
+                }
+            }
+            .padding(.horizontal, 14).padding(.top, 12).padding(.bottom, 10)
+            .background(RoundedRectangle(cornerRadius: 18).fill(ChatTheme.field))
+            .overlay(RoundedRectangle(cornerRadius: 18).stroke(focused ? ChatTheme.tealLine : ChatTheme.line2, lineWidth: 1))
+            .frame(maxWidth: 740)
+            Text(attachNote.isEmpty ? disclaimer : attachNote)
+                .font(.harbor(.caption, on: .window)).foregroundStyle(attachNote.isEmpty ? ChatTheme.text3 : ChatTheme.danger)
+        }
+        .padding(.horizontal, 24).padding(.bottom, 14).padding(.top, 4)
+        .frame(maxWidth: .infinity)
+        // Keyed on whether a note shows, not its words.
+        .animation(Theme.Motion.panel(reduceMotion: reduceMotion), value: notice?.isEmpty == false)
+        .onAppear {
+            focused = true
+            // A fresh composer picks up what was typed here before it was rebuilt.
+            text = draft.text
+            image = draft.image
+            if let restored = restoredInput {
+                // A message that came back wins over an older draft.
+                draft.text = restored; draft.restoredText = restored
+                text = restored; restoredInput = nil
+            } else if notice != nil, draft.text.isEmpty || draft.text != draft.restoredText {
+                // The box no longer holds the message the note speaks of.
+                notice = nil
+            }
+        }
+        .onChange(of: restoredInput) { _, restored in
+            guard let restored else { return }
+            draft.text = restored; draft.restoredText = restored
+            text = restored
+            restoredInput = nil
+        }
+        .onChange(of: image?.dataURL) { _, _ in draft.image = image }
+        .onChange(of: text) { _, edited in
+            draft.text = edited
+            // Typing over the message that came back dismisses the note about it.
+            // (Sending clears it in the store; the field emptying is not an edit.)
+            guard notice != nil, !edited.isEmpty, edited != draft.restoredText else { return }
+            notice = nil
+        }
+    }
+
+    private static let maxImageBytes = 10_000_000
+
+    private var disclaimer: String {
+        switch store.cloudInUse {
+        case .some(true): return "Harbor can use your cloud provider and can be wrong. Check anything important."
+        case .some(false): return "Harbor runs on this Mac and can be wrong. Check anything important."
+        case .none: return "Harbor can be wrong. Check anything important."
+        }
+    }
+
+    private func send() {
+        guard canSend else { return }
+        let prompt = text
+        let attached = image
+        text = ""
+        image = nil
+        attachNote = ""
+        draft.clear()   // sent, so nothing is left to bring back
+        store.submit(prompt, attachmentName: attached?.name, image: attached?.dataURL)
+    }
+
+    /// A sheet on the chat window, not an app-modal dialog: runModal also
+    /// locked the notch until the dialog closed.
+    private func pickImage() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.image]
+        panel.allowsMultipleSelection = false
+        let finish: (NSApplication.ModalResponse) -> Void = { response in
+            MainActor.assumeIsolated {
+                guard response == .OK, let url = panel.url else { return }
+                attachImage(url)
+            }
+        }
+        if let window = NSApp.keyWindow, !(window is NSPanel) {
+            panel.beginSheetModal(for: window, completionHandler: finish)
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+            panel.begin(completionHandler: finish)
+        }
+    }
+
+    private func attachImage(_ url: URL) {
+        let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        guard size <= Self.maxImageBytes else {
+            attachNote = "That image is over 10 MB. Choose a smaller one."
+            return
+        }
+        attachNote = ""
+        HarborClient().prewarmEncoder(.vision)
+        let ext = url.pathExtension.lowercased()
+        let name = url.lastPathComponent
+        // Read and encode off the main actor; a 10 MB file would hitch the window.
+        Task {
+            let encoded = await Task.detached { (try? Data(contentsOf: url))?.base64EncodedString() }.value
+            guard let encoded else { return }
+            image = (name, "data:image/\(ext);base64,\(encoded)")
+        }
+    }
+}
+
+// MARK: - Inspector
+
+struct ChatInspector: View {
+    @ObservedObject var store: ChatStore
+
+    var body: some View {
+        if let conversation = store.selected {
+            InspectorBody(store: store, conversation: conversation)
+        } else {
+            InspectorShell { Text("Send a message to see how Harbor answered it.").font(.harbor(.body, on: .window)).foregroundStyle(ChatTheme.text3) }
+        }
+    }
+
+    private struct InspectorBody: View {
+        @ObservedObject var store: ChatStore
+        @ObservedObject var conversation: ChatConversation
+
+        private var message: ChatMessage? {
+            if let id = store.inspectedMessage, let m = conversation.messages.first(where: { $0.id == id }), m.role == .assistant { return m }
+            return conversation.messages.last(where: { $0.role == .assistant && $0.meta != nil && !($0.meta?.model.isEmpty ?? true) })
+        }
+
+        var body: some View {
+            InspectorShell {
+                if let message, let meta = message.meta, !meta.model.isEmpty {
+                    section("This answer") {
+                        row("Route", meta.roleLabel.isEmpty ? "—" : meta.roleLabel)
+                        row("Model", meta.shortModel)
+                        row("Routed by", Self.routedBy(meta.routeSource))
+                        if meta.tokensPerSecond > 0 { row("Speed", "\(meta.tokensPerSecond) tok/s") }
+                        if let d = meta.duration { row("Time", String(format: "%.1f s", d)) }
+                        // Green only on a confirmed local launch, like the top bar's Local pill.
+                        row("Ran on", ChatCloudUse.ranOn(store.cloudInUse),
+                            color: store.cloudInUse == false ? ChatTheme.ok : ChatTheme.text2)
+                    }
+                    if !meta.routeReason.isEmpty {
+                        section("Why this route") {
+                            Text(meta.routeReason).font(.harbor(.footnote, on: .window)).foregroundStyle(ChatTheme.text2)
+                        }
+                    }
+                    section("Tools used") {
+                        if message.tools.isEmpty {
+                            Text("None. Answered from the model alone.").font(.harbor(.footnote, on: .window)).foregroundStyle(ChatTheme.text3)
+                        } else {
+                            ForEach(message.tools) { tool in
+                                VStack(alignment: .leading, spacing: 2) {
+                                    HStack {
+                                        Image(systemName: tool.kind.symbol).font(.harbor(size: 11)).foregroundStyle(ChatTheme.blue)
+                                        Text(tool.name).font(.harbor(.footnote, on: .window, design: .monospaced)).foregroundStyle(ChatTheme.text2).lineLimit(1)
+                                    }
+                                    Text(tool.detail).font(.harbor(.footnote, on: .window)).foregroundStyle(ChatTheme.text3).lineLimit(2)
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    Text("Send a message to see how Harbor answered it: which model, which tools, and how long it took.")
+                        .font(.harbor(.body, on: .window)).foregroundStyle(ChatTheme.text3)
+                }
+            }
+        }
+
+        private static func routedBy(_ source: String) -> String {
+            switch source {
+            case "air_router": return "Air router"
+            case "local_router": return "Local router"
+            case "fallback": return "Local fallback"
+            case "rules": return "Local rules"
+            case "default": return "Default"
+            default: return source.isEmpty ? "—" : source
+            }
+        }
+
+        private func section<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(title.uppercased()).font(.harbor(.caption, on: .window, weight: .medium)).tracking(1.0).foregroundStyle(ChatTheme.text3)
+                content()
+            }
+        }
+
+        private func row(_ key: String, _ value: String, color: Color = ChatTheme.text2) -> some View {
+            HStack(alignment: .firstTextBaseline) {
+                Text(key).font(.harbor(.body, on: .window)).foregroundStyle(ChatTheme.text3)
+                Spacer(minLength: 12)
+                Text(value).font(.harbor(.footnote, on: .window, design: .monospaced)).foregroundStyle(color).multilineTextAlignment(.trailing)
+            }
+        }
+    }
+
+    private struct InspectorShell<Content: View>: View {
+        @ViewBuilder var content: Content
+        var body: some View {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) { content }
+                    .padding(16).frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(.top, 52)
+            .background(ChatTheme.inspector)
+        }
+    }
+}

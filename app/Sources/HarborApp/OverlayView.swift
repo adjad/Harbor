@@ -1,0 +1,1583 @@
+import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
+
+struct OverlayView: View {
+    @StateObject var model: OverlayModel
+    @ObservedObject var corpus: NotchCorpusController
+    @ObservedObject var researchModel: ResearchModel
+    // Shared with the Harbor window's planner, so both show the same day.
+    @ObservedObject var todayModel: TodayModel
+    // The app's one SettingsLoader, shared with the Harbor window's Settings.
+    @ObservedObject var settings: SettingsLoader
+    // The app's one setup model, shared with Settings › Models › Setup.
+    @ObservedObject var setup: SetupGuideModel
+    var onClose: () -> Void
+    // X button: dismiss from the notch (frees the resident model) but Harbor keeps running
+    // in the menu bar — NOT a full quit. Full quit is still available via the
+    // menu-bar icon's right-click menu.
+    var onDismiss: () -> Void = {}
+    @FocusState private var focused: Bool
+    @State private var breathe = false
+    @Environment(\.accessibilityReduceMotion) private var systemReduceMotion
+    @Environment(\.reduceMotionOverride) private var reduceMotionOverride
+    private var reduceMotion: Bool { reduceMotionOverride ?? systemReduceMotion }
+    // Text size (the notch's Settings > Voice) and Increase Contrast both
+    // change values that child views read when they are built, so a change
+    // rebuilds the panel's content once. Cheap: both are rare, deliberate.
+    @AppStorage(Theme.textSizeKey) private var textSize: Double = 1.0
+    @State private var contrastTick = 0
+    // The notification also fires for Reduce Motion and Reduce Transparency;
+    // only a real Increase Contrast change rebuilds (it resets child views' state).
+    @State private var increasedContrast = Theme.increaseContrast
+    // Replies whose Details the person toggled away from the default (open in
+    // Debug Mode, closed otherwise).
+    @State private var detailsToggled: Set<UUID> = []
+    // Live display layout: notch on notched MacBooks, nothing drawn on other
+    // built-in displays (the menu-bar icon stands in), floating capsule on
+    // monitors. Refreshes when displays change.
+    @ObservedObject private var display = DisplayGeometry.shared
+    // The header's laid-out height (it grows with Text size), for the Brief and
+    // Day scroll cap.
+    @State private var headerHeight: CGFloat = 30
+    // The Brief in two columns in a wider panel (the header's toggle); persists.
+    @AppStorage(NotchBriefView.wideKey) private var briefWide = false
+    // Which way the page change in flight slides (NotchPageSlide).
+    @State private var pageSlide = NotchPageSlide()
+    // The panel's drawn height (followHeight): nil until the open panel's
+    // content is first measured, and again once it closes.
+    @State private var shownHeight: CGFloat?
+    // The selected tab's white capsule, which glides from tab to tab.
+    @Namespace private var tabSelection
+
+    var body: some View {
+        Group {
+            if model.collapsed {
+                // A notch fades to its hitbox and back as a full-screen app comes
+                // and goes (the hybrid notch); with Reduce Motion it just switches.
+                Group { if layout.barIsVisible { notchBar } else { hiddenBar } }
+                    .animation(reduceMotion ? nil : .easeOut(duration: 0.2), value: layout.barIsVisible)
+            } else {
+                expandedPanel
+            }
+        }
+        .id(renderKey)
+        .onAppear {
+            breathe = true
+            // A panel that opens expanded never sees `collapsed` change.
+            if !model.collapsed { model.refreshStarters(today: todayModel) }
+        }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(
+            for: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification)) { _ in
+            guard Theme.increaseContrast != increasedContrast else { return }
+            increasedContrast = Theme.increaseContrast
+            contrastTick &+= 1
+        }
+        // The rebuilt content is laid out fresh, so its height-change observer
+        // never sees a change; ask the window to re-fit to the new size.
+        .onChange(of: renderKey) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { model.onResize() }
+        }
+        // @Published sends before the value is stored, so read it on the next turn.
+        .onReceive(todayModel.$upcomingReply.map { _ in () }
+            .merge(with: todayModel.$plan.map { _ in () })
+            .receive(on: DispatchQueue.main)) { _ in
+            if !model.collapsed { model.updatePersonalStarters(today: todayModel) }
+        }
+        .onChange(of: model.collapsed) { _, isCollapsed in
+            if isCollapsed {
+                // Reopening shows its page without a slide from the last one,
+                // and each tab back at its top, as before.
+                pageSlide.forget()
+                PanelScrollMemory.forgetAll()
+                shownHeight = nil
+            }
+            if !isCollapsed {
+                if model.tab.hasPrompt { focused = true }
+                model.refreshRecentChats()
+                model.refreshStarters(today: todayModel)
+            }
+        }
+        // Switching to Ask or Research (including Ask Harbor from Brief or Day) puts the cursor in the field.
+        .onChange(of: model.tab) { _, tab in
+            if tab.hasPrompt && !model.collapsed { focused = true }
+        }
+    }
+
+    private var renderKey: String { "\(textSize)-\(contrastTick)" }
+    private var layout: SurfaceLayout { display.layout }
+    /// Whether the Brief can show two columns (NotchBriefView.canShowWide);
+    /// the header's toggle shows only then.
+    private var briefCanWiden: Bool {
+        NotchBriefView.canShowWide(model: model, today: todayModel, canWiden: layout.canWiden)
+    }
+    /// The Brief in two columns, in the wider panel.
+    private var briefIsWide: Bool { briefWide && briefCanWiden }
+    private var isNotch: Bool { layout.style == .notch }
+
+    /// Brief and Day under the fixed header: as tall as their content until the
+    /// panel would pass the screen's bottom (SurfaceLayout.maxPanelHeight), then
+    /// scrolling. Without this the window clipped the last rows out of reach.
+    /// It keeps the tab's scroll position while the panel is open
+    /// (PanelScrollMemory), so going back to a tab finds it where it was left.
+    private func tabScroll<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+        CappedScroll(cap: layout.tabScrollCap(headerHeight: headerHeight), reveals: true,
+                     remembers: PanelScrollMemory.key(model.tab)) {
+            content().frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.top, SurfaceLayout.tabTopPadding)
+    }
+
+    private func noteHeader(_ height: CGFloat) {
+        headerHeight = height
+        #if HARBOR_NOTCH_QA
+        NotchQAPages.liveHeader = height
+        #endif
+    }
+
+    private var expandedPanel: some View {
+        let page = model.page
+        pageSlide.follow(page)
+        return VStack(alignment: .leading, spacing: 0) {
+            header
+                .background(GeometryReader { geo in
+                    Color.clear.onAppear { noteHeader(geo.size.height) }
+                        .onChange(of: geo.size.height) { noteHeader(geo.size.height) }
+                })
+            // One page at a time, keyed by what it is, so any change of page
+            // (a tab, quick settings, a permission page, a card) crossfades with
+            // a short slide while the panel's height follows. The ZStack lets
+            // the leaving page and the arriving one overlap rather than stack.
+            ZStack(alignment: .topLeading) {
+                VStack(alignment: .leading, spacing: 0) { pageBody }
+                    .id(page)
+                    .transition(.notchPage(pageSlide))
+            }
+        }
+        .background(shortcuts)
+        // Fused with the notch, the panel hangs flush from the physical top,
+        // so its center is behind the camera housing — push the content
+        // below it. A floating card just uses ordinary padding.
+        .padding(EdgeInsets(top: layout.contentTopInset,
+                            leading: 22, bottom: SurfaceLayout.panelBottomPadding, trailing: 22))
+        // The panel's surface follows its content's height on the panel's
+        // spring, whatever changed it: a page, a card or notice arriving, an
+        // answer streaming in, the Brief's columns. The content lays out at
+        // once (measured at its own height) and the surface glides to it,
+        // clipping what is still below its edge, so nothing inside a page
+        // has to animate for the panel to. Width is never animated: the
+        // Brief re-laid out at every width in between took most of a second.
+        .fixedSize(horizontal: false, vertical: true)
+        .background(GeometryReader { geo in
+            Color.clear
+                .onAppear { followHeight(geo.size.height, animated: false) }
+                .onChange(of: geo.size.height) { _, height in followHeight(height, animated: true) }
+        })
+        .frame(height: shownHeight, alignment: .top)
+        // Re-fit the native window whenever the CONTENT height changes. The
+        // window doesn't auto-size to SwiftUI — OverlayPanel sets its height
+        // from host.fittingSize, and its bottom edge hard-CLIPS anything taller
+        // (see the slideView constraints). Some height changes trigger a resize
+        // explicitly (SSE events call model.onResize), but others don't — this
+        // measures the real laid-out height and re-fits on any change, covering
+        // every case (reasoning disclosure, suggestions) without a per-state
+        // onChange for each. resizeToFit no-ops when the height already matches,
+        // so there's no feedback loop.
+        .background(GeometryReader { geo in
+            Color.clear.onChange(of: geo.size.height) { model.onResize() }
+        })
+        // The content fades before the shape retracts and after it has grown;
+        // the surface below stays, so the panel still reads as the notch
+        // drawing back in and out.
+        .opacity(model.contentVeiled ? 0 : 1)
+        // Must match the width OverlayPanel sizes its window to — both widen
+        // SurfaceLayout.expandedWidth from the same state (AppDelegate's layout
+        // provider asks NotchBriefView.showsWide), so they cannot disagree.
+        .frame(width: layout.widened(briefIsWide).expandedWidth)
+        .background(Theme.surface)
+        .clipShape(layout.panelShape)
+        .shadow(color: .black.opacity(0.55), radius: 20, y: 10)
+        // Pointer enter/exit is handled by the panel's AppKit tracking area
+        // (HoverView), not SwiftUI .onHover — see OverlayPanel/AppDelegate.
+        .onExitCommand { model.requestCollapse() }
+        // Two columns on or off: refit the window, which reads the same state,
+        // once SwiftUI has laid the change out.
+        .onChange(of: briefIsWide) { model.onResize() }
+        // Every change of page moves together, on the panel's one spring: the
+        // pages, the panel's height and width, the selected tab's capsule, the
+        // header's buttons. The window grows ahead of it and shrinks after it
+        // (OverlayPanel.resizeToFit). Reduce Motion: an instant swap.
+        .animation(Theme.Motion.panel(reduceMotion: reduceMotion), value: page)
+    }
+
+    /// Moves the panel's surface to the content's measured height: on the
+    /// panel's spring, or at once when the panel has just opened (the open
+    /// has its own motion) or with Reduce Motion. A spring already moving
+    /// is retargeted, so text streaming in grows the panel in one smooth run.
+    private func followHeight(_ height: CGFloat, animated: Bool) {
+        guard abs(height - (shownHeight ?? -1)) > 0.25 else { return }
+        if animated, shownHeight != nil, let spring = Theme.Motion.panel(reduceMotion: reduceMotion) {
+            withAnimation(spring) { shownHeight = height }
+        } else {
+            shownHeight = height
+        }
+    }
+
+    /// What the page shows: the reset card, Getting to know you, a permission
+    /// page, quick settings, or the tab.
+    @ViewBuilder private var pageBody: some View {
+        if model.resetCard != nil {
+            // /resetharbor's confirmation takes the tab's place until Cancel.
+            ResetHarborCard(model: model)
+        } else if let knowYou = model.knowYou {
+            // Getting to know you takes the tab's place until Done or a tab.
+            KnowYouView(model: knowYou)
+        } else if model.showingPermissions {
+            // A permission row's page, like quick settings, in the tab's place.
+            NotchPermissionsView(model: model, cap: layout.pageContentCap(headerHeight: headerHeight))
+                .padding(.top, SurfaceLayout.tabTopPadding)
+        } else if model.showingQuickSettings {
+            QuickSettingsView(model: model, settings: settings,
+                              cap: layout.pageContentCap(headerHeight: headerHeight))
+                .padding(.top, SurfaceLayout.tabTopPadding)
+        } else {
+            tabBody
+        }
+    }
+
+    /// The tab's own content. Any tab added to NotchTab gets the same page
+    /// motion with no case of its own: the page is keyed by the tab.
+    @ViewBuilder private var tabBody: some View {
+        switch model.tab {
+        case .ask:
+            // First run: the open setup card replaces Ask until it is done or
+            // set aside, then shrinks to a line. One view in one place for both.
+            if model.setupCard != .open { chatSwitcherRow.padding(.top, 8) }
+            transientNotice
+            if model.setupCard.showsOnAsk { NotchSetupView(model: model, setup: setup) }
+            if model.setupCard != .open {
+                if model.reportIsUnattached {
+                    ReportDraftCard(draft: model.report,
+                                    title: model.report.snapshot?.key == "chat:none"
+                                        ? "Report a problem" : "Report a problem with the last turn",
+                                    save: { model.saveReport(model.report) })
+                        .padding(.top, 8)
+                }
+                if model.serviceDown { serviceDownCard }
+                MemoryReviewNotice()
+                NudgeStack(model: model)
+                promptArea
+                if model.showingCorpus {
+                    NotchCorpusView(controller: corpus, openWindow: model.openTabInWindow)
+                } else {
+                    content
+                    statusRow.padding(.top, 10)
+                }
+            }
+        case .brief:
+            tabScroll { NotchBriefView(model: model, today: todayModel, wide: briefIsWide) }
+        case .day:
+            tabScroll { NotchDayView(model: model, today: todayModel) }
+        case .meet:
+            tabScroll { NotchMeetingView(model: MeetingModel.shared) }
+        case .study:
+            // Study stops at half the screen and scrolls inside itself, so an
+            // opened material keeps its back row fixed (SurfaceLayout.studyContentCap).
+            NotchStudyView(model: model, study: StudyModel.shared,
+                           cap: layout.studyContentCap(headerHeight: headerHeight))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, SurfaceLayout.tabTopPadding)
+        case .research:
+            if model.showingResearch {
+                ResearchView(model: researchModel, compact: true,
+                             onBack: { model.returnToChat() })
+            } else {
+                transientNotice
+                promptArea
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Harbor drafts an editable plan first, then reads the web and writes a cited report.")
+                        .font(.harbor(.body)).foregroundStyle(Theme.textMuted)
+                    Spacer(minLength: 12)
+                    Button("Research library") { HarborRouter.shared.open(.research) }
+                        .buttonStyle(.plain).font(.harbor(.caption)).foregroundStyle(Theme.textSecondary)
+                        .fixedSize()
+                }
+                statusRow.padding(.top, 10)
+            }
+        }
+    }
+
+    // Collapsed with nothing drawn: a built-in display without a notch, or a notch
+    // behind a full-screen app (the hybrid notch). Its status is on the menu-bar
+    // icon (AppDelegate.updateMenuBarStatus), and the window ignores the mouse.
+    private var hiddenBar: some View {
+        Color.clear.frame(width: layout.barSize.width, height: layout.barSize.height)
+            .accessibilityHidden(true)
+    }
+
+    // Collapsed: a black bar that wraps the notch on a notched MacBook; on a
+    // monitor, a small capsule under the menu bar. Hover to open.
+    private var notchBar: some View {
+        ZStack(alignment: .bottom) {
+            Theme.surface
+            if model.isProcessing || model.phase == .streaming {
+                Circle().fill(.white.opacity(0.9))
+                    .frame(width: 4, height: 4)
+                    .padding(.bottom, 5)
+                    .opacity(!reduceMotion && breathe ? 0.3 : 1)
+                    .animation(reduceMotion ? nil : .easeInOut(duration: 1).repeatForever(autoreverses: true), value: breathe)
+                    .accessibilityHidden(true)
+            } else if model.setupCard.showsReadyDot {
+                // Ready while notifications are off: a still, quiet dot until the
+                // panel is opened (AppDelegate.tellReady, readyLineSeen).
+                HStack(spacing: 6) {
+                    if !isNotch { HarborOrb(resting: true).scaleEffect(0.7) }
+                    Circle().fill(Theme.good.opacity(0.75)).frame(width: 5, height: 5)
+                }
+                .padding(.bottom, isNotch ? 5 : 8)
+                .accessibilityLabel("Harbor is ready")
+            } else if model.setupCard != .later, todayModel.isShowingCurrentDay, todayCount > 0 {
+                // What's due today or overdue, from the day's last load (it loads only
+                // while Brief or Day is open, so the bar never triggers a load).
+                HStack(spacing: 6) {
+                    if !isNotch { HarborOrb(resting: true).scaleEffect(0.7) }
+                    Text("\(todayCount)").font(.harbor(.caption, weight: .bold)).foregroundStyle(.black)
+                        .padding(.horizontal, 5).frame(minWidth: 14, minHeight: 13)
+                        .background(Capsule().fill(.white))
+                }
+                .padding(.bottom, isNotch ? 3 : 8)
+                .accessibilityLabel(todayCount == 1 ? "1 thing is due today" : "\(todayCount) things are due today")
+            } else if model.setupCard == .later {
+                // Setup was set aside and Harbor still can't answer.
+                HStack(spacing: 6) {
+                    if !isNotch { HarborOrb(resting: true).scaleEffect(0.7) }
+                    Text("!").font(.harbor(.caption, weight: .heavy)).foregroundStyle(Theme.warn)
+                }
+                .padding(.bottom, isNotch ? 3 : 8)
+                .accessibilityLabel("Harbor isn't set up yet")
+            } else if !isNotch {
+                HStack(spacing: 8) {
+                    HarborOrb(resting: true).scaleEffect(0.7)
+                    Image(systemName: "chevron.down")
+                        .font(.harbor(size: 10, weight: .bold))
+                        .foregroundStyle(Theme.textMuted)
+                }
+                .padding(.bottom, 8)
+            }
+        }
+        // The visible bar and the window both come from the same layout, so
+        // they cannot drift apart.
+        .frame(width: layout.barSize.width, height: layout.barSize.height)
+        .clipShape(layout.barShape)
+        .contentShape(Rectangle())
+        // Hover-to-expand is driven by the panel's tracking area; tap is a
+        // fallback for click-to-open.
+        .onTapGesture { model.requestExpand() }
+        .help("Harbor — hover to open (⌥Space)")
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Harbor")
+        .accessibilityValue(notchBarStatus)
+        .accessibilityHint("Opens the panel")
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction { model.requestExpand() }
+    }
+
+    /// What the collapsed bar shows, for VoiceOver: the bar is one button, so
+    /// its dot and badge cannot be read as separate elements.
+    private var notchBarStatus: String {
+        if model.isProcessing || model.phase == .streaming { return "Working" }
+        if model.setupCard.showsReadyDot { return "Harbor is ready" }
+        if model.setupCard != .later, todayModel.isShowingCurrentDay, todayCount > 0 {
+            return todayCount == 1 ? "1 thing is due today" : "\(todayCount) things are due today"
+        }
+        if model.setupCard == .later { return "Harbor isn't set up yet" }
+        return ""
+    }
+
+    private var header: some View {
+        HStack(spacing: 10) {
+            HarborOrb(resting: false)
+            Text("Harbor").font(.harbor(.headline, weight: .medium)).foregroundStyle(Theme.textPrimary)
+            tabStrip.padding(.leading, 6)
+            Spacer()
+            windowControls
+        }
+    }
+
+    @ViewBuilder private var transientNotice: some View {
+        if let notice = model.transientNotice {
+            Text(notice)
+                .font(.harbor(.footnote))
+                .foregroundStyle(model.transientNoticeIsInfo ? Theme.textSecondary : Theme.bad)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, 8)
+        }
+    }
+
+    // The Ask field (Research's prompt on that tab), its command list and the rule under it.
+    @ViewBuilder private var promptArea: some View {
+        if let warning = model.lookWarning {
+            lookWarningBox(warning).padding(.top, 10)
+        }
+        if model.attachmentIsScreen, let thumb = model.attachedThumbnail {
+            screenPreview(thumb).padding(.top, 10)
+        }
+        inputRow.padding(.top, 10)
+        VoiceStatusLine(voice: model.voice)
+        if !model.commandSuggestions.isEmpty {
+            commandList.padding(.top, 8)
+        }
+        Divider().overlay(Theme.hairline).padding(.vertical, 10)
+    }
+
+    private var todayCount: Int { todayModel.dueBadgeCount }
+
+    private var tabStrip: some View {
+        HStack(spacing: 2) {
+            ForEach(NotchTab.strip, id: \.self) { tab in tabButton(tab) }
+        }
+        // One white capsule for the whole strip, over the grey labels, with
+        // the same labels in black shown only where the capsule is. The capsule
+        // never leaves the view tree: it takes the selected tab's frame (each
+        // tab is a source), so a switch slides one solid shape, and each label
+        // is dark exactly where white is under it, every frame.
+        // Before: a capsule inside the selected tab behind an `if`, so a switch
+        // removed one capsule and inserted another and SwiftUI faded the pair
+        // while both travelled (two half-white capsules), and each label's
+        // colour faded on its own clock (dark text on the dark strip before
+        // the capsule reached it).
+        .overlay {
+            ZStack {
+                selectionCapsule
+                HStack(spacing: 2) {
+                    ForEach(NotchTab.strip, id: \.self) { tab in tabLabel(tab, onCapsule: true) }
+                }
+                // At its own ideal width, like the buttons under it. Offered the
+                // strip's width instead, which rounds to the pixel grid, it can
+                // come up a fraction short: then "Day" truncates to "…" and the
+                // row re-centres, shifting every dark label off its capsule.
+                .fixedSize()
+                .mask { selectionCapsule }
+            }
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+        }
+        .padding(2)
+        .background(Capsule().fill(Theme.chipFill))
+        .overlay(Capsule().stroke(Theme.chipStroke, lineWidth: 1))
+        .fixedSize()
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Harbor tabs")
+    }
+
+    /// The strip's white capsule, wherever the selected tab is.
+    private var selectionCapsule: some View {
+        Capsule().fill(Color.white)
+            .matchedGeometryEffect(id: model.tab.stripTab, in: tabSelection, isSource: false)
+            .animation(Theme.Motion.panel(reduceMotion: reduceMotion), value: model.tab.stripTab)
+    }
+
+    /// A tab's title and Day's count: grey on the strip, black on the capsule.
+    private func tabLabel(_ tab: NotchTab, onCapsule: Bool) -> some View {
+        let count = tab == .day ? todayCount : 0
+        return HStack(spacing: 5) {
+            Text(tab.title).font(.harbor(.footnote, weight: .medium))
+            if count > 0 { countBadge(count, selected: onCapsule) }
+        }
+        .foregroundStyle(onCapsule ? Color.black : Theme.textSecondary)
+        .padding(.horizontal, 10).padding(.vertical, 4)
+    }
+
+    private func tabButton(_ tab: NotchTab) -> some View {
+        let selected = model.tab.stripTab == tab
+        let count = tab == .day ? todayCount : 0
+        let shortcut = tab.title + (tab.shortcutDigit.map { " (⌘" + String($0) + ")" } ?? "")
+        return Button { model.leaveKnowYou(); model.closePermissionPage(); model.tab = tab } label: {
+            tabLabel(tab, onCapsule: false)
+                // Where the strip's white capsule sits when this tab is chosen.
+                .matchedGeometryEffect(id: tab, in: tabSelection)
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .help(shortcut)
+        .accessibilityLabel(count > 0 ? "Day, \(count) due today" : tab.title)
+        .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
+    }
+
+    private func countBadge(_ count: Int, selected: Bool) -> some View {
+        Text(String(count))
+            .font(.harbor(.caption, weight: .bold).monospacedDigit())
+            .foregroundStyle(selected ? Color.white : Color.black)
+            .padding(.horizontal, 5).padding(.vertical, 1)
+            .background(Capsule().fill(selected ? Color.black : Color.white.opacity(0.85)))
+            // Never recoloured: the strip draws one copy for the dark strip and
+            // one for the capsule, and the capsule's mask decides which shows.
+    }
+
+    private var windowControls: some View {
+        HStack(spacing: 4) {
+            if model.tab == .ask && (!model.turns.isEmpty || model.showingCorpus) {
+                ctrl("square.and.pencil", "New chat (⌘N)", { model.newChat() })
+            }
+            // Brief: one column or two. The icon shows the layout the click switches to.
+            if briefCanWiden {
+                // VoiceOver hears one switch, "Two columns", with its state,
+                // rather than a label that flips with each press.
+                ctrl(briefWide ? "rectangle.split.1x2" : "rectangle.split.2x1",
+                     briefWide ? "Show the Brief in one column" : "Show the Brief in two columns",
+                     toggle: (label: "Two columns", isOn: briefWide),
+                     { setBriefWide(!briefWide) })
+            }
+            // Brief and Day: ask about your day out loud; it opens Ask and listens.
+            if model.tab != .ask && model.tab != .research {
+                ctrl("mic", "Ask about your day by voice (⌥⇧Space)", { model.toggleVoice() })
+            }
+            ctrl("gearshape", model.showingQuickSettings ? "Close quick settings" : "Quick settings",
+                 active: model.showingQuickSettings, { model.showingQuickSettings.toggle() })
+            ctrl(model.pinned ? "pin.fill" : "pin", model.pinned ? "Unpin (⌘P)" : "Keep open (⌘P)",
+                 active: model.pinned, { model.pinned.toggle() })
+            // The window opens on what this tab shows. For Ask it reads the saved
+            // history, which the service writes only at the end of a turn, so
+            // that hand-off waits for the turn to finish.
+            ctrl("macwindow", windowHelp, enabled: model.tab != .ask || model.showingCorpus || model.conversationSettled,
+                 { model.openTabInWindow() })
+            Rectangle().fill(Theme.hairline).frame(width: 1, height: 14).padding(.horizontal, 2)
+                .accessibilityHidden(true)
+            ctrl("chevron.up", "Collapse", { model.requestCollapse() })
+            ctrl("xmark", "Close (stays in menu bar; frees memory)", onDismiss)
+        }
+    }
+
+    private var windowHelp: String {
+        switch model.tab {
+        case .ask: return "Open this chat in the Harbor window (⌘O)"
+        case .brief, .day: return "Open the full planner in the Harbor window (⌘O)"
+        case .research: return "Open the research library (⌘O)"
+        case .meet: return "Open the Harbor window (⌘O)"
+        case .study: return "Open the Harbor window (⌘O)"
+        }
+    }
+
+    /// Panel-wide shortcuts, as invisible buttons so they work wherever focus is.
+    /// ⌘P rather than the ⌘. in the design: ⌘. means Cancel on macOS.
+    private var shortcuts: some View {
+        ZStack {
+            Button("") { model.newChat(); model.tab = .ask }.keyboardShortcut("n", modifiers: .command)
+            Button("") { model.run(.window) }.keyboardShortcut("o", modifiers: .command)
+            Button("") { model.pinned.toggle() }.keyboardShortcut("p", modifiers: .command)
+            ForEach(NotchTab.strip, id: \.self) { tab in
+                if let digit = tab.shortcutDigit {
+                    Button("") { model.tab = tab }.keyboardShortcut(KeyEquivalent(digit), modifiers: .command)
+                }
+            }
+        }
+        .opacity(0)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+
+    /// The Brief's columns, switched so the window and the content change width
+    /// in the same pass: the window is refit now, from the saved choice the
+    /// layout provider reads, instead of a runloop after SwiftUI has redrawn the
+    /// content at the new width (a visible one-frame snap). onChange(briefIsWide)
+    /// still refits once the new height is laid out.
+    private func setBriefWide(_ on: Bool) {
+        briefWide = on
+        model.onResizeNow()
+    }
+
+    /// A header button. `toggle` makes it a switch for VoiceOver: a fixed
+    /// label, an On/Off value and the toggle trait, while `help` stays the tooltip.
+    private func ctrl(_ icon: String, _ help: String, enabled: Bool = true, active: Bool = false,
+                      toggle: (label: String, isOn: Bool)? = nil,
+                      _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.harbor(size: Theme.iconGlyphSize, weight: .semibold))
+                .foregroundStyle(active ? Color.black : Theme.textSecondary)
+                .frame(width: Theme.iconButtonSize, height: Theme.iconButtonSize)
+                .background(Circle().fill(active ? Color.white : Theme.chipFill))
+                .overlay(Circle().stroke(active ? Color.clear : Theme.chipStroke, lineWidth: 1))
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+        .opacity(enabled ? 1 : 0.4)
+        .help(help)
+        .accessibilityLabel(toggle?.label ?? help)
+        .accessibilityValue(toggle.map { $0.isOn ? "On" : "Off" } ?? "")
+        .accessibilityAddTraits(toggle == nil ? [] : .isToggle)
+    }
+
+    // Which conversation is open here, and a way back into recent saved ones
+    // without opening the window.
+    private var chatSwitcherRow: some View {
+        HStack(spacing: 8) {
+            Menu {
+                if model.recentChats.isEmpty {
+                    Text("No other saved chats")
+                } else {
+                    ForEach(model.recentChats) { chat in
+                        Button(chat.title) { model.reopenChat(chat) }
+                    }
+                }
+                Divider()
+                Button("New chat") { model.newChat() }
+                Button("All chats in the Harbor window") { HarborRouter.shared.open(.chatList) }
+            } label: {
+                HStack(spacing: 4) {
+                    Text(model.chatTitle).lineLimit(1).truncationMode(.tail)
+                    Image(systemName: "chevron.down").font(.harbor(size: 8, weight: .bold))
+                }
+                .font(.harbor(.footnote, weight: .medium))
+                .foregroundStyle(Theme.textPrimary)
+                .padding(.horizontal, 10).padding(.vertical, 4)
+                .background(Capsule().fill(Theme.chipFill))
+                .overlay(Capsule().stroke(Theme.chipStroke, lineWidth: 1))
+            }
+            // A plain button style keeps the capsule label; the borderless menu
+            // style redraws its own and drops it.
+            .menuStyle(.button)
+            .buttonStyle(.plain)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .accessibilityLabel("Recent chats")
+            .accessibilityValue(model.chatTitle)
+            .disabled(!model.conversationSettled)
+            .help(model.conversationSettled ? "Switch to a recent chat" : "Available when Harbor finishes answering")
+            Spacer()
+            Text("Type / for commands").font(.harbor(.footnote)).foregroundStyle(Theme.textMuted)
+        }
+    }
+
+    // While the Ask field holds the start of a slash command: what it can become.
+    // Return runs a whole command; clicking runs any of them.
+    private var commandList: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(model.commandSuggestions, id: \.self) { command in
+                Button {
+                    model.input = ""
+                    model.run(command)
+                } label: {
+                    HStack(spacing: 10) {
+                        Text(command.title).font(.harbor(.body, design: .monospaced))
+                            .foregroundStyle(Theme.textPrimary)
+                            .frame(minWidth: 84, alignment: .leading)
+                        Text(command.summary).font(.harbor(.body)).foregroundStyle(Theme.textSecondary)
+                        Spacer()
+                        if NotchCommand.match(model.input) == command {
+                            Text("↩").font(.harbor(.footnote)).foregroundStyle(Theme.textMuted)
+                        }
+                    }
+                    .padding(.horizontal, 10).padding(.vertical, 5)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(4)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Theme.chipFill))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.chipStroke, lineWidth: 1))
+    }
+
+    private var statusColor: Color {
+        switch model.phase {
+        case .error: return Theme.bad
+        case .idle, .done: return Theme.good
+        default: return Theme.textSecondary
+        }
+    }
+
+    private var canSend: Bool {
+        !model.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.hasAttachment
+    }
+
+    /// A `/screen` or Look capture, large enough to read before it is sent: 240 pt
+    /// wide, at most 150 pt tall (aspect-fit), so the notch does not grow past one
+    /// row of it, with a "Harbor saw:" line naming what it shows.
+    private func screenPreview(_ thumb: NSImage) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            screenPreviewImage(thumb)
+            Label(ScreenLook.chipText(label: model.attachedScreenLabel), systemImage: "eye")
+                .font(.harbor(.footnote)).foregroundStyle(Theme.textMuted)
+                .lineLimit(1).truncationMode(.middle)
+                .frame(maxWidth: 240, alignment: .leading)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func screenPreviewImage(_ thumb: NSImage) -> some View {
+        ZStack(alignment: .topTrailing) {
+            Image(nsImage: thumb)
+                .resizable().scaledToFit()
+                .frame(width: 240, height: 150)
+                .background(RoundedRectangle(cornerRadius: 12).fill(Theme.chipFill))
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.chipStroke, lineWidth: 1))
+                .accessibilityLabel("Screen capture, not sent yet")
+            Button(action: model.removeAttachment) {
+                Image(systemName: "xmark.circle.fill").font(.harbor(size: 16))
+                    .foregroundStyle(Theme.textSecondary)
+                    .padding(6)
+            }
+            .buttonStyle(.plain).help("Remove attachment").accessibilityLabel("Remove attachment")
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// The pending image or clip: a small preview, what it is, and a one-tap remove.
+    /// Nothing is sent until the person presses send.
+    private var attachmentChip: some View {
+        HStack(spacing: 6) {
+            if let thumb = model.attachedThumbnail {
+                Image(nsImage: thumb)
+                    .resizable().scaledToFill()
+                    .frame(width: 32, height: 32)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .accessibilityHidden(true)
+            } else {
+                Image(systemName: "paperclip").foregroundStyle(Theme.textMuted)
+            }
+            Text(model.attachedLabel.isEmpty ? (model.attachedImageName ?? "") : model.attachedLabel)
+                .font(.harbor(.footnote)).foregroundStyle(Theme.textMuted)
+                .lineLimit(2).frame(maxWidth: 150, alignment: .leading)
+            Button(action: model.removeAttachment) {
+                Image(systemName: "xmark.circle.fill").foregroundStyle(Theme.textMuted)
+            }
+            .buttonStyle(.plain).help("Remove attachment").accessibilityLabel("Remove attachment")
+        }
+        .accessibilityElement(children: .contain)
+    }
+
+    /// Files and pictures dropped or pasted into Ask become the pending attachment.
+    private func attach(from providers: [NSItemProvider], source: MediaAttachment.Source) -> Bool {
+        for provider in providers {
+            if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                _ = provider.loadObject(ofClass: URL.self) { [model] url, _ in
+                    guard let url, url.isFileURL else { return }
+                    Task { @MainActor in model.loadAttachment(url: url, source: source) }
+                }
+                return true
+            }
+            if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
+                // Ask for the concrete image type on offer (TIFF, PNG, JPEG, HEIC…); the
+                // abstract public.image is not always loadable as data.
+                let concrete = provider.registeredTypeIdentifiers.first {
+                    UTType($0)?.conforms(to: .image) ?? false
+                } ?? UTType.image.identifier
+                provider.loadDataRepresentation(forTypeIdentifier: concrete) { [model] data, _ in
+                    guard let data else { return }
+                    Task { @MainActor in model.attachPasted(imageData: data, source: source) }
+                }
+                return true
+            }
+        }
+        return false
+    }
+
+    /// A browser is in what Look would capture: nothing is captured until Look anyway.
+    private func lookWarningBox(_ warning: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label(warning, systemImage: "eye.trianglebadge.exclamationmark")
+                .font(.harbor(.footnote)).foregroundStyle(Theme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                Button("Cancel", action: model.cancelLookWarning).keyboardShortcut(.cancelAction)
+                Button("Look anyway", action: model.confirmLookWarning)
+            }
+            .font(.harbor(.footnote, weight: .medium))
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 12).fill(Theme.chipFill))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.chipStroke, lineWidth: 1))
+        .accessibilityElement(children: .contain)
+    }
+
+    /// Look: the window in front (also ⌥⇧L), or a part of the screen dragged over.
+    /// Either becomes a preview with a "Harbor saw:" line; nothing is sent until send.
+    private var lookButton: some View {
+        Menu {
+            Button("Look at the front window  ⌥⇧L") { model.lookAtFrontWindow() }
+            Button("Drag over part of the screen…") { model.lookAtRegion() }
+        } label: {
+            Image(systemName: "eye").font(.harbor(size: 16)).foregroundStyle(Theme.textSecondary)
+        }
+        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+        .help("Look at your screen").accessibilityLabel("Look at your screen")
+    }
+
+    private var inputRow: some View {
+        HStack(spacing: 10) {
+            TextField(model.voice.isActive ? model.voice.placeholder
+                      : model.researchMode ? "What would you like to research?" : "Ask anything…",
+                      text: $model.input, axis: .vertical)
+                .textFieldStyle(.plain)
+                .font(.harbor(.input))
+                .foregroundStyle(Theme.textPrimary)
+                .focused($focused)
+                .accessibilityLabel(model.researchMode ? "Research question" : "Ask Harbor")
+                .onSubmit { model.submit() }
+                // Enlarge the click target well beyond the glyph height and make
+                // the whole padded area focus the field, so a click lands in text
+                // mode immediately instead of needing to hit the thin text line.
+                .padding(.vertical, 10)
+                .padding(.horizontal, 12)
+                .background(RoundedRectangle(cornerRadius: 12).fill(Theme.chipFill))
+                .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.chipStroke, lineWidth: 1))
+                .contentShape(RoundedRectangle(cornerRadius: 12))
+                .onTapGesture { focused = true }
+                .onPasteCommand(of: [.fileURL, .image]) { providers in
+                    _ = attach(from: providers, source: .paste)
+                }
+            if !model.attachmentIsScreen, model.attachedImageName != nil || !model.attachedLabel.isEmpty {
+                attachmentChip
+            }
+            if !model.queueLabel.isEmpty {
+                Text(model.queueLabel)
+                    .font(.harbor(.footnote, weight: .medium))
+                    .foregroundStyle(Theme.textMuted)
+            }
+            Button(action: pickImage) {
+                Image(systemName: "paperclip").font(.harbor(size: 16)).foregroundStyle(Theme.textSecondary)
+            }
+            .buttonStyle(.plain).help("Attach a picture, a short clip, a PDF or a document")
+            .accessibilityLabel("Attach a picture, clip or document")
+            if !model.researchMode {
+                lookButton
+            }
+            if !model.researchMode {
+                VoiceMicButton(voice: model.voice, speaker: model.speaker, action: model.toggleVoice)
+            }
+            Button(action: { model.submit() }) {
+                Image(systemName: "arrow.up.circle.fill")
+                    .font(.harbor(size: 22))
+                    .foregroundStyle(canSend ? Theme.accent : Theme.textMuted)
+            }
+            .buttonStyle(.plain).help(model.willQueuePrompt ? "Queue prompt" : "Send")
+            .accessibilityLabel(model.willQueuePrompt ? "Queue prompt" : "Send").disabled(!canSend)
+        }
+        .onDrop(of: [.fileURL, .image], isTargeted: nil) { providers in
+            attach(from: providers, source: .drop)
+        }
+    }
+
+    @ViewBuilder private var content: some View {
+        if model.phase == .idle && model.turns.isEmpty {
+            suggestionsRow
+        } else {
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 12) {
+                        ForEach(model.turns) { turn in turnView(turn) }
+                        liveTurn
+                        if model.offersTryAnother { tryAnotherRow }
+                        Color.clear.frame(height: 1).id("bottom")
+                    }
+                }
+                .frame(maxHeight: 360)
+                // Back from another tab with the conversation unchanged: where it
+                // was left (PanelScrollMemory). Anything new since goes to the end.
+                .modifier(RemembersScroll(key: Self.askScrollKey, version: askScrollVersion))
+                // Reopening the panel recreates this ScrollView; jump straight to
+                // the latest message so an existing conversation isn't scrolled to
+                // the top. Deferred a runloop so it runs after layout.
+                .onAppear {
+                    guard PanelScrollMemory.offset(Self.askScrollKey, version: askScrollVersion) == nil else { return }
+                    DispatchQueue.main.async { proxy.scrollTo("bottom", anchor: .bottom) }
+                }
+                .onChange(of: model.turns.count) {
+                    withAnimation { proxy.scrollTo("bottom", anchor: .bottom) }
+                }
+                .onChange(of: model.answer) { proxy.scrollTo("bottom", anchor: .bottom) }
+                // A report opened from the menu bar or /report unfolds under an
+                // earlier reply; bring it into view.
+                .onChange(of: model.report.snapshot?.key) { _, key in
+                    guard key != nil, !model.reportIsUnattached else { return }
+                    DispatchQueue.main.async { withAnimation { proxy.scrollTo("report", anchor: .bottom) } }
+                }
+            }
+        }
+    }
+
+    private static let askScrollKey = PanelScrollMemory.key(.ask)
+    /// Changes whenever the conversation does, so a kept position is only
+    /// used for the conversation it was kept for.
+    private var askScrollVersion: Int { model.turns.count &* 1_000_003 &+ model.answer.count }
+
+    // A completed exchange: user prompt as a chip, assistant reply as markdown.
+    @ViewBuilder private func turnView(_ turn: OverlayModel.Turn) -> some View {
+        if turn.role == "user" {
+            HStack {
+                Spacer(minLength: 40)
+                Text(turn.text)
+                    .font(.harbor(.reading))
+                    .foregroundStyle(Theme.textPrimary)
+                    .padding(.horizontal, 12).padding(.vertical, 7)
+                    .background(RoundedRectangle(cornerRadius: 12).fill(Theme.chipFill))
+                    .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.chipStroke, lineWidth: 1))
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 6) {
+                // Errors get a visible marker regardless of Debug Mode — this
+                // is a UX fix, not just a debug affordance: errors used to only
+                // flash in the live status color and vanish the moment the next
+                // message was sent, with no trace in the transcript at all.
+                if turn.isError {
+                    HStack(spacing: 5) {
+                        Image(systemName: "exclamationmark.triangle.fill").font(.harbor(size: 11))
+                        Text("Error").font(.harbor(.footnote, weight: .semibold))
+                    }
+                    .foregroundStyle(Theme.bad)
+                }
+                if !turn.activity.isEmpty {
+                    ForEach(turn.activity.indices, id: \.self) { i in
+                        Text(turn.activity[i]).font(.harbor(.body, design: .monospaced))
+                            .foregroundStyle(Theme.textMuted)
+                    }
+                }
+                if turn.nodeResultID != nil {
+                    // Remote titles and bodies are presentation only. Never parse
+                    // links or create ScriptRunner controls from node content.
+                    Text(verbatim: turn.text).textSelection(.enabled)
+                } else {
+                    MarkdownView(text: turn.text)
+                }
+                if !turn.needsAccess.isEmpty { accessFixes(turn.needsAccess) }
+                if model.offersTryAgain(turn) {
+                    // Nothing ran, so sending the same question again is safe.
+                    Button("Try again") { model.tryAgain(turn) }
+                        .buttonStyle(.plain).font(.harbor(.body, weight: .medium)).foregroundStyle(Theme.textPrimary)
+                        .padding(.horizontal, 12).padding(.vertical, 4)
+                        .background(Capsule().fill(Theme.chipFill))
+                        .overlay(Capsule().stroke(Theme.chipStroke, lineWidth: 1))
+                }
+                let hasDetails = !debugHeadline(for: turn).isEmpty || !(turn.routeReason ?? "").isEmpty
+                let showDetails = hasDetails && (model.debugMode != detailsToggled.contains(turn.id))
+                HStack(spacing: 14) {
+                    if hasDetails {
+                        Button {
+                            if detailsToggled.contains(turn.id) { detailsToggled.remove(turn.id) }
+                            else { detailsToggled.insert(turn.id) }
+                        } label: {
+                            Label("Details", systemImage: showDetails ? "chevron.down" : "chevron.right")
+                        }
+                        .help("Model, route, timing and tool calls for this reply")
+                        .accessibilityLabel("Details")
+                        .accessibilityValue(showDetails ? "Expanded" : "Collapsed")
+                    }
+                    Button("Report a problem") { model.reportProblem(for: turn) }
+                }
+                .buttonStyle(.plain).font(.harbor(.caption)).foregroundStyle(Theme.textMuted)
+                if showDetails { debugLine(for: turn) }
+                if model.report.snapshot?.key == OverlayModel.reportKey(for: turn) {
+                    ReportDraftCard(draft: model.report, save: { model.saveReport(model.report) })
+                        .padding(.top, 4)
+                        .id("report")
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    // Compact per-reply debug summary — model, route classification/source,
+    // timing, tok/s, tool-call count. Behind each reply's Details toggle, open
+    // by default in Debug Mode. Full detail
+    // (raw tool args/results, reasoning text) lives in the exported log, not
+    // here — this is a quick-glance strip, not the whole record.
+    @ViewBuilder private func debugLine(for turn: OverlayModel.Turn) -> some View {
+        let headline = debugHeadline(for: turn)
+        VStack(alignment: .leading, spacing: 2) {
+            Text(headline)
+                .font(.harbor(.footnote, design: .monospaced))
+                .foregroundStyle(Theme.textMuted)
+            if let reason = turn.routeReason, !reason.isEmpty {
+                Text(reason)
+                    .font(.harbor(.caption, design: .monospaced))
+                    .foregroundStyle(Theme.textMuted)
+            }
+        }
+        .padding(.horizontal, 8).padding(.vertical, 4)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.04)))
+        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Theme.hairline, lineWidth: 1))
+    }
+
+    private func debugHeadline(for turn: OverlayModel.Turn) -> String {
+        var parts: [String] = []
+        if let m = turn.model { parts.append(m) }
+        if let r = turn.routeRole {
+            parts.append(r + (turn.routeSource.map { " (\($0))" } ?? ""))
+        }
+        if let d = turn.durationSec { parts.append(String(format: "%.1fs", d)) }
+        if let ttft = turn.timeToFirstTokenSec { parts.append(String(format: "%.1fs to first token", ttft)) }
+        if let tps = turn.tokPerSec { parts.append("\(tps) tok/s") }
+        if !turn.toolCalls.isEmpty {
+            parts.append("\(turn.toolCalls.count) tool call\(turn.toolCalls.count == 1 ? "" : "s")")
+        }
+        if turn.heartbeatCount > 0 { parts.append("\(turn.heartbeatCount) heartbeats") }
+        return parts.joined(separator: " · ")
+    }
+
+    // The turn currently in flight: status, tool activity, reasoning, streaming text.
+    @ViewBuilder private var liveTurn: some View {
+        // A brief being composed shows its own progress on Brief.
+        if let progress = model.dailySyncProgress, !model.briefComposing {
+            SourceSyncTip(label: model.dailySyncLabel, progress: progress,
+                          sources: model.sourceSyncStatuses)
+        }
+        if model.isProcessing && (model.dailySyncProgress == nil || model.dailySyncProgress == 1) {
+            ProcessingRow(label: model.processingLabel)
+        }
+        if !model.activity.isEmpty {
+            ForEach(model.activity.indices, id: \.self) { i in
+                Text(model.activity[i]).font(.harbor(.body, design: .monospaced))
+                    .foregroundStyle(Theme.textMuted)
+            }
+        }
+        if let p = model.pending { confirmCard(p) }
+        if let draft = model.messageDraft { messageDraftCard(draft) }
+        if !model.reasoning.isEmpty {
+            DisclosureGroup(isExpanded: $model.showReasoning) {
+                // Long reasoning was previously hard-clipped at 120pt with no way
+                // to see the rest — a ScrollView lets it actually be read in full
+                // within the same bounded height. The backend delivers reasoning
+                // as one complete block (not token-by-token), so this starts at
+                // the top, not auto-scrolled to the end.
+                ScrollView {
+                    Text(model.reasoning).font(.harbor(.body))
+                        .foregroundStyle(Theme.textMuted)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                }
+                .frame(maxHeight: 160)
+            } label: {
+                Text("Show reasoning").font(.harbor(.body)).foregroundStyle(Theme.textSecondary)
+            }
+            .tint(Theme.textSecondary)
+        }
+        if !model.answer.isEmpty {
+            MarkdownView(text: StreamingMarkdown.withoutOpenBold(model.answer))
+                .frame(maxWidth: .infinity, alignment: .leading)
+            // Once real text starts, isProcessing (and the "Thinking…" row) go
+            // away by design — the growing text itself is the signal. But if
+            // generation genuinely PAUSES mid-stream (backend hiccup), that
+            // signal disappears: partial text just sits there with nothing
+            // indicating whether it's still alive. This stays visible for the
+            // whole streaming phase — a subtle pulse normally, and if a
+            // heartbeat arrives after the last of the text (the backend's
+            // stall watchdog, or the model thinking again), it names the
+            // silence explicitly instead of leaving it ambiguous. The count
+            // starts again whenever text arrives, so a flowing answer never
+            // shows it (OverlayModel.stallSeconds).
+            if model.phase == .streaming {
+                HStack(spacing: 6) {
+                    Circle().fill(Theme.textMuted).frame(width: 5, height: 5)
+                        .opacity(reduceMotion ? 0.9 : (breathe ? 0.25 : 0.9))
+                        .animation(reduceMotion ? nil : .easeInOut(duration: 0.9).repeatForever(autoreverses: true), value: breathe)
+                        .accessibilityHidden(true)
+                    if model.heartbeats > 0 {
+                        Text("still generating… (\(model.stallSeconds)s)")
+                            .font(.harbor(.caption)).foregroundStyle(Theme.textMuted)
+                    }
+                }
+            }
+        }
+    }
+
+    /// The fix for each source a tool in this reply wasn't allowed to read: the
+    /// same button the Brief and Day show, so allowing it is one click from Ask.
+    /// Gone once macOS says it's allowed.
+    @ViewBuilder private func accessFixes(_ kinds: [String]) -> some View {
+        let fixes = Permissions.askFixes(kinds)
+        if !fixes.isEmpty {
+            HStack(spacing: 8) {
+                ForEach(fixes, id: \.url) { fix in
+                    if let url = URL(string: fix.url) {
+                        NotchChrome.small(Permissions.fixLabel(fix)) { Permissions.openFix(url) }
+                    }
+                }
+            }
+            .padding(.top, 2)
+        }
+    }
+
+    // Starter questions a fresh install can answer, two to a row so four fit
+    // the panel's width, under a greeting once the person has told Harbor their name.
+    private var suggestionsRow: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if let greeting = AskStarters.greeting(name: model.starterName) {
+                Text(greeting).font(.harbor(.footnote)).foregroundStyle(Theme.textMuted)
+            }
+            LazyVGrid(columns: [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)],
+                      alignment: .leading, spacing: 8) {
+                ForEach(model.suggestions, id: \.self) { s in
+                    Button { model.pick(s) } label: {
+                        Text(s).lineLimit(1).truncationMode(.tail)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 12).padding(.vertical, 6)
+                            .background(Capsule().fill(Theme.chipFill))
+                            .overlay(Capsule().stroke(Theme.chipStroke, lineWidth: 1))
+                            .contentShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .font(.harbor(.body)).foregroundStyle(Theme.textSecondary)
+                    .help("Ask \u{201C}\(s)\u{201D}")
+                }
+            }
+        }
+    }
+
+    // A light row of the starters not yet asked in this chat, under the last reply.
+    // Buttons here are not focusable, so Return and the Ask field keep the keyboard.
+    private var tryAnotherRow: some View {
+        HStack(spacing: 8) {
+            Text("Try another").font(.harbor(.footnote)).foregroundStyle(Theme.textMuted)
+                .fixedSize()
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(model.remainingSuggestions, id: \.self) { s in
+                        Button { model.pick(s) } label: {
+                            Text(s).lineLimit(1).fixedSize()
+                                .padding(.horizontal, 10).padding(.vertical, 4)
+                                .background(Capsule().fill(Theme.chipFill))
+                                .overlay(Capsule().stroke(Theme.chipStroke, lineWidth: 1))
+                                .contentShape(Capsule())
+                        }
+                        .buttonStyle(.plain).focusable(false)
+                        .font(.harbor(.footnote)).foregroundStyle(Theme.textSecondary)
+                        .help("Ask \u{201C}\(s)\u{201D}")
+                    }
+                }
+            }
+        }
+    }
+
+    private func confirmCard(_ p: OverlayModel.Pending) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "exclamationmark.shield").foregroundStyle(Theme.textPrimary)
+                Text(p.reason).font(.harbor(.callout, weight: .medium)).foregroundStyle(Theme.textPrimary)
+            }
+            // The actual code being installed, when this is a create_tool
+            // confirm. Scrollable and height-capped so a long script can be
+            // read without the card swallowing the whole panel.
+            if !p.preview.isEmpty {
+                ScrollView {
+                    Text(p.preview)
+                        .font(.harbor(.footnote, design: .monospaced))
+                        .foregroundStyle(Theme.textPrimary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(8)
+                }
+                .frame(maxHeight: 220)
+                .background(RoundedRectangle(cornerRadius: 8).fill(Theme.chipFill))
+                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.chipStroke, lineWidth: 1))
+            }
+            // What an "Always allow" would actually cover, shown whenever the
+            // button is: a directory, a hostname or a command where the grant
+            // is that narrow, otherwise every action of the tool. A permission
+            // you can't see the boundaries of isn't one you can meaningfully
+            // consent to.
+            if p.grantable {
+                Text(OverlayModel.alwaysAllowLine(tool: p.tool, scopeHint: p.scopeHint))
+                    .font(.harbor(.footnote)).foregroundStyle(Theme.textSecondary)
+            }
+            HStack(spacing: 8) {
+                Spacer()
+                Button("Deny") { model.resolve(false) }.buttonStyle(.plain)
+                    .font(.harbor(.body)).foregroundStyle(Theme.textSecondary)
+                    .padding(.horizontal, 14).padding(.vertical, 6)
+                    .background(Capsule().fill(Theme.chipFill))
+                if p.grantable {
+                    Button("Always allow") { model.resolve(true, scope: "always") }
+                        .buttonStyle(.plain)
+                        .font(.harbor(.body)).foregroundStyle(Theme.textSecondary)
+                        .padding(.horizontal, 14).padding(.vertical, 6)
+                        .background(Capsule().fill(Theme.chipFill))
+                        .overlay(Capsule().stroke(Theme.chipStroke, lineWidth: 1))
+                }
+                Button("Allow once") { model.resolve(true) }.buttonStyle(.plain)
+                    .font(.harbor(.body, weight: .medium)).foregroundStyle(.black)
+                    .padding(.horizontal, 14).padding(.vertical, 6)
+                    .background(Capsule().fill(.white))
+            }
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 12).fill(Theme.chipFill))
+    }
+
+    private func messageDraftCard(_ draft: OverlayModel.MessageDraft) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: draft.sent ? "checkmark.circle.fill" : "bubble.left")
+                    .foregroundStyle(Theme.textPrimary)
+                Text(draft.sent ? "Message sent" : "Message draft")
+                    .font(.harbor(.callout, weight: .medium))
+                    .foregroundStyle(Theme.textPrimary)
+                Spacer()
+                Text("To: \(draft.to)")
+                    .font(.harbor(.footnote, design: .monospaced))
+                    .foregroundStyle(Theme.textSecondary)
+            }
+
+            Group {
+                if draft.isEditing {
+                    TextEditor(text: Binding(
+                        get: { model.messageDraft?.text ?? "" },
+                        set: { model.setDraftText($0) }))
+                        .font(.harbor(.body, design: .monospaced))
+                        .foregroundStyle(Theme.textPrimary)
+                        .scrollContentBackground(.hidden)
+                        .frame(minHeight: 90, maxHeight: 220)
+                        .padding(4)
+                } else {
+                    ScrollView {
+                        Text(draft.text)
+                            .font(.harbor(.body, design: .monospaced))
+                            .foregroundStyle(Theme.textPrimary)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(8)
+                    }
+                    .frame(maxHeight: 220)
+                }
+            }
+            .background(RoundedRectangle(cornerRadius: 8).fill(Theme.chipFill))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.chipStroke, lineWidth: 1))
+
+            if !draft.status.isEmpty {
+                Text(draft.status)
+                    .font(.harbor(.footnote))
+                    .foregroundStyle((draft.sent || draft.isSending)
+                                     ? Theme.textSecondary : Theme.bad)
+            }
+            if !draft.sent {
+                HStack(spacing: 8) {
+                    Spacer()
+                    Button("Discard") { model.discardMessageDraft() }
+                        .buttonStyle(.plain)
+                        .font(.harbor(.body)).foregroundStyle(Theme.textSecondary)
+                        .padding(.horizontal, 14).padding(.vertical, 6)
+                        .background(Capsule().fill(Theme.chipFill))
+                        .disabled(draft.isSending)
+                    Button(draft.isEditing ? "Done" : "Edit") { model.toggleDraftEditing() }
+                        .buttonStyle(.plain)
+                        .font(.harbor(.body)).foregroundStyle(Theme.textSecondary)
+                        .padding(.horizontal, 14).padding(.vertical, 6)
+                        .background(Capsule().fill(Theme.chipFill))
+                        .overlay(Capsule().stroke(Theme.chipStroke, lineWidth: 1))
+                        .disabled(draft.isSending)
+                    Button(draft.isSending ? "Sending…" : "Send") { model.sendMessageDraft() }
+                        .buttonStyle(.plain)
+                        .font(.harbor(.body, weight: .medium)).foregroundStyle(.black)
+                        .padding(.horizontal, 14).padding(.vertical, 6)
+                        .background(Capsule().fill(.white))
+                        .disabled(draft.isSending || draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 12).fill(Theme.chipFill))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.chipStroke, lineWidth: 1))
+    }
+
+    // Model/routing detail lives here, folded into the one status line at the
+    // bottom of Ask.
+    private var statusRow: some View {
+        HStack(spacing: 6) {
+            Circle().fill(model.serviceDown ? Theme.bad : statusColor).frame(width: 5, height: 5)
+            if model.serviceDown {
+                Text("Harbor's service isn't running").font(.harbor(.footnote)).foregroundStyle(Theme.textSecondary)
+                Button("Retry") { model.retryService() }
+                    .buttonStyle(.plain).font(.harbor(.footnote, weight: .medium)).foregroundStyle(Theme.textPrimary)
+                    .padding(.horizontal, 8).padding(.vertical, 2)
+                    .background(Capsule().fill(Theme.chipFill))
+                    .overlay(Capsule().stroke(Theme.chipStroke, lineWidth: 1))
+                    .accessibilityLabel("Retry starting the Harbor service")
+            } else if model.serviceStarting {
+                Text("Starting Harbor…").font(.harbor(.footnote)).foregroundStyle(Theme.textSecondary)
+            } else if model.setupCard == .later {
+                // Set aside, and Harbor still can't answer: one tap back to it.
+                Button("Finish setup") { model.setupCard = .open }
+                    .buttonStyle(.plain).font(.harbor(.footnote, weight: .medium)).foregroundStyle(Theme.textPrimary)
+                    .help("Harbor needs its AI model before it can answer")
+            } else if model.debugMode && !model.modelAbbrev.isEmpty {
+                // Model and route are details for Debug Mode, not a first-time user.
+                if !model.routeLabel.isEmpty {
+                    Text(model.routeLabel).font(.harbor(.footnote)).foregroundStyle(Theme.textSecondary)
+                    Image(systemName: "arrow.right").font(.harbor(size: 8, weight: .bold))
+                        .foregroundStyle(Theme.textMuted)
+                }
+                Text(model.modelAbbrev).font(.harbor(.footnote)).foregroundStyle(Theme.textSecondary)
+                if model.tokPerSec > 0 {
+                    Text("· \(model.tokPerSec) tok/s").font(.harbor(.footnote)).foregroundStyle(Theme.textMuted)
+                }
+            } else {
+                Text("Ready").font(.harbor(.footnote)).foregroundStyle(Theme.textSecondary)
+            }
+            Spacer()
+            Text("⌥ Space").font(.harbor(.footnote)).foregroundStyle(Theme.textMuted)
+                .padding(.horizontal, 8).padding(.vertical, 3)
+                .background(Capsule().fill(Theme.chipFill))
+        }
+        .lineLimit(1)
+    }
+
+    /// Shown at the top of Ask when Harbor's own service doesn't answer, instead of
+    /// a blank panel that silently fails.
+    private var serviceDownCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Harbor's service isn't running").font(.harbor(.callout, weight: .semibold))
+                .foregroundStyle(Theme.textPrimary)
+            Text("Harbor can't answer until it starts. Press Retry. If it keeps happening, send a report.")
+                .font(.harbor(.body)).foregroundStyle(Theme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let failure = model.serviceStartFailure {
+                Text(failure).font(.harbor(.footnote)).foregroundStyle(Theme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
+            HStack(spacing: 8) {
+                Button("Retry") { model.retryService() }
+                    .buttonStyle(.plain).font(.harbor(.body, weight: .semibold)).foregroundStyle(.black)
+                    .padding(.horizontal, 14).padding(.vertical, 5)
+                    .background(Capsule().fill(.white))
+                Button("Report") { model.reportCurrentProblem() }
+                    .buttonStyle(.plain).font(.harbor(.body, weight: .medium)).foregroundStyle(Theme.textSecondary)
+                    .padding(.horizontal, 12).padding(.vertical, 5)
+                    .background(Capsule().fill(Theme.chipFill))
+                    .overlay(Capsule().stroke(Theme.chipStroke, lineWidth: 1))
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 12).fill(Theme.chipFill))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.chipStroke, lineWidth: 1))
+        .padding(.top, 8)
+    }
+
+    /// The dialog runs beside the notch rather than app-modal: runModal blocked
+    /// every Harbor window until it closed, and, since the notch never activates
+    /// Harbor, macOS bounced the Dock icon for it and could open it behind other
+    /// apps. Harbor is brought forward first, and the dialog sits above the notch.
+    private func pickImage() {
+        if let open = model.filePicker {
+            NSApp.activate(ignoringOtherApps: true)
+            open.makeKeyAndOrderFront(nil)
+            return
+        }
+        model.cancelAttachmentRead()
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = MediaAttachment.acceptedTypes + DocumentAttachment.acceptedTypes
+        panel.allowsMultipleSelection = false
+        panel.level = NSWindow.Level(DisplayGeometry.shared.layout.windowLevel.rawValue + 1)
+        model.filePicker = panel
+        model.pickingFile = true
+        NSApp.activate(ignoringOtherApps: true)
+        panel.begin { [model] response in
+            MainActor.assumeIsolated {
+                model.filePicker = nil
+                model.pickingFile = false
+                guard response == .OK, let url = panel.url else { return }
+                model.loadAttachment(url: url)
+            }
+        }
+    }
+}
+
+/// Whether the orb breathes. It holds still on Reduce Motion, in Low Power Mode,
+/// while the displays sleep, and on the collapsed bar (`resting`), where nothing
+/// is going on and a repeating animation would run for as long as Harbor does.
+enum OrbMotion {
+    static func breathes(reduceMotion: Bool, lowPower: Bool, screensAsleep: Bool, resting: Bool) -> Bool {
+        !(reduceMotion || lowPower || screensAsleep || resting)
+    }
+}
+
+/// The breathing orb. Holding still takes the animated child out of the tree,
+/// because a nil animation on a live repeatForever does not reliably stop it
+/// (see ChatOrbBreathing); the still orb is the Reduce Motion look.
+private struct HarborOrb: View {
+    var resting: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
+    @State private var screensAsleep = false
+
+    var body: some View {
+        Group {
+            if OrbMotion.breathes(reduceMotion: reduceMotion, lowPower: lowPower,
+                                  screensAsleep: screensAsleep, resting: resting) {
+                BreathingOrb()
+            } else {
+                OrbDisc(scale: 1, opacity: 1)
+            }
+        }
+        .accessibilityHidden(true)
+        // Posted on whichever thread changed the setting.
+        .onReceive(NotificationCenter.default.publisher(for: .NSProcessInfoPowerStateDidChange)
+            .receive(on: DispatchQueue.main)) { _ in
+            lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
+        }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.screensDidSleepNotification)) { _ in
+            screensAsleep = true
+        }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.screensDidWakeNotification)) { _ in
+            screensAsleep = false
+        }
+    }
+}
+
+private struct OrbDisc: View {
+    var scale: CGFloat
+    var opacity: Double
+
+    var body: some View {
+        Circle()
+            .fill(Theme.orb)
+            .frame(width: 26, height: 26)
+            .scaleEffect(scale)
+            .opacity(opacity)
+            .shadow(color: .white.opacity(0.12), radius: 5)
+    }
+}
+
+private struct BreathingOrb: View {
+    @State private var breathe = false
+
+    var body: some View {
+        OrbDisc(scale: breathe ? 1.1 : 0.94, opacity: breathe ? 1.0 : 0.85)
+            .animation(.easeInOut(duration: 4).repeatForever(autoreverses: true), value: breathe)
+            .onAppear { breathe = true }
+    }
+}
+
+// Animated "working" indicator shown between submit and first output.
+struct ProcessingRow: View {
+    let label: String
+    @State private var animate = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        HStack(spacing: 8) {
+            HStack(spacing: 4) {
+                ForEach(0..<3) { i in
+                    Circle()
+                        .fill(Theme.textSecondary)
+                        .frame(width: 6, height: 6)
+                        .opacity(!reduceMotion && animate ? 0.25 : 1.0)
+                        .animation(reduceMotion ? nil : .easeInOut(duration: 0.6).repeatForever().delay(Double(i) * 0.18), value: animate)
+                }
+            }
+            .accessibilityHidden(true)
+            Text(label).font(.harbor(.body)).foregroundStyle(Theme.textSecondary)
+        }
+        .accessibilityElement(children: .combine)
+        .onAppear { animate = true }
+    }
+}
+
+// Keep sync peripheral to the conversation: one line, with per-source
+// percentages and freshness caveats available on hover and to VoiceOver.
+struct SourceSyncTip: View {
+    let label: String
+    let progress: Double
+    let sources: [HarborClient.SourceSyncStatus]
+
+    private var details: String {
+        sources.map { source in
+            "\(source.label): \(source.percentageLabel). "
+                + (source.warning.isEmpty ? source.detail : source.warning)
+        }.joined(separator: "\n")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 5) {
+                Image(systemName: progress < 1 ? "arrow.triangle.2.circlepath" : "info.circle")
+                    .accessibilityHidden(true)
+                Text(label).monospacedDigit()
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .help(details.isEmpty ? label : details)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(label)
+            .accessibilityValue(details)
+            // A source blocked on Full Disk Access says so and opens the setting,
+            // instead of a bare "Unavailable" the user can't act on.
+            ForEach(sources.filter(\.needsFullDiskAccess)) { source in
+                Button {
+                    if let url = URL(string: BriefDetail.fullDiskAccess.url) { Permissions.openFix(url) }
+                } label: {
+                    Text("\(source.label) needs Full Disk Access. \(Permissions.fixLabel(BriefDetail.fullDiskAccess))")
+                        .lineLimit(2)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Theme.accent)
+                .help(source.detail)
+            }
+        }
+        .font(.harbor(.footnote))
+        .foregroundStyle(Theme.textMuted)
+    }
+}
+
+extension TodayModel {
+    /// Due today or overdue, once the day has loaded. Undated items wait in the
+    /// Brief. Shown on the collapsed bar, or on the menu-bar icon when no bar is
+    /// drawn.
+    var dueBadgeCount: Int {
+        guard isShowingCurrentDay, let plan = currentPlan else { return 0 }
+        return DayTimeline.badgeCount(plan.dayNeeds, endOfDay: dayInterval.end.timeIntervalSince1970)
+    }
+}
+
+/// The slide of the page change in flight. A transition reads it when a page
+/// arrives or leaves, not when the page was last drawn: the leaving page was
+/// drawn before anyone knew where the panel was going, so a plain
+/// `.offset(x:)` transition would slide it the way the previous change went.
+@MainActor
+final class NotchPageSlide {
+    private(set) var shown: NotchPage?
+    private(set) var motion = NotchPageMotion.none
+
+    /// Called with the page about to be drawn; a new page sets the slide.
+    func follow(_ page: NotchPage) {
+        guard page != shown else { return }
+        motion = shown.map { NotchPage.motion(from: $0, to: page) } ?? .none
+        shown = page
+    }
+
+    func forget() {
+        shown = nil
+        motion = .none
+    }
+}
+
+/// A page part of the way in or out: shifted by its slide steps and faded.
+private struct NotchPageShift: ViewModifier {
+    let slide: NotchPageSlide
+    let arriving: Bool
+    let away: Bool
+
+    func body(content: Content) -> some View {
+        let steps = away ? (arriving ? slide.motion.insertion : slide.motion.removal) : 0
+        content
+            .offset(x: CGFloat(steps) * Theme.Motion.slideStep)
+            .opacity(away ? 0 : 1)
+    }
+}
+
+extension AnyTransition {
+    /// The notch page's arrival and departure (NotchPage.motion).
+    @MainActor static func notchPage(_ slide: NotchPageSlide) -> AnyTransition {
+        .asymmetric(
+            insertion: .modifier(active: NotchPageShift(slide: slide, arriving: true, away: true),
+                                 identity: NotchPageShift(slide: slide, arriving: true, away: false)),
+            removal: .modifier(active: NotchPageShift(slide: slide, arriving: false, away: true),
+                               identity: NotchPageShift(slide: slide, arriving: false, away: false)))
+    }
+}
