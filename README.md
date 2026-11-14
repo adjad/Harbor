@@ -45,7 +45,8 @@ where you connect it.
 - **Gemini for everything.** On Apple silicon, a switch in Settings > Advanced lets the Gemini API
   handle every role. While it is on, pictures and voice recordings also go to Gemini.
 - **Study.** Study has its own connector: OpenRouter or the Gemini API, with a key used for Study and
-  nothing else. Requests ask for JSON output and Harbor validates the result strictly before it
+  nothing else. On the Gemini API each kind of material, and page extraction, has its own response
+  schema; other providers fall back to JSON mode. Harbor validates the result strictly before it
   shows a quiz, flash cards, a lesson or a guide.
 - **Long context.** When the Study model is a Gemini model, Harbor reads more pages per import in
   parallel and sends much larger blocks of source text, so a guide can be written from a whole
@@ -59,10 +60,8 @@ where you connect it.
 
 ### Coming in the next update
 
-These two changes are written but are not in this source tree yet. They will land as later commits.
+This change is written but is not in this source tree yet. It will land as a later commit.
 
-- **Structured output for Study.** Quizzes, flash cards, lessons and guides will use Gemini response
-  schemas instead of free-form JSON.
 - **Slides and PDFs from Drive, page by page.** Gemini reads Drive slides and PDFs one page at a
   time, and the result is tied into the rest of the app. Brief shows "Ready for tomorrow" with a
   prepared quiz. Day shows matching slides, a "Review (15 min)" item, and offers a study block in a
