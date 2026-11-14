@@ -72,7 +72,7 @@ These three changes are written but are not in this source tree yet. They will l
 
 What stays on the Mac by default:
 
-- Mail, messages, calendar, reminders and notes are read on the Mac and stored in `~/.moe`.
+- Mail, messages, calendar, reminders, notes, and contacts are read on the Mac and stored in `~/.moe`.
 - The chat model, indexes and caches run and live on the Mac. Harbor's own engine is built in.
 - Every action Harbor takes is appended to `~/.moe/audit.jsonl`.
 - "Report a Problem" builds a file you save yourself. Nothing is uploaded.
