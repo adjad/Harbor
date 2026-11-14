@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleDevelopmentRegion</key><string>en</string>
+<key>CFBundleDisplayName</key><string>Harbor</string>
+<key>CFBundleExecutable</key><string>$(EXECUTABLE_NAME)</string>
+<key>CFBundleIdentifier</key><string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+<key>CFBundleName</key><string>Harbor</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleShortVersionString</key><string>$(MARKETING_VERSION)</string>
+<key>CFBundleVersion</key><string>$(CURRENT_PROJECT_VERSION)</string>
+<key>CFBundleURLTypes</key><array><dict>
+  <key>CFBundleURLName</key><string>app.harbor.iphone.pairing</string>
+  <key>CFBundleURLSchemes</key><array><string>harbor-pair</string></array>
+</dict></array>
+<key>LSRequiresIPhoneOS</key><true/>
+<key>UILaunchScreen</key><dict/>
+<key>UIUserInterfaceStyle</key><string>Dark</string>
+<key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string></array>
+<key>UIApplicationSceneManifest</key><dict><key>UIApplicationSupportsMultipleScenes</key><false/></dict>
+<key>NSAppTransportSecurity</key><dict>
+  <key>NSAllowsLocalNetworking</key><true/>
+  <!-- The Mac gateway speaks plain HTTP inside Tailscale's WireGuard tunnel, reached by its MagicDNS name. -->
+  <key>NSExceptionDomains</key><dict>
+    <key>ts.net</key><dict>
+      <key>NSIncludesSubdomains</key><true/>
+      <key>NSExceptionAllowsInsecureHTTPLoads</key><true/>
+    </dict>
+  </dict>
+</dict>
+<key>NSCameraUsageDescription</key><string>Harbor uses the camera only to scan the pairing code shown on your Mac.</string>
+<key>NSCalendarsFullAccessUsageDescription</key><string>Harbor needs access to read calendar events you explicitly choose to include in a briefing.</string>
+<key>NSRemindersFullAccessUsageDescription</key><string>Harbor needs access to read reminders you explicitly choose to include in a briefing.</string>
+<key>NSContactsUsageDescription</key><string>Harbor uses contacts you choose to help identify people in your requests.</string>
+</dict></plist>

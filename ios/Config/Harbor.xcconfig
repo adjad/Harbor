@@ -1,0 +1,5 @@
+// Shared app settings. Personal signing goes in Local.xcconfig (git-ignored), e.g.
+//   DEVELOPMENT_TEAM = ABCDE12345
+//   HARBOR_BUNDLE_ID = com.yourname.harbor
+HARBOR_BUNDLE_ID = app.harbor.iphone
+#include? "Local.xcconfig"

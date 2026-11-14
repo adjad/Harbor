@@ -1,0 +1,77 @@
+{
+  "tagOwners": {
+    "tag:harbor-inference": [
+      "operator@example.com"
+    ]
+  },
+  "grants": [
+    {
+      "src": [
+        "100.64.0.115"
+      ],
+      "dst": [
+        "tag:harbor-inference"
+      ],
+      "ip": [
+        "tcp:22",
+        "tcp:443",
+        "tcp:8443"
+      ]
+    }
+  ],
+  "ssh": [
+    {
+      "action": "check",
+      "src": [
+        "operator@example.com"
+      ],
+      "dst": [
+        "tag:harbor-inference"
+      ],
+      "users": [
+        "harbor"
+      ],
+      "checkPeriod": "always"
+    }
+  ],
+  "tests": [
+    {
+      "src": "100.64.0.115",
+      "proto": "tcp",
+      "accept": [
+        "tag:harbor-inference:22",
+        "tag:harbor-inference:443",
+        "tag:harbor-inference:8443"
+      ],
+      "deny": [
+        "tag:harbor-inference:80",
+        "tag:harbor-inference:8000",
+        "tag:harbor-inference:8765",
+        "tag:harbor-inference:8766"
+      ]
+    },
+    {
+      "src": "100.64.0.115",
+      "proto": "udp",
+      "deny": [
+        "tag:harbor-inference:22",
+        "tag:harbor-inference:443",
+        "tag:harbor-inference:8443"
+      ]
+    }
+  ],
+  "sshTests": [
+    {
+      "src": "operator@example.com",
+      "dst": [
+        "tag:harbor-inference"
+      ],
+      "check": [
+        "harbor"
+      ],
+      "deny": [
+        "root"
+      ]
+    }
+  ]
+}

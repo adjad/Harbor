@@ -1,0 +1,74 @@
+{
+  "tailscale": {
+    "BackendState": "Running",
+    "Self": {
+      "TailscaleIPs": [
+        "100.64.0.115"
+      ]
+    },
+    "Peer": {
+      "fixture-key": {
+        "DNSName": "harbor-mini.example-tailnet.ts.net.",
+        "ID": "nEXAMPLEONLY",
+        "TailscaleIPs": [
+          "100.64.0.10"
+        ],
+        "Tags": [
+          "tag:harbor-inference"
+        ],
+        "Online": true,
+        "sshHostKeys": [
+          "synthetic-host-key"
+        ]
+      }
+    }
+  },
+  "firewall_enabled": true,
+  "omlx_loopback_only": true,
+  "credentials": "ready",
+  "config": {
+    "omlx": {
+      "base_url": "http://127.0.0.1:8000"
+    },
+    "inference": {
+      "bindings": {}
+    },
+    "proactive_node": {
+      "enabled": false
+    }
+  },
+  "remote": {
+    "firewall_enabled": true,
+    "omlx_loopback_only": true,
+    "ssh_cli_variant": true,
+    "funnel_disabled": true,
+    "jobs_disabled": true,
+    "serve_restricted": true,
+    "backend_ports_silent": true,
+    "schema_version": 2,
+    "firewall_inventory": {
+      "schema_version": 1,
+      "complete": true,
+      "exceptions_absent": true
+    },
+    "account": {
+      "schema_version": 1,
+      "name": "harbor",
+      "uid": 501,
+      "administrator": true
+    }
+  },
+  "firewall_inventory": {
+    "schema_version": 1,
+    "complete": true,
+    "exceptions_absent": true
+  },
+  "policy_backups": {
+    "schema_version": 1,
+    "before": "{}",
+    "after": "{\"tagOwners\": {\"tag:harbor-inference\": [\"operator@example.com\"]}, \"grants\": [{\"src\": [\"100.64.0.115\"], \"dst\": [\"tag:harbor-inference\"], \"ip\": [\"tcp:22\", \"tcp:443\", \"tcp:8443\"]}], \"ssh\": [{\"action\": \"check\", \"src\": [\"operator@example.com\"], \"dst\": [\"tag:harbor-inference\"], \"users\": [\"harbor\"], \"checkPeriod\": \"always\"}], \"tests\": [{\"src\": \"100.64.0.115\", \"proto\": \"tcp\", \"accept\": [\"tag:harbor-inference:22\", \"tag:harbor-inference:443\", \"tag:harbor-inference:8443\"], \"deny\": [\"tag:harbor-inference:80\", \"tag:harbor-inference:8000\", \"tag:harbor-inference:8765\", \"tag:harbor-inference:8766\"]}, {\"src\": \"100.64.0.115\", \"proto\": \"udp\", \"deny\": [\"tag:harbor-inference:22\", \"tag:harbor-inference:443\", \"tag:harbor-inference:8443\"]}], \"sshTests\": [{\"src\": \"operator@example.com\", \"dst\": [\"tag:harbor-inference\"], \"check\": [\"harbor\"], \"deny\": [\"root\"]}]}",
+    "before_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "after_sha256": "3a69ff56c7ccbe23d283148259f7f1ef0240bd195bfa8a0079654c839546e547",
+    "plan_sha256": "4a366ec734d226f75af6dee62416031991434d7180463eb815e6d8bb716bf9b2"
+  }
+}
