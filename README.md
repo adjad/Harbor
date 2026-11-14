@@ -42,6 +42,8 @@ where you connect it.
   thought signature and sends it back unchanged on the next request of the same turn, as Google
   requires, then drops it when the turn ends. Signatures are never logged, shown or stored in
   history. Only the exact Gemini origin is accepted for a Gemini key.
+- **Gemini for everything.** On Apple silicon, a switch in Settings > Advanced lets the Gemini API
+  handle every role. While it is on, pictures and voice recordings also go to Gemini.
 - **Study.** Study has its own connector: OpenRouter or the Gemini API, with a key used for Study and
   nothing else. Requests ask for JSON output and Harbor validates the result strictly before it
   shows a quiz, flash cards, a lesson or a guide.
@@ -57,10 +59,8 @@ where you connect it.
 
 ### Coming in the next update
 
-These three changes are written but are not in this source tree yet. They will land as later commits.
+These two changes are written but are not in this source tree yet. They will land as later commits.
 
-- **Gemini for everything.** A switch in Settings > Advanced lets Gemini handle every role. While it
-  is on, pictures and voice also go to Gemini.
 - **Structured output for Study.** Quizzes, flash cards, lessons and guides will use Gemini response
   schemas instead of free-form JSON.
 - **Slides and PDFs from Drive, page by page.** Gemini reads Drive slides and PDFs one page at a
