@@ -21,7 +21,8 @@ Harbor is a Swift app plus a bundled Python (FastAPI) service. It is Apache-2.0 
   (with a draft ready), deadlines and bills found in mail, and today's to-dos from every source.
   Each item is a card you can act on or dismiss.
 - **Day.** A time-ordered agenda of meetings, reminders and open time, plus school deadlines and
-  suggested study blocks. Study blocks live in Harbor only; they are not written to your calendar.
+  suggested study blocks. A study block stays in Harbor until you tap "Add to calendar" on it; that
+  tap books exactly that block in your calendar, and Undo removes it again.
 - **Study.** Reads coursework from Canvas pages you have open in your browser (through the
   Accessibility API; Harbor never clicks, submits or types on a school site) and from Google Docs
   and Slides you pick in Google Drive. It makes study guides, practice quizzes, short lessons and
