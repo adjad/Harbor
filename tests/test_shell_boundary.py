@@ -21,7 +21,9 @@ from service.tools import builtin  # noqa: E402
 
 class ShellBoundary(unittest.TestCase):
     def setUp(self):
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory(dir=_scratch.name)))
+        # Outside HARBOR_HOME (_scratch): run_shell's sandbox denies writes under it, so a
+        # marker written there would be refused wherever sandbox-exec can be applied.
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="harbor-shell-fixture-")))
         self.enterContext(patch.object(Path, "home", return_value=self.root))
         self.enterContext(patch.object(policy, "_READ_ONLY", True))
         self.enterContext(patch.object(policy, "_FULL_ACCESS", False))
