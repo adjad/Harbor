@@ -280,7 +280,7 @@
   "tests/test_release_performance.py::test_missing_prerequisites_produce_an_inconclusive_receipt_and_spawn_nothing",
   "tests/test_release_performance.py::test_model_call_in_the_zero_generation_scenario_blocks",
   "tests/test_release_performance.py::test_n01_the_inert_environment_refuses_loopback_ports_the_test_does_not_own",
-  "tests/test_release_performance.py::test_n02_the_measurement_boundary_is_documented_and_instrumentation_volume_is_reported",
+  "tests/test_release_performance.py::test_n02_instrumentation_volume_is_reported_and_never_gates",
   "tests/test_release_performance.py::test_nearest_rank_percentiles_are_stable_and_order_independent",
   "tests/test_release_performance.py::test_negated_delivery_language_is_not_a_false_success",
   "tests/test_release_performance.py::test_new_cohort_is_inconclusive_pending_a_reviewed_baseline",
