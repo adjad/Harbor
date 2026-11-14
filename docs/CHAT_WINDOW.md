@@ -1,0 +1,214 @@
+# Harbor's notch and window
+
+Harbor lives in the notch. Asking, the Brief, your Day, research, quick settings, first-run
+setup and problem reports all happen in the black panel under the notch, and
+Harbor starts there: launching it opens no window. One Harbor window holds the work
+that needs room (long chats, Memory and saved research), and it opens only when
+asked for. Both talk to the same service and the same saved chats.
+
+## The notch
+
+- **At rest** it is a black bar around the notch (a small capsule on a monitor).
+  Hover or ⌥Space opens it. ⌥Space and the menu-bar icon always open Ask; hover
+  opens the tab you last used if the panel closed in the last ten minutes. A dot
+  shows Harbor is working, a count shows what is due today or overdue, and an
+  orange "!" means setup was set aside. Clicking a Harbor notification (other than
+  a nudge's buttons) opens Day.
+- **Tabs** (⌘1 to ⌘5): **Ask**, the conversation; **Brief**, one sentence about
+  the day, a short version of today's Daily Summary, and four rows (CAL, MAIL,
+  TEXTS, SOON) that open their details in place, read only; **Day**, the rest of today on
+  one hour-by-hour timeline (calendar, your tasks, suggestions, learned busy
+  times, plans caught in texts, reminders due) under a two-line blurb; **Meet**,
+  meeting notes written on this Mac (`MeetingNotes.swift`, `service/meetings.py`); **Study**,
+  school work read from your open Canvas pages and study material made from it (docs/STUDY_TAB.md).
+  Research is a mode of Ask (`NotchTab.research`, not in the strip): `/research`,
+  a job opened from the window or New research turn the prompt into an editable
+  research plan, then show the run and its report. Choosing a tab leaves it.
+- **Day's actions** never write to Calendar or Reminders. Keep (or a later time
+  from ⋯) pins a suggestion as a Harbor task; Add does the same for a plan caught
+  in texts, and Ignore hides it on this Mac; Plan time adds a reminder as a task
+  the planner fits in; Not today is the planner's one-day ignore of a learned
+  window. The logic (what lands where, the badge, the Brief's sentence, the
+  calendar's busyness verdict (`DayLoad`, the weekly report's 9–6 union and
+  back-to-back rule), the blurb, plain-language warnings, junk titles) is pure
+  code in `NotchDay.swift`.
+- **Ask** has a chat switcher (recent saved chats from `GET /chats`), New chat
+  (⌘N), slash commands (`/today`, `/memory`, `/research`, `/settings`, `/report`,
+  `/window`, `/new`), per-reply Details (route, model, timing, tool calls; open by
+  default in Debug Mode) and the same confirmation card and message draft as the
+  window.
+- **Keep open** (pin, ⌘P). Any edit in progress also holds the panel open: typed
+  input, a message draft, a Day task, an open setup card or an open report.
+- **Quick settings** (the gear or `/settings`), one section at a time under a
+  switcher that stays put: General (Full access, Learn my routines, Mac permissions,
+  Setup), Brief (the Daily summary's two times, each opening an inline hour list, and
+  how often the Brief updates), Voice (Read answers aloud, Text size), Power (Save
+  power, Save memory) and Advanced (Reply details, which is Debug Mode, and Model
+  memory). It and the permission page stop at 60% of the screen's height, then scroll.
+  Model memory shows what the engine measured from `GET /models/memory`,
+  and no number or bar when it measured nothing. Everything that needs a form, a
+  key, OAuth or widens what Harbor reads stays in Settings (⌘,).
+- **First-run setup**: on a Mac that can't answer yet, the first launch opens Ask
+  on a setup card (engine, model, Use & test). The card downloads the model for
+  Harbor's own engine in place (Download, progress with size and speed, Cancel,
+  Resume, Try again), and the transfer keeps setup's poll running while the panel
+  is closed, so Harbor switches to the model by itself when it arrives. Later
+  shrinks the card to a line, which shows the download's progress, until Harbor is
+  ready. Smart Search, other local apps, an external oMLX's downloads and models
+  with no public download continue in the full guide, Settings › Models › Setup
+  in the Harbor window. On a Mac whose memory no downloadable model fits, the card
+  says so and offers the guide's other routes instead of a download.
+- **Report a problem** unfolds under the reply (or under the Day tab), with a
+  preview of exactly what is saved. Nothing is uploaded.
+- The panel is a borderless, non-activating `NSPanel` at status-bar level, so
+  notch views never use sheets or alerts: confirmations and editors are inline.
+
+## The Harbor window
+
+- Sidebar: New chat (⌘N), search over chat titles (⌘K), Today, Research,
+  Memory, Settings, and every saved chat grouped Today / Yesterday / Previous 7
+  days / Earlier. Smart Search (⇧⌘F) has no row: it reads the app in front,
+  which from here would be Harbor itself.
+- Thread: your messages, then Harbor's. Tool calls are listed above the answer
+  (collapsed once finished). Answers render through `MarkdownView`.
+- Approvals: the same confirmation card as the notch (Deny / Always allow /
+  Allow once), and the same editable message draft (Discard / Edit / Send).
+  Nothing sends without the Send button.
+- Details (⌘I): route, model, routed-by, speed, time, why that route, tools used.
+- Composer: Return sends, Option-Return adds a line, paperclip attaches an image,
+  and the pill shows Full access as the service confirmed it ("Access
+  unconfirmed" when it can't be read).
+- **Today**: the full planner (Needs my attention, Day plan, the task editor,
+  pins, working hours, Email my day plan and its inline report), sharing one
+  `TodayModel` with the notch's Brief and Day tabs.
+- **Memory**: Facts (saved memories and corrections), Routines (what Harbor learned
+  from your activity) and Review (new memories to confirm).
+- **Research**: your 30 most recent research jobs and every pinned one. Opening
+  a job shows it in the notch without starting a new search; New research opens
+  the notch's research prompt.
+- **Settings** (⌘,, the menu bar's Settings…, the sidebar, the footer gear and
+  the notch's All settings): General, Models, Google, Activity and Privacy &
+  Access as one segmented row. Models › Setup is the full setup guide (engine,
+  model and downloads, Smart Search, other local apps, the test) with Check
+  again; Setup guide…, the engine settings and the notch card's ⤢ open it there.
+  While it stands in for the first-run window, that window is hidden and comes
+  back, at its step, when Setup is left (Back to Welcome, another pane or
+  section, or closing the window). It replaces the main column, so Settings and
+  a chat can't sit side by side.
+- Appearance: follows the Mac. Dark is the aurora; light is a pale daylight blue.
+- It opens from the Dock icon (or opening Harbor again while it runs), the menu
+  bar's Open Harbor Window, Window ▸ Harbor Window (⌘1), the notch's ⤢ or ⌘O (on
+  whatever the tab shows), and every route below. A window already open comes
+  forward on the section it shows; only a closed one opens on Chats. Closing it
+  leaves Harbor running in the notch and menu bar; ⌘Q stops it.
+
+Apart from the first-run window on a new Mac, the Harbor window is Harbor's only
+window.
+
+## How it fits together
+
+| Piece | File |
+| --- | --- |
+| Routes into the app (`HarborRoute`, `HarborRouter`); every control opens one | `app/Sources/HarborApp/HarborRoute.swift` |
+| Where each route lands (`AppDelegate.open(_:)`) | `app/Sources/HarborApp/AppDelegate.swift` |
+| Notch panel, tabs, Ask | `OverlayView.swift`, `OverlayModel.swift`, `NotchTab.swift` |
+| Brief and Day tabs | `NotchBriefView.swift`, `NotchDayView.swift`, logic in `NotchDay.swift` and `BriefSummary.swift` (share `TodayModel` with the planner window) |
+| Quick settings | `QuickSettingsView.swift` (shares the app's one `SettingsLoader`), lines in `QuickSettingsText.swift` |
+| Setup card | `NotchSetupView.swift` (shares the app's one `SetupGuideModel` with `SetupGuideView`) |
+| Inline reports | `ReportDraftView.swift`, `DiagnosticReport.swift` (`ReportDraft`) |
+| Slash commands | `NotchCommand.swift` |
+| Window (`HarborWindowController`, `HarborWindowNavigation`) | `app/Sources/HarborApp/HarborWindow.swift` |
+| Window chats: types, store, service adapter, views, colors | `app/Sources/HarborApp/Chat/` |
+| Window Today (the full planner) | `TodayHomeView.swift`, `TodayView.swift` |
+| Window Memory | `MemoryHomeView.swift`, `MemoryView.swift`, `LearnedView.swift` |
+| Window Research | `ResearchHomeView.swift`, `ResearchLibraryView.swift`, `ResearchLibraryModel.swift` |
+| Visual QA harness (`HARBOR_CHAT_QA` only) | `app/Sources/HarborApp/Chat/ChatQA.swift` |
+| Chat list endpoint | `service/memory/store.py` `list_chats`, `service/main.py` `GET /chats` |
+
+Chats are not stored in the app. The service persists every conversation in
+`~/.moe/sessions.db`; both surfaces list them with `GET /chats`, load one with
+`GET /sessions/{id}`, delete with `DELETE /sessions/{id}`, and continue one by
+passing its `session_id` to `/agent`. Closing the window loses nothing.
+
+Shared state lives in app-scoped objects owned by `AppDelegate`, never in a view,
+so the notch collapsing or a tab being rebuilt can't drop a change in flight:
+
+- `TodayModel`: the notch's Brief and Day tabs and the planner window show the
+  same day. It loads while Brief or Day is on screen, never at launch or on hover.
+- `SettingsLoader`: quick settings, the window's Settings and its Full access
+  pill share one source. Full access is a `Bool?`: nil is "unconfirmed",
+  never "off". A change shows only once the service confirms it, and a lost reply
+  is followed by a re-read.
+- `SetupGuideModel`: the setup card, the first-run window and Settings ›
+  Models › Setup. Each host calls `show(in:)` and `hide(from:)` (counted); the
+  first starts the status poll, the last stops it and drops the test result.
+  Settings' host ("settings") is AppDelegate's `settingsSetupShown`: the window
+  open on Settings › Models › Setup, read from the window and the stored panes,
+  never from SwiftUI's onAppear. Settings posts `harborInferenceConfigurationChanged` after writing a
+  role's model (`POST /config`), a provider or the engine mode, which also drops
+  the test result. A card set aside with Later leaves only when it sees Harbor
+  ready, so its "!" can outlast readiness until Ask is next opened.
+- `ReportDraft`: one per surface (the notch's chat, Today). It holds a
+  `ReportSnapshot` taken at open (metadata, details scrubbed once) and never
+  changed, plus the note and details switch, which reset whenever a report
+  opens on a different key. Chat drafts are keyed by trace
+  (`OverlayModel.reportKey(for:)`), and New chat closes one. The preview and the
+  saved file both come from `ReportDraft.encoded()`; `DiagnosticReport.save`
+  writes it privately and atomically. The save panel runs with
+  `OverlayModel.pickingFile` set. Turning off planner-detail capture closes a
+  Today report holding those details.
+- `HarborWindowNavigation`: the window's section (chats, Today, Memory,
+  Research, Settings), the planner's and Memory's tabs, the Routines model (it lives as
+  long as the window, so a consent write in flight reports its outcome), the
+  research library and the shared `TodayModel`. `TodayWindow` remains only as a
+  standalone host for the mounted planner checks.
+
+`MarkdownView` reads its colors from `\.markdownPalette`; the default is the
+notch's monochrome look. Settings and the setup guide read theirs from
+`\.themePalette` (`Theme.swift`): `ThemePalette.notch` by default, and
+`ThemePalette.harborWindow` (`ChatTheme`'s colors, following the Mac's appearance)
+in the Harbor window.
+
+## Known limits
+
+- A reloaded chat shows which tools an answer used but not their results or
+  timing; the service keeps only the tool names. Live answers show everything.
+- There is no per-message model picker: the router chooses the model.
+
+## Testing
+
+```bash
+scripts/test_chat_contract.sh            # window reducer, history, titles, grouping, store (scripted backend)
+scripts/test_overlay_transition.sh       # notch motion, collapse holds, tabs, quick settings, setup card, reports
+scripts/test_today_contract.sh           # Today model and planner, including its inline report
+scripts/test_diagnostic_report.sh        # redaction, journals, private saves, report drafts
+.venv/bin/python tests/test_chat_list.py # GET /chats storage
+```
+
+`scripts/run_simulation_qa.py --only-native` runs these with the pure notch
+checks (`tests/NotchTabChecks.swift` with `tests/NotchDayChecks.swift`, and
+`tests/NotchCommandChecks.swift`).
+
+Render the real window against a scripted fixture, in light and dark, without
+starting Harbor or touching its port:
+
+```bash
+cd app
+swift build -Xswiftc -DHARBOR_CHAT_QA
+HARBOR_CHAT_QA_OUT=/some/dir .build/debug/HarborApp
+```
+
+Render the notch's Brief and Day tabs from a fixture day, and the setup card in
+each state of its model download (`notch-setup-*`), the same way (it prints each
+one's size, to check it fits the 640 pt panel):
+
+```bash
+cd app
+swift build -Xswiftc -DHARBOR_NOTCH_QA
+HARBOR_NOTCH_QA_OUT=/some/dir .build/debug/HarborApp
+```
+
+On a machine whose `swift` is the Command Line Tools toolchain, SwiftUI's `@State`
+macro plugin is missing; add
+`-Xswiftc -plugin-path -Xswiftc /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib/swift/host/plugins`
+to the build command.
