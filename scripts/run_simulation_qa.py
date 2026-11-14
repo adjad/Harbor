@@ -1,0 +1,1777 @@
+#!/usr/bin/env python3
+"""Run Harbor's deterministic, non-mutating Simulation QA gates.
+
+Every Python test runs in its own process and temporary HARBOR_HOME.  This is
+intentional: several legacy tests use process-global registries and check
+counters, so a blanket ``pytest tests`` can both create false failures and
+silently miss failed checks.
+
+This runner never starts Harbor, calls a model server, installs cache fixtures,
+opens Mail drafts, or seeds/mutates native apps.  Native gates compile and run
+only fixture-backed or pure contract checks.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.metadata
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+try:
+    from scripts.test_replay_failure_fixes import LEGACY_SCRIPT_TESTS
+except ModuleNotFoundError:  # Direct execution from scripts/ puts that directory first.
+    from test_replay_failure_fixes import LEGACY_SCRIPT_TESTS
+
+
+ROOT = Path(__file__).resolve().parents[1]
+TRUSTED_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+TRUSTED_GIT = "/usr/bin/git"
+TRUSTED_BASH = "/bin/bash"
+TRUSTED_SWIFTC = "/usr/bin/swiftc"
+# Parallel workers share one console. Each gate's status line and any failure
+# output are written under this lock so they never interleave mid-gate.
+_OUTPUT_LOCK = threading.Lock()
+
+
+def default_jobs() -> int:
+    """One worker per available CPU; ``--jobs 1`` restores sequential runs."""
+    return max(1, os.cpu_count() or 1)
+
+
+class NodeRuntimeError(RuntimeError):
+    """A required fixed Node runtime is missing or does not match its pin."""
+
+
+def resolve_node_runtime(expected: str | None = None) -> Path:
+    """Validate the fixed native runtime; an explicit value can only pin it.
+
+    Never resolve or execute a caller-provided path. PATH, NODE_OPTIONS and
+    NODE_PATH do not participate in selection. Unsupported layouts fail closed.
+    """
+    magics = {b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xfe\xed\xfa\xce",
+              b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca", b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca"}
+    for candidate in (Path("/usr/local/bin/node"), Path("/opt/homebrew/bin/node")):
+        if not candidate.is_file() or not os.access(candidate, os.X_OK):
+            continue
+        selected = candidate.resolve(strict=True)
+        if (selected.name != "node" or selected.is_relative_to(Path.home().resolve())
+                or not any(selected.is_relative_to(prefix)
+                           for prefix in (Path("/usr/local"), Path("/opt/homebrew")))):
+            raise NodeRuntimeError("Node runtime must remain in an approved installation prefix")
+        with selected.open("rb") as handle:
+            if handle.read(4) not in magics:
+                raise NodeRuntimeError("Node runtime must be a native macOS executable")
+        if expected is not None and expected != str(selected):
+            raise NodeRuntimeError("Node runtime does not match the validated selection")
+        return selected
+    raise NodeRuntimeError("Node is required at /usr/local/bin/node or /opt/homebrew/bin/node")
+
+PROFILE_TESTS = {
+    "conversation": {
+        "tests/test_conversation_memory.py",
+        "tests/test_conversational_skills.py",
+        "tests/test_mac_controls_skill.py",
+        "tests/test_contextual_outbound_routing.py",
+        "tests/test_workflow_bindings.py",
+        "tests/test_workflow_engine.py",
+    },
+    "sources": {
+        # The 2026-10-29 eval reads: sent mail, folder sizes, file search, accounts,
+        # what's new, Focus and volume. Mocked sources and tmp_path only.
+        "tests/test_rc1_eval_reads.py",
+        "tests/test_dev8_ask_reads.py",
+        "tests/test_brief_fallback.py",
+        "tests/test_daily_summary_history_independence.py",
+        "tests/test_email_digest_presentation.py",
+        "tests/test_email_scoping.py",
+        "tests/test_live_corpus.py",
+        "tests/test_long_email_digest.py",
+        # Email search: ranked, fair budget, clean text, honest coverage (synthetic mail, stub model).
+        "tests/test_email_search_ranking.py",
+        # Voice input: the clip reaches only a local model with an audio encoder (stub client).
+        "tests/test_voice_transcribe.py",
+        # Meeting notes: windows to transcript to notes, text only on disk, fenced transcript,
+        # a reminder only on the person's press (stub client, tmp_path as the home folder).
+        "tests/test_meetings.py",
+        # Your writing style: rows from sent mail, a child trains and drafts, drafts only, erased by
+        # forget (a /bin/sh stand-in for the MLX Python, fake Mail bridge, tmp_path as the home folder).
+        "tests/test_personal_style.py",
+        # Image/video input: one dedicated vision call (stub client, synthetic media).
+        "tests/test_vision.py",
+        # Pictures that lead to actions: the reading as untrusted data, every effect
+        # carded (stub vision client, scripted agent client, synthetic tools).
+        "tests/test_vision_actions.py",
+        # Several distinct writes in one turn; only true repeats refused, a per-turn
+        # cap, picture turns still carded (scripted client, synthetic tools).
+        "tests/test_effect_dedupe.py",
+        # Document input: text extracted in memory, one no-tools call (stub client, synthetic files).
+        "tests/test_documents.py",
+        # Email attachments and large files: the isolated reader, condensing, the tool and its
+        # safety wiring (synthetic files, fake Mail and Gmail, stub model).
+        "tests/test_attachment_child.py",
+        # Finding a file by what is inside it, the background switch, many files at once, saving a
+        # file, recordings, Messages files and the seams between them (synthetic files, fake Mail,
+        # Gmail and Messages, stub model, tmp_path as the home folder).
+        "tests/test_attachment_audio.py",
+        "tests/test_attachment_fields.py",
+        "tests/test_attachment_find.py",
+        "tests/test_attachment_index.py",
+        "tests/test_attachment_save.py",
+        "tests/test_attachment_seams.py",
+        "tests/test_attachment_seams_tools.py",
+        "tests/test_attachment_sources.py",
+        "tests/test_attachment_tools.py",
+        "tests/test_message_attachment_bridge.py",
+        "tests/test_attachment_reading_sharper.py",
+        "tests/test_attachment_store.py",
+        "tests/test_email_attachment_tool.py",
+        "tests/test_large_document.py",
+        "tests/test_mail_attachments.py",
+        "tests/test_recognize_bridge.py",
+        "tests/test_corpus_prompts.py",
+        "tests/test_corpus_reasoning_export.py",
+        "tests/test_gmail_source.py",
+        "tests/test_google_workspace.py",
+        "tests/test_linked_documents.py",
+        "tests/test_mail_history_wire.py",
+        "tests/test_message_attribution.py",
+        "tests/test_message_content.py",
+        "tests/test_message_digest.py",
+        "tests/test_message_reason_memo.py",
+        "tests/test_multi_source_fallback.py",
+        "tests/test_privacy_sync.py",
+        "tests/test_reply_bridge_simulation.py",
+        "tests/test_sandbox_wire.py",
+        "tests/test_schedule_presentation.py",
+        "tests/test_tomorrow_planning.py",
+        "tests/test_assistant_read_regressions.py",
+        "tests/test_tomorrow_study_slot.py",
+        "tests/test_reminder_source_truth.py",
+        "tests/test_source_sync_contract.py",
+        "tests/test_sync_readiness.py",
+        "tests/test_temporal_facts.py",
+        "tests/test_daily_workspace.py",
+        "tests/test_day_review_blocks.py",
+        "tests/test_day_past_purpose.py",
+        "tests/test_day_remove_suggestion.py",
+        "tests/test_brief_needs_you.py",
+        "tests/test_day_timeline_event_fields.py",
+        "tests/test_mail_gists.py",
+        "tests/test_mail_memory.py",
+        "tests/test_behavior_gmail_history.py",
+        "tests/test_behavior_availability.py",
+    },
+    "outbound": {
+        "tests/test_action_tools_sanitize.py",
+        "tests/test_event_move.py",
+        "tests/test_outbound_content_provenance.py",
+        "tests/test_outbound_language_clarification.py",
+        "tests/test_outbound_payload_presentation.py",
+        "tests/test_schedule_send.py",
+        "tests/test_scheduled_send_claims.py",
+        "tests/test_scheduled_send_preview.py",
+        "tests/test_typed_email_reply.py",
+        "tests/test_typed_message_send.py",
+        "tests/test_typed_reminder_operations.py",
+        "tests/test_typed_task_engine.py",
+        "tests/test_reminder_batch_creation.py",
+        "tests/test_reminder_creation_review_controls.py",
+        "tests/test_reminder_civil_date_controls.py",
+        "tests/test_reminder_entrypoint.py",
+        "tests/test_reminder_date_updates.py",
+        "tests/test_reminder_date_only_due_today.py",
+    },
+    "safety": {
+        # The user's access choice survives a restart; boots under tmp_path only.
+        "tests/test_access_mode_persistence.py",
+        "tests/test_always_confirm_grants.py",
+        "tests/test_approver_timeout.py",
+        "tests/test_destructive_shell.py",
+        "tests/test_execution_contract_loop.py",
+        "tests/test_forced_step_withholding.py",
+        "tests/test_shell_boundary.py",
+        # run_shell's write guard: a Harbor folder and a home in a temp dir. The real-process
+        # cases need to apply a sandbox, so they skip inside this profile's own sandbox.
+        "tests/test_shell_sandbox.py",
+        "tests/test_shell_local_service_deny.py",
+        # /resetharbor on a scratch home under pytest's temp dir; no Google, Keychain, TCC or live service.
+        "tests/test_harbor_reset.py",
+        "tests/test_outbound_shell_gate.py",
+        "tests/test_local_http_guard.py",
+        "tests/test_tool_calling_invariants.py",
+        "tests/test_tool_outcomes.py",
+        "tests/test_tool_test_mode.py",
+    },
+    "reliability": {
+    "tests/test_cloud_provider_settings.py",
+    "tests/test_local_provider_settings.py",
+    "tests/test_setup_guide.py",
+    # Fresh-install model detection over fake model folders and fake /v1/models answers.
+    "tests/test_setup_existing_omlx.py",
+    "tests/test_onboarding_window.py",
+    # Settings and Setup as sections of the Harbor window, read from the Swift sources.
+    "tests/test_settings_in_window.py",
+    # The app's idle-time polling cadences, read from the Swift and service sources.
+    "tests/test_idle_polling_swift_contract.py",
+    "tests/test_super_model_routing.py",
+        "tests/test_inference_endpoints.py",
+        "tests/test_inference_providers.py",
+        "tests/test_cloud_key_read.py",
+        "tests/test_remote_reasoning_replay.py",
+        "tests/test_gemini_provider.py",
+        "tests/test_node_inbox.py",
+        "tests/test_assistant_delivery.py",
+        "tests/test_calendar_create_interval.py",
+        "tests/test_assistant_dedupe.py",
+        "tests/test_assistant_migrations.py",
+        "tests/test_native_sync_stall.py",
+        "tests/test_manual_reminders_survive_sync.py",
+        "tests/test_stale_harbor_only_reminders.py",
+        "tests/test_undated_reminders.py",
+        "tests/test_stale_reminders.py",
+        "tests/test_notes_lookup_strict.py",
+        "tests/test_assistant_recovery.py",
+        "tests/test_discovery_store.py",
+        "tests/test_discovery_approvals.py",
+        "tests/test_discovery_jobs.py",
+        "tests/test_broad_web_search.py",
+        "tests/test_daily_summary_clean.py",
+        "tests/test_daily_summary_delivery.py",
+        "tests/test_daily_summary_schedule.py",
+        "tests/test_error_translation.py",
+        "tests/test_latency_prompt_contract.py",
+        "tests/test_lazy_inference_readiness.py",
+        "tests/test_turn_engine_calls.py",
+        "tests/test_mini_http.py",
+        "tests/test_mini_store.py",
+        "tests/test_mini_contract.py",
+        "tests/test_phone_gateway.py",
+        "tests/test_paths_override.py",
+        "tests/test_regression_gate.py",
+        "tests/test_retry_nudge.py",
+        "tests/test_sandbox_world.py",
+        "tests/test_search_reliability.py",
+        "tests/test_streamed_answer_discard.py",
+        "tests/test_tool_dispatch.py",
+    },
+    "research": {
+        "tests/test_broad_web_search.py",
+        "tests/test_research_library.py",
+        "tests/test_research_mode.py",
+    },
+    "routing": {
+        "tests/test_alias_reachability.py",
+        "tests/test_compound_claims.py",
+        "tests/test_compound_task_routing.py",
+        "tests/test_current_web_routing.py",
+        # Route metadata over synthetic prompts; mocked retrieval, no tool execution.
+        "tests/test_personal_grounding.py",
+        "tests/test_web_response_followup.py",
+        "tests/test_direct_dispatch.py",
+        "tests/test_direct_dispatch_exec.py",
+        # Actual ASGI with inert registry, fake inference and blocked sockets/processes.
+        "tests/test_topical_email_contract.py",
+        "tests/test_historical_routing_regressions.py",
+        "tests/test_router_adversarial_cases.py",
+        "tests/test_router_execution_contract.py",
+        "tests/test_router_no_vision.py",
+        "tests/test_router_scoping.py",
+        "tests/test_router_dataset_findings.py",
+        "tests/test_router_roster_models.py",
+        "tests/test_fast_path_intent.py",
+        "tests/test_reminder_compound_allowance.py",
+        # Pure labelled-title compiler/planner fixtures; never executes tools.
+        "tests/test_reminder_labelled_title.py",
+        "tests/test_routing_contract_regressions.py",
+        "tests/test_routing_quality_fixes.py",
+        "tests/test_routing_quality_corpus.py",
+        "tests/test_read_context_continuations.py",
+        "tests/test_routing_semantic_correctness.py",
+        "tests/test_semantic_routing.py",
+        "tests/test_tool_consolidation.py",
+        "tests/test_terse_tool_schemas.py",
+        "tests/test_search_reliability.py",
+        "tests/test_short_circuit.py",
+        "tests/test_brief_never_verbatim.py",
+    },
+}
+
+# Explicitly reviewed as deterministic and non-mutating at the infrastructure
+# baseline.  The full profile refuses to auto-run a newly added test until it
+# is classified here; this prevents an innocently named live test from entering
+# an offline release gate without review.
+ADDITIONAL_FULL_TESTS = {
+    "tests/test_final_weather_place.py",
+    "tests/test_final_emails_to_answer.py",
+    # rc3 fix batch: one file per fixed area (pure Python, stub models, scratch stores, or source
+    # contracts that read the Swift and service text; nothing live).
+    "tests/test_final_ask_headings.py",
+    "tests/test_final_public_web_lookup.py",
+    "tests/test_rc3_app_lifecycle.py",
+    "tests/test_rc3_audit_repairs.py",
+    "tests/test_rc3_backend_launch.py",
+    "tests/test_rc3_brief_cards.py",
+    "tests/test_rc3_cache_fixture_scripts.py",
+    "tests/test_rc3_calendar_read.py",
+    "tests/test_rc3_chat_window.py",
+    "tests/test_rc3_config_overlay_damaged.py",
+    "tests/test_rc3_dangerous_commands.py",
+    "tests/test_rc3_engine_start_messages.py",
+    "tests/test_rc3_event_retention.py",
+    "tests/test_rc3_human_replies_compose_only.py",
+    "tests/test_rc3_idle_timeout_saved.py",
+    "tests/test_rc3_late_rings.py",
+    "tests/test_rc3_legacy_script_tests.py",
+    "tests/test_rc3_mail_actions.py",
+    "tests/test_rc3_move_rule_asks_again.py",
+    "tests/test_rc3_notch_contract.py",
+    "tests/test_rc3_page_reader.py",
+    "tests/test_rc3_parent_watch.py",
+    "tests/test_rc3_plain_delete_card.py",
+    "tests/test_rc3_research_elapsed.py",
+    "tests/test_rc3_settings.py",
+    "tests/test_rc3_setup_window.py",
+    "tests/test_rc3_smart_search.py",
+    "tests/test_rc3_standing_rules.py",
+    "tests/test_rc3_time_phrases.py",
+    "tests/test_rc3_timers.py",
+    "tests/test_rc3_toolbench_scorer.py",
+    "tests/test_rc3_tools_rest2.py",
+    "tests/test_rc3_ui_sweep.py",
+    "tests/test_rc3_untitled_sync.py",
+    "tests/test_rc3_untitled_sync_swift.py",
+    # rc2 known-issue batch: pure Python, scratch stores, fake engines and clocks, or source contracts.
+    "tests/test_rc2_ask_web_own_events.py",
+    "tests/test_rc2_ask_web_possessive.py",
+    "tests/test_rc2_engine_fold_resident.py",
+    "tests/test_rc2_engine_guard_wake.py",
+    "tests/test_rc2_grants_inert_move_rule.py",
+    "tests/test_rc2_policy_delete_recheck.py",
+    "tests/test_rc2_policy_inert_text.py",
+    "tests/test_rc2_policy_never_run_gaps.py",
+    "tests/test_rc2_policy_quoted_delete.py",
+    "tests/test_rc2_sends_host_bound.py",
+    "tests/test_rc2_sends_own_address.py",
+    "tests/test_rc2_sessions_old_text.py",
+    "tests/test_rc2_text_size_contract.py",
+    # 0.5.0 Ask dead ends: store-hours wordings and the search-first head start (pure Python).
+    "tests/test_final_ask_direct_leads.py",
+    "tests/test_final_ask_own_switches.py",
+    "tests/test_final_ask_write_followups.py",
+    "tests/test_final_notes_delete_and_bullets.py",
+    "tests/test_final_send_to_myself.py",
+    "tests/test_final_ask_card_and_referents.py",
+    "tests/test_final_ask_web_wordings.py",
+    "tests/test_final_web_ownership.py",
+    "tests/test_rc2_ask_web_possessive_egress.py",
+    "tests/test_rc2_policy_audit_repairs.py",
+    "tests/test_rc2_policy_audit_repairs_2.py",
+    # rc1 Brief and Day honesty: no all-clear for an unread source, per-source blocked reasons.
+    "tests/test_first_day_honesty.py",
+    # rc1 reminders: expiry and supersede, the first-launch auto-action hold, the day-one Daily Summary.
+    "tests/test_reminder_expiry.py",
+    "tests/test_behavior_auto_trial.py",
+    "tests/test_brief_day_one.py",
+    # rc2: Brief cards stay put across cycles, and a dismissed or cleared ask stays gone (fake model, scratch store).
+    "tests/test_brief_card_stability.py",
+    # rc2: the first Brief once onboarding is answered (scheduler slots with a stubbed store
+    # and clock, and the marker endpoint through TestClient); nothing is composed or sent.
+    "tests/test_brief_onboarding.py",
+    # rc2: an unoffered web lookup on a general-knowledge question, with a scripted model.
+    "tests/test_general_knowledge_unoffered_web.py",
+    "tests/test_ask_skill_misnamed_as_tool.py",
+    "tests/test_stock_previous_close.py",
+    # rc1 Ask backend: reply-needed reads stay read-only, the capability welcome, Gmail-only identity.
+    "tests/test_router_reply_needed_reads.py",
+    "tests/test_capability_welcome.py",
+    "tests/test_harbor_self_questions.py",
+    # Onboarding Ask access fix: needs_access from scripted tool results through the
+    # agent loop, reads, workflows and tasks; no live source or model.
+    "tests/test_ask_access_fix.py",
+    # The first launch day's rhythm line and first-Brief progress over a scratch store.
+    "tests/test_brief_first_day.py",
+    "tests/test_email_gmail_only_and_dedup.py",
+    # rc2 duplicated email summaries: synthetic Gmail + Mail rows, two linked accounts; no live source.
+    "tests/test_email_summary_dedupe.py",
+    # Needs you Clear / Mark done over synthetic stores and a stubbed native outbox.
+    "tests/test_needs_you_clear.py",
+    # Passed events stop asking for time: synthetic titles over a scratch store; nothing native.
+    "tests/test_day_past_purpose.py",
+    # Day Remove on a suggestion: kept out of Replan over a scratch store; nothing native.
+    "tests/test_day_remove_suggestion.py",
+    # Messages read-failure reasons over module state and an inert ASGI app; no native reader.
+    "tests/test_messages_read_failure.py",
+    # Real ASGI modes over disposable pending owners and fully inert capabilities.
+    "tests/test_conversation_authority_contract.py",
+    "tests/test_calendar_literal_entrypoint.py",
+    # Pure named-time parsing, fictional stores and inert ASGI calls; no live sources.
+    "tests/test_calendar_time_contract.py",
+    # Pure end-time formatter over fictional rows; no store, source or model.
+    "tests/test_calendar_end_time_format.py",
+    # Scorer self-test on synthetic fixtures; tmp_path files only, no model or network.
+    "tests/test_memory_eval_scorer.py",
+    # Toolbench matchers/scorer/report on hand-built trajectories and fake-world
+    # tools called directly; temp HARBOR_HOME, no model, network or tool execution.
+    "tests/test_toolbench.py",
+    # Toolbench fake-world receipts and seeded facts against the real outcome
+    # classifier; temp HARBOR_HOME, no model, network, Mac apps or tool execution.
+    "tests/test_toolbench_world.py",
+    # Planner eval --dry-run in a temp HOME/HARBOR_HOME: builds menus, no model, oMLX or tool execution.
+    "tests/test_eval_planner_dry_run.py",
+    # Inert bounded attestation store; supplied facts and manual interleavings only.
+    "tests/test_attestation_store.py",
+    # Synthetic content-free journal, bounded offline planner replay; no external effects.
+    "tests/test_diagnostics.py",
+    # Fake streaming client in test mode over a tmp_path journal; audit stubbed,
+    # no memory/identity context, model, network or tool execution.
+    "tests/test_model_step_trace.py",
+    # Pure switch parsing over monkeypatched env/config; no model, store or network.
+    "tests/test_model_only_switch.py",
+    # Proactive Brief engine, critical-mail, email-reply and Google/remote-inference
+    # contracts: fake model clients over a scratch HARBOR_HOME; no native reader,
+    # live model, network or send.
+    "tests/test_critical_mail.py",
+    "tests/test_email_reply_api.py",
+    "tests/test_google_calendar_source.py",
+    "tests/test_mcp_large_tool_list.py",
+    "tests/test_model_only_quality.py",
+    # Long-chat recall digest and _fit_window condensing: scratch SessionStore,
+    # synthetic chat, scripted model client and synthetic tools; no model or network.
+    "tests/test_ask_history_recall.py",
+    # Owner-only (0600) SQLite stores: every store opened under tmp_path with a
+    # 022 umask; no model, network or user data.
+    "tests/test_private_sqlite_files.py",
+    # The send queue overwrites what it removes: an assistant.db in tmp_path, no
+    # network, engine or real send.
+    "tests/test_outbound_queue_secure_delete.py",
+    # Owner-only (0600) state files and logs (checkins, audit, grants, caches,
+    # timers, research cache, script outputs): tmp_path, 022 umask; no model,
+    # network or user data.
+    "tests/test_private_state_files.py",
+    # Ask stall re-prompt, tomorrow typos and the day plan: fake model client, stubbed snapshot.
+    "tests/test_ask_day_answers.py",
+    # get_my_day_plan lists each item once across sections: synthetic snapshots only.
+    "tests/test_day_plan_once_each.py",
+    # Ask stall nudge (one retry on a promise-only final): fake model client, synthetic tools.
+    "tests/test_ask_stall_guard.py",
+    # Ask claims with no tool call, a bare "yes" to a create offer, and the
+    # stored reply of a draft turn: fake model clients, synthetic tools, the
+    # synthetic /agent entrypoint over a scratch SessionStore; no model or network.
+    "tests/test_ask_claimed_action_guard.py",
+    # Brief items beside day/week and schedule answers: stubbed snapshot and
+    # store, fixture calendars, fake behavior engine; no model, source or network.
+    "tests/test_schedule_brief_items.py",
+    "tests/test_brief_in_schedule_tools.py",
+    # Reply-draft reads and day-plan corrections: regex and registry checks only.
+    "tests/test_reply_draft_reads.py",
+    # Ask quality: code-failure fixes, tool-pair descriptions, the Harbor self-reference
+    # sheet, the follow-up subject record and intent hard stops; registry checks,
+    # fake model client, synthetic tools, private HARBOR_HOME.
+    "tests/test_ask_code_failures.py",
+    "tests/test_ask_tool_pair_descriptions.py",
+    "tests/test_harbor_self_reference.py",
+    "tests/test_followup_subject.py",
+    "tests/test_intent_guard.py",
+    # Ask eval fixes: spoken periods, tool-call markup, tool wording and head start;
+    # fake model client, stubbed tools, private HARBOR_HOME.
+    "tests/test_ask_eval_tool_wording.py",
+    "tests/test_ask_text_tool_calls.py",
+    "tests/test_timeranges_spoken_days.py",
+    # Ask chat routing: the personal-data guard and stalls (pure regex checks),
+    # and standing answer styles saved to an isolated profile file.
+    "tests/test_ask_casual_chat_guard.py",
+    "tests/test_answer_style.py",
+    # Public-fact web lookups with private context: scripted model, fake web tools.
+    "tests/test_public_fact_lookups.py",
+    "tests/test_proactive_accounts.py",
+    "tests/test_proactive_auto_add.py",
+    "tests/test_autoadd_mail_timing.py",
+    # Let Harbor act for me: the gate, the shared record and card. Fake config and store; no model, network or native write.
+    "tests/test_acting.py",
+    # One strict reading of a mail From value: pure strings, no mail is read.
+    "tests/test_mail_sender.py",
+    "tests/test_policy_moe_wildcards.py",
+    "tests/test_stage_mode.py",
+    "tests/test_stage_mode_menu.py",
+    "tests/test_stage_mode_overrides.py",
+    "tests/test_stage_mode_background.py",
+    "tests/test_stage_warm.py",
+    "tests/test_followups_cycle.py",
+    "tests/test_text_records_join.py",
+    "tests/test_mail_history_regex.py",
+    # Mail acts only with proof: injected Sent rows, Contacts and fetched authentication results.
+    "tests/test_autoadd_mail_proof.py",
+    "tests/test_capture_mail_stays_a_card.py",
+    "tests/test_mail_auth.py",
+    "tests/test_mail_known.py",
+    "tests/test_reply_recipient_sender.py",
+    # Hold time for a deadline under the gate: fake holds and a fake Day store; no calendar, model or native write.
+    "tests/test_autohold.py",
+    # The background cycle calling the hold step: injected fakes and a tmp store only.
+    "tests/test_autohold_cycle.py",
+    "tests/test_proactive_clear.py",
+    "tests/test_proactive_handled.py",
+    "tests/test_proactive_sent_check.py",
+    "tests/test_proactive_followups.py",
+    "tests/test_proactive_deadlines.py",
+    "tests/test_proactive_engine.py",
+    "tests/test_proactive_idle_refresh.py",
+    "tests/test_proactive_return_refresh.py",
+    "tests/test_brief_pace.py",
+    "tests/test_proactive_mail_recall.py",
+    "tests/test_proactive_past_week.py",
+    "tests/test_proactive_quality.py",
+    "tests/test_remote_model_only.py",
+    "tests/test_workspace_accounts.py",
+    # Bounded public-manifest JS fixtures only; no DOM, browser or network access.
+    "tests/browser_dom/test_page_extractor.py",
+    # D1 live-capture/private-filter/ModelView JS over a synthetic DOM on
+    # .invalid hosts; no browser, network, native host or model access.
+    "tests/browser_dom/test_live_capture.py",
+    # Synthetic Chrome popup/worker/host policy; no browser or native-host access.
+    "tests/browser_chrome/test_chrome_acquisition.py",
+    # Synthetic action-executor fixtures on .invalid hosts; no browser, network or user state.
+    "tests/browser_actions/test_action_executor.py",
+    # Synthetic browser/discovery contract payloads; no browser or user-state access.
+    "tests/test_browser_contracts.py",
+    # Proactive-attention Slice 0: synthetic fixtures and temp directories only; no
+    # subprocess, network, model, or access to the real caches or assistant.db.
+    "tests/test_attention_slice0.py",
+    # Pure detector, resolver, screen and matcher over in-memory synthetic items;
+    # no I/O, clock, model or live store.
+    "tests/test_attention_detector.py",
+    # Runner, ledger, planner and settings with every effect faked; ledger and settings live
+    # in temp directories. No Reminders, hub, model or real ~/.moe access.
+    "tests/test_attention_runner.py",
+    # Wiring and endpoints with faked feed, reminder tool, hub and store reads, and MOE_DIR
+    # redirected to a temp dir. An in-process TestClient only; no listener or network.
+    "tests/test_attention_wiring.py",
+    # Paired event capture over synthetic mail/messages, temp ledgers, fake native
+    # effects and in-process endpoint clients; no source/provider/native access.
+    "tests/test_event_capture.py",
+    # Calendar consent, civil dates, durable claims and fault-injected saves;
+    # disposable stores and fake effect channels only, no Calendar/user state.
+    "tests/test_attention_calendar.py",
+    # Disposable signed AF_UNIX peers; artifact pipeline imports the complete
+    # separately sandboxed exact-case report rather than granting network here.
+    "tests/test_browser_transport_native.py",
+    # A10 WP3 service endpoint: synthetic control messages and in-memory socketpairs,
+    # disposable SQLite; no browser, Keychain, listener or model access.
+    "tests/test_browser_bridge_host.py",
+    "tests/test_discovery_contracts.py",
+    # Pure captured-text extraction; synthetic spans, no model or source access.
+    "tests/test_discovery_extraction.py",
+    "tests/test_artifact_signature.py",
+    "tests/test_arrival_completion.py",
+    "tests/test_credential_recovery_completion.py",
+    "tests/test_local_auth_completion.py",
+    # Synthetic policy/state fixtures and disposable loopback child processes;
+    # these suites never use the user's oMLX port, Keychain, or Tailnet.
+    "tests/test_additive_policy.py",
+    "tests/test_credential_pipe.py",
+    "tests/test_remote_recovery.py",
+    "tests/test_runtime_peer.py",
+    # Characterization of the desktop oMLX attestation walker and _listener call shape
+    # on disposable temporary trees and in-process fakes; no oMLX, port 8000 or real process.
+    "tests/test_runtime_attestation_t0.py",
+    "tests/test_runtime_attestation_t1t3.py",
+    # The bundled-engine suites run Harbor's own stand-in HTTP engine and impostors as child
+    # processes on random loopback ports (never 8000, 8765 or 8791 for real traffic), in
+    # disposable temp directories with a private HOME; no oMLX, user data or network.
+    "tests/test_bundled_attribution.py",
+    "tests/test_bundled_engine_api.py",
+    "tests/test_engine_downloads.py",
+    # 0.5.0 Gemma Harbor: the published layout from a JSON extract, and role repair over fake
+    # model lists; pure Python, no engine, download or network.
+    "tests/test_gemma_harbor_checkpoint.py",
+    "tests/test_stranded_roles.py",
+    # Per-model engine settings seeded into a temp model_settings.json; no engine runs.
+    "tests/test_engine_profiles.py",
+    "tests/test_engine_memory_guard.py",
+    "tests/test_bundled_engine.py",
+    "tests/test_bundled_engine_mode.py",
+    # Engine packaging on a synthetic oMLX.app: selection, pruning, pinning, validation.
+    "tests/test_engine_packaging.py",
+    "tests/test_engine_licenses.py",
+    # Pure fake enforcers/tasks, synthetic package bytes and intercepted HTTP.
+    # No engine/model/native launch, real provider or host memory probes.
+    "tests/test_engine_guard_proof.py",
+    "tests/test_engine_guard_overlay.py",
+    # Threadgroup guard and MTP fallback against a fake MLX with a 448-thread
+    # cap; the real-kernel test skips without the pinned oMLX and a Metal device.
+    "tests/test_engine_kernel_guard.py",
+    # Background GPU power tier: settings in tmp_path, idle state and clients stubbed.
+    "tests/test_power_tier.py",
+    # Save memory: a fake client and clock, settings in tmp_path; one read-only
+    # sysctl of macOS memory pressure (unknown when denied), no engine or model.
+    "tests/test_memory_saver.py",
+    # Other models on the user's oMLX.app: fake clients and mock transports, settings
+    # in tmp_path, no engine, model or port. Same one read-only sysctl as above.
+    "tests/test_omlx_other_models.py",
+    # On-demand Gemma 4 encoders: the engine overlay's state machine on a fake mlx
+    # and fake model (one in-process thread pool), and the service's prewarm on a
+    # fake client. No engine, model, GPU or port.
+    "tests/test_engine_lazy_encoders.py",
+    "tests/test_encoders_prewarm.py",
+    "tests/test_engine_guard_client.py",
+    "tests/test_engine_guard_admission.py",
+    "tests/test_bundled_engine_startup.py",
+    # Attestation reuse (lease, fence, shadow) on in-process fakes with a fake clock, this
+    # process's own loopback sockets and one disposable bash child; no oMLX or port 8000.
+    "tests/test_attestation_reuse.py",
+    # Differential of the libproc executable-path lookup against the old lsof one, on disposable
+    # copies of the interpreter started by the test itself (skips where that is denied); no oMLX,
+    # port 8000, network or other process.
+    "tests/test_runtime_proc_path.py",
+    # Temporary directories and synthetic cache files only; never touches ~/.omlx or oMLX.
+    "tests/test_omlx_cache.py",
+    "tests/test_omlx_updates.py",
+    "tests/test_primary_runtime_completion.py",
+    "tests/test_credential_quarantine.py",
+    # Pure string redaction plus temporary stores; no real keys, Keychain or model.
+    "tests/test_credential_redaction.py",
+    # In-process approvers and endpoint calls only; no sockets or real actions.
+    "tests/test_approval_routing.py",
+    # Stand-in model loop and executor; the real stream/runner cancellation wiring only.
+    "tests/test_agent_disconnect.py",
+    # A stand-in client in place of oMLX; the read-only /models/memory route only.
+    "tests/test_models_memory.py",
+    # Source-text checks of the composed brief's headers; nothing is composed or sent.
+    "tests/test_brief_summary_contract.py",
+    # Mail gists with a fake model and an isolated cache; nothing is read or sent.
+    "tests/test_mail_gists.py",
+    # Mail memory with a stand-in app, model and hub, a temporary store and stubbed idle/power
+    # probes; no Mail, no model, no subprocess, nothing is added to Reminders.
+    "tests/test_mail_memory.py",
+    # Mail memory's profile facts with a stand-in model, a temporary store, facts.db and settings
+    # file; synthetic mail only, nothing is read from Mail and no fact reaches the real memory.
+    "tests/test_mail_memory_facts.py",
+    # The kept Daily Summary with an isolated file and a stand-in hub; nothing is composed, read or sent.
+    "tests/test_brief_latest.py",
+    # Pure identity/port policy; the shell checks skip where spawning is forbidden.
+    "tests/test_backend_identity_and_sandbox_isolation.py",
+    # Environment-variable echo only; no server, socket or process.
+    "tests/test_identity_launch_nonce.py",
+    "tests/test_backend_ownership_no_disk_receipt.py",
+    # A temporary session database only; lists saved chats for the Chat window. No model, socket or real data.
+    "tests/test_chat_list.py",
+    # Pure policy decisions, temporary symlinks and fake MCP specs; nothing is run or contacted.
+    "tests/test_policy_floor_and_mcp_trust.py",
+    # Pure header classification and string layout; no mail, model or network.
+    "tests/test_email_digest_sections.py",
+    "tests/test_email_digest_review_regressions.py",
+    # Pure compiler classification; no model, sources or effects.
+    "tests/test_workflow_authored_message.py",
+    "tests/test_workflow_inline_delivery.py",
+    "tests/test_router_everyday_prompts.py",
+    "tests/test_router_common_prompts.py",
+    "tests/test_user_facing_failure_text.py",
+    "tests/test_upcoming_agenda_and_tomorrow_prep.py",
+    "tests/test_calendar_batch_approval_ids.py",
+    # In-process fake engines bound to 127.0.0.1; no real app, Keychain or user data.
+    "tests/test_local_provider_tools.py",
+    "tests/test_helper_provenance.py",
+    "tests/test_node_prep.py",
+    "tests/test_primary_credentials.py",
+    "tests/test_codex_monitor.py",
+    "tests/test_fit_window.py",
+    "tests/test_lexical_tool_retrieval.py",
+    # Pure capability metadata, scripted inference/fake tool registry, and
+    # in-process /agent with disposable SQLite; no lifespan, model or native tools.
+    "tests/test_model_led_routing.py",
+    "tests/test_model_led_integration.py",
+    "tests/test_repeated_read_guard.py",
+    "tests/test_model_led_preload_stubs.py",
+    "tests/test_model_led_entrypoint.py",
+    "tests/test_model_led_full_routing.py",
+    "tests/test_model_led_effect_ownership.py",
+    # Real send tools and loop with a fake bridge, synthetic contacts, scripted model.
+    "tests/test_send_recipient_preflight.py",
+    # Real effect tools and loop with a fake bridge and queue, fake Notes results, scripted model.
+    "tests/test_effect_refusal_no_lock.py",
+    "tests/test_model_led_1_2_5_boundaries.py",
+    # httpx MockTransport only; redirect and strict-host checks never touch the network.
+    "tests/test_web_strict_host.py",
+    # Synthetic MIME fixtures only; offline parser tests never access real Mail.
+    "tests/test_mail_mime.py",
+    "tests/test_move_and_coverage.py",
+    "tests/test_narration_thinking.py",
+    # Explicit think-block policy, experiment-switch parsing, and verify()
+    # grounding: pure functions over in-memory strings and the packaged
+    # models.yaml; no model, network, subprocess, or user state.
+    "tests/test_experiments.py",
+    "tests/test_search_verify_grounding.py",
+    "tests/test_thinking_kwargs.py",
+    # Agent-loop stall on refused repeats: scripted fake client and fake
+    # registry tools only; no model, network, subprocess, or user state.
+    "tests/test_loop_repeat_stall.py",
+    # Truncated narration fallback and evidence rendering: scripted fake client
+    # and fake registry tool only; no model, network, subprocess, or user state.
+    "tests/test_task_evidence_fallback.py",
+    # Prompt scoped to the fitted toolset and the skills catalog gate: scripted
+    # fake client and the packaged prompt only; no model, network, subprocess,
+    # or user state.
+    "tests/test_prompt_scope_fit.py",
+    # Grammar-constrained planner, planner menu and read budget: scripted fake
+    # client, fake registry tools and the packaged registry/router only; no
+    # model, network, subprocess, or user state.
+    "tests/test_planner.py",
+    "tests/test_notes_defaults.py",
+    "tests/test_phase1_tools.py",
+    "tests/test_recent_activity.py",
+    "tests/test_reminder_bulk_clear.py",
+    "tests/test_reminder_creation.py",
+    "tests/test_reminder_update.py",
+    # Disposable SQLite claims and exact synthetic native readback; no EventKit.
+    "tests/test_verified_reminders.py",
+    "tests/test_reminder_notes_marker.py",
+    "tests/test_replay_failure_fixes.py",
+    # Synthetic benchmark evidence, owned loopback receivers and owned child process groups only.
+    "tests/test_release_performance.py",
+    # Local-install re-sign (scripts/resign_local_install.py): fake codesign/security/ditto
+    # over a tiny fake bundle in a temp dir; no signing, keychain or /Applications.
+    "tests/test_resign_local_install.py",
+    "tests/test_simulation_qa_runner.py",
+    "tests/test_think_leak.py",
+    "tests/test_timeranges.py",
+    "tests/test_today_plan.py",
+    # Daily workspace: pure source fixtures, private disposable SQLite, fixed
+    # verified-self identity, fake policy/outbox and ASGI transport; no effects.
+    "tests/test_daily_workspace.py",
+    "tests/test_day_review_blocks.py",
+    # Export Chat Debug Log opens no modal session: reads Swift source only.
+    "tests/test_debug_export_stays_modeless.py",
+    # The Brief's "Needs you today" selection over synthetic attention items.
+    "tests/test_brief_needs_you.py",
+    # Day timeline Cancel/Move fields: disposable AssistantStore, the planner and
+    # today_api.snapshot in process; no model, app, hub or real ~/.moe.
+    "tests/test_day_timeline_event_fields.py",
+    # The user's profile (Getting to know you): JSON in a temp path, pure prompt/brief/
+    # ranking helpers and an in-process TestClient; no model, listener or real ~/.moe.
+    "tests/test_user_profile.py",
+    # Working and quiet hours, and the offer to move an event outside them: JSON in a
+    # temp path, disposable AssistantStore, in-process TestClient and Hub; no model or real ~/.moe.
+    "tests/test_user_hours.py",
+    "tests/test_hours_offers.py",
+    "tests/test_quiet_hold.py",
+    # Study tab (docs/STUDY_TAB.md): a disposable study.db in tmp_path, pure page
+    # parsing and due planning, an in-process TestClient, and injected key readers
+    # and transports for the Study connector; no Keychain, browser, model or network.
+    "tests/test_study_store.py",
+    "tests/test_study_api.py",
+    "tests/test_study_connector.py",
+    "tests/test_study_generate.py",
+    "tests/test_study_canvas_parse.py",
+    "tests/test_study_plan.py",
+    "tests/test_study_drive.py",
+    # Evening check-in, carry-forward and goal pulse: disposable AssistantStore and
+    # state files, in-process TestClient; no model, scheduler, hub or real ~/.moe.
+    "tests/test_checkin.py",
+    # oMLX prompt-cache budget: settings.json and cache files in tmp_path only.
+    "tests/test_omlx_cache.py",
+    "tests/test_day_plan_email.py",
+    "tests/test_user_reported_regressions_20260902.py",
+    "tests/test_user_reported_regressions_20260903.py",
+    "tests/test_user_reported_regressions_20260903_noon.py",
+    "tests/test_user_reported_regressions_20260908.py",
+    "tests/test_user_facing_summary_thinking.py",
+    # Reviewed synthetic Workflow20 fixtures: temporary state, fake providers,
+    # and guarded owned Python children; no live inference or personal sources.
+    # Behavior engine: pure SQLite in temp dirs, the fictional test persona, ASGI
+    # TestClient/httpx MockTransport (no listener) and FakeHub; no model, Keychain,
+    # Calendar, Messages or network.
+    "tests/test_behavior_api.py",
+    # Generic availability: disposable histories/receipts, injected completions,
+    # and a pure interval Swift harness; no native collector, model or network.
+    "tests/test_behavior_availability.py",
+    "tests/test_behavior_activity_native.py",
+    "tests/test_behavior_interpreter.py",
+    # Supplied fake snapshots/analyzers, disposable behavior DBs and metadata-only
+    # history/relation checks; no native, provider, real model or user-state access.
+    "tests/test_behavior_source_index.py",
+    # Publication ordering and history use synthetic authorities, MockTransport,
+    # fake source snapshots and disposable databases; no real accounts or native IO.
+    "tests/test_gmail_behavior_history.py",
+    "tests/test_behavior_gmail_history.py",
+    "tests/test_behavior_config_authority_changes.py",
+    "tests/test_behavior_history_driver.py",
+    "tests/test_behavior_publication_boundary.py",
+    "tests/test_native_source_publication_stamps.py",
+    "tests/test_retained_source_publication_stamps.py",
+    "tests/test_behavior_associations.py",
+    "tests/test_behavior_boundary.py",
+    "tests/test_behavior_engine.py",
+    "tests/test_behavior_miners.py",
+    # Compiles actual Swift sources, then exercises pure mapping/transport
+    # guards only; no EventKit store, native app, model or personal data access.
+    "tests/test_behavior_native_history.py",
+    # Owned disposable process groups and synthetic pipes only; no native stores.
+    "tests/test_native_fixture_cleanup.py",
+    "tests/test_behavior_persona.py",
+    "tests/test_behavior_phraser.py",
+    "tests/test_behavior_predict_nudges.py",
+    "tests/test_behavior_privacy.py",
+    "tests/test_behavior_routing.py",
+    "tests/test_behavior_runtime.py",
+    "tests/test_behavior_tools.py",
+    "tests/test_behavior_weekly_history.py",
+    # Remote-inference mode: fictional example profile, patched sockets, mocked
+    # transports and AST-selected main functions; no network, Keychain or model.
+    "tests/test_remote_inference_client.py",
+    "tests/test_remote_inference_full.py",
+    "tests/test_remote_inference_main.py",
+    "tests/test_remote_inference_no_local.py",
+    "tests/test_remote_inference_policy.py",
+    "tests/test_remote_inference_read_boundary.py",
+    # Workflow20 draft/receipt identity: sockets and subprocess forbidden, disposable stores.
+    "tests/test_workflow20_draft_identity.py",
+    "tests/test_workflow20_executor_draft_identity.py",
+    "tests/test_workflow20_outbound_receipts.py",
+    "tests/test_native_bridge_reconnect.py",
+    "tests/test_workflow20_availability.py",
+    "tests/test_workflow20_calendar.py",
+    "tests/test_workflow20_calendar_identity.py",
+    "tests/test_workflow20_compiler.py",
+    "tests/test_workflow20_daily.py",
+    "tests/test_workflow20_files.py",
+    "tests/test_workflow20_knowledge.py",
+    "tests/test_workflow20_meeting.py",
+    "tests/test_workflow20_meeting_approval.py",
+    "tests/test_workflow20_messages.py",
+    "tests/test_workflow20_model_pilot.py",
+    "tests/test_workflow20_pending_actions.py",
+    "tests/test_workflow20_priorities.py",
+    "tests/test_honest_assistant_results.py",
+    "tests/test_task_plan_engine.py",
+    "tests/test_workflow20_reminder_time.py",
+    "tests/test_workflow20_routing.py",
+    # Topical Mail ASGI over disposable stores; registered/native execution is inert.
+    "tests/test_topical_email_contract.py",
+    # Actual unread stream with temporary stores and synthetic read tools only.
+    "tests/test_unread_summary_entrypoint.py",
+    "tests/test_workflow20_schedule_time.py",
+    "tests/test_workflow20_snapshot.py",
+    "tests/test_workflow20_travel.py",
+    "tests/test_workflow20_weather.py",
+    # Answer edge trimming and the plain-language weather reply; pure text.
+    "tests/test_answer_polish.py",
+    "tests/workflow20/test_contract.py",
+}
+# Integrated runtime contracts are mandatory; missing files fail selection.
+MINI_RUNTIME_INTEGRATION_TESTS = {
+    "tests/test_mini_acquisition.py",
+    "tests/test_mini_resources.py", "tests/test_mini_backup.py",
+    "tests/test_node_runtime_completion.py",
+}
+PROFILE_TESTS["reliability"].update(MINI_RUNTIME_INTEGRATION_TESTS)
+
+SAFE_FULL_TESTS = set().union(*PROFILE_TESTS.values(), ADDITIONAL_FULL_TESTS)
+
+NATIVE_PROFILES = {"sources", "outbound", "reliability"}
+EXCLUDED_LIVE_COMMANDS = [
+    "scripts/test_all_tools.py",
+    "scripts/test_mail_reply_live.sh --live-prepare",
+    "scripts/replay_prompts.py",
+    "scripts/seed_real_apps.sh",
+    "scripts/clear_real_apps.sh",
+    "scripts/install_cache_fixtures.sh",
+    "scripts/restore_cache_backup.sh",
+    "scripts/run.sh",
+    "scripts/package_app.sh",
+    "write-enabled model/retrieval/routing evaluations",
+]
+_SUMMARY_COUNT = re.compile(r"(?P<count>\d+)\s+(?P<kind>passed|failed|skipped|errors?)\b")
+_UNITTEST_RUN = re.compile(r"^Ran (?P<total>\d+) tests?(?: in .*)?$", re.MULTILINE)
+_UNITTEST_STATUS = re.compile(r"^(?P<status>OK|FAILED)(?: \((?P<details>[^)]*)\))?$", re.MULTILINE)
+_UNITTEST_DETAIL = re.compile(r"(?P<kind>[a-z ]+)=(?P<count>\d+)")
+_NATIVE_PASSED = re.compile(
+    r"(?P<passed>\d+)(?:\s+[A-Za-z-]+){0,3}\s+(?:checks|scenarios) passed\b"
+)
+_LEGACY_PROMPTS_VALIDATED = re.compile(r"\bok:\s*(?P<passed>\d+)\s+prompts validated\b")
+_NATIVE_GATE_DEPENDENCIES = {
+    "native/mail-db-contract": "native/mail-db-compile",
+    "native/mail-memory-contract": "native/mail-memory-compile",
+    "native/mail-memory-brief-contract": "native/mail-memory-brief-compile",
+    "native/mail-history-contract": "native/mail-history-compile",
+    "native/privacy-sync-contract": "native/privacy-sync-compile",
+    "native/source-sync-label-contract": "native/source-sync-label-compile",
+    "native/settings-response-contract": "native/settings-response-compile",
+    "native/port-guard-contract": "native/port-guard-compile",
+    "native/backend-trust-contract": "native/backend-trust-compile",
+    "native/reminders-policy-contract": "native/reminders-policy-compile",
+    "native/reminder-action-ledger-contract": "native/reminder-action-ledger-compile",
+    "native/calendar-move-contract": "native/calendar-move-compile",
+    "native/checkin-cancel-contract": "native/checkin-cancel-compile",
+    "native/privacy-relaunch-contract": "native/privacy-relaunch-compile",
+    "native/chat-logic-contract": "native/chat-logic-compile",
+    "native/chat-store-contract": "native/chat-store-compile",
+    "native/chat-debug-archive-contract": "native/chat-debug-archive-compile",
+    "native/notch-command-contract": "native/notch-command-compile",
+    "native/screen-look-contract": "native/screen-look-compile",
+    "native/read-aloud-voice-contract": "native/read-aloud-voice-compile",
+    "native/notch-tab-contract": "native/notch-tab-compile",
+    "native/know-you-contract": "native/know-you-compile",
+    "native/user-hours-contract": "native/user-hours-compile",
+}
+
+
+@dataclass
+class GateResult:
+    name: str
+    command: list[str]
+    returncode: int | None
+    duration_s: float
+    # Some compile/contract commands report only an exit status. Null is more
+    # honest than inventing one passed or failed test for those gates.
+    passed: int | None
+    failed: int | None
+    skipped: int | None
+    stdout: str
+    stderr: str
+    launch_error: str | None = None
+    blocked_by: str | None = None
+
+
+def _gate_status(result: GateResult) -> str:
+    if result.blocked_by is not None:
+        return "BLOCKED"
+    if result.launch_error is not None or result.returncode != 0:
+        return "FAIL"
+    return "PASS"
+
+
+def _git(*args: str) -> str:
+    proc = subprocess.run(
+        [TRUSTED_GIT, *args],
+        cwd=ROOT,
+        env={"PATH": TRUSTED_PATH, "LANG": "C", "LC_ALL": "C"},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode:
+        raise RuntimeError(proc.stderr.strip() or "git command failed")
+    return proc.stdout.strip()
+
+
+def _counts(output: str, returncode: int) -> tuple[int | None, int | None, int | None]:
+    """Extract test outcomes without treating a skip or process as a pass.
+
+    Pytest and legacy counter scripts print explicit outcome tokens. Unittest
+    instead reports the total first and skip/failure details on its trailing
+    status line. Those details may describe subtest events, so only an outcome-
+    free status permits an exact passed-parent count. Commands with no recognized
+    count contract return null counts; their gate status is still represented by
+    ``returncode``.
+    """
+    runs = list(_UNITTEST_RUN.finditer(output))
+    statuses = list(_UNITTEST_STATUS.finditer(output))
+    if runs and statuses and statuses[-1].start() > runs[-1].end():
+        total = int(runs[-1].group("total"))
+        details = {
+            match.group("kind").strip(): int(match.group("count"))
+            for match in _UNITTEST_DETAIL.finditer(statuses[-1].group("details") or "")
+        }
+        failed = (details.get("failures", 0) + details.get("errors", 0)
+                  + details.get("unexpected successes", 0))
+        skipped = details.get("skipped", 0) + details.get("expected failures", 0)
+        # Failure and skip counts can describe subtest events rather than parent
+        # methods. The summary does not reveal how many parent methods own those
+        # events, so either kind makes the passed-parent count unknowable.
+        if failed or skipped:
+            return None, failed, skipped
+        if statuses[-1].group("status") == "FAILED":
+            return None, None, skipped
+        return total, 0, 0
+
+    summaries: list[tuple[int, dict[str, int]]] = []
+    offset = 0
+    for line in output.splitlines(keepends=True):
+        counts: dict[str, int] = {}
+        for match in _SUMMARY_COUNT.finditer(line):
+            kind = match.group("kind")
+            kind = "failed" if kind in {"error", "errors"} else kind
+            counts[kind] = counts.get(kind, 0) + int(match.group("count"))
+        if counts:
+            summaries.append((offset + len(line), counts))
+        offset += len(line)
+    if summaries:
+        counts = max(summaries, key=lambda item: item[0])[1]
+        passed = counts.get("passed", 0)
+        failed = counts.get("failed")
+        if failed is None:
+            failed = 0 if returncode == 0 else None
+        return passed, failed, counts.get("skipped", 0)
+
+    checks = list(_NATIVE_PASSED.finditer(output))
+    if checks:
+        passed = int(checks[-1].group("passed"))
+        return passed, 0 if returncode == 0 else None, 0
+    prompts = list(_LEGACY_PROMPTS_VALIDATED.finditer(output))
+    if prompts:
+        passed = int(prompts[-1].group("passed"))
+        return passed, 0 if returncode == 0 else None, 0
+    return None, None, None
+
+
+def _child_environment(state_dir: Path, *, include_node_runtime: bool = False) -> dict[str, str]:
+    """Build a deterministic child environment isolated from host Harbor state."""
+    fake_home = state_dir / "home"
+    fake_tmp = state_dir / "tmp"
+    fake_cache = state_dir / "cache"
+    fake_home.mkdir()
+    fake_tmp.mkdir()
+    fake_cache.mkdir()
+    # Start from an allowlist rather than subtracting known-dangerous names.
+    # This excludes host credentials, loader injection, shell hooks, pytest
+    # plugins, model settings, and executable-path shims by construction.
+    env = {
+        "HOME": str(fake_home),
+        "PATH": TRUSTED_PATH,
+        "TMPDIR": str(fake_tmp),
+        "XDG_CACHE_HOME": str(fake_cache),
+        "LANG": "C",
+        "LC_ALL": "C",
+        "HARBOR_HOME": str(state_dir / "harbor"),
+        "HARBORAIR_HOME": str(state_dir / "air"),
+        "HARBOR_TEST_PYTHON": sys.executable,
+        "PYTHONPATH": str(ROOT),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONOPTIMIZE": "0",
+        "PYTHONHASHSEED": "0",
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+        "PYTEST_ADDOPTS": "-p no:cacheprovider",
+    }
+    # The outer build sandbox allows Foundation replacement folders bearing
+    # only this run's executable prefix. Native contracts must retain it through
+    # the environment allowlist; it grants no new sandbox permission.
+    fixture_prefix = os.environ.get("HARBOR_BUILD_FIXTURE_PREFIX")
+    if fixture_prefix is not None:
+        if not re.fullmatch(r"harborqa-[A-Za-z0-9_-]{1,64}", fixture_prefix):
+            raise RuntimeError("Invalid native fixture prefix")
+        env["HARBOR_BUILD_FIXTURE_PREFIX"] = fixture_prefix
+    if include_node_runtime:
+        env["QA_NODE_RUNTIME"] = str(resolve_node_runtime(os.environ.get("QA_NODE_RUNTIME")))
+    return env
+
+
+def _run(
+        name: str, command: list[str], cwd: Path = ROOT,
+        *, require_nonzero_count: bool = False,
+) -> GateResult:
+    started = time.monotonic()
+    try:
+        with tempfile.TemporaryDirectory(prefix="harbor-simqa-state-") as state_dir:
+            env = _child_environment(Path(state_dir),
+                include_node_runtime=name in {"tests/browser_dom/test_page_extractor.py",
+                                              "tests/browser_dom/test_live_capture.py",
+                                              "tests/browser_chrome/test_chrome_acquisition.py",
+                                              "tests/browser_actions/test_action_executor.py"})
+            proc = subprocess.run(
+                command, cwd=cwd, env=env, text=True, capture_output=True, check=False
+            )
+    except (OSError, NodeRuntimeError) as exc:
+        duration = time.monotonic() - started
+        error = f"{type(exc).__name__}: {exc}"
+        result = GateResult(
+            name=name,
+            command=command,
+            returncode=None,
+            duration_s=round(duration, 3),
+            passed=None,
+            failed=None,
+            skipped=None,
+            stdout="",
+            stderr=error,
+            launch_error=error,
+        )
+        with _OUTPUT_LOCK:
+            print(f"[FAIL] {name} (launch error; {duration:.2f}s)", flush=True)
+            print(error, file=sys.stderr, flush=True)
+        return result
+    duration = time.monotonic() - started
+    passed, failed, skipped = _counts(proc.stdout + "\n" + proc.stderr, proc.returncode)
+    count_error = None
+    if require_nonzero_count and proc.returncode == 0:
+        reported = [count for count in (passed, failed, skipped) if count is not None]
+        if not reported or sum(reported) == 0:
+            count_error = "legacy script did not report a nonzero test count"
+    result = GateResult(
+        name=name,
+        command=command,
+        returncode=1 if count_error else proc.returncode,
+        duration_s=round(duration, 3),
+        passed=passed,
+        failed=failed,
+        skipped=skipped,
+        stdout=proc.stdout,
+        stderr=(proc.stderr + (f"\n{count_error}\n" if count_error else "")),
+    )
+    state = _gate_status(result)
+    rendered = tuple("unreported" if count is None else str(count)
+                     for count in (passed, failed, skipped))
+    with _OUTPUT_LOCK:
+        print(
+            f"[{state}] {name} ({rendered[0]} passed, {rendered[1]} failed, "
+            f"{rendered[2]} skipped; {duration:.2f}s)",
+            flush=True,
+        )
+        if proc.returncode:
+            print(proc.stdout, end="", flush=True)
+            print(proc.stderr, end="", file=sys.stderr, flush=True)
+    return result
+
+
+def _blocked_result(name: str, command: list[str], dependency: str) -> GateResult:
+    message = f"not run because prerequisite gate {dependency} did not pass"
+    result = GateResult(
+        name=name,
+        command=command,
+        returncode=None,
+        duration_s=0.0,
+        passed=None,
+        failed=None,
+        skipped=None,
+        stdout="",
+        stderr=message,
+        blocked_by=dependency,
+    )
+    with _OUTPUT_LOCK:
+        print(f"[BLOCKED] {name} ({message})", flush=True)
+    return result
+
+
+def _totals(results: list[GateResult], duration_s: float) -> dict[str, int | float | bool]:
+    reported = [item for item in results
+                if any(count is not None for count in (item.passed, item.failed, item.skipped))]
+    complete = [item for item in results
+                if all(count is not None for count in (item.passed, item.failed, item.skipped))]
+    statuses = [_gate_status(item) for item in results]
+    return {
+        "gates": len(results),
+        "passed_gates": statuses.count("PASS"),
+        "failed_gates": statuses.count("FAIL"),
+        "blocked_gates": statuses.count("BLOCKED"),
+        "reported_gates": len(reported),
+        "unreported_gates": len(results) - len(reported),
+        "incomplete_gates": len(results) - len(complete),
+        "counts_complete": len(complete) == len(results),
+        "passed": sum(item.passed for item in results if item.passed is not None),
+        "failed": sum(item.failed for item in results if item.failed is not None),
+        "skipped": sum(item.skipped for item in results if item.skipped is not None),
+        "duration_s": round(duration_s, 3),
+    }
+
+
+def _python_command(path: str) -> list[str]:
+    if path in LEGACY_SCRIPT_TESTS:
+        return [sys.executable, path]
+    command = [sys.executable, "-m", "pytest", "-p", "pytest_asyncio.plugin"]
+    return [*command, "-q", "-rs", path]
+
+
+def _dependencies() -> dict[str, str]:
+    required = {"pytest": "pytest", "pytest-asyncio": "pytest_asyncio"}
+    missing = [distribution for distribution, module in required.items()
+               if importlib.util.find_spec(module) is None]
+    if missing:
+        raise RuntimeError(f"missing Simulation QA dependencies: {', '.join(missing)}")
+    return {name: importlib.metadata.version(name) for name in required}
+
+
+def _native_gates(build_dir: Path) -> list[tuple[str, list[str]]]:
+    module_cache = str(build_dir / "module-cache")
+    mail_db = str(build_dir / "mail-db-regression")
+    mail_memory = str(build_dir / "mail-memory-regression")
+    mail_memory_brief = str(build_dir / "mail-memory-brief")
+    mail_history = str(build_dir / "mail-history")
+    privacy_sync = str(build_dir / "privacy-sync")
+    sync_label = str(build_dir / "source-sync-label")
+    prompt_queue = str(build_dir / "prompt-queue")
+    agent_send = str(build_dir / "agent-send")
+    notch_command = str(build_dir / "notch-command")
+    screen_look = str(build_dir / "screen-look")
+    read_aloud_voice = str(build_dir / "read-aloud-voice")
+    notch_tab = str(build_dir / "notch-tab")
+    know_you = str(build_dir / "know-you")
+    user_hours = str(build_dir / "user-hours")
+    chat_logic = str(build_dir / "chat-logic")
+    chat_store = str(build_dir / "chat-store")
+    chat_debug_archive = str(build_dir / "chat-debug-archive")
+    reminders_policy = str(build_dir / "reminders-policy")
+    reminder_action_ledger = str(build_dir / "reminder-action-ledger")
+    calendar_move = str(build_dir / "calendar-move")
+    checkin_cancel = str(build_dir / "checkin-cancel")
+    privacy_relaunch = str(build_dir / "privacy-relaunch")
+    settings_response = str(build_dir / "settings-response")
+    port_guard = str(build_dir / "port-guard")
+    backend_trust = str(build_dir / "backend-trust")
+    return [
+        (
+            "native/mail-reply-contract",
+            [TRUSTED_BASH, "scripts/test_mail_reply_contract.sh"],
+        ),
+        (
+            "native/search-contract",
+            [TRUSTED_BASH, "scripts/test_search_contract.sh"],
+        ),
+        ("native/diagnostic-report-contract", [TRUSTED_BASH, "scripts/test_diagnostic_report.sh"]),
+        (
+            "native/today-contract",
+            [TRUSTED_BASH, "scripts/test_today_contract.sh"],
+        ),
+        (
+            "native/brief-time-contract",
+            [TRUSTED_BASH, "scripts/test_brief_time.sh"],
+        ),
+        (
+            "native/release-interactions-contract",
+            [TRUSTED_BASH, "scripts/test_release_interactions.sh", "--outer-isolation"],
+        ),
+        (
+            "native/markdown-contract",
+            [TRUSTED_BASH, "scripts/test_markdown_contract.sh"],
+        ),
+        (
+            "native/research-library-contract",
+            [TRUSTED_BASH, "scripts/test_research_library_contract.sh"],
+        ),
+        (
+            "native/display-geometry-contract",
+            [TRUSTED_BASH, "scripts/test_display_geometry.sh"],
+        ),
+        (
+            "native/first-run-setup-contract",
+            [TRUSTED_BASH, "scripts/test_first_run_setup.sh"],
+        ),
+        (
+            "native/mail-db-compile",
+            [
+                TRUSTED_SWIFTC, "-module-cache-path", module_cache,
+                "app/Sources/HarborApp/MailDBReader.swift",
+                "tests/MailDBReaderRegression.swift", "-lsqlite3", "-o", mail_db,
+            ],
+        ),
+        ("native/mail-db-contract", [mail_db]),
+        (
+            "native/mail-memory-compile",
+            [
+                TRUSTED_SWIFTC, "-module-cache-path", module_cache,
+                "app/Sources/HarborApp/MailMemoryReader.swift", "app/Sources/HarborApp/TextRecognizer.swift",
+                "tests/MailMemoryReaderRegression.swift", "-lsqlite3", "-o", mail_memory,
+            ],
+        ),
+        ("native/mail-memory-contract", [mail_memory]),
+        (
+            "native/mail-memory-brief-compile",
+            [
+                TRUSTED_SWIFTC, "-parse-as-library", "-module-cache-path", module_cache,
+                "app/Sources/HarborApp/MailMemory.swift",
+                "tests/MailMemoryChecks.swift", "-o", mail_memory_brief,
+            ],
+        ),
+        ("native/mail-memory-brief-contract", [mail_memory_brief]),
+        (
+            "native/mail-history-compile",
+            [
+                TRUSTED_SWIFTC, "-parse-as-library", "-swift-version", "5",
+                "-module-cache-path", module_cache,
+                "app/Sources/HarborApp/MailHistoryMerge.swift",
+                "tests/MailHistoryChecks.swift", "-o", mail_history,
+            ],
+        ),
+        ("native/mail-history-contract", [mail_history]),
+        (
+            "native/privacy-sync-compile",
+            [
+                TRUSTED_SWIFTC, "-module-cache-path", module_cache,
+                "app/Sources/HarborApp/BrowserHistoryReader.swift",
+                "app/Sources/HarborApp/ContactsReader.swift",
+                "tests/PrivacySyncChecks.swift", "-lsqlite3", "-o", privacy_sync,
+            ],
+        ),
+        ("native/privacy-sync-contract", [privacy_sync]),
+        (
+            "native/source-sync-label-compile",
+            [
+                TRUSTED_SWIFTC, "-module-cache-path", module_cache,
+                "app/Sources/HarborApp/HarborClient.swift", "app/Sources/HarborApp/AgentSend.swift",
+                "tests/SourceSyncLabelRegression.swift", "-o", sync_label,
+            ],
+        ),
+        ("native/source-sync-label-contract", [sync_label]),
+        (
+            "native/prompt-queue-compile",
+            [
+                TRUSTED_SWIFTC, "-parse-as-library", "-swift-version", "5",
+                "-module-cache-path", module_cache,
+                "app/Sources/HarborApp/PromptQueue.swift", "app/Sources/HarborApp/AgentSend.swift",
+                "tests/PromptQueueChecks.swift", "-o", prompt_queue,
+            ],
+        ),
+        ("native/prompt-queue-contract", [prompt_queue]),
+        (
+            "native/agent-send-compile",
+            [
+                TRUSTED_SWIFTC, "-parse-as-library", "-swift-version", "5",
+                "-module-cache-path", module_cache,
+                "app/Sources/HarborApp/HarborClient.swift", "app/Sources/HarborApp/AgentSend.swift",
+                "app/Sources/HarborApp/AskAccess.swift",
+                "tests/AgentSendChecks.swift", "-o", agent_send,
+            ],
+        ),
+        # A stub URLProtocol answers every request in-process; nothing reaches a socket.
+        ("native/agent-send-contract", [agent_send]),
+        (
+            "native/notch-command-compile",
+            [
+                TRUSTED_SWIFTC, "-parse-as-library", "-swift-version", "5",
+                "-module-cache-path", module_cache,
+                "app/Sources/HarborApp/NotchCommand.swift",
+                "tests/NotchCommandChecks.swift", "-o", notch_command,
+            ],
+        ),
+        ("native/notch-command-contract", [notch_command]),
+        (
+            "native/screen-look-compile",
+            [
+                TRUSTED_SWIFTC, "-parse-as-library", "-swift-version", "5",
+                "-module-cache-path", module_cache,
+                "app/Sources/HarborApp/ScreenLook.swift",
+                "tests/ScreenLookChecks.swift", "-o", screen_look,
+            ],
+        ),
+        ("native/screen-look-contract", [screen_look]),
+        (
+            "native/read-aloud-voice-compile",
+            [
+                TRUSTED_SWIFTC, "-parse-as-library", "-swift-version", "5",
+                "-module-cache-path", module_cache,
+                "app/Sources/HarborApp/ReadAloudVoice.swift",
+                "tests/ReadAloudVoiceChecks.swift", "-o", read_aloud_voice,
+            ],
+        ),
+        ("native/read-aloud-voice-contract", [read_aloud_voice]),
+        (
+            "native/notch-tab-compile",
+            [
+                TRUSTED_SWIFTC, "-parse-as-library", "-swift-version", "5",
+                "-module-cache-path", module_cache,
+                "app/Sources/HarborApp/NotchTab.swift",
+                "app/Sources/HarborApp/NotchDay.swift",
+                "app/Sources/HarborApp/BriefSummary.swift",
+                "app/Sources/HarborApp/QuickSettingsText.swift",
+                "app/Sources/HarborApp/StaleReminders.swift",
+                "app/Sources/HarborApp/NeedsYouActions.swift",
+                "app/Sources/HarborApp/Study.swift",
+                "tests/NotchTabChecks.swift", "tests/NotchDayChecks.swift",
+                "tests/BriefSummaryChecks.swift", "tests/QuickSettingsChecks.swift",
+                "tests/StaleReminderChecks.swift", "tests/NeedsYouActionChecks.swift",
+                "tests/StudyChecks.swift", "-o", notch_tab,
+            ],
+        ),
+        ("native/notch-tab-contract", [notch_tab]),
+        (
+            "native/know-you-compile",
+            [
+                TRUSTED_SWIFTC, "-parse-as-library", "-swift-version", "5",
+                "-module-cache-path", module_cache,
+                "app/Sources/HarborApp/KnowYouFlow.swift",
+                "tests/KnowYouChecks.swift", "-o", know_you,
+            ],
+        ),
+        ("native/know-you-contract", [know_you]),
+        (
+            "native/user-hours-compile",
+            [
+                TRUSTED_SWIFTC, "-parse-as-library", "-swift-version", "5",
+                "-module-cache-path", module_cache,
+                "app/Sources/HarborApp/UserHours.swift",
+                "tests/UserHoursChecks.swift", "-o", user_hours,
+            ],
+        ),
+        ("native/user-hours-contract", [user_hours]),
+        (
+            "native/chat-logic-compile",
+            [
+                TRUSTED_SWIFTC, "-parse-as-library", "-swift-version", "5",
+                "-module-cache-path", module_cache,
+                "app/Sources/HarborApp/Chat/ChatTypes.swift",
+                "tests/ChatChecks.swift", "-o", chat_logic,
+            ],
+        ),
+        ("native/chat-logic-contract", [chat_logic]),
+        (
+            "native/chat-store-compile",
+            [
+                TRUSTED_SWIFTC, "-parse-as-library", "-swift-version", "5",
+                "-module-cache-path", module_cache,
+                "app/Sources/HarborApp/Chat/ChatTypes.swift",
+                "app/Sources/HarborApp/Chat/AssistantTaskCorpus.swift",
+                "app/Sources/HarborApp/Chat/ChatStore.swift",
+                "app/Sources/HarborApp/Chat/NotchCorpusController.swift",
+                "app/Sources/HarborApp/AskAccess.swift",
+                "tests/ChatStoreChecks.swift", "-o", chat_store,
+            ],
+        ),
+        ("native/chat-store-contract", [chat_store]),
+        (
+            "native/chat-debug-archive-compile",
+            [
+                TRUSTED_SWIFTC, "-parse-as-library", "-swift-version", "5",
+                "-module-cache-path", module_cache,
+                "app/Sources/HarborApp/ChatDebugArchive.swift",
+                "tests/ChatDebugArchiveChecks.swift", "-o", chat_debug_archive,
+            ],
+        ),
+        ("native/chat-debug-archive-contract", [chat_debug_archive]),
+        (
+            "native/port-guard-compile",
+            [
+                TRUSTED_SWIFTC, "-parse-as-library", "-swift-version", "5",
+                "-module-cache-path", module_cache,
+                "app/Sources/HarborApp/PortGuard.swift",
+                "app/Sources/HarborApp/BackendOwnership.swift",
+                "tests/PortGuardChecks.swift", "-o", port_guard,
+            ],
+        ),
+        ("native/port-guard-contract", [port_guard]),
+        (
+            "native/backend-trust-compile",
+            [
+                TRUSTED_SWIFTC, "-parse-as-library", "-swift-version", "5",
+                "-module-cache-path", module_cache,
+                "app/Sources/HarborApp/PortGuard.swift",
+                "app/Sources/HarborApp/BackendOwnership.swift",
+                "app/Sources/HarborApp/BackendTrust.swift",
+                "tests/BackendTrustChecks.swift", "-o", backend_trust,
+            ],
+        ),
+        ("native/backend-trust-contract", [backend_trust]),
+        (
+            "native/reminders-policy-compile",
+            [
+                TRUSTED_SWIFTC, "-parse-as-library", "-swift-version", "5",
+                "-module-cache-path", module_cache,
+                "app/Sources/HarborApp/RemindersWriter.swift",
+                "app/Sources/HarborApp/ReminderActionLedger.swift",
+                "tests/RemindersPolicyChecks.swift", "-o", reminders_policy,
+            ],
+        ),
+        ("native/reminders-policy-contract", [reminders_policy]),
+        (
+            "native/reminder-action-ledger-compile",
+            [
+                TRUSTED_SWIFTC, "-parse-as-library", "-swift-version", "5",
+                "-module-cache-path", module_cache,
+                "app/Sources/HarborApp/ReminderActionLedger.swift",
+                "tests/ReminderActionLedgerChecks.swift", "-o", reminder_action_ledger,
+            ],
+        ),
+        ("native/reminder-action-ledger-contract", [reminder_action_ledger]),
+        (
+            "native/calendar-move-compile",
+            [
+                TRUSTED_SWIFTC, "-parse-as-library", "-swift-version", "5",
+                "-module-cache-path", module_cache,
+                "app/Sources/HarborApp/CalendarMove.swift",
+                "tests/CalendarMoveChecks.swift", "-o", calendar_move,
+            ],
+        ),
+        ("native/calendar-move-contract", [calendar_move]),
+        (
+            "native/checkin-cancel-compile",
+            [
+                TRUSTED_SWIFTC, "-parse-as-library", "-swift-version", "5",
+                "-module-cache-path", module_cache,
+                "app/Sources/HarborApp/CheckInCancel.swift",
+                "tests/CheckInCancelChecks.swift", "-o", checkin_cancel,
+            ],
+        ),
+        ("native/checkin-cancel-contract", [checkin_cancel]),
+        (
+            "native/privacy-relaunch-compile",
+            [
+                TRUSTED_SWIFTC, "-parse-as-library", "-swift-version", "5",
+                "-module-cache-path", module_cache,
+                "app/Sources/HarborApp/PrivacyRelaunch.swift",
+                "tests/PrivacyRelaunchChecks.swift", "-o", privacy_relaunch,
+            ],
+        ),
+        ("native/privacy-relaunch-contract", [privacy_relaunch]),
+        (
+            "native/settings-response-compile",
+            [
+                TRUSTED_SWIFTC, "-module-cache-path", module_cache,
+                "app/Sources/HarborApp/SettingsResponseValidator.swift",
+                "tests/settings_response/main.swift", "-o", settings_response,
+            ],
+        ),
+        ("native/settings-response-contract", [settings_response]),
+    ]
+
+
+def _run_native_gates(build_dir: Path) -> list[GateResult]:
+    results: list[GateResult] = []
+    by_name: dict[str, GateResult] = {}
+    for name, command in _native_gates(build_dir):
+        dependency = _NATIVE_GATE_DEPENDENCIES.get(name)
+        if (dependency is not None
+                and (dependency not in by_name or _gate_status(by_name[dependency]) != "PASS")):
+            result = _blocked_result(name, command, dependency)
+        else:
+            result = _run(name, command)
+        results.append(result)
+        by_name[name] = result
+    return results
+
+
+# Scheduling hint for parallel runs only: start the slowest known modules first
+# so one of them does not begin near the end and become the critical path.
+# This never changes selection, the report order or any verdict; a stale or
+# missing entry only costs wall time.
+_START_FIRST = (
+    "tests/test_runtime_attestation_t0.py",
+    "tests/test_outbound_content_provenance.py",
+    "tests/test_fast_path_intent.py",
+    "tests/test_release_performance.py",
+    "tests/build_pipeline/managed_live_qa_checks.py",
+    "tests/build_pipeline/pipeline_checks.py",
+    "tests/test_workflow20_reminder_time.py",
+    "tests/test_runtime_proc_path.py",
+)
+
+
+# Modules with real-socket peer attestation under a fixed wall-clock readiness
+# budget. They run alone, after every concurrent gate has finished, so CPU
+# contention from other gates cannot turn a timing budget into a false failure.
+# (The build pipeline already runs this module in its own native peer gate.)
+RUN_ALONE_TESTS = frozenset({"tests/test_runtime_peer.py"})
+
+
+def _submission_order(tests: list[str]) -> list[str]:
+    selected = set(tests)
+    first = [path for path in _START_FIRST if path in selected]
+    return first + [path for path in tests if path not in first]
+
+
+def _run_python_gate(path: str) -> GateResult:
+    # Resolve _run/_python_command at call time: the build pipeline wrapper
+    # substitutes _run to import separately sandboxed evidence.
+    return _run(
+        path,
+        _python_command(path),
+        require_nonzero_count=path in LEGACY_SCRIPT_TESTS,
+    )
+
+
+def _run_gates(tests: list[str], run_native: bool, jobs: int) -> list[GateResult]:
+    """Run every selected gate; results always follow selection order.
+
+    Each Python module keeps its own process and temporary state (see _run),
+    so modules are independent and may run concurrently. Native gates keep
+    their compile-before-contract dependencies by running as one ordered chain
+    on a single worker, started first because it is the longest serial path.
+    ``jobs == 1`` is exactly the historical sequential schedule.
+    """
+    if jobs <= 1:
+        results = [_run_python_gate(path) for path in tests]
+        if run_native:
+            with tempfile.TemporaryDirectory(prefix="harbor-simqa-native-") as build:
+                results.extend(_run_native_gates(Path(build)))
+        return results
+    with tempfile.TemporaryDirectory(prefix="harbor-simqa-native-") as build, \
+            ThreadPoolExecutor(max_workers=jobs, thread_name_prefix="simqa") as pool:
+        try:
+            native = pool.submit(_run_native_gates, Path(build)) if run_native else None
+            futures = {path: pool.submit(_run_python_gate, path)
+                       for path in _submission_order(tests) if path not in RUN_ALONE_TESTS}
+            by_path = {path: future.result() for path, future in futures.items()}
+            native_results = native.result() if native is not None else []
+            for path in tests:                                   # pool is idle now
+                if path in RUN_ALONE_TESTS:
+                    by_path[path] = _run_python_gate(path)
+            results = [by_path[path] for path in tests] + native_results
+        except BaseException:
+            # An unexpected runner error aborts the run as it would sequentially;
+            # do not start queued gates while the error propagates.
+            pool.shutdown(wait=True, cancel_futures=True)
+            raise
+    return results
+
+
+def _selected_tests(profiles: list[str]) -> list[str]:
+    if "full" in profiles:
+        discovered = {
+            str(path.relative_to(ROOT))
+            for path in (ROOT / "tests").rglob("test_*.py")
+        }
+        unknown = sorted(discovered - SAFE_FULL_TESTS)
+        missing = sorted(SAFE_FULL_TESTS - discovered)
+        if unknown or missing:
+            details = []
+            if unknown:
+                details.append(f"unclassified tests: {unknown}")
+            if missing:
+                details.append(f"missing reviewed tests: {missing}")
+            raise RuntimeError("unsafe full-profile manifest drift; " + "; ".join(details))
+        return sorted(SAFE_FULL_TESTS)
+    selected: set[str] = set()
+    for profile in profiles:
+        selected.update(PROFILE_TESTS[profile])
+    return sorted(selected)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    choices = ["full", *sorted(PROFILE_TESTS)]
+    parser.add_argument(
+        "--profile", action="append", choices=choices,
+        help="Repeat to combine targeted profiles; default: full.",
+    )
+    parser.add_argument(
+        "--expected-sha", required=True,
+        help="Exact 40-character candidate commit that must remain checked out.",
+    )
+    parser.add_argument(
+        "--base-sha", help="Optional comparison commit recorded with changed paths.",
+    )
+    parser.add_argument(
+        "--report", type=Path,
+        help="Caller-owned path for complete JSON results and captured gate logs.",
+    )
+    parser.add_argument(
+        "--safety-mode", choices=["offline"], default="offline",
+        help="Only offline, non-mutating simulation is supported.",
+    )
+    native_mode = parser.add_mutually_exclusive_group()
+    native_mode.add_argument(
+        "--skip-native", action="store_true",
+        help="Skip Swift gates; retain a separate native-only report before verdict.",
+    )
+    native_mode.add_argument(
+        "--only-native", action="store_true",
+        help="Run only the non-sending Swift gates.",
+    )
+    parser.add_argument(
+        "--allow-dirty", action="store_true",
+        help="Infrastructure development only; candidate verdicts must never use this.",
+    )
+    parser.add_argument(
+        "--jobs", type=int, default=None, metavar="N",
+        help="Concurrent gate processes (default: one per CPU; 1 runs sequentially).",
+    )
+    parser.add_argument("--list", action="store_true", help="List selected gates and exit.")
+    args = parser.parse_args()
+    if not args.list and args.report is None:
+        parser.error("--report is required unless --list is used")
+    if not args.list and args.report is not None:
+        try:
+            args.report.resolve().relative_to(ROOT.resolve())
+        except ValueError:
+            pass
+        else:
+            parser.error("--report must be outside the candidate Worktree")
+
+    jobs = default_jobs() if args.jobs is None else args.jobs
+    if jobs < 1:
+        parser.error("--jobs must be at least 1")
+    profiles = args.profile or ["full"]
+    expected = args.expected_sha.lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", expected):
+        parser.error("--expected-sha must be a full 40-character commit SHA")
+    base = args.base_sha.lower() if args.base_sha else None
+    if base is not None:
+        if not re.fullmatch(r"[0-9a-f]{40}", base):
+            parser.error("--base-sha must be a full 40-character commit SHA")
+        try:
+            resolved_base = _git("rev-parse", "--verify", f"{base}^{{commit}}")
+        except RuntimeError as exc:
+            parser.error(f"--base-sha does not resolve to a commit: {exc}")
+        if resolved_base != base:
+            parser.error("--base-sha must resolve to the exact supplied commit")
+    start_sha = _git("rev-parse", "HEAD")
+    if start_sha != expected:
+        parser.error(f"HEAD is {start_sha}, expected {expected}")
+    dirty = _git("status", "--porcelain")
+    if dirty and not args.allow_dirty:
+        parser.error("candidate Worktree is dirty; exact-SHA verdicts require a clean checkout")
+
+    tests = [] if args.only_native else _selected_tests(profiles)
+    run_native = args.only_native or (
+        not args.skip_native
+        and ("full" in profiles or bool(NATIVE_PROFILES.intersection(profiles)))
+    )
+    if args.list:
+        for path in tests:
+            print(path)
+        if run_native:
+            for name, _command in _native_gates(Path("/tmp/harbor-simqa-list")):
+                print(name)
+        print("excluded live/mutating commands:")
+        for command in EXCLUDED_LIVE_COMMANDS:
+            print(f"  {command}")
+        return 0
+    dependencies = _dependencies() if tests else {}
+
+    changed_paths = (
+        _git("diff", "--name-only", f"{base}..{start_sha}", "--").splitlines()
+        if base else []
+    )
+    started = time.monotonic()
+    if jobs > 1:
+        print(f"Simulation QA: {len(tests)} modules"
+              f"{' + native gates' if run_native else ''}; {jobs} parallel jobs", flush=True)
+    results = _run_gates(tests, run_native, jobs)
+
+    end_sha = _git("rev-parse", "HEAD")
+    stable = end_sha == start_sha == expected
+    ending_dirty = _git("status", "--porcelain").splitlines()
+    worktree_clean = not ending_dirty
+    totals = _totals(results, time.monotonic() - started)
+    ok = (stable and (args.allow_dirty or worktree_clean)
+          and all(_gate_status(item) == "PASS" for item in results))
+    report = {
+        "schema_version": 3,
+        "safety_mode": args.safety_mode,
+        "environment": {
+            "python": sys.executable,
+            "python_version": sys.version.split()[0],
+            "dependencies": dependencies,
+        },
+        "status": "PASS" if ok else "FAIL",
+        "candidate_sha": start_sha,
+        "ending_sha": end_sha,
+        "sha_stable": stable,
+        "worktree_clean": worktree_clean,
+        "ending_dirty": ending_dirty,
+        "dirty_allowed": bool(args.allow_dirty),
+        "native_mode": "only" if args.only_native else ("skip" if args.skip_native else "included"),
+        "profiles": profiles,
+        "base_sha": args.base_sha,
+        "changed_paths": changed_paths,
+        "excluded_live_commands": EXCLUDED_LIVE_COMMANDS,
+        "totals": totals,
+        "results": [dict(asdict(item), status=_gate_status(item)) for item in results],
+    }
+    args.report.parent.mkdir(parents=True, exist_ok=True)
+    args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps({key: report[key] for key in (
+        "status", "candidate_sha", "sha_stable", "worktree_clean", "totals"
+    )}, indent=2))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
