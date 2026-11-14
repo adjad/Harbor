@@ -222,11 +222,65 @@ jobs:
           include-hidden-files: true
           retention-days: 7
 
+  # Every push to a branch (main): the same Swift build, assembly, native validation,
+  # ad-hoc signing and relocated-backend smoke as `all`, without Simulation QA, the
+  # peer gates, benchmark contracts or distribution evidence. It exposes no secrets
+  # (the built-in Google sign-in client is simply not bundled), and the result is a
+  # preview that every release command refuses. v* tags and manual dispatch run `full`.
+  push-build:
+    name: Preview build (push)
+    if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    outputs:
+      sha: ${{ steps.candidate.outputs.sha }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify exact candidate checkout
+        id: candidate
+        env:
+          CANDIDATE_SHA: ${{ github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          echo "sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
+      - name: Validate committed dependency locks before bootstrap
+        run: python3 -B -c 'import sys; sys.path.insert(0, "build-support"); import pipeline; pipeline.check_locks()'
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: .harbor-build/uv-cache
+          key: harbor-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build-support/toolchain.json', 'build-support/*.lock') }}
+      - name: Build, sign and smoke-test preview from source
+        run: ./scripts/harbor-build preview --strict-toolchain --fetch-engine --output dist/preview
+      - name: Verify synthetic publisher signatures and provisioning transactions
+        run: |
+          .harbor-build/test-env/bin/python -m venv /tmp/harbor-provisioning-tests
+          /tmp/harbor-provisioning-tests/bin/python -m pip install --require-hashes --only-binary=:all: -r build-support/requirements-test.lock
+          /tmp/harbor-provisioning-tests/bin/python -m pytest -q tests/test_artifact_signature.py tests/test_node_prep.py tests/test_arrival_completion.py tests/test_local_auth_completion.py tests/test_credential_recovery_completion.py tests/test_primary_runtime_completion.py
+      - name: Upload preview diagnostics
+        continue-on-error: true
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: harbor-push-diagnostics-${{ github.sha }}
+          path: |
+            .harbor-build/run-*/*.log
+            .harbor-build/run-*/*.json
+          if-no-files-found: warn
+          include-hidden-files: true
+          retention-days: 7
+
   full:
     name: Full verified artifact
-    # Push to main, v* tags and manual dispatch: every gate, unchanged, plus
-    # distribution evidence. Releases rebuild from source after this passes.
-    if: github.event_name != 'pull_request'
+    # v* tags and manual dispatch only: every gate, unchanged, plus distribution
+    # evidence. Releases rebuild from source after this passes. Pushes to main run
+    # the lighter push-build job instead.
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
     runs-on: macos-15
     timeout-minutes: 60
     env:
@@ -306,7 +360,7 @@ jobs:
   # and runs nothing from the candidate, it only binds the gate results.
   verify:
     name: Verified macOS artifact
-    needs: [preview, simulation-qa, full]
+    needs: [preview, simulation-qa, push-build, full]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -315,11 +369,14 @@ jobs:
       - name: Require every gate for this event on the exact candidate
         env:
           EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
           CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           PREVIEW_RESULT: ${{ needs.preview.result }}
           PREVIEW_SHA: ${{ needs.preview.outputs.sha }}
           QA_RESULT: ${{ needs.simulation-qa.result }}
           QA_SHA: ${{ needs.simulation-qa.outputs.sha }}
+          PUSH_RESULT: ${{ needs.push-build.result }}
+          PUSH_SHA: ${{ needs.push-build.outputs.sha }}
           FULL_RESULT: ${{ needs.full.result }}
         run: |
           if [ "$EVENT" = "pull_request" ]; then
@@ -330,6 +387,12 @@ jobs:
                 exit 1
               fi
             done
+          elif [ "$EVENT" = "push" ] && [ "${REF_TYPE}" != "tag" ]; then
+            echo "push-build=$PUSH_RESULT ($PUSH_SHA) candidate=$CANDIDATE_SHA"
+            if [ "$PUSH_RESULT@$PUSH_SHA" != "success@$CANDIDATE_SHA" ]; then
+              echo "::error::Preview build (push) must pass on $CANDIDATE_SHA"
+              exit 1
+            fi
           else
             echo "full=$FULL_RESULT candidate=$CANDIDATE_SHA"
             if [ "$FULL_RESULT" != "success" ]; then

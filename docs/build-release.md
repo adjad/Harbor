@@ -301,7 +301,7 @@ The client secret of a Desktop app is not confidential once shipped: anyone who 
 read it from the bundle. That is why the project stays in Google's Testing mode with a tester list.
 
 **Where CI supplies it.** The `harbor-build.yml` steps that run `harbor-build preview` (the pull request
-preview build) and `harbor-build all` (the full build on push, the signed `release` job and the ad-hoc
+preview build) and `harbor-build all` (the full build on tags and manual dispatch, the signed `release` job and the ad-hoc
 `publish-ad-hoc-release` job) set it from `secrets.HARBOR_GOOGLE_OAUTH_CLIENT`. It is the only secret in
 the preview job. GitHub passes an empty value to pull requests from forks, so those builds ship
 without a client. Define it as a repository secret so all four steps can read it.
@@ -484,18 +484,23 @@ Pull requests (fast path, `harbor-build.yml`):
   is kept because it is the stricter gate (pinned runtime, OS sandbox,
   reviewed manifest) and is the one release evidence relies on.
 
-Pushes to main, `v*` tags and manual dispatch (full path):
+Pushes to main (push path):
 
-- **Full verified artifact** runs `harbor-build all --strict-toolchain` unchanged:
-  every gate plus distribution evidence, then the provisioning tests and mini
-  artifact, and uploads `harbor-candidate-<sha>`. **Verified macOS artifact**
-  passes only if it succeeded. Release jobs depend on it directly and still
-  rebuild from source.
+- **Preview build (push)** (`macos-15`, no secrets) runs `harbor-build preview
+  --strict-toolchain --fetch-engine` and the synthetic publisher/provisioning
+  tests. **Verified macOS artifact** passes only if it succeeded.
 - **python-regressions** runs the complete regression gate outside the sandbox
   as a cross-check, one module per runner CPU at a time.
 
-The full path builds and uploads candidates on main pushes, tags, and manual
-dispatch. [GitHub's runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
+`v*` tags and manual dispatch (full path):
+
+- **Full verified artifact** runs `harbor-build all --strict-toolchain` unchanged:
+  every gate plus distribution evidence, then the provisioning tests and mini
+  artifact, and uploads `harbor-candidate-<sha>` as a workflow artifact (not a
+  GitHub release). **Verified macOS artifact** passes only if it succeeded.
+  Release jobs depend on it directly and still rebuild from source.
+
+The full path builds and uploads candidates on tags and manual dispatch. [GitHub's runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
 identifies `macos-15` as arm64; `doctor` independently rejects any other host
 architecture. CI selects Xcode 16.4 and requires Swift 6.1.2. A local Command Line
 Tools build records `strict_toolchain: false` and cannot pass release preflight.
