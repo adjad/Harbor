@@ -1,0 +1,207 @@
+import Darwin
+import Foundation
+
+// Harbor's backend listens on 127.0.0.1:8765 and oMLX on 8000. They need those
+// ports, and the app used to guarantee it by SIGTERM-ing whatever else was
+// listening (a leftover `python -m http.server`, but also an unrelated
+// development server, another app, or the previous Harbor's own healthy backend).
+// That is not safe: a port says nothing about who owns the process, and killing a
+// stranger risks their unsaved work. A second Harbor launch terminated the first
+// one's backend and then raced against its shutdown.
+//
+// The policy now is: Harbor signals ONLY a process that provably is its own backend,
+// never a stranger. "Provably" is BackendOwnership's one policy: the exact process
+// incarnation (pid + kernel start time + executable) recorded in memory when THIS app
+// instance spawned it. Where an executable lives proves nothing (the backend runs on a
+// generic Python interpreter that other programs can run too), and nothing is trusted
+// from disk. At startup no receipt exists yet, so whatever holds the port, including a
+// backend left by an earlier Harbor, is reported to the user and left running.
+enum PortGuard {
+    struct Listener: Equatable {
+        let pid: Int32
+        let path: String
+        /// Kernel start time when listed. Re-checked before any signal: a recycled pid
+        /// has a different one.
+        var start: BackendOwnership.StartTime? = nil
+    }
+
+    enum Verdict: Equatable {
+        /// Nothing is listening.
+        case free
+        /// The listeners could not be inspected. Never act on this.
+        case unknown
+        /// Every listener is the backend named by the given in-memory receipt. Never the
+        /// answer at startup, which judges with no receipt.
+        case owned([Listener])
+        /// At least one listener is not Harbor's. These are NEVER terminated.
+        case conflict([Listener])
+    }
+
+    /// Pure policy: classifies listeners, signals nothing. A listener is owned only
+    /// when BackendOwnership says it is Harbor's backend.
+    static func verdict(listeners: [Listener]?, receipt: BackendOwnership.ReceiptState,
+                        facts: (Int32) -> BackendOwnership.ProcessFacts?) -> Verdict {
+        guard let listeners else { return .unknown }
+        if listeners.isEmpty { return .free }
+        let foreign = listeners.filter {
+            BackendOwnership.verdict(listener: $0, receipt: receipt, facts: facts($0.pid)) != .harborBackend
+        }
+        return foreign.isEmpty ? .owned(listeners) : .conflict(foreign)
+    }
+
+    /// Whether the executable lies inside one of Harbor's backend folders. WORDING ONLY: it
+    /// lets the conflict message suggest an earlier Harbor's leftover. Never a trust signal.
+    static func runsFromHarborFolder(_ listener: Listener, folders: [String]) -> Bool {
+        // An empty folder would match every path; a relative or unresolved path
+        // says nothing about where the executable really is.
+        listener.path.hasPrefix("/") && !listener.path.contains("/../")
+            && folders.contains { $0.hasPrefix("/") && $0.count > 1 && listener.path.hasPrefix($0) }
+    }
+
+    /// Where Harbor's backend usually runs from (the bundled backend, or the developer
+    /// checkout the app falls back to). Used only to word the conflict message.
+    static func backendFolderHints(bundle: Bundle = .main, devRoot: String? = nil) -> [String] {
+        var folders: [String] = []
+        if let resources = bundle.resourceURL?.resolvingSymlinksInPath().path {
+            folders.append(resources + "/backend/")
+        }
+        if let devRoot { folders.append(devRoot.hasSuffix("/") ? devRoot : devRoot + "/") }
+        return folders
+    }
+
+    static func check(port: Int, receipt: BackendOwnership.ReceiptState,
+                      listeners: (Int) -> [Listener]? = PortGuard.listeners(port:),
+                      facts: (Int32) -> BackendOwnership.ProcessFacts? = BackendOwnership.processFacts(pid:)) -> Verdict {
+        verdict(listeners: listeners(port), receipt: receipt, facts: facts)
+    }
+
+    /// The one signalling primitive: terminate listeners that are still provably the
+    /// backend named by the in-memory receipt. Ownership is re-verified from fresh kernel
+    /// facts immediately before each signal, including the start time seen at listing, so
+    /// a pid that was recycled since the listing is never signalled. The app does not call
+    /// this at startup (no receipt exists then); it is kept, tested, as the only sanctioned
+    /// way to signal a backend. Returns the pids signalled.
+    @discardableResult
+    static func terminateOwned(_ listeners: [Listener], receipt: BackendOwnership.ReceiptState,
+                               facts: (Int32) -> BackendOwnership.ProcessFacts? = BackendOwnership.processFacts(pid:),
+                               signal: (Int32, Int32) -> Int32 = { kill($0, $1) }) -> [Int32] {
+        var signalled: [Int32] = []
+        for listener in listeners where listener.pid > 1 {
+            guard let listedStart = listener.start, let current = facts(listener.pid),
+                  current.executablePath == listener.path, current.start == listedStart,
+                  BackendOwnership.verdict(listener: listener, receipt: receipt, facts: current) == .harborBackend
+            else { continue }
+            if signal(listener.pid, SIGTERM) == 0 { signalled.append(listener.pid) }
+        }
+        return signalled
+    }
+
+    /// What the person is told when the port is held by something this Harbor did not start.
+    /// A holder running from Harbor's own folder may be a backend an earlier Harbor left behind
+    /// (a crash or an upgrade), so the advice says so; that is a hint, never trust.
+    static func conflictMessage(port: Int, listeners: [Listener], folderHints: [String]) -> String {
+        let named = listeners.isEmpty
+            ? "Another program is already using port \(port)."
+            : "Another program is already using port \(port): \(describe(listeners))."
+        if listeners.contains(where: { runsFromHarborFolder($0, folders: folderHints) }) {
+            return named + " It runs from Harbor's folder, but this Harbor didn't start it, so Harbor can't confirm "
+                + "it is its own service and did not stop it. If an earlier copy of Harbor left it running, quit it "
+                + "in Activity Monitor (or restart your Mac), then reopen Harbor."
+        }
+        return named + " Harbor didn't start it, so it did not stop it. Quit that program, then reopen Harbor."
+    }
+
+    static func describe(_ listeners: [Listener]) -> String {
+        listeners.map { listener in
+            let name = (listener.path as NSString).lastPathComponent
+            return "\(name.isEmpty ? "an unknown program" : name) (pid \(listener.pid))"
+        }.joined(separator: ", ")
+    }
+
+    // MARK: - Inspection
+
+    /// Processes listening on `port`, or nil when the system could not be asked.
+    static func listeners(port: Int) -> [Listener]? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        process.arguments = ["-nP", "-iTCP:\(port)", "-sTCP:LISTEN", "-t"]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return nil }
+        let deadline = Date().addingTimeInterval(3)
+        while process.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.01) }
+        guard !process.isRunning else { process.terminate(); return nil }
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        guard let text = String(data: data, encoding: .utf8) else { return nil }
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
+        // lsof may repeat a pid (one per socket). Any line that is not a pid means the
+        // output cannot be trusted, and the answer is "unknown", not a guess.
+        let parsed = lines.map { Int32($0.trimmingCharacters(in: .whitespaces)) }
+        guard parsed.allSatisfy({ $0 != nil }) else { return nil }
+        let pids = Set(parsed.compactMap { $0 })
+        // A listener whose path cannot be read cannot be shown to be Harbor's, so it
+        // is carried with an empty path and classified as a conflict.
+        return pids.sorted().map {
+            Listener(pid: $0, path: executablePath(pid: $0) ?? "", start: BackendOwnership.startTime(pid: $0))
+        }
+    }
+
+    /// The kernel's own record of the executable a process is running.
+    static func executablePath(pid: Int32) -> String? {
+        var buffer = [CChar](repeating: 0, count: 4096)
+        let length = proc_pidpath(pid, &buffer, UInt32(buffer.count))
+        return length > 0 ? String(cString: buffer) : nil
+    }
+}
+
+/// A second Harbor must hand over to the first, not fight it for the backend port.
+enum SingleInstance {
+    static func shouldYield(bundleIdentifier: String?, selfPID: Int32, peers: [Int32]) -> Bool {
+        // A development binary run outside a bundle has no identity to compare.
+        guard let bundleIdentifier, !bundleIdentifier.isEmpty else { return false }
+        return peers.contains { $0 != selfPID && $0 > 0 }
+    }
+
+    /// How a second launch hands over once `shouldYield` says a copy is running.
+    enum HandOver: Equatable {
+        /// To the running copy, without a word: it is this same app.
+        case silent
+        /// The running copy is quitting, or setup expects a relaunch: wait for it to
+        /// go, then launch (FirstRunSetup.waitsForPeerToQuit). Never asked about.
+        case waitForQuit
+        /// The running copy is a different Harbor.app (another folder, usually another
+        /// version, as when a downloaded update is opened while the old one runs).
+        /// Handing over silently left the person using the old one: ask.
+        case ask
+    }
+
+    /// Pure. `peerPaths` are the running copies' bundle folders, nil where macOS
+    /// would not say; an unknown one is treated as this same app, as before.
+    static func handOver(selfPath: String, peerPaths: [String?], waitsForPeerToQuit: Bool) -> HandOver {
+        if waitsForPeerToQuit { return .waitForQuit }
+        let own = canonicalPath(selfPath)
+        let different = peerPaths.contains { peer in peer.map { canonicalPath($0) != own } ?? false }
+        return different ? .ask : .silent
+    }
+
+    /// One spelling per folder: no trailing slash, no "..", symlinks resolved.
+    static func canonicalPath(_ path: String) -> String {
+        URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
+    }
+
+    /// What the question says: which Harbor is running, from where, and which this is.
+    /// The versions read like "0.5.0 (3468)"; nil when one can't be read. Pure.
+    static func otherCopyDetail(running: String?, this: String?, runningFolder: String?) -> String {
+        var text = running.map { "Harbor \($0) is already running" } ?? "Harbor is already running"
+        if let runningFolder, !runningFolder.isEmpty { text += " from \(runningFolder)" }
+        text += ". "
+        switch (running, this) {
+        case let (old?, new?) where old != new: text += "This one is \(new). "
+        case (_?, _?): text += "This one is the same version. "
+        case (nil, let new?): text += "This one is \(new). "
+        default: break
+        }
+        return text + "Only one can run at a time. Your chats, memory and settings are the same in both."
+    }
+}

@@ -1,0 +1,449 @@
+import Foundation
+
+// Sends mail and iMessages on the backend's behalf, and reports the outcome
+// back. Lives here for the same reason MailReader does: Automation (TCC) is
+// per-process, and only Harbor.app has the stable signed identity those grants
+// attach to — the Python backend can't drive Mail or Messages at all.
+//
+// Unlike the calendar events (fire-and-forget, confirmed by the next sync),
+// these are REQUEST/RESPONSE: the backend blocks an agent turn waiting for the
+// result so it can tell the user "sent" or "that failed" truthfully. Every path
+// out of here therefore has to post a result — including the failures. A
+// silent return would hang the turn until the backend's timeout and then
+// report a misleading "the app didn't respond".
+//
+// The user has already approved the send on a confirmation card by the time
+// this runs; the policy engine treats mail and messages as always-confirm and
+// refuses to let them be pre-approved (service/safety/grants.py).
+enum OutboundSender {
+
+    // -1743 is macOS itself refusing the Apple Event, before Mail or Messages
+    // sees it, so nothing can have been sent. That one case is posted with a
+    // fixed code beside the error text. The backend takes the code, never the
+    // text, as proof that nothing went out and tells the user which setting
+    // to change (service/assistant/outbox.py). Every other failure carries no
+    // code and stays "outcome unknown".
+    private static func refusal(_ code: Int) -> [String: Any] {
+        code == -1743 ? ["refusal": "automation_denied"] : [:]
+    }
+
+    // AppleScript string literals; the rules live with the script builders.
+    private static func escape(_ s: String) -> String {
+        MailActionScript.escape(s)
+    }
+
+    /// A recipient in the form Messages' own chat ids can actually be matched
+    /// against.
+    ///
+    /// VERIFIED FAILURE 2026-08-10. Messages chat ids are E.164 —
+    /// `any;-;+15555550142` — while `lookup_contact` returns the display form,
+    /// `1 (555) 555-0142`. `id contains "1 (555) 555-0142"` is therefore FALSE
+    /// for the very chat it names, so draftMessage's lookup matched nothing and
+    /// (see below) typed a message to the user's mother into an unrelated group
+    /// chat. Confirmed against the real Messages library: the display form
+    /// returns no chat, the digit run returns `any;-;+15555550142`.
+    ///
+    /// Matching on the bare DIGIT RUN rather than reconstructing a `+1…` E.164
+    /// is deliberate: it makes `1 (555) 555-0142`, `(555) 555-0142` and
+    /// `+15555550142` all match the same chat (verified, all three), without
+    /// this having to guess a country code it doesn't know.
+    static func messagesHandle(_ s: String) -> String {
+        if s.contains("@") { return s }          // an iMessage email address
+        let digits = s.filter(\.isNumber)
+        // Below ~7 digits a substring match stops identifying anyone — "0142"
+        // matches half the library — so keep the original and let the lookup
+        // fail closed rather than select a stranger's thread.
+        return digits.count >= 7 ? digits : s
+    }
+
+    static func sendEmail(actionId: String, to: [String], cc: [String],
+                          subject: String, body: String) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            // The script raises when Mail's `send` answers false, so an email
+            // Mail refused is never reported as sent.
+            let script = MailActionScript.sendEmail(to: to, cc: cc, subject: subject, body: body)
+            var err: NSDictionary?
+            guard let s = NSAppleScript(source: script) else {
+                post(actionId: actionId, ok: false, error: "couldn't build the send script")
+                return
+            }
+            s.executeAndReturnError(&err)
+            if let err {
+                let code = err[NSAppleScript.errorNumber] as? Int ?? 0
+                // -1743 is the TCC "not authorized" code — worth naming
+                // explicitly, since "Mail got an error" tells the user nothing
+                // about the one thing they can actually fix.
+                let reason = code == -1743
+                    ? "Mail Automation access isn't granted — allow it in System Settings › Privacy & Security › Automation"
+                    : (err[NSAppleScript.errorMessage] as? String ?? "Mail refused the send")
+                post(actionId: actionId, ok: false, error: reason, extra: refusal(code))
+                return
+            }
+            post(actionId: actionId, ok: true, error: "")
+        }
+    }
+
+    /// A short code (3 to 6 digits, like 22821) is never an iMessage address.
+    /// Messages accepts an iMessage send to one without an error and then
+    /// marks it Not Delivered, so the SMS fallback below never ran for it
+    /// (seen on the real app, 2026-11-13).
+    static func isShortCode(_ s: String) -> Bool {
+        let t = s.trimmingCharacters(in: .whitespaces)
+        return (3...6).contains(t.count) && t.allSatisfy(\.isNumber)
+    }
+
+    static let noSMSAccount = "no_sms_account"
+    static let noTextRelay = "This Mac can't send SMS texts. On your iPhone, turn on Settings › Apps › Messages › Text Message Forwarding for this Mac."
+
+    static func sendMessage(actionId: String, to: String, text: String) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let shortCode = isShortCode(to)
+            // A short code goes by SMS only: iMessage cannot reach it, and an
+            // iMessage send to it does not fail here, it fails later in
+            // Messages. With no SMS account the script raises and nothing is
+            // sent. Everyone else: iMessage first, then SMS, because `buddy
+            // ... of service ... iMessage` fails outright for a recipient who
+            // isn't on iMessage.
+            let script = shortCode ? """
+            tell application "Messages"
+                set targetBuddy to "\(escape(to))"
+                if (count of (accounts whose service type = SMS)) is 0 then return "\(noSMSAccount)"
+                set theService to 1st account whose service type = SMS
+                send "\(escape(text))" to participant targetBuddy of theService
+            end tell
+            """ : """
+            tell application "Messages"
+                set targetBuddy to "\(escape(to))"
+                try
+                    set theService to 1st account whose service type = iMessage
+                    send "\(escape(text))" to participant targetBuddy of theService
+                on error
+                    set theService to 1st account whose service type = SMS
+                    send "\(escape(text))" to participant targetBuddy of theService
+                end try
+            end tell
+            """
+            var err: NSDictionary?
+            guard let s = NSAppleScript(source: script) else {
+                post(actionId: actionId, ok: false, error: "couldn't build the send script")
+                return
+            }
+            // A few seconds of slack: the row's date is Messages' clock for the send.
+            let since = MessageDeliveryCheck.storeDate(Date().addingTimeInterval(-5))
+            let out = s.executeAndReturnError(&err)
+            if let err {
+                let code = err[NSAppleScript.errorNumber] as? Int ?? 0
+                let reason = code == -1743
+                    ? "Messages Automation access isn't granted — allow it in System Settings › Privacy & Security › Automation"
+                    : shortCode ? noTextRelay
+                    : (err[NSAppleScript.errorMessage] as? String ?? "Messages refused the send")
+                post(actionId: actionId, ok: false, error: reason, extra: refusal(code))
+                return
+            }
+            if out.stringValue == noSMSAccount {
+                // The script stopped before any send: this Mac has no SMS account.
+                post(actionId: actionId, ok: true, error: "", extra: ["delivery": noSMSAccount])
+                return
+            }
+            // Messages accepting a text is not the text going out. Its own
+            // store says which, so read the row back before answering.
+            let seen = MessageDeliveryCheck.settle(to: to, text: text, sinceNs: since)
+            post(actionId: actionId, ok: true, error: "",
+                 extra: ["delivery": seen.state.rawValue, "delivery_service": seen.service])
+        }
+    }
+
+    // Runs a Mail/Messages script and reports the outcome, so the six actions
+    // below don't each repeat the NSAppleScript + TCC-code + post dance.
+    private static func run(actionId: String, app: String, script: String,
+                            parse: ((String) -> [String: Any])? = nil) {
+        var err: NSDictionary?
+        guard let s = NSAppleScript(source: script) else {
+            post(actionId: actionId, ok: false, error: "couldn't build the \(app) script")
+            return
+        }
+        let out = s.executeAndReturnError(&err)
+        if let err {
+            let code = err[NSAppleScript.errorNumber] as? Int ?? 0
+            let reason = code == -1743
+                ? "\(app) Automation access isn't granted — allow it in System Settings › Privacy & Security › Automation"
+                : (err[NSAppleScript.errorMessage] as? String ?? "\(app) refused the request")
+            post(actionId: actionId, ok: false, error: reason, extra: refusal(code))
+            return
+        }
+        // A script may hand back what it actually acted on. That is the
+        // difference between "something succeeded" and a receipt.
+        post(actionId: actionId, ok: true, error: "",
+             extra: parse?(out.stringValue ?? "") ?? [:])
+    }
+
+    // Locates a message by its RFC Message-ID across every account's inbox.
+    // Mail has no "message whose message id is X" lookup that spans accounts,
+    // so this walks them. `message id` is the only stable handle — index
+    // position shifts every time mail arrives (see MailReader.rawScript).
+    // Mark read, flag and archive use MailActionScript.findInboxMessage, which
+    // names the inbox the way MailReader does.
+    //
+    // FORWARD ONLY, and held back on purpose. `inbox of acct` is not in Mail's
+    // dictionary for an account, so this lookup finds nothing and a forward
+    // stops before Mail composes anything. The forward script below has never
+    // sent a real email: it reads the new message's content before setting
+    // it, which the reply script found can come back empty, so a note could go
+    // out without the original under it. Move forwardEmail to
+    // MailActionScript.findInboxMessage only after a forward to the owner's
+    // own address, with and without a note, has been checked in Mail.
+    private static func unverifiedForwardLookup(_ messageId: String, account: String = "") -> String {
+        let accountList = account.isEmpty
+            ? "accounts"
+            : "(every account whose name is \"\(escape(account))\")"
+        return """
+            set theMsg to missing value
+            set theAcct to ""
+            repeat with acct in \(accountList)
+                if theMsg is missing value then
+                    try
+                        repeat with mbx in {inbox of acct}
+                            try
+                                set hits to (every message of mbx whose message id is "\(escape(messageId))")
+                                if (count of hits) > 0 then
+                                    set theMsg to item 1 of hits
+                                    set theAcct to (name of acct)
+                                    exit repeat
+                                end if
+                            end try
+                        end repeat
+                    end try
+                end if
+            end repeat
+            if theMsg is missing value then error "couldn't find that message in the inbox — it may have been moved or is older than the synced window"
+        """
+    }
+
+    static func prepareEmailReply(actionId: String, messageId: String, body: String,
+                                  replyAll: Bool, account: String, accountID: String = "") {
+        runReply(actionId: actionId, messageId: messageId, body: body,
+                 replyAll: replyAll, account: account, expected: nil, sourceAccountID: accountID)
+    }
+
+    static func replyToEmail(actionId: String, messageId: String, body: String,
+                             replyAll: Bool, account: String = "",
+                             expected: [String: Any] = [:]) {
+        guard !expected.isEmpty else {
+            post(actionId: actionId, ok: false, error: "Missing approved reply envelope; nothing sent.")
+            return
+        }
+        runReply(actionId: actionId, messageId: messageId, body: body,
+                 replyAll: replyAll, account: account, expected: expected)
+    }
+
+    private static func runReply(actionId: String, messageId: String, body: String,
+                                 replyAll: Bool, account: String, expected: [String: Any]?,
+                                 sourceAccountID: String = "") {
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard let source = MailReplyScript.build(messageID: messageId, account: account,
+                                                     body: body, replyAll: replyAll, expected: expected,
+                                                     sourceAccountID: sourceAccountID),
+                  let script = NSAppleScript(source: source) else {
+                post(actionId: actionId, ok: false, error: "Invalid reply contract; nothing sent.")
+                return
+            }
+            var error: NSDictionary?
+            let result = script.executeAndReturnError(&error)
+            if let error {
+                let code = error[NSAppleScript.errorNumber] as? Int ?? 0
+                post(actionId: actionId, ok: false,
+                     error: error[NSAppleScript.errorMessage] as? String ?? "Mail could not verify the reply.",
+                     extra: refusal(code))
+                return
+            }
+            guard let envelope = MailReplyScript.decode(result) else {
+                post(actionId: actionId, ok: false,
+                     error: "Reply outcome unknown: Mail returned no readable envelope. Do not retry automatically.")
+                return
+            }
+            post(actionId: actionId, ok: true, error: "",
+                 extra: ["reply": envelope, "accepted": expected != nil])
+        }
+    }
+
+    static func draftEmail(actionId: String, to: [String], cc: [String],
+                           subject: String, body: String) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            var recipientLines = to.map {
+                "make new to recipient at end of to recipients with properties {address:\"\(escape($0))\"}"
+            }
+            recipientLines += cc.map {
+                "make new cc recipient at end of cc recipients with properties {address:\"\(escape($0))\"}"
+            }
+            // visible:true and NO `send` — the entire difference from
+            // sendEmail. The window is brought to the front so the user
+            // actually sees the thing they asked to review.
+            let script = """
+            tell application "Mail"
+                set newMsg to make new outgoing message with properties {subject:"\(escape(subject))", content:"\(escape(body))", visible:true}
+                tell newMsg
+                    \(recipientLines.joined(separator: "\n            "))
+                end tell
+                activate
+            end tell
+            """
+            run(actionId: actionId, app: "Mail", script: script)
+        }
+    }
+
+    static func draftMessage(actionId: String, to: String, text: String) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            // Messages exposes no "create draft" verb, so this opens the
+            // conversation and types the text into the compose field without
+            // pressing send. System Events needs Accessibility, which is a
+            // different grant from Automation — reported as such if missing.
+            // FAILS CLOSED. The previous version wrapped the chat lookup in a
+            // bare `try … end try` and then typed REGARDLESS of whether it had
+            // found anything — so when the lookup missed (which it always did,
+            // see messagesHandle above) `keystroke` went to whatever
+            // conversation happened to be selected in Messages. Verified
+            // 2026-08-10 from a user report: asked to draft their mother an
+            // update, Harbor typed the whole message into an unrelated group
+            // chat she is not even a member of, and still reported
+            // `ok: true` — the tool then told the user "Messages opened with a
+            // draft to 1 (555) 555-0142", naming a recipient it had never
+            // targeted.
+            //
+            // So the selection is now VERIFIED before a single character is
+            // typed: didTarget is only set on the success path, and the script
+            // returns NOTFOUND (typing nothing at all) otherwise. Typing into
+            // an unverified conversation is the one outcome this must never
+            // produce — the text lands in a live compose field where one
+            // stray Return sends it to the wrong people.
+            let handle = messagesHandle(to)
+            let script = """
+            tell application "Messages"
+                activate
+                set targetHandle to "\(escape(handle))"
+                set didTarget to false
+                try
+                    set theChat to 1st chat whose id contains targetHandle
+                    set selected of theChat to true
+                    set didTarget to true
+                end try
+                if didTarget is false then return "NOTFOUND"
+            end tell
+            delay 0.4
+            tell application "System Events"
+                tell process "Messages"
+                    keystroke "\(escape(text))"
+                end tell
+            end tell
+            return "OK"
+            """
+            var err: NSDictionary?
+            guard let s = NSAppleScript(source: script) else {
+                post(actionId: actionId, ok: false, error: "couldn't build the Messages script")
+                return
+            }
+            let out = s.executeAndReturnError(&err)
+            if let err {
+                let code = err[NSAppleScript.errorNumber] as? Int ?? 0
+                let reason: String
+                switch code {
+                case -1743:
+                    reason = "Messages Automation access isn't granted — allow it in System Settings › Privacy & Security › Automation"
+                case -25211, -1719:
+                    reason = "typing the draft needs \(PrivacyNames.accessibility) access — allow Harbor in \(PrivacyNames.accessibilityPath)"
+                default:
+                    reason = err[NSAppleScript.errorMessage] as? String ?? "Messages refused the draft"
+                }
+                post(actionId: actionId, ok: false, error: reason)
+                return
+            }
+            // The script ran cleanly but found no conversation, so it typed
+            // NOTHING. Reported as a failure rather than swallowed: the whole
+            // point is that the caller must not go on to tell the user a draft
+            // is waiting for someone it never reached.
+            if out.stringValue == "NOTFOUND" {
+                post(actionId: actionId, ok: false,
+                     error: "no existing Messages conversation matches \(to) — "
+                          + "nothing was typed. Open or start that conversation "
+                          + "once, or send it directly instead of drafting.")
+                return
+            }
+            post(actionId: actionId, ok: true, error: "")
+        }
+    }
+
+    static func markEmailRead(actionId: String, messageId: String, read: Bool) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let script = """
+            tell application "Mail"
+            \(MailActionScript.findInboxMessage(messageID: messageId))
+                set read status of theMsg to \(read ? "true" : "false")
+            end tell
+            """
+            run(actionId: actionId, app: "Mail", script: script)
+        }
+    }
+
+    static func archiveEmail(actionId: String, messageId: String) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            // Prefer the account's real Archive mailbox; fall back to a
+            // top-level one. Deliberately a MOVE, never `delete` — the tool
+            // promises the message stays findable.
+            let script = """
+            tell application "Mail"
+            \(MailActionScript.findInboxMessage(messageID: messageId))
+                set acct to account of mailbox of theMsg
+                set archiveBox to missing value
+                try
+                    set archiveBox to mailbox "Archive" of acct
+                end try
+                if archiveBox is missing value then
+                    try
+                        set archiveBox to mailbox "Archive"
+                    end try
+                end if
+                if archiveBox is missing value then error "no Archive mailbox found for this account"
+                move theMsg to archiveBox
+            end tell
+            """
+            run(actionId: actionId, app: "Mail", script: script)
+        }
+    }
+
+    static func forwardEmail(actionId: String, messageId: String, to: [String], body: String) {
+        guard !to.isEmpty else {
+            post(actionId: actionId, ok: false, error: "forwardEmail needs at least one recipient")
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let script = MailActionScript.forwardEmail(
+                lookup: unverifiedForwardLookup(messageId), to: to, note: body)
+            run(actionId: actionId, app: "Mail", script: script)
+        }
+    }
+
+    static func flagEmail(actionId: String, messageId: String, flagged: Bool) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let script = """
+            tell application "Mail"
+            \(MailActionScript.findInboxMessage(messageID: messageId))
+                set flagged status of theMsg to \(flagged ? "true" : "false")
+            end tell
+            """
+            run(actionId: actionId, app: "Mail", script: script)
+        }
+    }
+
+    private static func post(actionId: String, ok: Bool, error: String,
+                             extra: [String: Any] = [:]) {
+        let url = HarborClient.baseURL.appendingPathComponent("assistant/action_result")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        var payload: [String: Any] = [
+            "action_id": actionId, "ok": ok, "error": error,
+        ]
+        payload.merge(extra) { current, _ in current }
+        req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+        URLSession.shared.dataTask(with: req).resume()
+    }
+}

@@ -1,0 +1,3438 @@
+import AppKit
+import Combine
+import SwiftUI
+import Carbon.HIToolbox
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var statusItem: NSStatusItem!
+    private var panel: OverlayPanel?
+    private var hotKey: GlobalHotKey?
+    private var searchHotKey: GlobalHotKey?
+    private var voiceHotKey: GlobalHotKey?
+    private var lookHotKey: GlobalHotKey?
+    // Hosted in an OverlayPanel — the SAME notch-fused reveal panel class the
+    // chat assistant uses (see createSearchPanelIfNeeded), so Smart Search
+    // gets identical chrome and animation rather than a separately-styled
+    // window. The two are mutually exclusive at the notch (only one physical
+    // notch exists to fuse with) — see toggleSearch/expand.
+    private var searchPanel: OverlayPanel?
+    private lazy var searchModel = SearchModel(client: client)
+    private lazy var researchModel = ResearchModel(client: client)
+    // One day plan for the notch's Brief and Day tabs and the window's planner.
+    private lazy var todayModel = TodayModel()
+    // One settings loader for the notch's quick settings, the Harbor window's Settings
+    // and its Full access pill: one source for confirmed and pending state.
+    private lazy var settingsLoader = SettingsLoader()
+    private var fullAccessObserver: AnyCancellable?
+    private var fullAccessProblemObserver: AnyCancellable?
+    // One setup model for the notch's setup card, the first-run window and
+    // Settings › Models › Setup, so a test result, a running action and readiness
+    // are the same in all of them.
+    private lazy var setupModel = SetupGuideModel()
+    // The Harbor window: long conversations, saved chats, the same approvals as the
+    // notch, Today, Research, Memory and Settings, in a real window. It opens only
+    // when asked for; Harbor starts in the notch. Its sidebar opens the other parts
+    // of the app through HarborRouter, like every other control (see open(_:)).
+    private lazy var harborWindow: HarborWindowController = {
+        let window = HarborWindowController(
+            backend: LiveChatBackend(client: client, access: settingsLoader),
+            launchers: ChatLaunchers(
+                today: { HarborRouter.shared.open(.today(focus: .plan)) },
+                research: { HarborRouter.shared.open(.research) },
+                openResearchJob: { [weak self] id in self?.openSavedResearch(id) },
+                newResearch: { [weak self] in self?.startResearchInNotch() },
+                memory: { HarborRouter.shared.open(.memory(.facts)) },
+                settings: { HarborRouter.shared.open(.settings) }),
+            debug: { UserDefaults.standard.bool(forKey: "harbor.debugMode") })
+        window.navigation.researchLibrary = ResearchLibraryModel(client: client)
+        window.navigation.today = todayModel
+        window.navigation.settings = settingsLoader
+        window.navigation.setup = setupModel
+        window.onClose = { [weak self] in self?.updateSettingsSetupHost() }
+        settingsSetupObservers = [
+            window.navigation.$section.dropFirst().sink { [weak self] _ in
+                // @Published sends before the change lands: read it on the next turn.
+                DispatchQueue.main.async { self?.updateSettingsSetupHost() }
+            },
+            // Settings keeps its pane and subpane in UserDefaults (@AppStorage).
+            NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] _ in MainActor.assumeIsolated { self?.updateSettingsSetupHost() } },
+        ]
+        return window
+    }()
+    /// Settings › Models › Setup is on screen: the Harbor window is open on Settings,
+    /// pane Models, subpane Setup. It is the setup guide's "settings" host while it is.
+    private var settingsSetupShown = false
+    private var settingsSetupObservers: [AnyCancellable] = []
+    private var searchKeyMonitor: Any?
+    private var presentation = OverlayTransition()
+    private var searchCaptureID: UUID?
+    private var searchReady = false
+    private var capturedSearchPage: PageText?
+    private lazy var notchCorpus = NotchCorpusController(store: harborWindow.store)
+    private let model = OverlayModel()
+    private let client = HarborClient()
+    private let backend = BackendManager()
+    // The onboarding window: model, permissions, Google, Getting to know you, how
+    // to use. Opens by itself only on a Mac that has never run Harbor
+    // (FirstRunSetup.shouldShow); Settings › Privacy's Permissions… opens it at that step.
+    private var firstRunWindow: NSWindow?
+    private var firstRunCloseObserver: NSObjectProtocol?
+    private var firstRunFinishing = false
+    private var firstRunPermissionStates: [FirstRunPermissions.Item: FirstRunPermissions.State] = [:]
+    // The window's Getting to know you and Google steps keep their state while
+    // the person moves between steps (and across a close and reopen).
+    private lazy var onboardingKnowYou = KnowYouModel(client: client)
+    private lazy var onboardingGoogle = GoogleAccountModel()
+    // Which titled Harbor window was key most recently, for the Dock (HarborReopen).
+    private var windowKeyOrder: [ObjectIdentifier: Int] = [:]
+    private var windowKeyCount = 0
+    private var setupObserver: NSObjectProtocol?
+    // One spelling for the keys the first-run window takes over (FirstRunSetup):
+    // a drifted copy would show existing users the window, or new users the old tip.
+    private static let setupGuideShownKey = FirstRunSetup.setupGuideShownKey
+    private static let notchTipShownKey = FirstRunSetup.notchTipShownKey
+    private var pendingCollapse: DispatchWorkItem?
+    // A menu opened from the panel (the chat switcher) is open. See
+    // installMenuTrackingObservers.
+    private var menuTracking = false
+    // An auto-collapse came due while that menu was open and was held back.
+    private var collapseHeldForMenu = false
+    /// A close that an answer in flight held off. Once the answer is done the panel
+    /// stays this long for reading it, and then closes unless the pointer came back.
+    private var collapseHeldForAnswer = false
+    private var answerReadDelay: TimeInterval = 60
+    /// When the close being held for an answer first came due. An answer holds
+    /// it for at most `answerHoldCeiling`: a turn the service keeps alive past
+    /// that (heartbeats with nothing else) no longer keeps the notch over the
+    /// person's work. Cleared when the answer settles.
+    private var answerHeldSince: Date?
+    /// Ten minutes, the chat stream's own limit for silence (HarborClient's
+    /// timeoutInterval for /agent); no answer worth waiting for runs longer.
+    private var answerHoldCeiling: TimeInterval = 600
+    private var answerEnded: AnyCancellable?
+    // Whether the pointer is over the expanded panel. Replaceable so the motion
+    // checks, which host no real panel, can exercise both answers.
+    private var pointerInPanel: () -> Bool = { false }
+    private var hoverIntent = HoverIntent()
+    private var hoverDwell: DispatchWorkItem?
+    private var hoverMonitors: [Any] = []
+    // The menu-bar icon carries the bar's status where no bar is drawn
+    // (SurfaceLayout.statusInMenuBar). See observeMenuBarStatus.
+    private var menuBarStatusObservers: [AnyCancellable] = []
+    // What reads the day at once instead of at the next tick. See observeDayRefreshTriggers.
+    private var dayRefreshObservers: [AnyCancellable] = []
+    private var dayChangeObserver: NSObjectProtocol?
+    private var menuBarStatusQueued = false
+    private var shownMenuBarStatus: MenuBarStatus?
+    private var workingPulse: Timer?
+    private var workingPulseDim = false
+    // Whether the notch-fused bar is showing at all. The X button turns this
+    // off (dismiss from the notch, free the resident model, stay in the menu bar); the
+    // menu-bar icon or ⌥Space bring it back. Distinct from `model.collapsed`,
+    // which only tracks bar-vs-expanded WHILE docked.
+    private var notchDocked = true
+    private var calendarReader: CalendarReader?
+    private var remindersWriter: RemindersWriter?
+    private var mailReader: MailReader?
+    private var mailMemoryReader: MailMemoryReader?
+    private var messagesReader: MessagesReader?
+    private var notesReader: NotesReader?
+    private var contactsReader: ContactsReader?
+    private var browserHistoryReader: BrowserHistoryReader?
+    private var activityReader: ActivityReader?
+    private var nativeSourceReadersStarted = false
+    private static let autoCollapseDelay: TimeInterval = 2
+    /// The content's fade at the start of a close. The shape is already
+    /// moving (the close has no hold), slowly at first, so its edge crosses
+    /// the fading content for these first frames; the content's layers are
+    /// taken out soon after (OverlayPanel.contentHideDelay).
+    static let closeFade: TimeInterval = 0.05
+    /// The content's fade at an open: it waits `openFadeDelay` while the shape
+    /// grows out of the notch, then fades in as the shape nears full size, so
+    /// the growing edge never wipes across live text.
+    static let openFadeDelay: TimeInterval = 0.07
+    static let openFade: TimeInterval = 0.16
+
+    /// A close with the content veiled for it (OverlayModel.contentVeiled):
+    /// the content fades in the first part of the close, so the retracting
+    /// shape carries only the surface. The veil lifts whenever the close ends,
+    /// finished or cut short, as the collapsed bar replaces the content.
+    /// `rollUp` is the panel's close; `then` runs once the bar is in the model.
+    static func veiledClose(model: OverlayModel, animated: Bool,
+                            rollUp: (@escaping () -> Void) -> Void, then: @escaping () -> Void) {
+        if animated {
+            withAnimation(.easeOut(duration: closeFade)) { model.contentVeiled = true }
+        }
+        rollUp {
+            model.contentVeiled = false
+            model.collapsed = true
+            then()
+        }
+    }
+
+    /// An open with the content veiled for it: the content stays behind the
+    /// surface while the shape grows out of the notch, then fades in. The fade
+    /// is started with the open itself, not at its end, so nothing can leave
+    /// the content hidden, and an open always clears a veil left behind.
+    /// `dropOpen` is the panel's open; `then` is its completion.
+    static func veiledOpen(model: OverlayModel, animated: Bool,
+                           dropOpen: @escaping (@escaping () -> Void) -> Void, then: @escaping () -> Void) {
+        model.contentVeiled = animated
+        model.collapsed = false
+        DispatchQueue.main.async {
+            if animated {
+                withAnimation(.easeOut(duration: openFade).delay(openFadeDelay)) { model.contentVeiled = false }
+            }
+            dropOpen(then)
+        }
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // One Harbor at a time. A second launch used to terminate the first one's
+        // backend and race it for the port; now it hands over to the running app.
+        let selfPID = ProcessInfo.processInfo.processIdentifier
+        let peerApps = NSRunningApplication
+            .runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "")
+            .filter { $0.processIdentifier != selfPID }
+        if SingleInstance.shouldYield(bundleIdentifier: Bundle.main.bundleIdentifier,
+                                      selfPID: selfPID, peers: peerApps.map(\.processIdentifier)) {
+            // macOS's Quit & Reopen (after Full Disk Access) can relaunch Harbor while
+            // the old copy is still stopping its engine (up to 20 s). Handing over
+            // to that dying copy left nothing running, so wait for it to go, then
+            // launch. A live copy still gets the hand-over, as before.
+            let defaults = UserDefaults.standard
+            let shuttingDown = defaults.integer(forKey: Self.shuttingDownPIDKey)
+            let waits = FirstRunSetup.waitsForPeerToQuit(
+                resumePending: defaults.bool(forKey: FirstRunSetup.resumeKey),
+                peerShuttingDown: peerApps.contains { Int($0.processIdentifier) == shuttingDown })
+            switch SingleInstance.handOver(
+                selfPath: Self.realLocation(Bundle.main.bundleURL).path,
+                peerPaths: peerApps.map { $0.bundleURL.map { Self.realLocation($0).path } },
+                waitsForPeerToQuit: waits) {
+            case .silent:
+                yield(to: peerApps)
+                return
+            case .ask:
+                // A different Harbor.app is running (a downloaded update opened while the
+                // old one runs). Handing over silently left the person on the old one.
+                guard asksToReplaceRunningHarbor(peerApps) else {
+                    yield(to: peerApps)
+                    return
+                }
+                // An ordinary quit, never a forced one: the running copy stops its
+                // engine and service as on any quit, and this one waits for it below.
+                for peer in peerApps where !peer.isTerminated { peer.terminate() }
+            case .waitForQuit:
+                break
+            }
+            Task { @MainActor [weak self] in
+                // Polled on the main actor between sleeps, so the run loop keeps
+                // turning (isTerminated is updated there) and nothing hangs.
+                let deadline = Date().addingTimeInterval(FirstRunSetup.peerQuitWait)
+                while !peerApps.allSatisfy(\.isTerminated), Date() < deadline {
+                    try? await Task.sleep(nanoseconds: 250_000_000)
+                }
+                guard let self else { return }
+                if peerApps.allSatisfy(\.isTerminated) { self.launch() } else { self.yield(to: peerApps) }
+            }
+            return
+        }
+        launch()
+    }
+
+    /// Where a copy of Harbor really is: the download, not macOS's temporary copy of it.
+    private static func realLocation(_ url: URL) -> URL {
+        Translocation.original(of: url).original ?? url
+    }
+
+    /// Another Harbor.app is running. Nothing is quit without the person's click: true
+    /// means quit the running one and open this one, false means keep the running one.
+    private func asksToReplaceRunningHarbor(_ peers: [NSRunningApplication]) -> Bool {
+        let running = peers.first { !$0.isTerminated }?.bundleURL
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Another copy of Harbor is running"
+        alert.informativeText = SingleInstance.otherCopyDetail(
+            running: running.flatMap { MoveToApplications.version(at: $0.path) },
+            this: MoveToApplications.version(at: Bundle.main.bundleURL.path),
+            runningFolder: running.map {
+                (Self.realLocation($0).deletingLastPathComponent().path as NSString).abbreviatingWithTildeInPath
+            })
+        alert.addButton(withTitle: "Quit It and Open This One")
+        // Esc keeps things as they are.
+        alert.addButton(withTitle: "Keep the Running One").keyEquivalent = "\u{1b}"
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    /// Set by a Harbor that has started quitting (noteTerminating), so a copy
+    /// launched in the meantime waits for it instead of handing over to it.
+    private static let shuttingDownPIDKey = "harbor.shuttingDownPID"
+    /// The full launch ran. Until then (a second copy waiting for the first to
+    /// quit) a Dock click or a quit does nothing of Harbor's own.
+    private var launched = false
+
+    private func yield(to peers: [NSRunningApplication]) {
+        peers.first { !$0.isTerminated }?.activate(options: [])
+        terminateWithoutShutdown()
+    }
+
+    private func launch() {
+        launched = true
+        // Opened from Downloads (or macOS's temporary copy of a download): offer to
+        // move into Applications first, before anything starts. Only the person's
+        // click moves it; then this copy quits and the moved one opens.
+        if MoveToApplications.offerIfNeeded() == .relaunching {
+            terminateWithoutShutdown()
+            return
+        }
+        // A committed /resetharbor (its marker is on disk): this app's part runs once
+        // per marker, before any setting is read, so this launch is a first run.
+        var resetPending = false
+        var ignoredResetMarker = false
+        switch HarborReset.readMarker() {
+        case .valid(let marker):
+            resetPending = true
+            // Never once the service says "erased": a crash between removing the marker
+            // and the app's record, or a marker that won't delete, must not wipe the
+            // settings of a Harbor already set up again.
+            if !marker.serviceDone && !HarborReset.appPartRan(
+                markerID: marker.id, record: HarborReset.readAppDone(),
+                defaultsID: UserDefaults.standard.string(forKey: HarborReset.appPartDoneKey)) {
+                let problems = HarborResetLaunch.run(bundleID: Bundle.main.bundleIdentifier)
+                // The problems first: once the done id is there the part never runs again.
+                UserDefaults.standard.set(problems, forKey: HarborReset.appPartProblemsKey)
+                UserDefaults.standard.set(marker.id, forKey: HarborReset.appPartDoneKey)
+                HarborReset.writeAppDone(HarborReset.AppDone(id: marker.id, problems: problems))
+                // The model read Debug Mode before the defaults were cleared.
+                if model.debugMode { model.debugMode = false }
+            }
+        case .invalid(let reason):
+            NSLog("%@", "Harbor reset: ignored a reset marker (\(reason))")
+            ignoredResetMarker = !UserDefaults.standard.bool(forKey: HarborReset.ignoredMarkerReportedKey)
+            UserDefaults.standard.set(true, forKey: HarborReset.ignoredMarkerReportedKey)
+        case .absent:
+            break
+        }
+        // Whoever was shutting down is gone now.
+        UserDefaults.standard.removeObject(forKey: Self.shuttingDownPIDKey)
+        // Port 8000 belongs to oMLX and is deliberately NOT policed here: it used to be
+        // cleared by killing whatever listened (which took out MTPLX and Homebrew oMLX
+        // along with the odd stray server). oMLX's own peer attribution refuses an
+        // engine it cannot verify, with a message that says so.
+        //
+        // Port 8765 is Harbor's backend. Whatever holds it at STARTUP is a conflict: this
+        // app instance has spawned nothing yet, and Harbor keeps no record of an earlier
+        // launch's backend (a file any same-user program could forge). So a holder is
+        // never adopted, reclaimed or signalled, including a backend an earlier Harbor left
+        // behind after a crash or upgrade; the person is told and can quit it. Judged only
+        // here, after the single-instance hand-over, so a yielding second launch touches nothing.
+        let folderHints = PortGuard.backendFolderHints(devRoot: backend.backendRootPath)
+        // From here on, every request to the backend port is sent only after a fresh check that
+        // the program there is the process this app spawned (see BackendTrust). The check is
+        // not bound to the connection that carries the request (audit N7, accepted residual).
+        BackendTrustConfiguration.set()
+        BackendTrustProtocol.enforcedPort = BackendTrust.productionPort
+        URLProtocol.registerClass(BackendTrustProtocol.self)
+        NotificationCenter.default.addObserver(
+            forName: .harborRestartBackend, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in await self?.backend.restart() }
+        }
+        NotificationCenter.default.addObserver(
+            forName: .harborBackendRefused, object: nil, queue: .main) { [weak self] note in
+            let message = note.userInfo?["message"] as? String ?? ""
+            MainActor.assumeIsolated { self?.presentBackendRefusal(message) }
+        }
+        backend.onBackendChangeEnded = { [weak self] in self?.releaseHeldRefusal() }
+        // Something the listing missed (or that arrived after it) answering on the port
+        // with no live child of ours: the manager stops and reports it here, once.
+        backend.onPortConflict = { [weak self] in
+            DispatchQueue.global(qos: .userInitiated).async {
+                var holders: [PortGuard.Listener] = []
+                if case .conflict(let foreign) = PortGuard.check(port: 8765, receipt: .none) { holders = foreign }
+                let message = PortGuard.conflictMessage(port: 8765, listeners: holders, folderHints: folderHints)
+                DispatchQueue.main.async { self?.presentPortConflict(message) }
+            }
+        }
+        // A10 WP3: inert unless the user enabled a browser (default off).
+        backend.extraEnvironment = {
+            BrowserBridgeActivation.shared.controlPathForBackend()
+                .map { ["HARBOR_BROWSER_BRIDGE_CONTROL": $0] } ?? [:]
+        }
+        backend.didLaunchBackend = { BrowserBridgeActivation.shared.backendLaunched(pid: $0) }
+        let launchedAt = Date()
+        var outage = 0
+        backend.onReachabilityChange = { [weak self] up in
+            guard let self else { return }
+            outage += 1
+            if up {
+                self.model.serviceReachable = true
+                self.model.serviceStarting = false
+                self.considerKnowYouOffer(after: 5)
+                // The service keeps each source's last sync in memory only, so a
+                // service that just came up (a relaunch, macOS's Quit & Reopen after
+                // Full Disk Access) has no Calendar or Reminders until the readers
+                // post again, and their launch-time posts went out before it was
+                // listening. Post them now, then load what was waiting.
+                self.resyncAllReaders()
+                StageMode.shared.pushIfOn()    // the service keeps Demo mode in memory only
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    await self.todayModel.refresh()
+                    await DayCards.refresh(force: true)
+                    self.model.onResize()
+                    // The readers' posts land a moment later (EventKit reads off the
+                    // main thread), so look once more for what they brought.
+                    try? await Task.sleep(nanoseconds: NativeSyncPace.reachableRefreshDelay)
+                    await self.todayModel.refresh()
+                    await DayCards.refresh(force: true)
+                    self.model.onResize()
+                }
+                return
+            }
+            let this = outage
+            Task { @MainActor [weak self] in
+                // Until the service has answered once, a cold first launch can take
+                // minutes (bundle verification, first import): that is "Starting
+                // Harbor…", not down. Nor is a service busy answering right now.
+                while let self, this == outage, self.backend.lastReachable == false,
+                      self.model.isProcessing
+                        || (!self.backend.everReachable && Date().timeIntervalSince(launchedAt) < 180) {
+                    self.model.serviceStarting = true
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                }
+                guard let self, this == outage, self.backend.lastReachable == false else { return }
+                self.model.serviceStarting = false
+                self.model.serviceReachable = false
+            }
+        }
+        model.onRetryService = { [weak self] in
+            guard let self else { return }
+            // Visible feedback even when a start is already under way.
+            self.model.serviceStarting = true
+            Task { @MainActor [weak self] in
+                await self?.backend.startIfNeeded()
+                try? await Task.sleep(nanoseconds: 20_000_000_000)
+                guard let self, self.backend.lastReachable != true else { return }
+                self.model.serviceStarting = false
+                self.model.serviceReachable = false
+            }
+        }
+        backend.startReachabilityWatch()
+        Task { await BrowserBridgeActivation.shared.begin() }
+        // The backend starts only after the port has been judged. The judgment is retried for
+        // a few seconds when a holder is there, because after a quick quit and relaunch the
+        // holder is usually the previous run's backend still shutting down; a holder that
+        // outlasts that window is a conflict, as before.
+        Task { [weak self] in
+            let verdict = await Task.detached(priority: .userInitiated) {
+                BackendManager.settledStartupVerdict(check: { PortGuard.check(port: 8765, receipt: .none) })
+            }.value
+            guard let self else { return }
+            if case .conflict(let foreign) = verdict {
+                self.backend.portConflict = true
+                self.startupPortWasJudged()
+                self.presentPortConflict(PortGuard.conflictMessage(port: 8765, listeners: foreign,
+                                                                   folderHints: folderHints))
+                return
+            }
+            self.startupPortWasJudged()
+            // `.owned` cannot occur without a receipt. On `.free`/`.unknown` a responder the
+            // listing missed is still caught by BackendManager before it launches anything.
+            await self.backend.startIfNeeded()
+            guard !self.shutdownStarted else { return }
+            self.todayModel.startBackgroundRefresh(cadence: { [weak self] in
+                DayRefreshPace.interval(notchOpen: self?.model.collapsed == false,
+                                        secondsSinceInput: DayRefreshPace.secondsSinceInput())
+            }, afterRefresh: { [weak self] in
+                guard let self else { return }
+                if self.todayModel.isShowingCurrentDay {
+                    await CheckInModel.shared.load(day: self.todayModel.day, timezone: self.todayModel.timezone.identifier)
+                    self.model.checkInDue = false
+                }
+                await DayCards.refresh()
+                self.model.onResize()
+            })
+            self.observeDayRefreshTriggers()
+        }
+        HarborRouter.shared.handler = { [weak self] route in self?.open(route) }
+        // Report a Problem carries how setup went (event names and times only).
+        DiagnosticReport.onboardingTimeline = { OnboardingTimeline.entries() }
+        observeFullAccess()
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        if let button = statusItem.button {
+            button.image = Self.menubarOrb()
+            button.setAccessibilityLabel("Harbor")
+            button.toolTip = "Harbor"
+            button.action = #selector(toggle)
+            button.target = self
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        }
+        buildMenu()
+        observeMenuBarStatus()
+        installEditMenu()    // enables ⌘C/⌘V/⌘X/⌘A in the text field
+        // ⌥Space summons the overlay
+        hotKey = GlobalHotKey(keyCode: UInt32(kVK_Space), modifiers: UInt32(optionKey)) { [weak self] in
+            DispatchQueue.main.async { self?.askHotkeyPressed() }
+        }
+        // ⌥⇧Space asks by voice, like holding the Siri key: it opens Ask and
+        // listens; pressed again while listening, it sends at once.
+        voiceHotKey = GlobalHotKey(keyCode: UInt32(kVK_Space), modifiers: UInt32(optionKey | shiftKey)) { [weak self] in
+            DispatchQueue.main.async { self?.askByVoice() }
+        }
+        // ⌥⇧L looks at the window in front: Ask opens with it as a preview to ask about.
+        lookHotKey = GlobalHotKey(keyCode: UInt32(kVK_ANSI_L), modifiers: UInt32(optionKey | shiftKey)) { [weak self] in
+            DispatchQueue.main.async { self?.lookAtScreen() }
+        }
+        // ⌘⇧F is Smart Search. Deliberately NOT ⌘F: Carbon would claim that
+        // system-wide and break native find in every app on the machine,
+        // including the ones (Xcode, terminals) where native find is better.
+        searchHotKey = GlobalHotKey(keyCode: UInt32(kVK_ANSI_F),
+                                    modifiers: UInt32(cmdKey | shiftKey)) { [weak self] in
+            DispatchQueue.main.async { self?.toggleSearch() }
+        }
+        // Notchbox-style: the panel lives at the top-centre permanently — the
+        // notch on a notched MacBook, an invisible top-edge zone on other
+        // built-in displays, a floating capsule on a monitor. Hovering it
+        // expands. Layout
+        // follows the displays live, so attaching a monitor or changing
+        // resolution re-fits it instead of leaving it stranded.
+        DisplayGeometry.shared.onChange = { [weak self] in self?.displaysChanged() }
+        // The hybrid notch: a full-screen app in front of the notch turns the bar
+        // into an undrawn hitbox, and back (CollapsedPresentation).
+        DisplayGeometry.shared.onPresentationChange = { [weak self] in self?.barPresentationChanged() }
+        DisplayGeometry.shared.startObserving()
+        installHoverMonitors()
+        installMenuTrackingObservers()
+        setupObserver = NotificationCenter.default.addObserver(
+            forName: .harborOpenSetupGuide, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.openSetupGuide() }
+        }
+        NotificationCenter.default.addObserver(
+            forName: .harborContinueFirstRun, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.bringSetupForward() }
+        }
+        // Settings › Privacy's Permissions… and the notch's Setup row: the setup window.
+        NotificationCenter.default.addObserver(
+            forName: .harborOpenPermissions, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.openFirstRunSetup(at: .permissions) }
+        }
+        // A Brief, Day or Ask row about a source Harbor can't read: the notch's page.
+        NotificationCenter.default.addObserver(
+            forName: .harborOpenPermissionPage, object: nil, queue: .main
+        ) { [weak self] note in
+            let raw = note.object as? String
+            MainActor.assumeIsolated { self?.openPermissionPage(raw.flatMap(FirstRunPermissions.Item.init(rawValue:))) }
+        }
+        NotificationCenter.default.addObserver(
+            forName: .harborStepAside, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.stepAside() }
+        }
+        NotificationCenter.default.addObserver(
+            forName: .harborStepBack, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.stepBack() }
+        }
+        // The Brief's Gmail reconnect link (BriefFix.open), on its Google pane.
+        NotificationCenter.default.addObserver(
+            forName: .harborOpenSettings, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.openSettings() }
+        }
+        // Settings › Privacy's More Access… and Settings › General's chat debug log.
+        NotificationCenter.default.addObserver(
+            forName: .harborGrantMoreAccess, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.grantMoreAccess() }
+        }
+        NotificationCenter.default.addObserver(
+            forName: .harborExportDebugLog, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                await self.exportDebugLog()
+            }
+        }
+        // Remember which Harbor window was used last, so the Dock brings back that one.
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            MainActor.assumeIsolated {
+                guard let window = note.object as? NSWindow else { return }
+                self?.noteKeyWindow(window)
+                self?.stepAside(forKey: window)
+            }
+        }
+        let defaults = UserDefaults.standard
+        let reopens = defaults.integer(forKey: FirstRunSetup.reopensKey)
+        let flag: (String) -> Bool = { defaults.bool(forKey: $0) }
+        let firstRun = FirstRunSetup.shouldShow(flag, reopens: reopens)
+        let countsTowardCap = FirstRunSetup.launchCountsTowardCap(flag)
+        // A quit with the window up (or macOS's Quit & Reopen after Full Disk
+        // Access) resumes once, here; the next quit sets it again if the window is up.
+        defaults.removeObject(forKey: FirstRunSetup.resumeKey)
+        if firstRun {
+            // Opening by itself again after an early close counts toward the cap;
+            // past it, Continue setup and the Dock still open it. Harbor ending under
+            // the window never counts (FirstRunSetup.launchCountsTowardCap).
+            if countsTowardCap {
+                defaults.set(reopens + 1, forKey: FirstRunSetup.reopensKey)
+            }
+            // The window gets the model, offers permissions and shows where Harbor
+            // lives; the old launch did the tip and the setup card on its own.
+            FirstRunSetup.takeOverLaunchPrompts { defaults.set(true, forKey: $0) }
+        } else {
+            offerSetupGuideOnFirstRun()
+        }
+        createPanelIfNeeded()
+        model.collapsed = true
+        panel?.present()
+        watchSetupReadiness()
+        watchSleepDuringDownload()
+        armKnowYouOffers()
+        // Harbor starts in the notch. The Harbor window opens only when asked for:
+        // the Dock icon, the menu bar, or a hand-off from the notch.
+        if firstRun { openFirstRunSetup() } else { showNotchTipOnce() }
+        // macOS's Quit & Reopen, from the System Settings page the notch's permission
+        // page sent the person to: back where they were, with the new answer.
+        if let item = NotchPermissionPage.takeResume(), !firstRun { openPermissionPage(item) }
+        if resetPending { finishPendingReset() }
+        if ignoredResetMarker { model.showTransientNotice(HarborReset.ignoredMarkerNotice, duration: 15) }
+    }
+
+    /// The last step of a reset: once the service's restart pass says "erased" (it
+    /// runs in the backend this launch started, before any store opens), remove the
+    /// app's record and then the marker, and say what didn't work, if anything. A
+    /// restart pass that didn't finish leaves the marker; the next launch waits again
+    /// (the service gives up after a few attempts and lists what it left).
+    private func finishPendingReset() {
+        Task { [weak self] in
+            for _ in 0..<90 {
+                switch HarborReset.readMarker() {
+                case .valid(let marker) where marker.serviceDone:
+                    let appProblems = Self.resetAppProblems(marker)
+                    // The marker first: while it says "erased" the app's part never runs
+                    // again, so its record may go after it (or stay, if the marker won't).
+                    let markerGone = HarborReset.removeOwnedFile(HarborReset.markerURL().path)
+                    if markerGone, !HarborReset.removeOwnedFile(HarborReset.appDoneURL().path) {
+                        NSLog("%@", "Harbor reset: couldn't remove the app's reset record")
+                    }
+                    if markerGone {
+                        UserDefaults.standard.removeObject(forKey: HarborReset.appPartDoneKey)
+                        UserDefaults.standard.removeObject(forKey: HarborReset.appPartProblemsKey)
+                    }
+                    if !markerGone { NSLog("%@", "Harbor reset: couldn't remove the reset marker") }
+                    let notice = HarborReset.launchNotice(marker: marker, appProblems: appProblems)
+                    let text = markerGone ? notice : [notice, HarborReset.markerStuckNotice].compactMap { $0 }
+                        .joined(separator: " ")
+                    if let text { self?.model.showTransientNotice(text, duration: 15) }
+                    return
+                case .valid:
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                case .absent, .invalid:
+                    return
+                }
+            }
+            if case .valid(let marker) = HarborReset.readMarker(),
+               let notice = HarborReset.launchNotice(marker: marker, appProblems: Self.resetAppProblems(marker)) {
+                self?.model.showTransientNotice(notice, duration: 15)
+            }
+        }
+    }
+
+    /// What the app's part of this reset couldn't do: from its record in ~/.moe, or
+    /// from the defaults when only they prove the part ran.
+    private static func resetAppProblems(_ marker: HarborReset.Marker) -> [String] {
+        let defaults = UserDefaults.standard
+        return HarborReset.appPartProblems(markerID: marker.id, record: HarborReset.readAppDone(),
+                                         defaultsID: defaults.string(forKey: HarborReset.appPartDoneKey),
+                                         defaultsProblems: defaults.stringArray(forKey: HarborReset.appPartProblemsKey))
+    }
+
+    /// Opens the onboarding window at the step the person was on (or `step`), or
+    /// brings it forward, out of the Dock if it was minimized, if it is already up.
+    private func openFirstRunSetup(at step: OnboardingStep? = nil) {
+        let defaults = UserDefaults.standard
+        stepAside()
+        if let step { defaults.set(step.rawValue, forKey: FirstRunSetup.stepKey) }
+        if let open = firstRunWindow {
+            if step != nil { open.contentView = onboardingContent() }
+            NSApp.activate(ignoringOtherApps: true)
+            if open.isMiniaturized { open.deminiaturize(nil) }
+            open.makeKeyAndOrderFront(nil)
+            return
+        }
+        // 600 pt tall where it fits; on a small or scaled display, the room under
+        // the menu bar and above the Dock, so the footer's buttons stay reachable.
+        let room = NSScreen.main?.visibleFrame.height ?? 800
+        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: FirstRunSetup.width,
+                                               height: FirstRunSetup.windowHeight(room: room)),
+                           styleMask: Self.onboardingStyle, backing: .buffered, defer: false)
+        win.contentMinSize = NSSize(width: FirstRunSetup.width, height: FirstRunSetup.minimumHeight)
+        win.contentMaxSize = NSSize(width: FirstRunSetup.width, height: 900)
+        win.title = "Welcome to Harbor"
+        win.titlebarAppearsTransparent = true
+        win.titleVisibility = .hidden
+        win.isMovableByWindowBackground = true
+        win.appearance = NSAppearance(named: .darkAqua)
+        win.isReleasedWhenClosed = false
+        win.contentView = onboardingContent()
+        win.center()
+        firstRunWindow = win
+        OnboardingTimeline.record(!FirstRunSetup.isUnfinished { defaults.bool(forKey: $0) } ? "permissions opened after setup"
+            : OnboardingTimeline.entries().contains { $0.hasSuffix(" setup window opened") } ? "setup window reopened"
+            : "setup window opened")
+        // Closing it early does not give setup up: the download keeps going in the
+        // engine, the notch's quiet setup cue carries it until Harbor can answer, and
+        // the window comes back at this step from the Dock or the next launch.
+        firstRunCloseObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification, object: win, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.firstRunClosed() }
+        }
+        setupModel.show(in: "first-run")
+        // "Harbor is ready" is promised only for when the person isn't looking at
+        // this window (FirstRunSetup.notifiesReady).
+        if setupModel.status?.canAnswer != true { notifyWhenReady() }
+        NSApp.activate(ignoringOtherApps: true)
+        win.makeKeyAndOrderFront(nil)
+    }
+
+    /// Titled, closable, minimizable (the yellow button and ⌘M) and resizable in height.
+    static let onboardingStyle: NSWindow.StyleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
+
+    private func onboardingContent() -> NSView {
+        let defaults = UserDefaults.standard
+        return NSHostingView(rootView: FirstRunSetupView(
+            setup: setupModel, knowYou: onboardingKnowYou, google: onboardingGoogle,
+            initialStep: OnboardingStep.restored(defaults.object(forKey: FirstRunSetup.stepKey) as? Int),
+            openDetailedSetup: { [weak self] in self?.openSetupGuide() },
+            finish: { [weak self] prompt in self?.finishFirstRun(asking: prompt) },
+            permissionsChanged: { [weak self] states in self?.firstRunPermissionsChanged(states) },
+            stepChanged: { [weak self] step in
+                UserDefaults.standard.set(step.rawValue, forKey: FirstRunSetup.stepKey)
+                // The last step means the permissions and About you are answered, so the
+                // first Brief can be composed now instead of at its hour. Only during
+                // setup (Permissions… opened later never gets here), and only once the
+                // model answers: a Brief made without it would stand as the day's.
+                if step == .tour, FirstRunSetup.isUnfinished({ UserDefaults.standard.bool(forKey: $0) }),
+                   self?.setupModel.status?.canAnswer == true {
+                    if self?.claimFirstBrief() == true { self?.requestFirstBrief() }
+                } else if FirstRunSetup.owesFirstBrief(after: step), FirstRunSetup.isUnfinished({ UserDefaults.standard.bool(forKey: $0) }) {
+                    // Reached before the model: the Brief is owed, and asked for once
+                    // the model answers (finishing setup or the readiness watch).
+                    self?.oweFirstBrief()
+                }
+            },
+            askKeyRegistered: hotKey?.registered ?? false,
+            voiceKeyRegistered: voiceHotKey?.registered ?? false,
+            // "Setup still unfinished" (started, not done), not "doneKey unset": someone
+            // who upgraded from a build without this window never had doneKey written,
+            // and opening Permissions… must not switch or test their model.
+            setupDone: !FirstRunSetup.isUnfinished { defaults.bool(forKey: $0) },
+            aboutYouDecided: {
+                UserDefaults.standard.set(true, forKey: FirstRunSetup.aboutYouDecidedKey)
+                UserDefaults.standard.set(Date(), forKey: KnowYouSecondOffer.decidedAtKey)
+            },
+            // The notch can't be opened during setup, so the window carries why Harbor's
+            // start failed and the same Retry the notch has. A service that answers is
+            // left alone: only its next answer ends the notch's "Starting Harbor…" hold.
+            recordedStartFailure: { [weak self] in self?.model.serviceStartFailure },
+            restartHarbor: { [weak self] in
+                guard let self, self.backend.lastReachable != true else { return }
+                self.model.retryService()
+            },
+            closeForNow: { [weak self] in
+                // Put aside while the model downloads: the first Brief is owed, so it
+                // is composed the moment the model answers, before Harbor is opened.
+                if FirstRunSetup.owesFirstBrief(after: OnboardingStep.restored(
+                    UserDefaults.standard.object(forKey: FirstRunSetup.stepKey) as? Int)) {
+                    self?.oweFirstBrief()
+                }
+                self?.firstRunWindow?.close()
+            }))
+    }
+
+    /// Done, or one of the last step's prompts: close the window and open the
+    /// notch on Ask. A prompt waits in Ask's box, unsent, for the person's Return.
+    /// This is the only way setup becomes done (FirstRunSetup.marksDone).
+    private func finishFirstRun(asking prompt: String? = nil) {
+        firstRunFinishing = true
+        let ready = setupModel.status?.canAnswer == true
+        // Finishing setup answers everything the first Brief waits on; without
+        // the model yet, the readiness watch asks for it when the model arrives.
+        // (Done in Permissions… opened later is not setup, and owes nothing.)
+        if FirstRunSetup.isUnfinished({ UserDefaults.standard.bool(forKey: $0) }) { oweFirstBrief() }
+        settleFirstBrief(canAnswer: ready)
+        firstRunWindow?.close()
+        // Not ready yet: the quiet cue (a line on Ask) carries the download in the
+        // notch, and a notification says when Harbor can answer.
+        if !ready {
+            if model.setupCard == .hidden || model.setupCard == .ready { model.setupCard = .later }
+            notifyWhenReady()
+        }
+        model.showingQuickSettings = false
+        model.tab = .ask
+        if let prompt { model.input = prompt }
+        openAssistant()
+    }
+
+    private func firstRunClosed() {
+        let defaults = UserDefaults.standard
+        let canAnswer = setupModel.status?.canAnswer == true
+        // Only Done (or a last-step prompt) ends setup. A close while Harbor is
+        // quitting is the quit, and an early close, even with a ready model, leaves
+        // setup unfinished at its saved step.
+        let ending = FirstRunSetup.ending(finishing: firstRunFinishing, terminating: appTerminating)
+        // Done in Permissions… opened after setup also counts as finishing, but
+        // setup was already done: that is "permissions closed", not a second finish.
+        OnboardingTimeline.record(!FirstRunSetup.isUnfinished({ defaults.bool(forKey: $0) }) ? "permissions closed"
+            : ending == .finished ? "setup finished"
+            : ending == .closedEarly ? "setup window closed early" : "setup window closed by quit")
+        if FirstRunSetup.marksDone(ending) {
+            defaults.set(true, forKey: FirstRunSetup.doneKey)
+            // Only the first finish starts the two days of Change Setup… in the menu.
+            if defaults.object(forKey: FirstRunSetup.doneAtKey) == nil { defaults.set(Date(), forKey: FirstRunSetup.doneAtKey) }
+            defaults.removeObject(forKey: FirstRunSetup.stepKey)
+            defaults.removeObject(forKey: FirstRunSetup.reopensKey)
+            defaults.removeObject(forKey: FirstRunSetup.resumeKey)
+        } else if FirstRunSetup.resumesAtNextLaunch(ending) {
+            defaults.set(true, forKey: FirstRunSetup.resumeKey)
+        } else {
+            // Closed early: the person put setup aside, so a mark left by opening
+            // Full Disk Access (and never toggling it) must not reopen it past the cap.
+            defaults.removeObject(forKey: FirstRunSetup.resumeKey)
+        }
+        setupModel.hide(from: "first-run")
+        if let observer = firstRunCloseObserver { NotificationCenter.default.removeObserver(observer) }
+        firstRunCloseObserver = nil
+        // Let the window and its view go (the view's permission poll stops with it);
+        // Continue setup builds a new one.
+        let closing = firstRunWindow
+        firstRunWindow = nil
+        DispatchQueue.main.async { closing?.contentView = nil }
+        defer { firstRunFinishing = false }
+        guard ending == .closedEarly else { return }
+        // An early close opens nothing by itself: the notch keeps its quiet setup
+        // cue, the Dock or Continue setup brings the window back at this step, and
+        // "Harbor is ready" follows once the model has arrived.
+        if !canAnswer {
+            if model.setupCard == .hidden || model.setupCard == .ready { model.setupCard = .later }
+            notifyWhenReady()
+        }
+    }
+
+    private var setupWatch: Task<Void, Never>?
+    private var notifyOnReady = false
+
+    /// Once Harbor can answer, say so to someone who isn't looking at setup: the
+    /// model download is the long wait, and nobody should have to keep checking.
+    /// The setup cue stays the way in until then.
+    private func notifyWhenReady() {
+        notifyOnReady = true
+        watchSetupReadiness()
+    }
+
+    /// From launch until Harbor can answer, on every launch: while it can't and no
+    /// first-run window is up, the notch carries the quiet setup cue
+    /// (FirstRunSetup.setupCue), so leaving setup aside, an early close or a quit
+    /// never leaves Harbor silent on a later launch. Once it can, the cue goes,
+    /// "Harbor is ready" follows if it was promised, and a first Brief setup still
+    /// owes is asked for.
+    private func watchSetupReadiness() {
+        guard setupWatch == nil else { return }
+        let started = Date()
+        setupWatch = Task { @MainActor [weak self] in
+            var request = URLRequest(url: HarborClient.baseURL.appendingPathComponent("setup/status"))
+            request.timeoutInterval = 10
+            var answered = false
+            // When the service first said Harbor can't answer, in this run of such answers.
+            var notReadySince: Date?
+            while !Task.isCancelled {
+                // Quick until the service first answers (a cold first launch takes
+                // minutes); then every 5 s while a notification is promised, else
+                // every 30 s, easing to 5 minutes after an hour.
+                let seconds: UInt64 = !answered ? 2 : self?.notifyOnReady == true ? 5
+                    : Date().timeIntervalSince(started) < 3600 ? 30 : 300
+                try? await Task.sleep(nanoseconds: seconds * 1_000_000_000)
+                guard let self else { return }
+                guard let (data, _) = try? await URLSession.shared.data(for: request),
+                      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let ready = object["ready"] as? Bool else { continue }
+                answered = true
+                let canAnswer = FirstRunSetup.canAnswer(ready: ready,
+                                                        remoteOnly: object["remote_only"] as? Bool == true)
+                // After setup was finished, "can't answer" at launch is usually the model
+                // warming up: no setup cue and no Finish Setup… until it has lasted
+                // (FirstRunSetup.warmUpGrace). An unfinished setup is told at once.
+                if canAnswer { notReadySince = nil } else if notReadySince == nil { notReadySince = Date() }
+                let notReadyFor = notReadySince.map { Date().timeIntervalSince($0) } ?? 0
+                let setupFinished = !FirstRunSetup.isUnfinished({ UserDefaults.standard.bool(forKey: $0) })
+                self.setupCanAnswer = FirstRunSetup.knownCanAnswer(canAnswer, setupFinished: setupFinished,
+                                                                   notReadyFor: notReadyFor)
+                let cue = FirstRunSetup.setupCue(self.model.setupCard, canAnswer: canAnswer,
+                                                 firstRunWindowUp: self.firstRunWindow != nil,
+                                                 setupFinished: setupFinished, notReadyFor: notReadyFor)
+                if cue != self.model.setupCard { self.model.setupCard = cue }
+                guard canAnswer else { continue }
+                self.settleFirstBrief(canAnswer: true)
+                let onPermissions = UserDefaults.standard.integer(forKey: FirstRunSetup.stepKey)
+                    == OnboardingStep.permissions.rawValue
+                if FirstRunSetup.notifiesReady(promised: self.notifyOnReady, windowUp: self.firstRunWindow != nil,
+                                               windowMinimized: self.firstRunWindow?.isMiniaturized == true,
+                                               harborFrontmost: NSApp.isActive, onPermissions: onPermissions) {
+                    self.tellReady()
+                }
+                self.notifyOnReady = false
+                self.setupWatch = nil
+                return
+            }
+        }
+    }
+
+    /// "Harbor is ready" as a notification when they are allowed. Harbor never asks
+    /// for them here, so when they are off (the setup row was skipped) the notch
+    /// says it instead: a dot on the closed bar and a line in the open panel,
+    /// until the person has opened it.
+    private func tellReady() {
+        // ⌥ Space is taught only when it is Harbor's: another app may own the key.
+        let askKey = hotKey?.registered ?? false
+        Task { @MainActor [weak self] in
+            let shown = await Notifications.postIfAllowed(id: Notifications.readyId, title: ReadyNotice.title,
+                                                          body: ReadyNotice.body(askKeyRegistered: askKey))
+            OnboardingTimeline.record(shown ? "ready notice delivered" : "ready notice fell back to notch")
+            guard !shown, let self else { return }
+            self.readyLineUnseen = true
+            // An open setup card is left to its Done.
+            if self.model.setupCard == .hidden { self.model.setupCard = .ready }
+            self.model.showTransientNotice(ReadyNotice.notchLine(askKeyRegistered: askKey),
+                                           duration: ReadyNotice.unseenFor, info: true)
+            if self.presentation.desired == .chat { self.readyLineSeen() }
+        }
+    }
+
+    /// The notch's "Harbor is ready" line is waiting for the person to open Ask.
+    private var readyLineUnseen = false
+
+    /// The panel is open in front of the person: Ask, Brief, Day and Quick
+    /// Settings all show the ready line, so it has been seen, and goes after a
+    /// short while instead of waiting a day. Getting to know you and /resetharbor
+    /// take the tab's place and hide it.
+    private func readyLineSeen() {
+        guard readyLineUnseen, model.knowYou == nil, model.resetCard == nil else { return }
+        readyLineUnseen = false
+        if model.setupCard == .ready { model.setupCard = .hidden }
+        guard let line = model.transientNotice, ReadyNotice.isNotchLine(line) else { return }
+        model.showTransientNotice(line, duration: ReadyNotice.seenFor, info: true)
+    }
+
+    /// The last step was reached (or setup finished): the first Brief is owed.
+    private func oweFirstBrief() {
+        guard !UserDefaults.standard.bool(forKey: FirstBrief.owedKey) else { return }
+        UserDefaults.standard.set(true, forKey: FirstBrief.owedKey)
+        OnboardingTimeline.record("first brief owed")
+    }
+
+    /// Marks the first Brief asked for; false when it already was. Only during
+    /// setup, as the last step's hook and finishFirstRun are, or once the model
+    /// arrives for a Brief setup owes.
+    private func claimFirstBrief() -> Bool {
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: FirstBrief.requestedKey) else { return false }
+        defaults.set(true, forKey: FirstBrief.owedKey)
+        defaults.set(true, forKey: FirstBrief.requestedKey)
+        OnboardingTimeline.record("first brief requested")
+        return true
+    }
+
+    /// Asks for an owed first Brief once the model answers: a Brief made
+    /// without it would stand as the day's.
+    private func settleFirstBrief(canAnswer: Bool) {
+        let defaults = UserDefaults.standard
+        guard FirstBrief.asksNow(owed: defaults.bool(forKey: FirstBrief.owedKey),
+                                 requested: defaults.bool(forKey: FirstBrief.requestedKey),
+                                 canAnswer: canAnswer),
+              claimFirstBrief() else { return }
+        requestFirstBrief()
+    }
+
+    /// Sends the claimed first Brief's request. A failed POST (the service was
+    /// restarting, say) un-claims it, so finishing setup or the next readiness
+    /// check asks again; the service ignores a repeat.
+    private func requestFirstBrief() {
+        Task { [client] in
+            if await client.onboardingBriefReady() == false {
+                UserDefaults.standard.removeObject(forKey: FirstBrief.requestedKey)
+                OnboardingTimeline.record("first brief request failed")
+            }
+        }
+    }
+
+    private var sleepObservers: [NSObjectProtocol] = []
+    /// What each running download had received when the Mac went to sleep; nil
+    /// when nothing was downloading.
+    private var downloadBytesAtSleep: [String: Double]?
+
+    /// A closed lid sleeps the Mac and pauses the model download with it. On
+    /// wake the notch's setup card says so, and only what is true (SleepPause),
+    /// and the download is read again at once instead of at the next poll.
+    private func watchSleepDuringDownload() {
+        guard sleepObservers.isEmpty else { return }
+        let center = NSWorkspace.shared.notificationCenter
+        sleepObservers = [
+            center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.downloadBytesAtSleep = SleepPause.atSleep(
+                        self.setupModel.downloads.map { (model: $0.model, state: $0.state, bytes: $0.downloadedBytes) })
+                }
+            },
+            center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self, let bytes = self.downloadBytesAtSleep else { return }
+                    self.downloadBytesAtSleep = nil
+                    NotchSetupNotices.shared.wake = SleepPause.Wake(at: Date(), bytesAtSleep: bytes)
+                    OnboardingTimeline.record("download paused by sleep")
+                    Task { @MainActor [weak self] in await self?.setupModel.refreshDownloads() }
+                }
+            },
+        ]
+    }
+
+    // Clicking the Dock icon, or opening Harbor again from Finder or Spotlight while it
+    // is running, brings forward exactly one window (HarborReopen): the onboarding
+    // window while setup is unfinished, else the Harbor window used last (out of the
+    // Dock if minimized), else the Harbor window. It returns false so AppKit doesn't
+    // also bring back a minimized window of its own choosing: that, and opening
+    // chat while unfinished setup sat in the notch, was the "two windows" bug.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        guard launched else { return false }
+        let guideStandsIn = firstRunHiddenForGuide && settingsSetupShown
+        let unfinished = firstRunWindow != nil || guideStandsIn
+            || FirstRunSetup.isUnfinished({ UserDefaults.standard.bool(forKey: $0) })
+        let windows = reopenCandidates()
+        switch HarborReopen.choose(setupUnfinished: unfinished, windows: windows.map(\.candidate)) {
+        case .onboarding:
+            bringSetupForward()
+        case .window(let id, let deminiaturize):
+            guard let window = windows.first(where: { $0.candidate.id == id })?.window else { break }
+            NSApp.activate(ignoringOtherApps: true)
+            if deminiaturize { window.deminiaturize(nil) }
+            window.makeKeyAndOrderFront(nil)
+        case .chat:
+            open(.chat(sessionId: nil))
+        }
+        return false
+    }
+
+    /// Harbor's own titled windows (not the notch panel, Search, alerts or sheets).
+    private func reopenCandidates() -> [(window: NSWindow, candidate: HarborReopen.Candidate)] {
+        NSApp.windows.enumerated().compactMap { index, window in
+            guard window.styleMask.contains(.titled), !(window is NSPanel), window.sheetParent == nil,
+                  window.contentView != nil, window !== firstRunWindow else { return nil }
+            return (window, HarborReopen.Candidate(id: index, visible: window.isVisible,
+                                                 minimized: window.isMiniaturized,
+                                                 lastKey: windowKeyOrder[ObjectIdentifier(window)] ?? 0))
+        }
+    }
+
+    private func noteKeyWindow(_ window: NSWindow) {
+        guard window.styleMask.contains(.titled), !(window is NSPanel) else { return }
+        windowKeyCount += 1
+        windowKeyOrder[ObjectIdentifier(window)] = windowKeyCount
+    }
+
+    /// The one setup surface on screen, forward: the detailed guide while it
+    /// stands in for the first-run window, else the first-run window (reopened at
+    /// its step when setup is unfinished), else the notch's setup card.
+    private func bringSetupForward() {
+        if firstRunHiddenForGuide, settingsSetupShown {
+            harborWindow.showSettings()
+        } else if firstRunWindow != nil || FirstRunSetup.isUnfinished({ UserDefaults.standard.bool(forKey: $0) }) {
+            openFirstRunSetup()
+        } else {
+            openSetupInNotch()
+        }
+    }
+
+    // The menu's "Finish Setup…" is there only while setup is (FirstRunSetup.menuOffersSetup).
+    // Changing the model or engine later is Settings › Models.
+    private var setupMenuItem: NSMenuItem?
+    /// The last /setup/status answer of the readiness watch; nil until one arrives.
+    private var setupCanAnswer: Bool?
+
+    @objc private func openSetupFromMenu() { bringSetupForward() }
+
+    /// Opening the window at launch used to be how Harbor said "I'm running". Now
+    /// that it starts in the notch, open the notch once and say where Harbor lives,
+    /// so neither a first launch nor an upgrade looks like Harbor failed to open.
+    private func showNotchTipOnce() {
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: Self.notchTipShownKey) else { return }
+        defaults.set(true, forKey: Self.notchTipShownKey)
+        let duration: TimeInterval = 10
+        // After the bar is on screen, so the drop-open reads as coming from the notch.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+            guard let self else { return }
+            self.openAssistant()
+            self.model.showTransientNotice(DisplayGeometry.shared.layout.firstRunTip, duration: duration)
+            // Tuck back in once the tip is gone, unless the pointer is on the panel
+            // (scheduleCollapse also keeps an unsent draft open).
+            DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak self] in
+                guard let self, !self.model.collapsed,
+                      !(self.panel?.frame.contains(NSEvent.mouseLocation) ?? false) else { return }
+                self.scheduleCollapse()
+            }
+        }
+    }
+
+    /// Full access has one source; the Harbor window's composer pill follows it
+    /// wherever it changes (quick settings, Settings, or the pill itself).
+    private func observeFullAccess() {
+        fullAccessObserver = settingsLoader.$fullAccess.dropFirst().sink { [weak self] value in
+            MainActor.assumeIsolated { self?.harborWindow.store.applyFullAccess(value) }
+        }
+        fullAccessProblemObserver = settingsLoader.$fullAccessSaveProblem.dropFirst().sink { [weak self] problem in
+            MainActor.assumeIsolated { self?.harborWindow.store.applyFullAccessSaveProblem(problem) }
+        }
+    }
+
+    /// Where every route lands. Today, Research, Memory and Settings (with Setup as
+    /// Settings › Models › Setup) are sections of the Harbor window; setup while it is
+    /// unfinished is the first-run window or the notch's card. Moving a part changes
+    /// this switch, never its callers.
+    private func open(_ route: HarborRoute) {
+        switch route {
+        case .settings, .setup: break
+        default:
+            if holdUntilModelReady() { return }
+            client.prewarmModel()
+        }
+        switch route {
+        case .chat, .chatList, .today, .research, .memory: stepAside()
+        case .settings, .setup, .knowYou: break
+        }
+        switch route {
+        case .chat(let sessionId):
+            if let sessionId { harborWindow.show(sessionId: sessionId) } else { harborWindow.show() }
+        case .chatList:
+            harborWindow.showChats()
+        case .today(let focus):
+            harborWindow.showToday(tab: focus.tab)
+        case .research:
+            harborWindow.showResearch()
+        case .memory(let focus):
+            harborWindow.show(memory: focus)
+        case .settings:
+            openSettings()
+        case .setup:
+            bringSetupForward()
+        case .knowYou:
+            knowYouChosen = true
+            openAssistant()
+            model.startKnowYou()
+        }
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    // MARK: - Smart Search (⌘⇧F)
+
+    @objc private func toggleSearch() {
+        if presentation.desired == .search {
+            closeSearch()
+            return
+        }
+        if holdUntilModelReady() { return }
+        // Record intent before the asynchronous capture, so repeated shortcuts
+        // cancel it and stale captures can never reopen a dismissed surface.
+        cancelScheduledCollapse()
+        let captureID = UUID()
+        searchCaptureID = captureID
+        searchReady = false
+        capturedSearchPage = nil
+        presentation.request(.search)
+        Task { @MainActor [weak self] in
+            let page = await PageReader.read()
+            guard let self, self.searchCaptureID == captureID,
+                  self.presentation.desired == .search else { return }
+            self.capturedSearchPage = page
+            self.searchReady = true
+            self.drivePresentation()
+        }
+        drivePresentation()
+    }
+
+    private func createSearchPanelIfNeeded() {
+        guard searchPanel == nil else { return }
+        let panel = OverlayPanel { SearchView(model: self.searchModel) }
+        // Search has no separate "collapsed bar" content of its own — it's
+        // either closed or open at full size — so it's never compact; the
+        // notch-stretch open/close animation still applies (dropOpen/rollUp
+        // animate purely on window geometry, independent of this flag), this
+        // only governs resizeToFit's guard against resizing while compact.
+        panel.isCompact = { false }
+        searchModel.onResize = { [weak panel] in
+            DispatchQueue.main.async { panel?.resizeToFit() }
+        }
+        searchPanel = panel
+    }
+
+    private func closeSearch() {
+        guard presentation.desired == .search || presentation.settled == .search else { return }
+        requestPresentation(notchDocked ? .bar : .hidden)
+    }
+
+    /// Arrow/escape handling. A local monitor rather than SwiftUI `.onKeyPress`
+    /// so ↑/↓ still navigate results while the text field holds focus — the
+    /// field would otherwise swallow them as cursor movement.
+    private func installSearchKeyMonitor() {
+        guard searchKeyMonitor == nil else { return }
+        searchKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] ev in
+            guard let self, let panel = self.searchPanel, panel.isKeyWindow else { return ev }
+            switch Int(ev.keyCode) {
+            case kVK_Escape:
+                self.closeSearch(); return nil
+            case kVK_DownArrow:
+                self.searchModel.move(1); return nil
+            case kVK_UpArrow:
+                self.searchModel.move(-1); return nil
+            case kVK_Return where ev.modifierFlags.contains(.command):
+                self.searchModel.askAnyway(); return nil
+            case kVK_Return:
+                // ↵ jumps to the current hit and leaves the panel open, so a
+                // second ↵ walks to the next one — same rhythm as ⌘G.
+                self.searchModel.move(ev.modifierFlags.contains(.shift) ? -1 : 1)
+                return nil
+            default:
+                return ev
+            }
+        }
+    }
+
+    // The app's main menu: Harbor (Settings, Hide, Quit), Edit (so the standard edit
+    // shortcuts route to the focused field), and Window.
+    private func installEditMenu() {
+        let main = NSMenu()
+        let appItem = NSMenuItem()
+        main.addItem(appItem)
+        let app = NSMenu(title: "Harbor")
+        appItem.submenu = app
+        let settingsItem = app.addItem(withTitle: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
+        settingsItem.target = self
+        app.addItem(.separator())
+        app.addItem(withTitle: "Hide Harbor", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        app.addItem(.separator())
+        app.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        let quitItem = app.addItem(withTitle: "Quit Harbor", action: #selector(quit), keyEquivalent: "q")
+        quitItem.target = self
+        let editItem = NSMenuItem()
+        main.addItem(editItem)
+        let edit = NSMenu(title: "Edit")
+        editItem.submenu = edit
+        edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        edit.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+        edit.addItem(.separator())
+        edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        let windowItem = NSMenuItem()
+        main.addItem(windowItem)
+        let window = NSMenu(title: "Window")
+        windowItem.submenu = window
+        window.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        window.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
+        window.addItem(.separator())
+        let chatItem = window.addItem(withTitle: "Harbor Window", action: #selector(openChat), keyEquivalent: "1")
+        chatItem.target = self
+        NSApp.windowsMenu = window
+        NSApp.mainMenu = main
+    }
+
+    private func buildMenu() {
+        let menu = NSMenu()
+        // Kept short: the window, Settings, and setup while it is unfinished.
+        // Everything else has a home in Settings: model and engine in Models,
+        // Permissions… and More Access… in Privacy. The chat debug log is in
+        // General too, and here for a tester sending one in. Getting to know
+        // you is /about or Memory › About you.
+        menu.addItem(withTitle: "Open Harbor Window", action: #selector(openChat), keyEquivalent: "")
+        menu.addItem(withTitle: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
+        setupMenuItem = menu.addItem(withTitle: "Finish Setup…", action: #selector(openSetupFromMenu), keyEquivalent: "")
+        setupMenuItem?.isHidden = true
+        // For the first two days after setup, a way back into it (FirstRunSetup.offersChangeSetup);
+        // after that, the notch's quick settings keep one.
+        changeSetupMenuItem = menu.addItem(withTitle: FirstRunSetup.changeSetupTitle,
+                                           action: #selector(changeSetupFromMenu), keyEquivalent: "")
+        changeSetupMenuItem?.isHidden = true
+        menu.addItem(.separator())
+        // Demo mode (StageMode.swift): a checkmark while on, and one plain line under it.
+        demoModeMenuItem = menu.addItem(withTitle: StageMode.menuTitle,
+                                        action: #selector(toggleDemoModeFromMenu), keyEquivalent: "")
+        demoModeNoteItem = menu.addItem(withTitle: "", action: nil, keyEquivalent: "")
+        demoModeNoteItem?.isEnabled = false
+        refreshDemoModeMenuItems()
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "Report a Problem…", action: #selector(reportProblem), keyEquivalent: "")
+        menu.addItem(withTitle: Self.exportDebugLogTitle, action: #selector(exportDebugLogFromMenu), keyEquivalent: "")
+            .toolTip = SettingsView.debugLogPrivacyLine
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "Quit Harbor", action: #selector(quit), keyEquivalent: "q")
+        for item in menu.items { item.target = self }
+        // Attach the menu only on right-click; left-click toggles the panel.
+        statusItem?.menu = nil
+        rightClickMenu = menu
+    }
+
+    private var rightClickMenu: NSMenu?
+    static let exportDebugLogTitle = "Export Chat Debug Log…"
+
+    /// The same all-chats export as Settings › General's button: it posts the one
+    /// notification both use, so the alert and the Finder reveal are the same.
+    @objc private func exportDebugLogFromMenu() {
+        NotificationCenter.default.post(name: .harborExportDebugLog, object: nil)
+    }
+    private var changeSetupMenuItem: NSMenuItem?
+    private var demoModeMenuItem: NSMenuItem?
+    private var demoModeNoteItem: NSMenuItem?
+
+    @objc private func toggleDemoModeFromMenu() {
+        StageMode.shared.set(!StageMode.shared.isOn)
+    }
+
+    /// The checkmark and the line under it, current each time the menu opens.
+    private func refreshDemoModeMenuItems() {
+        let stage = StageMode.shared
+        demoModeMenuItem?.state = stage.isOn ? .on : .off
+        demoModeNoteItem?.title = StageMode.menuNote(on: stage.isOn, remaining: stage.remaining,
+                                                     problem: stage.problem)
+    }
+
+    /// The setup window again at Permissions, for someone already set up. It never
+    /// switches or tests their model (FirstRunSetup.drivesModel).
+    @objc private func changeSetupFromMenu() {
+        OnboardingTimeline.record("change setup from the menu")
+        openFirstRunSetup(at: .permissions)
+    }
+
+    // The panel is always on screen; the hotkey and menu-bar click just flip
+    // between the notch bar and the expanded assistant. No reset — the visible
+    // transcript (and server-side session) survive collapse/expand.
+    private func askByVoice() {
+        if holdUntilModelReady() { return }
+        notchDocked = true
+        if presentation.desired != .chat {
+            model.prepareTab(byHover: false)
+            expand()
+        }
+        model.toggleVoice()
+    }
+
+    /// ⌥⇧L: the front app is read before Ask opens, so Harbor looks at what the
+    /// person was looking at, then Ask opens on the preview.
+    private func lookAtScreen() {
+        if holdUntilModelReady() { return }
+        let front = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        notchDocked = true
+        if presentation.desired != .chat {
+            model.prepareTab(byHover: false)
+            expand()
+        }
+        model.tab = .ask
+        model.lookAtFrontWindow(frontPID: front)
+    }
+
+    /// ⌥Space: what the menu-bar icon does. Each time it opens Ask, the setup
+    /// window's last step hears it (proof the shortcut works on this Mac).
+    private func askHotkeyPressed() {
+        let opens = presentation.desired != .chat
+        toggle()
+        if opens { NotificationCenter.default.post(name: .harborAskHotkeyPressed, object: nil) }
+    }
+
+    @objc private func toggle() {
+        if let event = NSApp.currentEvent, event.type == .rightMouseUp, let menu = rightClickMenu {
+            setupMenuItem?.isHidden = !FirstRunSetup.menuOffersSetup(
+                canAnswer: setupCanAnswer, card: model.setupCard, firstRunWindowUp: firstRunWindow != nil,
+                unfinished: FirstRunSetup.isUnfinished { UserDefaults.standard.bool(forKey: $0) })
+            changeSetupMenuItem?.isHidden = !FirstRunSetup.offersChangeSetup(
+                finishing: setupMenuItem?.isHidden == false,
+                doneAt: UserDefaults.standard.object(forKey: FirstRunSetup.doneAtKey) as? Date, now: Date())
+            // While the model downloads, the menu says so first, in plain words.
+            if let progress = shownDownloadProgress {
+                setupMenuItem?.title = FirstRunSetup.menuBarProgressMenuLine(progress)
+            } else {
+                setupMenuItem?.title = "Finish Setup…"
+            }
+            refreshDemoModeMenuItems()
+            statusItem.menu = menu
+            statusItem.button?.performClick(nil)
+            statusItem.menu = nil
+            return
+        }
+        // Re-dock if the X button previously dismissed the notch bar — the
+        // menu-bar icon (or ⌥Space) is the way back in.
+        notchDocked = true
+        if presentation.desired == .chat {
+            // An explicit close, like the chevron and Esc: an open Getting to
+            // know you counts as Later.
+            model.leaveKnowYou()
+            collapse()
+        } else {
+            // ⌥Space and the menu-bar icon always open Ask.
+            model.prepareTab(byHover: false)
+            expand()
+        }
+    }
+
+    /// Track menus so an open one holds auto-collapse. AppKit posts these for every
+    /// menu in the app, in begin/end pairs. In case a pair is ever unbalanced, any
+    /// presentation change or the pointer coming back into the panel also clears
+    /// the flag, but only when no menu is actually on screen, so it can never
+    /// disable auto-collapse for good and never lets the panel collapse under an
+    /// open menu. When the menu closes, a collapse it held back is re-armed if the
+    /// pointer is outside the panel.
+    private func installMenuTrackingObservers() {
+        pointerInPanel = { [weak self] in
+            self?.panel?.frame.contains(NSEvent.mouseLocation) ?? false
+        }
+        NotificationCenter.default.addObserver(forName: NSMenu.didBeginTrackingNotification,
+                                               object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.menuTracking = true }
+        }
+        NotificationCenter.default.addObserver(forName: NSMenu.didEndTrackingNotification,
+                                               object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.menuDidEndTracking() }
+        }
+    }
+
+    private func menuDidEndTracking() {
+        menuTracking = false
+        guard collapseHeldForMenu else { return }
+        collapseHeldForMenu = false
+        if !model.collapsed, !pointerInPanel() { scheduleCollapse() }
+    }
+
+    /// Drop a menu flag left set by an unbalanced begin, unless a menu really is open.
+    private func clearStaleMenuTracking(menuOnScreen: Bool? = nil) {
+        let menuOnScreen = menuOnScreen
+            ?? (NSApp?.windows.contains { $0.isVisible && $0.level == .popUpMenu } ?? false)
+        guard !menuOnScreen else { return }
+        menuTracking = false
+        collapseHeldForMenu = false
+    }
+
+    private func requestPresentation(_ surface: OverlayTransition.Surface) {
+        clearStaleMenuTracking()
+        // Pinning only holds off automatic collapse. Once the panel goes back to
+        // the bar or away by any route (collapse, Search closing, dismiss), it is unpinned.
+        if surface == .bar || surface == .hidden { model.pinned = false }
+        // Opening Ask (hover, ⌥Space, ⌥⇧Space, the menu-bar icon): a model Save
+        // memory unloaded starts loading while the user types. Not while setup holds
+        // the app: the model may not be downloaded yet.
+        if surface == .chat && !modelGateHolds { client.prewarmModel() }
+        cancelScheduledCollapse()
+        cancelHoverDwell()
+        if surface != .search {
+            searchCaptureID = nil
+            searchReady = false
+            capturedSearchPage = nil
+        }
+        presentation.request(surface)
+        drivePresentation()
+    }
+
+    private func expand() {
+        notchDocked = true
+        if holdUntilModelReady() { return }
+        requestPresentation(.chat)
+    }
+
+    /// While setup is under way and the model hasn't arrived (FirstRunSetup.gatesUse),
+    /// the notch, the Harbor window and asking stay closed: a click on any of them
+    /// brings the setup window forward instead, and it says why. Setup, Permissions
+    /// and Settings stay open. Returns whether the click was held back.
+    private func holdUntilModelReady() -> Bool {
+        guard modelGateHolds else { return false }
+        OnboardingTimeline.record("open held until the model is ready")
+        bringSetupForward()
+        // After the window's view is up, so a window built just now hears it too.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            NotificationCenter.default.post(name: .harborHeldUntilModelReady, object: nil)
+        }
+        return true
+    }
+
+    private var modelGateHolds: Bool {
+        FirstRunSetup.gatesUse(setupUnfinished: FirstRunSetup.isUnfinished { UserDefaults.standard.bool(forKey: $0) },
+                               canAnswer: setupCanAnswer,
+                               brain: setupModel.status.map { FirstRunBrain.from(status: $0, downloads: setupModel.downloads) })
+    }
+
+    private func collapse() {
+        // A delayed focus/hover callback from chat must not cancel Search.
+        guard presentation.desired == .chat else { return }
+        // Closed, the panel holds nothing for the answer any more; if it opens
+        // again during the same answer, its hold starts over.
+        collapseHeldForAnswer = false
+        answerHeldSince = nil
+        requestPresentation(.bar)
+    }
+
+    // MARK: - Nothing opens under the panel
+
+    /// The panel's level is above every normal window, and a click leaves the
+    /// pointer inside it, so nothing closed it when one opened: a window opened
+    /// from it sat underneath ("nothing happens"), and System Settings stayed
+    /// covered through the panel's grace delay. Whatever the panel opens comes
+    /// here first, holds or no holds, since it is what the person just asked for.
+    /// Nothing in the panel is lost; it is only closed.
+    private func stepAside() {
+        switch presentation.desired {
+        case .chat: requestPresentation(.bar)
+        case .search: closeSearch()
+        case .bar, .hidden: break
+        }
+    }
+
+    /// One of Harbor's own windows took the keyboard while the panel is above it: a
+    /// window opened from a menu, the Dock or a click in it. A pin means the person
+    /// wants the panel to stay; a dialog raised above the panel (the file and save
+    /// panels) has nothing to step aside for.
+    private func stepAside(forKey window: NSWindow) {
+        guard let panel, window !== panel, window !== searchPanel, !model.collapsed, !model.pinned,
+              !model.pickingFile, !model.answerInFlight,
+              Self.panelCovers(window: window.level, panel: panel.level) else { return }
+        stepAside()
+    }
+
+    /// Pure: a window at or under the panel's level is what it would cover.
+    nonisolated static func panelCovers(window: NSWindow.Level, panel: NSWindow.Level) -> Bool {
+        window.rawValue <= panel.rawValue
+    }
+
+    /// What it stepped aside for was answered (the microphone's question).
+    private func stepBack() {
+        guard presentation.desired == .bar else { return }
+        expand()
+    }
+
+    /// The notch on its permission page. While setup holds the notch closed, the
+    /// setup window's own Permissions step is what can be reached.
+    private func openPermissionPage(_ item: FirstRunPermissions.Item?) {
+        if modelGateHolds { openFirstRunSetup(at: .permissions); return }
+        notchDocked = true
+        createPanelIfNeeded()
+        model.openPermissionPage(item)
+    }
+
+    /// The page again, with macOS's answer on it. Nobody may be looking, so unless
+    /// the pointer goes there it closes again on its own after a moment to read.
+    private func permissionPageComesBack() {
+        // Still open and nothing closing it, so no opening will end the page's wait.
+        if presentation.desired == .chat && !model.collapsed {
+            model.permissionPage.panelOpened()
+            return
+        }
+        // Nobody asked for this open, so the keyboard stays with the app in front.
+        panel?.revealsWithoutKey = true
+        // Not openAssistant: the answer can arrive during the roll-up, while
+        // model.collapsed is still false. The request outlives that step, and the
+        // page's wait keeps it through the close (NotchPermissionPageModel.Waiting).
+        expand()
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.permissionAnswerShownFor) { [weak self] in
+            guard let self else { return }
+            self.panel?.revealsWithoutKey = false
+            guard self.model.showingPermissions, !self.model.collapsed, !self.pointerInPanel() else { return }
+            self.scheduleCollapse()
+        }
+    }
+    private static let permissionAnswerShownFor: TimeInterval = 6
+
+    private func finishPresentation(_ step: OverlayTransition.Step) {
+        guard presentation.finish(step) else { return }
+        // A pointer left resting on the bar after a close must leave the zone
+        // once before hovering can open the panel again.
+        if step.to == .bar || step.to == .hidden {
+            hoverIntent.didCollapse(pointerInZone: pointerInHoverZone())
+        }
+        // A panel that just closed is the moment Getting to know you may be offered.
+        if step.to == .bar { considerKnowYouOffer(after: 10) }
+        if step.to == .chat { readyLineSeen() }
+        drivePresentation()
+    }
+
+    /// Serialize native and SwiftUI changes through one owner. An input during
+    /// motion updates `desired`; the short current step finishes before the
+    /// next starts, keeping content mounted and preventing competing masks.
+    private func drivePresentation() {
+        guard let step = presentation.next(searchReady: searchReady) else { return }
+        if step.from == .chat {
+            guard let panel else { finishPresentation(step); return }
+            panel.makeFirstResponder(nil)
+            Self.veiledClose(model: model, animated: !panel.reduceMotion(), rollUp: { panel.rollUp($0) }) { [weak self] in
+                DispatchQueue.main.async {
+                    panel.settleToBar()
+                    self?.finishPresentation(step)
+                }
+            }
+        } else if step.from == .search {
+            if let monitor = searchKeyMonitor { NSEvent.removeMonitor(monitor); searchKeyMonitor = nil }
+            guard let searchPanel else { finishPresentation(step); return }
+            searchPanel.makeFirstResponder(nil)
+            searchPanel.rollUp { [weak self] in
+                guard let self else { return }
+                searchPanel.orderOut(nil)
+                self.searchModel.reset()
+                if self.notchDocked { self.panel?.present() }
+                self.finishPresentation(step)
+            }
+        } else {
+            switch step.to {
+            case .chat:
+                createPanelIfNeeded()
+                guard let panel else { finishPresentation(step); return }
+                if !panel.isVisible { panel.present() }
+                Self.veiledOpen(model: model, animated: !panel.reduceMotion(), dropOpen: { panel.dropOpen($0) }) { [weak self] in
+                    self?.finishPresentation(step)
+                }
+            case .search:
+                createSearchPanelIfNeeded()
+                guard let searchPanel else { finishPresentation(step); return }
+                panel?.orderOut(nil)
+                searchModel.reset()
+                if let page = capturedSearchPage { searchModel.capture(page) }
+                capturedSearchPage = nil
+                searchPanel.present()
+                installSearchKeyMonitor()
+                DispatchQueue.main.async { [weak self] in
+                    searchPanel.dropOpen { self?.finishPresentation(step) }
+                }
+            case .bar:
+                model.collapsed = true
+                panel?.present()
+                finishPresentation(step)
+            case .hidden:
+                model.collapsed = true
+                panel?.orderOut(nil)
+                finishPresentation(step)
+                Task { await client.unloadAgent() }
+            }
+        }
+    }
+
+    // Reset at the explicit dismiss action, before any subsequent input or
+    // summary request can be created. Presentation callbacks only move views.
+    private func dismissToMenuBar() {
+        // Closing the notch outright while Getting to know you is open is Later.
+        model.leaveKnowYou()
+        notchDocked = false
+        let wasCollapsed = model.collapsed
+        model.newChat()
+        model.collapsed = wasCollapsed
+        requestPresentation(.hidden)
+    }
+
+    // Auto-collapse triggers (mouse leaves the panel, or focus moves to another
+    // app) don't collapse immediately — they give a 3-second grace period so a
+    // quick glance away or an accidental drift-off doesn't tuck it away. Coming
+    // back (re-hover or re-focus) cancels it.
+    private func scheduleCollapse() {
+        guard !model.collapsed else { return }
+        pendingCollapse?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, !self.model.collapsed else { return }
+            // Don't hide a pinned panel, an unfinished edit (typed input, a
+            // message draft being edited) or an answer being written out from
+            // under the user.
+            // Past the answer's ceiling only the person's own holds remain.
+            if self.holdForAnswer() { return }
+            if self.model.holdsOpenBesidesAnswer { return }
+            // A menu opened from the panel (the chat switcher) runs outside it,
+            // so the pointer leaving the panel is not the person leaving. Hold
+            // the collapse until the menu closes (see installMenuTrackingObservers).
+            if self.menuTracking { self.collapseHeldForMenu = true; return }
+            self.collapse()
+        }
+        pendingCollapse = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.autoCollapseDelay, execute: work)
+    }
+
+    /// The answer a close was held for is done. The person left while it was being
+    /// written, so 3 seconds is too short to read it, and the panel shouldn't stay over
+    /// their work for good either.
+    private func answerSettled() {
+        guard collapseHeldForAnswer else { return }
+        collapseHeldForAnswer = false
+        answerHeldSince = nil
+        guard !model.collapsed, !pointerInPanel() else { return }
+        pendingCollapse?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, !self.model.collapsed, !self.menuTracking else { return }
+            if self.holdForAnswer() { return }
+            if self.model.holdsOpenBesidesAnswer { return }
+            self.collapse()
+        }
+        pendingCollapse = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + answerReadDelay, execute: work)
+    }
+
+    /// Watches for the end of the answer a close is waiting on. It follows the
+    /// values sent (@Published sends before it stores them), each in order, so
+    /// an answer that ends and a queued one that starts in the same turn of the
+    /// run loop still read as an end and a start: the queued one gets its own
+    /// hold, not what is left of the last one's.
+    private func watchForAnswerEnding() {
+        guard answerEnded == nil else { return }
+        answerEnded = model.$phase.map(OverlayModel.inFlight)
+            .combineLatest(model.$briefComposing) { $0 || $1 }
+            .removeDuplicates()
+            .dropFirst()
+            .receive(on: DispatchQueue.main).sink { [weak self] generating in
+                guard let self else { return }
+                if generating { self.answerHeldSince = nil } else { self.answerSettled() }
+            }
+    }
+
+    /// Holds an automatic close while Harbor is writing (OverlayModel.generating),
+    /// for at most `answerHoldCeiling` from when the first close came due; then
+    /// the close goes ahead as usual. True while it holds. The turn's own state
+    /// ends the hold (answerSettled), not a flag of this one.
+    private func holdForAnswer() -> Bool {
+        guard model.generating else { return false }
+        let since = answerHeldSince ?? Date()
+        let left = answerHoldCeiling - Date().timeIntervalSince(since)
+        guard left > 0 else { return false }
+        if answerHeldSince == nil {
+            answerHeldSince = since
+            // Look again at the ceiling, in case the answer never ends.
+            DispatchQueue.main.asyncAfter(deadline: .now() + left) { [weak self] in
+                guard let self, self.collapseHeldForAnswer, self.answerHeldSince == since,
+                      !self.model.collapsed, !self.pointerInPanel() else { return }
+                self.scheduleCollapse()
+            }
+        }
+        collapseHeldForAnswer = true
+        return true
+    }
+
+    private func pointerEnteredPanel() {
+        // Reentry cancels auto-collapse even while opening. Only the hover
+        // expansion itself must wait for a settled, docked bar.
+        cancelScheduledCollapse()
+        clearStaleMenuTracking()
+        guard notchDocked, presentation.active == nil,
+              presentation.desired != .search else { return }
+        // Entering the bar window only re-evaluates intent; the same dwell and
+        // arming rules as the global pointer monitor decide whether to open.
+        if model.collapsed { pointerMoved() }
+    }
+
+    // MARK: - Hover intent
+
+    /// Hover never opens anything while the model gate holds: only a click
+    /// brings the setup window forward (holdUntilModelReady).
+    private var canHoverOpen: Bool {
+        model.collapsed && notchDocked && presentation.active == nil
+            && presentation.desired == .bar && !modelGateHolds
+    }
+
+    private func pointerInHoverZone() -> Bool {
+        DisplayGeometry.shared.layout.hoverZone.contains(NSEvent.mouseLocation)
+    }
+
+    /// Hover is detected from the pointer's screen position, not only from the
+    /// bar window's tracking area: the bar is a few points tall, the window
+    /// changes size and order as it opens and closes, and a window that appears
+    /// under a resting pointer never receives an enter event. A global monitor
+    /// sees every move regardless of window state (and needs no permission).
+    private func installHoverMonitors() {
+        guard hoverMonitors.isEmpty else { return }
+        if let global = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved], handler: { [weak self] _ in
+            MainActor.assumeIsolated { self?.pointerMoved() }
+        }) { hoverMonitors.append(global) }
+        if let local = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved], handler: { [weak self] event in
+            self?.pointerMoved()
+            return event
+        }) { hoverMonitors.append(local) }
+    }
+
+    private func pointerMoved() {
+        let action = hoverIntent.pointerMoved(inZone: pointerInHoverZone(),
+                                              buttonsDown: NSEvent.pressedMouseButtons != 0,
+                                              collapsed: canHoverOpen)
+        switch action {
+        case .beginDwell: beginHoverDwell()
+        case .cancelDwell: cancelHoverDwell()
+        case .none: break
+        }
+    }
+
+    private func beginHoverDwell() {
+        guard hoverDwell == nil else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.hoverDwell = nil
+            if self.hoverIntent.shouldOpen(inZone: self.pointerInHoverZone(),
+                                           buttonsDown: NSEvent.pressedMouseButtons != 0,
+                                           collapsed: self.canHoverOpen) {
+                self.model.prepareTab(byHover: true)
+                self.expand()
+            }
+        }
+        hoverDwell = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + DisplayGeometry.shared.layout.hoverDwell, execute: work)
+    }
+
+    private func cancelHoverDwell() {
+        hoverDwell?.cancel()
+        hoverDwell = nil
+    }
+
+    /// Displays were attached, removed, rearranged, or rescaled.
+    private func displaysChanged() {
+        cancelHoverDwell()
+        panel?.applyDisplayChange()
+        searchPanel?.applyDisplayChange()
+    }
+
+    /// The collapsed bar switched between drawn and hitbox. The hover zone is
+    /// the same notch zone either way, so the pointer rules carry on; a dwell
+    /// already counting restarts on the next move with the new dwell time. The
+    /// menu-bar icon follows through observeMenuBarStatus.
+    private func barPresentationChanged() {
+        cancelHoverDwell()
+        panel?.applyPresentationChange()
+    }
+
+    private func cancelScheduledCollapse() {
+        pendingCollapse?.cancel()
+        pendingCollapse = nil
+    }
+
+    private func createPanelIfNeeded() {
+        guard panel == nil else { return }
+        model.todayReport = todayModel.report
+        notchCorpus.canStart = { [weak self] in self?.model.canStartCorpusCommand() ?? false }
+        notchCorpus.onStateChanged = { [weak self] busy, presented in
+            self?.model.corpusBusy = busy
+            self?.model.showingCorpus = presented
+            self?.model.onResize()
+        }
+        model.onCorpusCommand = { [weak self] command in self?.notchCorpus.submit(command) }
+        model.onHideCorpus = { [weak self] in self?.notchCorpus.hide() }
+        model.onResetCorpus = { [weak self] in self?.notchCorpus.stopAndHide() }
+        model.onOpenCorpus = { [weak self] in
+            guard let self else { return }
+            self.notchCorpus.selectInWindow()
+            // Chats even if the window is open on Settings or Today: the run was just selected there.
+            self.harborWindow.showChats()
+        }
+        model.onResetHarbor = { [weak self] in
+            guard let self else { return "Harbor is quitting." }
+            return await self.performHarborReset()
+        }
+        panel = OverlayPanel {
+            OverlayView(model: self.model, corpus: self.notchCorpus, researchModel: self.researchModel, todayModel: self.todayModel,
+                        settings: self.settingsLoader, setup: self.setupModel,
+                        onClose: { [weak self] in self?.collapse() },
+                        onDismiss: { [weak self] in self?.dismissToMenuBar() })
+        }
+        panel?.isCompact = { [weak self] in self?.model.collapsed ?? false }
+        // The Brief's two columns widen this window, from the same state
+        // OverlayView widens its content from. The search panel keeps the plain layout.
+        panel?.layoutProvider = { [weak self] in
+            MainActor.assumeIsolated {
+                let layout = DisplayGeometry.shared.layout
+                guard let self else { return layout }
+                return layout.widened(NotchBriefView.showsWide(model: self.model, today: self.todayModel,
+                                                               canWiden: layout.canWiden))
+            }
+        }
+        model.onResize = { [weak self] in
+            DispatchQueue.main.async { self?.panel?.resizeToFit() }
+        }
+        model.onResizeNow = { [weak self] in self?.panel?.resizeToFit() }
+        model.requestExpand = { [weak self] in self?.expand() }
+        model.permissionPage.comeBack = { [weak self] in self?.permissionPageComesBack() }
+        model.requestCollapse = { [weak self] in
+            // An explicit close (chevron, Esc) while Getting to know you is
+            // open counts as Later. Auto-collapse never reaches here: the open
+            // flow holds the panel open.
+            self?.model.leaveKnowYou()
+            self?.collapse()
+        }
+
+        // Assistant layer: the commitment clock and reminder stream (the notch
+        // "Up Next" countdown). Nothing here asks macOS for a permission: the
+        // setup window's rows do, one click each (Permissions.swift).
+        model.onCreateCalendarEvent = { [weak self] title, ts, dur, loc in
+            self?.calendarReader?.createEvent(title: title, startTs: ts,
+                                              durationMin: dur, location: loc)
+                ?? ["ok": false, "error": "Calendar handler unavailable"]
+        }
+        model.onCreateAllDayCalendarEvent = { [weak self] title, day, zone, loc in
+            self?.calendarReader?.createAllDayEvent(title: title, day: day, timezone: zone, location: loc)
+                ?? ["ok": false, "error": "Calendar handler unavailable"]
+        }
+        model.showCalendarEventURL = { [weak self] identifier, startTs in
+            self?.calendarReader?.showInCalendarURL(identifier: identifier, at: startTs)
+        }
+        model.onDeleteCalendarEvent = { [weak self] identifier, occurrenceTs in
+            self?.calendarReader?.deleteEvent(identifier: identifier, occurrenceTs: occurrenceTs)
+                ?? ["ok": false, "error": "Calendar handler unavailable"]
+        }
+        model.onCancelCalendarEvent = { [weak self] identifier, title, expected, invitees in
+            self?.calendarReader?.cancelEvent(identifier: identifier, expectedTitle: title,
+                                              expectedStart: expected, expectedInvitees: invitees)
+                ?? ["ok": false, "error": "Calendar handler unavailable"]
+        }
+        model.onMoveCalendarEvent = { [weak self] identifier, title, expected, start, duration, invitees in
+            self?.calendarReader?.moveEvent(identifier: identifier, expectedTitle: title,
+                                            expectedStart: expected, newStart: start, durationMin: duration,
+                                            expectedInvitees: invitees)
+                ?? ["ok": false, "error": "Calendar handler unavailable"]
+        }
+        model.onVerifiedReminderAction = { [weak self] kind, actionID, sourceID,
+            expectedTitle, expectedDueTs, title, dueTs, commitmentKind, dueDate, expectedDueDate in
+            self?.remindersWriter?.performVerified(kind: kind, actionID: actionID,
+                sourceID: sourceID, expectedTitle: expectedTitle,
+                expectedDueTs: expectedDueTs, title: title, dueTs: dueTs,
+                commitmentKind: commitmentKind, dueDate: dueDate, expectedDueDate: expectedDueDate)
+                ?? ["ok": false, "status": "failed", "error": "Reminders handler unavailable"]
+        }
+        model.onReconcileReminderAction = { [weak self] kind, actionID, sourceID,
+            title, dueTs, commitmentKind, dueDate in
+            guard let self else {
+                return ["ok": false, "status": "unknown", "error": "Reminders handler unavailable"]
+            }
+            guard let writer = self.remindersWriter else {
+                return ["ok": false, "status": "unknown", "error": "Reminders handler unavailable"]
+            }
+            return await writer.reconcileVerified(kind: kind, actionID: actionID,
+                sourceID: sourceID, title: title, dueTs: dueTs,
+                commitmentKind: commitmentKind, dueDate: dueDate)
+        }
+        model.onOpenChat = { [weak self] sessionId in
+            self?.open(.chat(sessionId: sessionId))
+        }
+        model.onStartResearch = { [weak self] prompt in
+            self?.openResearch(prompt: prompt)
+        }
+        // Backend requests an on-demand Mail sync (cold-cache email query);
+        // refresh both header and raw caches so summarize_emails/view_emails
+        // can be served without waiting on the 5-min timer.
+        model.onSyncEmails = { [weak self] in
+            guard let self else { return }
+            self.mailReader?.sync()
+            self.mailReader?.syncRaw()
+        }
+        model.onSyncAssistantSources = { [weak self] sources in
+            guard let self else { return }
+            if sources.contains("calendar") { self.calendarReader?.sync() }
+            if sources.contains("reminders") { self.remindersWriter?.sync() }
+            if sources.contains("email") { self.mailReader?.sync() }
+            if sources.contains("messages") { self.messagesReader?.sync() }
+            if sources.contains("notes") { self.notesReader?.sync() }
+            if sources.contains("browser_history") { self.browserHistoryReader?.sync() }
+        }
+        model.onMailMemoryRead = { [weak self] payload in
+            self?.mailMemoryReader?.handle(payload) ?? false
+        }
+        model.startAssistant()
+        Notifications.onOpenToday = { [weak self] in self?.openTodayInNotch() }
+        Notifications.onOpenAsk = { [weak self] in self?.openAssistant() }
+        startNativeSourceReaders()
+
+        // Pointer enter/exit come from a real AppKit tracking area on the
+        // panel (HoverView), not SwiftUI's flaky .onHover. Entering the bar
+        // expands; entering the open panel cancels a pending collapse; leaving
+        // the open panel arms the 2s grace timer so it retreats into the notch.
+        watchForAnswerEnding()
+        panel?.onMouseEnter = { [weak self] in self?.pointerEnteredPanel() }
+        panel?.onMouseExit = { [weak self] in
+            guard let self, !self.model.collapsed else { return }
+            self.scheduleCollapse()
+        }
+
+        // "Don't sit on top of everything at all times": the panel keeps its
+        // elevated level (required to fuse with the notch / be visible from an
+        // accessory app), but when it stops being the key window — the user
+        // clicked into another app — it tucks back into the notch after the
+        // grace delay instead of hovering over their work.
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didResignKeyNotification, object: panel, queue: .main
+        ) { [weak self] _ in
+            DispatchQueue.main.async {
+                guard let self, !self.model.collapsed else { return }
+                // Not when focus moved to one of OUR windows (the attach-file
+                // dialog, Settings) — only when it left the app for real.
+                if self.model.pickingFile || NSApp.keyWindow != nil { return }
+                self.scheduleCollapse()
+            }
+        }
+        // Coming back to the panel cancels a pending auto-collapse.
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification, object: panel, queue: .main
+        ) { [weak self] _ in
+            DispatchQueue.main.async { self?.cancelScheduledCollapse() }
+        }
+    }
+
+    /// The day's background refresh slows down while nobody is looking
+    /// (DayRefreshPace). These make it read at once when someone starts to.
+    private func observeDayRefreshTriggers() {
+        guard dayRefreshObservers.isEmpty else { return }
+        // The notch opening shows the Brief and Day, so they are read now unless
+        // a read began a moment ago.
+        dayRefreshObservers = [
+            model.$collapsed.dropFirst().removeDuplicates().sink { [weak self] collapsed in
+                guard !collapsed else { return }
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.todayModel.refreshSoon(ifOlderThan: DayRefreshPace.wakeFloor)
+                    // Back after a long absence: the service catches the Brief up
+                    // and says so; read again so "Updating your Brief…" shows now.
+                    Task { @MainActor [weak self] in
+                        guard let self, await self.client.noteReturn() else { return }
+                        self.todayModel.refreshSoon()
+                    }
+                }
+            },
+        ]
+        // The service says "changed" after every source sync, even when nothing did,
+        // so with the notch closed that must not wake the slow pace; opening it reads.
+        dayChangeObserver = NotificationCenter.default.addObserver(
+            forName: .harborAssistantChanged, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, !self.model.collapsed else { return }
+                self.todayModel.refreshSoon()
+            }
+        }
+    }
+
+    // Monochrome orb glyph for the menu bar (template → adapts to light/dark).
+    // MARK: - Menu-bar status
+
+    /// Where no bar is drawn (a built-in display without a notch), the menu-bar
+    /// icon shows what the bar would: working, due today, or not set up.
+    private func observeMenuBarStatus() {
+        let changed: () -> Void = { [weak self] in self?.queueMenuBarStatus() }
+        menuBarStatusObservers = [
+            model.objectWillChange.sink { _ in changed() },
+            todayModel.objectWillChange.sink { _ in changed() },
+            DisplayGeometry.shared.$layout.sink { _ in changed() },
+            setupModel.objectWillChange.sink { _ in changed() },
+        ]
+        updateMenuBarStatus()
+    }
+
+    /// Both publishers fire BEFORE the change lands, and a streaming reply fires
+    /// once per token: read the state once, on the next turn of the run loop.
+    private func queueMenuBarStatus() {
+        guard !menuBarStatusQueued else { return }
+        menuBarStatusQueued = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.menuBarStatusQueued = false
+            self.updateMenuBarStatus()
+        }
+    }
+
+    private func updateMenuBarStatus() {
+        guard let button = statusItem?.button else { return }
+        // The model download as a ring around the icon, so it can be watched from
+        // anywhere once the setup window is put aside.
+        let progress = FirstRunSetup.menuBarProgress(FirstRunBrain.from(status: setupModel.status,
+                                                                         downloads: setupModel.downloads),
+                                                     polling: setupModel.isShown)
+        if progress != shownDownloadProgress {
+            shownDownloadProgress = progress
+            button.image = Self.menubarOrb(progress: progress)
+            button.toolTip = progress.map(FirstRunSetup.menuBarProgressTip) ?? "Harbor"
+            // Said in words beside the ring too: Harbor isn't usable yet.
+            shownMenuBarStatus = nil
+        }
+        // The same conditions as the collapsed bar (OverlayView.notchBar). Shown
+        // wherever no bar is drawn: a notchless built-in display, or a notch
+        // behind a full-screen app (the hybrid notch).
+        let status = DisplayGeometry.shared.layout.statusInMenuBar
+            ? MenuBarStatus(working: model.isProcessing || model.phase == .streaming,
+                            ready: model.setupCard.showsReadyDot,
+                            dueToday: todayModel.dueBadgeCount,
+                            setupSetAside: model.setupCard == .later)
+            : MenuBarStatus(working: false, dueToday: 0, setupSetAside: false)
+        guard status != shownMenuBarStatus else { return }
+        shownMenuBarStatus = status
+        let title = shownDownloadProgress.map(FirstRunSetup.menuBarProgressTitle) ?? status.title
+        button.title = title
+        button.imagePosition = title.isEmpty ? .imageOnly : .imageLeading
+        button.setAccessibilityLabel(shownDownloadProgress.map(FirstRunSetup.menuBarProgressTip)
+                                     ?? status.accessibilityLabel)
+        setWorkingPulse(status.mark == .working)
+    }
+
+    /// The bar's breathing dot, on the icon: a slow fade while Harbor works. With
+    /// Reduce Motion it holds dimmed instead.
+    private func setWorkingPulse(_ on: Bool) {
+        workingPulse?.invalidate()
+        workingPulse = nil
+        workingPulseDim = false
+        statusItem.button?.alphaValue = 1
+        guard on else { return }
+        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            statusItem.button?.alphaValue = 0.55
+            return
+        }
+        workingPulse = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, let button = self.statusItem.button else { return }
+                self.workingPulseDim.toggle()
+                NSAnimationContext.runAnimationGroup { context in
+                    context.duration = 0.9
+                    button.animator().alphaValue = self.workingPulseDim ? 0.35 : 1
+                }
+            }
+        }
+    }
+
+    /// The download ring shown on the icon right now (nil: the plain orb).
+    private var shownDownloadProgress: Double?
+
+    /// Harbor's orb; with `progress`, a faint ring with the part downloaded drawn
+    /// full strength, clockwise from the top.
+    private static func menubarOrb(progress: Double? = nil) -> NSImage {
+        let d: CGFloat = 18
+        let img = NSImage(size: NSSize(width: d, height: d))
+        img.lockFocus()
+        if let ctx = NSGraphicsContext.current?.cgContext {
+            ctx.setLineWidth(1.5)
+            let inset: CGFloat = 2.5
+            if let progress {
+                ctx.setStrokeColor(NSColor.black.withAlphaComponent(0.3).cgColor)
+                ctx.strokeEllipse(in: CGRect(x: inset, y: inset, width: d - 2 * inset, height: d - 2 * inset))
+                let top = CGFloat.pi / 2
+                ctx.addArc(center: CGPoint(x: d / 2, y: d / 2), radius: d / 2 - inset,
+                           startAngle: top, endAngle: top - CGFloat(progress) * 2 * .pi, clockwise: true)
+                ctx.setStrokeColor(NSColor.black.cgColor)
+                ctx.setLineCap(.round)
+                ctx.strokePath()
+            }
+            ctx.setFillColor(NSColor.black.cgColor)
+            if progress == nil {
+                // The "Daybreak" mark (daybreak-glyph-small.svg, a 64 grid with y down):
+                // a half sun on the waterline over two breakwater arms.
+                let k = d / 64
+                func p(_ x: CGFloat, _ y: CGFloat) -> CGPoint { CGPoint(x: x * k, y: d - y * k) }
+                let sun = CGMutablePath()
+                sun.addArc(center: p(32, 32), radius: 16 * k, startAngle: 0, endAngle: .pi, clockwise: false)
+                sun.closeSubpath()
+                ctx.addPath(sun)
+                for x in [CGFloat(4), 36] {
+                    ctx.addPath(CGPath(roundedRect: CGRect(x: x * k, y: d - 44 * k, width: 24 * k, height: 8 * k),
+                                       cornerWidth: 4 * k, cornerHeight: 4 * k, transform: nil))
+                }
+                ctx.fillPath()
+            } else {
+                ctx.fillEllipse(in: CGRect(x: d * 0.6, y: d * 0.6, width: 3, height: 3))
+            }
+        }
+        img.unlockFocus()
+        img.isTemplate = true
+        return img
+    }
+
+    /// Reveal the normal prompt surface from the right-click menu. This uses
+    /// the same transition as the menu-bar icon, so a previously dismissed
+    /// notch panel is restored before the user starts typing.
+    @objc private func openAssistant() {
+        notchDocked = true
+        createPanelIfNeeded()
+        if model.collapsed || panel?.isVisible != true { expand() }
+    }
+
+    /// New research starts in the notch's Research tab, where the prompt drafts
+    /// an editable plan before Harbor searches the web.
+    private func startResearchInNotch() {
+        prepareNewResearch()
+        openAssistant()
+    }
+
+    private func prepareNewResearch() {
+        model.showingQuickSettings = false
+        // Leaves a plan on screen the way Back does, releasing the prompt queue it held.
+        model.returnToChat()
+        model.tab = .research
+    }
+
+    @objc private func openChat() { open(.chat(sessionId: nil)) }
+
+    private func openSavedResearch(_ id: String) {
+        openAssistant()
+        model.showingResearch = true
+        model.tab = .research
+        researchModel.openJob(id)
+    }
+
+    private func startNativeSourceReaders() {
+        startPromptingReaders()
+        guard !nativeSourceReadersStarted else { return }
+        nativeSourceReadersStarted = true
+        // These never make macOS ask: a missing Full Disk Access is only a failed read.
+        mailMemoryReader = MailMemoryReader(send: MailMemoryReader.poster(
+            to: HarborClient.baseURL.appendingPathComponent("assistant/sync/mail_memory")))
+        messagesReader = MessagesReader()
+        browserHistoryReader = BrowserHistoryReader()
+        activityReader = ActivityReader()
+        messagesReader?.start()
+        browserHistoryReader?.start()
+        activityReader?.start()
+    }
+
+    /// The source readers, each started once at launch. None of them asks macOS
+    /// for access (Permissions.swift): Calendar and Reminders read only what is
+    /// already allowed, Contacts never asks, and Mail and Notes skip scripted
+    /// reads until Automation has an answer.
+    private func startPromptingReaders() {
+        if calendarReader == nil {
+            calendarReader = CalendarReader()
+            calendarReader?.start()
+        }
+        if mailReader == nil {
+            mailReader = MailReader()
+            mailReader?.start()
+        }
+        if remindersWriter == nil {
+            remindersWriter = RemindersWriter()
+            remindersWriter?.start()
+        }
+        if notesReader == nil {
+            notesReader = NotesReader()
+            notesReader?.start()
+        }
+        if contactsReader == nil {
+            // Contacts is asked for from its row in setup, never by the reader.
+            contactsReader = ContactsReader(mayAsk: { false })
+            contactsReader?.start()
+        }
+    }
+
+    /// The setup window read its permissions: a new grant is read at once instead
+    /// of on the reader's next tick.
+    private func firstRunPermissionsChanged(_ states: [FirstRunPermissions.Item: FirstRunPermissions.State]) {
+        let before = firstRunPermissionStates
+        firstRunPermissionStates = states
+        for (item, state) in states where state == .allowed && before[item].map({ $0 != .allowed }) == true {
+            resyncReaders(after: item)
+        }
+    }
+
+    /// Every source reader posts what it can read now. Each one still reads only
+    /// what macOS already allows, so this never asks for anything.
+    private func resyncAllReaders() {
+        for item in Self.resyncedWhenReachable { resyncReaders(after: item) }
+    }
+
+    /// The readers posted again each time Harbor's service comes up. The service
+    /// holds each source's last sync in memory only, and a reader's launch-time
+    /// posts can land before a cold service listens, which left Reminders missing
+    /// for a heartbeat after macOS's Quit & Reopen (2026-10-29 fresh-install test).
+    /// Mail is here for its body read, which Full Disk Access's resync leaves out:
+    /// without it mail bodies waited for the next 15-minute tick after a restart.
+    nonisolated static let resyncedWhenReachable: [FirstRunPermissions.Item] = [.calendar, .reminders, .mail, .fullDiskAccess, .contacts]
+
+    private func resyncReaders(after item: FirstRunPermissions.Item) {
+        switch item {
+        case .calendar:
+            calendarReader?.sync()
+        case .reminders:
+            remindersWriter?.sync()
+        case .mail:
+            mailReader?.sync()
+            mailReader?.syncRaw()
+            notesReader?.sync()
+        case .fullDiskAccess:
+            // Messages, and the on-disk Mail and Notes reads used while those apps are closed.
+            messagesReader?.sync()
+            mailReader?.sync()
+            notesReader?.sync()
+        case .contacts:
+            contactsReader?.sync()
+        case .messages, .notifications, .screenRecording, .accessibility:
+            // Sending only: nothing here reads with them.
+            break
+        }
+    }
+
+    /// Opens the report inline in the notch, under the last reply.
+    @objc private func reportProblem() {
+        model.reportCurrentProblem()
+        openAssistant()
+    }
+
+    // Settings › General's Export Chat Debug Log…: writes every chat since Harbor
+    // opened, the open one last (every turn's model, route decision, timing,
+    // tok/s, tool calls, and any errors) to ~/Downloads as JSON + a readable .txt companion, then reveals
+    // them in Finder. No-ops with a brief notice if there's no conversation yet.
+    // Debug metadata is tracked for every turn whether or not Debug Mode is on
+    // (see OverlayModel.applyDebugFields).
+    //
+    // It says so without an app-modal alert. runModal locked the notch until it was
+    // answered, and from the menu bar, which never activates Harbor, macOS also bounced
+    // the Dock icon and could open the alert behind other apps, so the only way out
+    // was clicking the icon. See NonModalAlert.
+    private func exportDebugLog() async {
+        if let open = debugLogNotice { open.bringForward(); return }
+        guard !debugLogExporting else { return }
+        debugLogExporting = true
+        let result = await model.exportDebugLog(to: debugLogFolder)
+        debugLogExporting = false
+        showDebugLogNotice(result)
+    }
+
+    private var debugLogExporting = false
+    private var debugLogNotice: NonModalAlert?
+    /// Nil is Downloads; only the checks choose another folder.
+    private var debugLogFolder: URL?
+    private var revealExportedFile: (URL) -> Void = { NSWorkspace.shared.activateFileViewerSelecting([$0]) }
+
+    private func showDebugLogNotice(_ result: OverlayModel.DebugLogExport) {
+        let title: String, text: String, style: NSAlert.Style
+        var reveal: URL?
+        switch result {
+        case .nothing:
+            title = "Nothing to export yet"
+            text = "Start a conversation in Harbor first, then export its debug log."
+            style = .informational
+        case .failed(let reason):
+            title = "Couldn't save the chat debug log"
+            text = reason
+            style = .warning
+        case .saved(let url):
+            title = "Chat debug log saved to Downloads"
+            text = SettingsView.debugLogPrivacyLine
+            style = .informational
+            reveal = url
+        }
+        let notice = NonModalAlert(title: title, text: text, style: style) { [weak self] in
+            guard let self else { return }
+            self.debugLogNotice = nil
+            // The notice took focus from an open notch without counting as the person
+            // leaving (see the panel's didResignKey), so the notch goes back to its
+            // usual auto-collapse here, before Finder takes focus.
+            if !self.model.collapsed, !self.pointerInPanel() { self.scheduleCollapse() }
+            if let reveal { self.revealExportedFile(reveal) }
+        }
+        debugLogNotice = notice
+        notice.show()
+    }
+
+    /// Quit Harbor after the engine and its helpers have stopped. Every quit request
+    /// goes through here (see applicationShouldTerminate), so the Dock, the
+    /// application menu and the menu bar all shut down the same way.
+    @objc private func quit() {
+        // A second Quit while the first is still stopping the engine means "now".
+        if shutdownStarted { finishShutdown(); return }
+        beginShutdown()
+    }
+
+    private var shutdownStarted = false
+    private var shutdownFinished = false
+    /// Set before anything else on every way out, so the first-run window's close
+    /// (if AppKit sends one while Harbor ends) is read as the quit, never as the
+    /// person finishing or putting setup aside.
+    private var appTerminating = false
+
+    /// Harbor is ending: with setup unfinished and its window up (or stood aside for
+    /// the detailed guide), the next launch reopens it at its step, uncounted.
+    private func noteTerminating() {
+        guard !appTerminating else { return }
+        appTerminating = true
+        // A copy that is only handing over (or waiting) owns nothing to resume.
+        guard launched else { return }
+        let defaults = UserDefaults.standard
+        defaults.set(Int(ProcessInfo.processInfo.processIdentifier), forKey: Self.shuttingDownPIDKey)
+        if firstRunWindow != nil, FirstRunSetup.resumesAtNextLaunch(.appQuit),
+           FirstRunSetup.isUnfinished({ defaults.bool(forKey: $0) }) {
+            defaults.set(true, forKey: FirstRunSetup.resumeKey)
+        }
+    }
+    /// True when the system (logout, restart) asked to quit and is waiting for a reply.
+    private var systemAwaitingReply = false
+
+    private func beginShutdown() {
+        noteTerminating()
+        shutdownStarted = true
+        todayModel.stopBackgroundRefresh()
+        // Quitting must never hang: exit after a bound even if a stop step stalls.
+        // The bound is longer than the stop steps' own limits added together.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) {
+            MainActor.assumeIsolated { self.finishShutdown() }
+        }
+        // Stopping the engine unloads any models and frees its ~2GB baseline too.
+        Task {
+            // A meeting being recorded: stop the microphone and the call audio first, and let
+            // the last window reach the service before it is stopped (bounded, about 6 s).
+            await MeetingModel.shared.stopForQuit()
+            // Let any just-fired Settings change (role/model) finish
+            // persisting to ~/.moe/config.yaml before the backend that writes it
+            // gets killed — see PendingConfigWrites' docstring for the race this
+            // closes. Capped so a genuinely stuck request can't hang quitting.
+            await PendingConfigWrites.shared.waitUntilIdle()
+            // Only Harbor's own service: another program on the port (kept open at
+            // the port-conflict alert) must not have its engine stopped for good.
+            if !backend.portConflict { await client.shutdownOMLX() }
+            await BrowserBridgeActivation.shared.shutdown()
+            await backend.stopAndWait()
+            await MainActor.run { self.finishShutdown() }
+        }
+    }
+
+    /// /resetharbor, after the person clicked Reset Harbor on its card. Returns why it
+    /// stopped. Once the service has committed the reset (its marker is on disk)
+    /// this never returns: Harbor stops the engine and the service and relaunches,
+    /// and that launch finishes the reset (HarborReset), so no launch ever sees half
+    /// a reset. A reset whose answer was lost is finished by the next launch too.
+    func performHarborReset() async -> String {
+        guard launched, !shutdownStarted else { return "Harbor is quitting." }
+        guard !backend.portConflict else {
+            return "Another program holds Harbor's port, so nothing was reset."
+        }
+        // Harbor's own activity. The service seals itself, cancels its requests and
+        // stops its schedulers and syncs.
+        todayModel.stopBackgroundRefresh()
+        let (status, body) = await client.resetHarbor()
+        var reply = HarborReset.ServiceReply.parse(status: status, body: body)
+        if reply.kind == .unknown {
+            // No answer: the marker on disk says whether the reset committed.
+            if case .valid = HarborReset.readMarker() {
+                reply = .afterNoAnswer(markerOnDisk: true)
+            } else {
+                reply = .afterNoAnswer(markerOnDisk: false)
+            }
+        }
+        guard reply.relaunches else { return reply.detail }
+        NSLog("%@", "Harbor reset: service committed (\(reply.kind == .erased ? "erased" : "unfinished")); relaunching")
+        noteTerminating()
+        shutdownStarted = true
+        // The engine and the service stop as on quit; the model files stay. The next
+        // service start erases the engine's prompt cache, now that it is stopped.
+        await client.shutdownOMLX()
+        await BrowserBridgeActivation.shared.shutdown()
+        await backend.stopAndWait()
+        // Open again once this process is gone; that launch finishes the reset.
+        if let arguments = HarborReset.relaunchArguments(pid: ProcessInfo.processInfo.processIdentifier,
+                                                        app: Bundle.main.bundleURL) {
+            let relaunch = Process()
+            relaunch.executableURL = URL(fileURLWithPath: HarborReset.relaunchShell)
+            relaunch.arguments = arguments
+            try? relaunch.run()
+        }
+        // Not NSApp.terminate: nothing this process still writes matters, and the
+        // relaunched Harbor clears the defaults before reading any.
+        exit(0)
+    }
+
+    private func finishShutdown() {
+        guard !shutdownFinished else { return }
+        shutdownFinished = true
+        // Signals the backend if the stop steps did not get to it. After a clean
+        // stop the backend is already detached, so this does nothing.
+        backend.stop()
+        exitNow()
+    }
+
+    /// Exit without the quit path's engine stop. Used when this launch only hands over
+    /// to a copy that is already running, and when an alert quits Harbor without a service.
+    private func terminateWithoutShutdown() {
+        noteTerminating()
+        shutdownFinished = true
+        // "Quit Harbor" on the refusal alert can come while this app's own backend is
+        // alive: signal it so it does not outlive Harbor. Only the process this app
+        // spawned; with none (a hand-over, a port conflict at launch) this does nothing.
+        backend.stop()
+        exitNow()
+    }
+
+    /// Ends the app, answering a system logout or restart that is waiting for it.
+    private func exitNow() {
+        if systemAwaitingReply {
+            NSApp.reply(toApplicationShouldTerminate: true)
+        } else {
+            NSApp.terminate(nil)
+        }
+    }
+
+    // A quit from the Dock, the application menu or the system does not call quit().
+    // Run the same shutdown and reply once it finishes, so a logout is not cancelled.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        noteTerminating()
+        if shutdownFinished { return .terminateNow }
+        // Still waiting for a quitting copy: no engine or backend of ours to stop.
+        if !launched { shutdownFinished = true; return .terminateNow }
+        // Read now, while the quit Apple Event is still the one being handled.
+        relaunchIfSystemSettingsAsked(PrivacyRelaunch.Quit.current())
+        systemAwaitingReply = true
+        if !shutdownStarted { beginShutdown() }
+        return .terminateLater
+    }
+
+    private var relaunchScheduled = false
+
+    /// macOS's Quit & Reopen after a privacy switch: System Settings gives up on
+    /// the reopen while Harbor is still stopping its engine, so Harbor opens itself
+    /// again once this process has gone (PrivacyRelaunch).
+    private func relaunchIfSystemSettingsAsked(_ quit: PrivacyRelaunch.Quit) {
+        guard !relaunchScheduled else { return }
+        let relaunch = PrivacyRelaunch.shouldRelaunch(quit, paneOpenedAt: PrivacyRelaunch.paneOpenedAt(),
+                                                      now: Date().timeIntervalSince1970)
+        if case let .appleEvent(bundleID, path, reason) = quit {
+            NSLog("%@", "Harbor quit: Apple Event from \(bundleID ?? path ?? "an unknown sender")"
+                  + (reason.map { " (reason \($0))" } ?? "") + "; "
+                  + (relaunch ? "reopening once this copy has quit" : "not reopening"))
+        }
+        guard relaunch, let arguments = HarborReset.relaunchArguments(
+            pid: ProcessInfo.processInfo.processIdentifier, app: Bundle.main.bundleURL) else { return }
+        relaunchScheduled = true
+        PrivacyRelaunch.clearPaneOpened()
+        let helper = Process()
+        helper.executableURL = URL(fileURLWithPath: HarborReset.relaunchShell)
+        helper.arguments = arguments
+        do { try helper.run() } catch { NSLog("%@", "Harbor quit: couldn't schedule the reopen (\(error))") }
+    }
+
+    /// Settings is a section of the Harbor window (⌘,, the menus, the window's
+    /// sidebar and footer gear, and the notch's All settings all land here).
+    @objc private func openSettings() {
+        stepAside()
+        harborWindow.showSettings()
+    }
+
+    private var lastRefusalShown = ""
+    /// The port has been judged at launch (see launch()). Until then whatever holds it
+    /// is the port-conflict alert's to report, once.
+    private var startupPortJudged = false
+    /// A refusal arrived while it could not be shown (BackendTrust.RefusalNotice.hold).
+    private var refusalHeld = false
+
+    /// The app has just refused to talk to the program on the backend port. Shown once
+    /// per distinct reason, never repeatedly while it stays refused, and only when it is
+    /// news (BackendTrust.refusalNotice): not for Harbor stopping or restarting its own
+    /// service, not before the port is judged at launch, not beside the port-conflict alert.
+    private func presentBackendRefusal(_ message: String) {
+        guard !message.isEmpty, message != lastRefusalShown else { return }
+        switch BackendTrust.refusalNotice(startupJudged: startupPortJudged,
+                                          changingOwnBackend: backend.changingBackend,
+                                          portConflict: backend.portConflict,
+                                          quitting: shutdownStarted || appTerminating) {
+        case .show: break
+        case .hold: refusalHeld = true; return
+        case .drop: return
+        }
+        lastRefusalShown = message
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Harbor isn't using its service"
+        alert.informativeText = message
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Quit Harbor")
+        guard alert.runModal() == .alertSecondButtonReturn else { return }
+        // With a service of this app's own running, quit the usual way, so it and the
+        // engine have stopped before Harbor exits. With none there is nothing to stop.
+        if backend.childRunning { quit() } else { terminateWithoutShutdown() }
+    }
+
+    private func startupPortWasJudged() {
+        startupPortJudged = true
+        releaseHeldRefusal()
+    }
+
+    /// A refusal held back may have been true for that moment only (a holder that left
+    /// during the launch check, a request under Harbor's own restart), so it is not shown
+    /// from memory. The gate forgets it announced it, and the next check, a few seconds
+    /// away at most (the reachability watch), announces it again if it still holds.
+    private func releaseHeldRefusal() {
+        guard refusalHeld else { return }
+        refusalHeld = false
+        Task { await BackendTrustGate.shared.announceAgain() }
+    }
+
+    /// A program that is not Harbor's own holds the backend port. Harbor does not stop
+    /// it: the person decides.
+    private func presentPortConflict(_ message: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Harbor can't start its service"
+        alert.informativeText = message
+        alert.addButton(withTitle: "Quit Harbor")
+        alert.addButton(withTitle: "Keep Harbor Open")
+        if alert.runModal() == .alertFirstButtonReturn { terminateWithoutShutdown() }
+    }
+
+    /// The full setup guide, Settings › Models › Setup in the Harbor window: every
+    /// step, including Smart Search, other local apps and model downloads. Settings'
+    /// Setup guide…, the engine settings and the notch card's ⤢ open it, and so do
+    /// the first-run window's detailed-setup links.
+    // The first-run window steps aside while the detailed guide is up (both
+    // centred, the guide covering it, read as two Harbor windows at once) and
+    // comes back, at its step, when the guide is left: the Harbor window closes,
+    // or Settings moves off Models › Setup (updateSettingsSetupHost).
+    private var firstRunHiddenForGuide = false {
+        didSet { harborWindow.navigation.setupStandsInForWelcome = firstRunHiddenForGuide }
+    }
+
+    @objc private func openSetupGuide() {
+        // Minimized counts too: otherwise a Dock click brought it back out of the
+        // Dock beside the guide. Standing aside, the Dock brings the guide alone.
+        if let welcome = firstRunWindow, welcome.isVisible || welcome.isMiniaturized {
+            welcome.orderOut(nil)
+            firstRunHiddenForGuide = true
+        }
+        let defaults = UserDefaults.standard
+        defaults.set("models", forKey: SettingsView.paneKey)
+        defaults.set("setup", forKey: SettingsView.modelsPaneKey)
+        defaults.set(true, forKey: Self.setupGuideShownKey)
+        // An open Settings follows the two keys (@AppStorage); showing the section
+        // starts the guide's poll through updateSettingsSetupHost.
+        openSettings()
+    }
+
+    /// Settings › Models › Setup is the setup guide's "settings" host exactly while
+    /// it is on screen. Counted from the window and the stored panes, not from
+    /// SwiftUI's onAppear: the window is built once and kept. Leaving it brings
+    /// back a first-run window it was standing in for.
+    private func updateSettingsSetupHost() {
+        let defaults = UserDefaults.standard
+        let shown = harborWindow.isOpen && harborWindow.navigation.section == .settings
+            && (defaults.string(forKey: SettingsView.paneKey) ?? "models") == "models"
+            && defaults.string(forKey: SettingsView.modelsPaneKey) == "setup"
+        guard shown != settingsSetupShown else { return }
+        settingsSetupShown = shown
+        if shown {
+            // Showing it starts the poll (the first host), which re-reads the machine.
+            setupModel.show(in: "settings")
+            return
+        }
+        setupModel.hide(from: "settings")
+        if firstRunHiddenForGuide {
+            firstRunHiddenForGuide = false
+            DispatchQueue.main.async { self.openFirstRunSetup() }
+        }
+    }
+
+    /// Setup in the notch: the panel opens on Ask with the setup card, which
+    /// keeps it open until the person finishes or chooses Later.
+    @objc private func openSetupInNotch() {
+        showSetupCard()
+        openAssistant()
+    }
+
+    /// Day in the notch: where a clicked notification lands.
+    private func openTodayInNotch() {
+        prepareTodayInNotch()
+        openAssistant()
+    }
+
+    private func prepareTodayInNotch() {
+        model.showingQuickSettings = false
+        model.tab = .day
+    }
+
+    private func showSetupCard() {
+        model.showingQuickSettings = false
+        model.setupCard = .open
+        model.tab = .ask
+    }
+
+    /// On a Mac where Harbor can't answer yet (no engine, or no model), open the
+    /// notch on the setup card once. It never reopens by itself afterwards; Later
+    /// leaves a line on Ask until Harbor is ready, and the menu-bar item and
+    /// Settings remain the way back in.
+    private func offerSetupGuideOnFirstRun() {
+        guard !UserDefaults.standard.bool(forKey: Self.setupGuideShownKey) else { return }
+        Task { @MainActor [weak self] in
+            var request = URLRequest(url: HarborClient.baseURL.appendingPathComponent("setup/status"))
+            request.timeoutInterval = 10
+            // The backend starts alongside the app; a cold first launch can take
+            // minutes (bundle verification, first import), so wait up to ~3 min.
+            for _ in 0..<120 {
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                guard let self else { return }
+                guard let (data, _) = try? await URLSession.shared.data(for: request),
+                      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let ready = object["ready"] as? Bool else { continue }
+                if !ready { self.openSetupInNotch() }
+                UserDefaults.standard.set(true, forKey: Self.setupGuideShownKey)
+                return
+            }
+            // Never came up: say so in the notch instead of staying silent. The
+            // guide is not marked shown, so the next launch tries again.
+            // It isn't opened unasked: the reachability watch already shows it
+            // the next time the notch opens.
+            guard let self, self.backend.lastReachable != true else { return }
+            self.model.serviceStarting = false
+            self.model.serviceReachable = false
+        }
+    }
+
+    /// Settings › Privacy's More Access…: the permissions first launch defers
+    /// (Screen Recording, Accessibility, Full Disk Access), asked for when the
+    /// person chooses to: only what is still off, each with its reason, and one
+    /// system surface per click.
+    private func grantMoreAccess() {
+        stepAside()
+        let missing = Permissions.missingExtras()
+        let alert = NSAlert()
+        if let next = missing.first {
+            alert.messageText = "Give Harbor more access"
+            alert.informativeText = missing.map { "• \($0.title), \($0.reason)." }.joined(separator: "\n")
+                + (missing.count > 1 ? "\n\nOne at a time: choose More Access… again for the next." : "")
+            alert.addButton(withTitle: next == .fullDiskAccess ? "Open Full Disk Access…" : "Allow \(next.title)…")
+            alert.addButton(withTitle: "Not Now")
+        } else {
+            alert.messageText = "Harbor has all the access it can use"
+            alert.informativeText = "Screen Recording, \(PrivacyNames.accessibility) and Full Disk Access are on."
+            alert.addButton(withTitle: "OK")
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn, let next = missing.first { Permissions.request(next) }
+    }
+
+    /// Getting to know you chosen through HarborRoute.knowYou: it ends Harbor's own
+    /// offers for this session.
+    private var knowYouChosen = false
+    /// Set from GET /profile: once About you is complete, panel closes stop asking.
+    private var knowYouProfileComplete = false
+    private var knowYouOffersArmed = false
+    private var knowYouCheck: Task<Void, Never>?
+    private var knowYouTimer: Timer?
+    private var wakeObserver: NSObjectProtocol?
+
+    /// Harbor's own offer of Getting to know you, for the life of the app: checked
+    /// when the service comes up, when the panel closes, on wake and every half
+    /// hour. The service says whether it is due (never finished, no recent Later,
+    /// at most twice on its own; the menu bar, /about and Memory → About you remain
+    /// the way in); KnowYouOffer says whether now is a quiet moment.
+    private func armKnowYouOffers() {
+        guard !knowYouOffersArmed else { return }
+        knowYouOffersArmed = true
+        // A skip from before the window kept its date counts from now, so it too
+        // gets its one later offer (KnowYouSecondOffer).
+        let defaults = UserDefaults.standard
+        if FirstRunSetup.aboutYouDecidedInWindow({ defaults.bool(forKey: $0) }),
+           defaults.object(forKey: KnowYouSecondOffer.decidedAtKey) == nil {
+            defaults.set(Date(), forKey: KnowYouSecondOffer.decidedAtKey)
+        }
+        knowYouTimer = Timer.scheduledTimer(withTimeInterval: 1800, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.considerKnowYouOffer() }
+        }
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.considerKnowYouOffer(after: 30) }
+        }
+        considerKnowYouOffer(after: 20)
+    }
+
+    private var knowYouMoment: KnowYouOffer.Moment {
+        KnowYouOffer.Moment(
+            firstRunWindowUp: firstRunWindow != nil, setupWindowUp: settingsSetupShown,
+            setupCardOpen: model.setupCard == .open, replying: model.isProcessing,
+            flowOpen: model.knowYou != nil,
+            panelInUse: presentation.desired == .chat || presentation.desired == .search
+                || !model.collapsed || model.holdsOpen,
+            dismissedToMenuBar: !notchDocked, chosenThisSession: knowYouChosen,
+            profileComplete: knowYouProfileComplete,
+            aboutYouDecidedInWindow: FirstRunSetup.aboutYouDecidedInWindow { UserDefaults.standard.bool(forKey: $0) }
+                && knowYouWindowDecisionHolds)
+    }
+
+    /// The window's Done or skip still holds the notch's offers back: always,
+    /// except for one later offer a few days after a skip (KnowYouSecondOffer).
+    private var knowYouWindowDecisionHolds: Bool {
+        let defaults = UserDefaults.standard
+        return KnowYouSecondOffer.holdsBack(
+            decidedInWindow: true, decidedAt: defaults.object(forKey: KnowYouSecondOffer.decidedAtKey) as? Date,
+            offered: defaults.bool(forKey: KnowYouSecondOffer.offeredKey), now: Date())
+    }
+
+    /// One check, after `seconds` (a panel that just closed gets a moment before
+    /// anything opens it again). A newer trigger replaces a pending one.
+    private func considerKnowYouOffer(after seconds: Double = 0) {
+        guard knowYouOffersArmed else { return }
+        knowYouCheck?.cancel()
+        knowYouCheck = Task { @MainActor [weak self] in
+            if seconds > 0 { try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000)) }
+            guard !Task.isCancelled, let self, KnowYouOffer.quiet(self.knowYouMoment) else { return }
+            guard let envelope = await HarborClient().profile(), !Task.isCancelled else { return }
+            // Finished, or both automatic offers spent (two Laters, or an erase,
+            // which records the same): stop asking the service on every close.
+            if envelope.status.completed || envelope.profile.dismissCount >= 2 { self.knowYouProfileComplete = true }
+            guard KnowYouOffer.shouldOffer(self.knowYouMoment, serviceOffers: envelope.status.offer) else { return }
+            // After a skip in the window this is the one later offer: whatever the
+            // answer, it is the last.
+            if FirstRunSetup.aboutYouDecidedInWindow({ UserDefaults.standard.bool(forKey: $0) }) {
+                UserDefaults.standard.set(true, forKey: KnowYouSecondOffer.offeredKey)
+                OnboardingTimeline.record("getting to know you offered again")
+            }
+            // An offer nobody asked for must not take the keyboard from the
+            // app the person is typing in: it opens without becoming key.
+            self.createPanelIfNeeded()
+            self.panel?.revealsWithoutKey = true
+            self.openAssistant()
+            self.model.startKnowYou()
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            self.panel?.revealsWithoutKey = false
+        }
+    }
+
+    private func openResearch(prompt: String) {
+        openAssistant()
+        model.showingResearch = true
+        model.tab = .research
+        researchModel.createPlan(prompt: prompt)
+    }
+}
+
+#if HARBOR_MOTION_APP_DELEGATE_CHECKS
+extension AppDelegate {
+    /// Exercise actual delegate/model side effects without launching readers,
+    /// the backend, a window, or any native permission flow.
+    static func checkPointerReentryDuringOpening() {
+        let delegate = AppDelegate()
+        delegate.presentation.request(.chat)
+        let opening = delegate.presentation.next()!
+        delegate.model.collapsed = false
+        delegate.scheduleCollapse()
+        let scheduled = delegate.pendingCollapse!
+        delegate.pointerEnteredPanel()
+        precondition(scheduled.isCancelled && delegate.pendingCollapse == nil,
+                     "Pointer reentry during opening must cancel auto-collapse")
+        precondition(delegate.presentation.active == opening && delegate.presentation.desired == .chat,
+                     "Reentry must not introduce a competing transition")
+        print("PASS: AppDelegate pointer reentry cancels collapse during opening")
+    }
+
+    static func checkSummaryDuringDismissal() async {
+        let delegate = AppDelegate()
+        delegate.presentation.request(.chat)
+        let opening = delegate.presentation.next()!
+        delegate.model.collapsed = false
+        delegate.model.requestExpand = { [weak delegate] in delegate?.expand() }
+        delegate.dismissToMenuBar()
+        delegate.model.runDailySummary()
+        delegate.finishPresentation(opening)
+        for _ in 0..<100 {
+            if delegate.model.brief != nil { break }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        precondition(delegate.model.brief?.text == "Synthetic daily summary",
+                     "Summary response was discarded after dismissal/reopen")
+        precondition(delegate.model.tab == .brief && !delegate.model.briefComposing,
+                     "The brief lands on the Brief tab")
+        precondition(delegate.model.turns.isEmpty, "The brief no longer goes into the chat transcript")
+        precondition(delegate.model.conversationSettled && !delegate.model.willQueuePrompt,
+                     "A composed brief frees the prompt queue")
+        delegate.model.newChat()
+        precondition(delegate.model.brief != nil, "New chat keeps the brief")
+        delegate.model.reset()
+        print("PASS: AppDelegate Daily Summary during dismissal completes")
+    }
+
+    static func checkPinnedPanelHoldsOpen() async {
+        func opened() -> AppDelegate {
+            let delegate = AppDelegate()
+            delegate.presentation.request(.chat)
+            let opening = delegate.presentation.next()!
+            delegate.model.collapsed = false
+            delegate.finishPresentation(opening)
+            return delegate
+        }
+        let idle = opened()
+        let pinned = opened()
+        pinned.model.pinned = true
+        let typing = opened()
+        typing.model.input = "half a thought"
+        let editing = opened()
+        editing.model.messageDraft = OverlayModel.MessageDraft(to: "fixture", text: "Hi", isEditing: true)
+        let addingTask = opened()
+        addingTask.model.tab = .day
+        addingTask.model.todayTaskTitle = "Lab report draft"
+        let picking = opened()
+        picking.model.pickingFile = true
+        let inFlight: [OverlayModel.Phase] = [.routing, .working, .streaming, .confirming]
+        let answering = inFlight.map { phase -> AppDelegate in
+            let delegate = opened()
+            delegate.model.phase = phase
+            return delegate
+        }
+        // The Brief being composed holds like an answer; a turn that fails lets go;
+        // a turn that never ends holds only up to the ceiling.
+        let composing = opened()
+        composing.model.qaSetBriefComposing(true)
+        let failing = opened()
+        failing.model.phase = .working
+        let hung = opened()
+        hung.model.phase = .streaming
+        hung.answerHoldCeiling = 0.3
+        for delegate in [idle, pinned, typing, editing, addingTask, picking, composing, failing, hung] + answering {
+            delegate.scheduleCollapse()
+        }
+        try? await Task.sleep(for: .seconds(autoCollapseDelay + 0.5))
+        precondition(composing.presentation.desired == .chat && composing.collapseHeldForAnswer,
+                     "The Brief being written must hold the panel open")
+        precondition(failing.presentation.desired == .chat && failing.collapseHeldForAnswer,
+                     "A turn running tools must hold the panel open")
+        precondition(hung.presentation.desired == .chat, "Inside its ceiling an answer still holds")
+        precondition(idle.presentation.desired == .bar, "Control: an idle panel must auto-collapse")
+        for (delegate, what) in [(pinned, "a pin"), (typing, "typed input"), (editing, "a draft being edited"),
+                                 (addingTask, "a Day task being typed"), (picking, "an open file dialog")] {
+            precondition(delegate.presentation.desired == .chat, "\(what) must hold the panel open")
+        }
+        for delegate in answering {
+            precondition(delegate.presentation.desired == .chat && delegate.collapseHeldForAnswer,
+                         "An answer being written must hold the panel open (\(delegate.model.phase))")
+        }
+        // Done: it stays long enough to read, then closes; the pointer coming back keeps it.
+        let reading = answering[2]
+        // A queued turn that starts in the same run-loop turn as the last one ends
+        // gets a hold of its own, not what was left of the last one's.
+        let queued = answering[0]
+        let firstHold = queued.answerHeldSince
+        precondition(firstHold != nil, "A held answer records when its hold began")
+        for delegate in [reading, failing, composing, queued] {
+            delegate.answerReadDelay = 0.3
+            delegate.watchForAnswerEnding()
+        }
+        reading.model.phase = .done
+        failing.model.phase = .error
+        composing.model.qaSetBriefComposing(false)
+        queued.model.phase = .done
+        queued.model.phase = .routing
+        try? await Task.sleep(for: .seconds(0.1))
+        precondition(!queued.collapseHeldForAnswer && queued.answerHeldSince == nil && queued.presentation.desired == .chat,
+                     "An answer ending lets its hold go even when the next starts at once")
+        for (delegate, what) in [(reading, "A finished answer"), (failing, "A failed turn"), (composing, "A composed Brief")] {
+            precondition(!delegate.collapseHeldForAnswer && delegate.presentation.desired == .chat,
+                         "\(what) stays up to be read: the close timer starts again at the turn's end")
+        }
+        try? await Task.sleep(for: .seconds(0.5))
+        for (delegate, what) in [(reading, "A finished answer"), (failing, "A failed turn"), (composing, "A composed Brief")] {
+            precondition(delegate.presentation.desired == .bar, "\(what) doesn't hold the panel forever")
+        }
+        precondition(queued.presentation.desired == .chat && queued.collapseHeldForAnswer
+                     && (queued.answerHeldSince ?? .distantPast) > firstHold!,
+                     "The queued turn holds the panel from its own start")
+        // An explicit close still closes, and a window of Harbor's doesn't during an answer.
+        let closing = answering[1]
+        closing.collapse()
+        precondition(closing.presentation.desired == .bar, "The chevron, Esc and the hotkey still close during an answer")
+        precondition(closing.model.phase == .working, "Closing the notch mid-answer leaves the answer running")
+        precondition(!closing.collapseHeldForAnswer && closing.answerHeldSince == nil,
+                     "A close lets the answer's hold go, so opening again starts it over")
+        // The hung turn: past its ceiling the usual close goes ahead, the turn untouched.
+        try? await Task.sleep(for: .seconds(autoCollapseDelay + 0.6))
+        precondition(hung.presentation.desired == .bar && hung.model.phase == .streaming,
+                     "An answer that never ends holds the notch open only up to the ceiling")
+        pinned.collapse()
+        precondition(!pinned.model.pinned, "An explicit collapse must unpin")
+        precondition(pinned.presentation.desired == .bar, "An explicit collapse still collapses a pinned panel")
+        let dismissed = opened()
+        dismissed.model.pinned = true
+        dismissed.dismissToMenuBar()
+        precondition(!dismissed.model.pinned, "Dismissing must unpin")
+        let history = [OverlayModel.Turn(role: "user", text: "a"), OverlayModel.Turn(role: "assistant", text: "b"),
+                       OverlayModel.Turn(role: "user", text: "c")]
+        let local = [OverlayModel.Turn(role: "user", text: "c"), OverlayModel.Turn(role: "assistant", text: "d")]
+        precondition(OverlayModel.joining(history: history, before: local).map(\.text) == ["a", "b", "c", "d"],
+                     "A turn saved before its chat's history loaded appears once")
+        precondition(OverlayModel.joining(history: Array(history.prefix(2)), before: local).map(\.text) == ["a", "b", "c", "d"],
+                     "History goes before turns asked while it loaded")
+        // The tab survives collapse; ⌥Space reopens on Ask, a prompt hover on the last tab.
+        precondition(addingTask.model.tab == .day, "The tab survives collapse")
+        addingTask.model.collapsed = true
+        addingTask.model.prepareTab(byHover: true)
+        precondition(addingTask.model.tab == .day, "A hover soon after closing reopens the last tab")
+        addingTask.model.prepareTab(byHover: true, at: Date().addingTimeInterval(NotchTabMemory.hoverWindow + 60))
+        precondition(addingTask.model.tab == .ask, "A hover long after closing opens Ask")
+        addingTask.model.tab = .research
+        addingTask.model.prepareTab(byHover: false)
+        precondition(addingTask.model.tab == .ask, "⌥Space opens Ask")
+        print("PASS: AppDelegate collapse holds (pin, typing, draft, Day task, file dialog, answers and the Brief up to a ceiling; done or failed turns restart the close), unpins on collapse and dismiss; tabs reopen as designed")
+    }
+
+    /// A reply written in the Brief holds the panel open until it is sent or
+    /// closed, and the notch tucking away or a tab change keeps the same reply:
+    /// its text, its one draft request and the result of its one send.
+    static func checkBriefReplyHoldsAndSurvives() async {
+        final class Calls {
+            var draft = 0
+            var send = 0
+            var release: CheckedContinuation<Void, Never>?
+        }
+        let calls = Calls()
+        let transport: BriefReplyModel.Transport = { request in
+            let draft = request.url?.lastPathComponent == "draft"
+            if draft {
+                calls.draft += 1
+            } else {
+                calls.send += 1
+                // Held until the check lets go, so the send is seen in flight.
+                await withCheckedContinuation { calls.release = $0 }
+            }
+            let body: [String: Any] = draft
+                ? ["ok": true, "draft": "Thursday works.", "to": ["sam@example.com"], "cc": [],
+                   "subject": "Re: Lunch", "account": "Work", "envelope": "fixture", "can_send": true]
+                : ["ok": true, "status": "sent"]
+            return (try JSONSerialization.data(withJSONObject: body),
+                    HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+        }
+        let replies = ProactiveActions.shared
+        let thread = ProactiveThread(id: "t-fixture", source: "mail", replyRef: ["message_id": "m-fixture"])
+        let delegate = AppDelegate()
+        delegate.presentation.request(.chat)
+        let opening = delegate.presentation.next()!
+        delegate.model.collapsed = false
+        delegate.finishPresentation(opening)
+        let model = delegate.model
+        model.tab = .brief
+        precondition(!model.holdsOpen, "Control: the Brief with no reply open doesn't hold the panel")
+        // Reply is tapped: the row is open and its composer asks for the reply.
+        replies.expanded = [thread.id]
+        replies.replying = thread.id
+        let reply = replies.replyModel(for: thread, transport: transport)
+        precondition(model.holdsOpen, "A reply being drafted holds the panel open")
+        await reply.loadDraft()
+        reply.text = "Thursday at noon works."
+        precondition(reply.phase == .ready && model.holdsOpen, "A reply being written holds the panel open")
+        delegate.scheduleCollapse()
+        try? await Task.sleep(for: .seconds(autoCollapseDelay + 0.5))
+        precondition(delegate.presentation.desired == .chat, "The pointer leaving must not close a reply being written")
+        model.tab = .ask
+        precondition(!model.holdsOpen, "A Brief reply holds the panel on the Brief tab only")
+        model.tab = .brief
+        replies.expanded = []
+        precondition(!model.holdsOpen, "A reply whose row is closed doesn't hold the panel")
+        replies.expanded = [thread.id]
+        // The notch tucked away (Esc, the chevron) or the tab changed, and the
+        // row is back: the same reply, with no second draft.
+        let remounted = replies.replyModel(for: thread, transport: transport)
+        await remounted.loadDraft()
+        precondition(remounted === reply && remounted.text == "Thursday at noon works." && calls.draft == 1,
+                     "Reopening the Brief keeps the typed reply and drafts once")
+        // Close reply while the send is out keeps the reply, so opening it
+        // again shows what happened instead of a new draft with a live Send.
+        let sending = Task { await reply.send() }
+        for _ in 0..<200 where calls.release == nil { try? await Task.sleep(for: .milliseconds(10)) }
+        precondition(reply.phase == .sending && model.holdsOpen, "A send in flight holds the panel open")
+        replies.closeReply(thread.id)
+        precondition(replies.replying == nil && !model.holdsOpen, "Close reply closes the composer")
+        precondition(replies.replyModel(for: thread, transport: transport) === reply,
+                     "A reply closed while sending is kept until its send settles")
+        calls.release?.resume()
+        calls.release = nil
+        await sending.value
+        replies.replying = thread.id
+        let reopened = replies.replyModel(for: thread, transport: transport)
+        await reopened.loadDraft()
+        precondition(reopened === reply && reopened.phase == .sent && !reopened.sendEnabled,
+                     "Reopening Reply after the send shows it sent, with no live Send")
+        await reopened.send()
+        precondition(calls.send == 1 && calls.draft == 1, "One draft and one send, however often the row comes back")
+        precondition(!model.holdsOpen, "A sent reply lets the panel tuck away")
+        // Done forgets it; the next Reply is a new one.
+        replies.closeReply(thread.id)
+        precondition(replies.replyModels[thread.id] == nil && replies.replying == nil, "Done forgets the sent reply")
+        // A thread the Brief no longer lists can't keep the panel open.
+        let stale = replies.replyModel(for: thread, transport: transport)
+        replies.replying = thread.id
+        precondition(stale !== reply && model.holdsOpen, "A new reply holds the panel again")
+        replies.pruneReplies(keeping: ["t-other"])
+        precondition(replies.replying == nil && replies.replyModels.isEmpty && !model.holdsOpen,
+                     "A reply to a thread that left the Brief is dropped and holds nothing")
+        replies.expanded = []
+        print("PASS: AppDelegate a Brief reply holds the panel while unfinished and survives collapse (one draft, one send)")
+    }
+
+    static func checkResearchReleasesQueueOffTab() async {
+        let delegate = AppDelegate()
+        let model = delegate.model
+        var started: [String] = []
+        model.onStartResearch = { started.append($0) }
+        model.tab = .research
+        model.input = "battery chemistry"
+        model.submit()
+        precondition(started == ["battery chemistry"] && model.showingResearch, "A research prompt starts a plan")
+        precondition(model.willQueuePrompt, "An on-screen research plan holds the prompt queue")
+        model.tab = .ask
+        precondition(!model.willQueuePrompt, "Leaving the Research tab frees the queue for Ask")
+        precondition(model.showingResearch, "The research plan stays on its tab")
+        model.runDailySummary()
+        precondition(model.briefComposing, "A brief can be composed while research sits on its tab")
+        model.reset()
+        // New research from the window, while a plan is on screen in the notch.
+        let window = AppDelegate()
+        window.model.onStartResearch = { _ in }
+        window.model.tab = .research
+        window.model.input = "solid-state batteries"
+        window.model.submit()
+        precondition(window.model.willQueuePrompt, "A plan on screen holds the queue")
+        window.prepareNewResearch()
+        precondition(window.model.tab == .research && !window.model.showingResearch && !window.model.willQueuePrompt,
+                     "New research opens the Research prompt and frees the queue the old plan held")
+        print("PASS: AppDelegate research releases the prompt queue when its tab is left or New research opens")
+    }
+
+    static func checkPermissionPageStepsAside() async {
+        let delegate = AppDelegate()
+        let model = delegate.model
+        delegate.presentation.request(.chat)
+        let opening = delegate.presentation.next()!
+        model.collapsed = false
+        delegate.finishPresentation(opening)
+        model.tab = .brief
+        model.openPermissionPage(.calendar)
+        precondition(model.showingPermissions && model.permissionPage.focus == .calendar && model.tab == .brief,
+                     "A Brief row opens the page on its permission, on the Brief")
+        // A plain close and any way off the tab leave the page, as they do quick settings.
+        model.collapsed = true
+        precondition(!model.showingPermissions, "Closing the panel closes the page")
+        model.collapsed = false
+        model.openPermissionPage(.calendar)
+        model.tab = .day
+        precondition(!model.showingPermissions, "Another tab closes the page")
+        model.tab = .brief
+        model.openPermissionPage(nil)
+        model.showingQuickSettings = true
+        precondition(!model.showingPermissions && model.showingQuickSettings, "The gear closes the page")
+        model.openPermissionPage(.reminders)
+        precondition(model.showingPermissions && model.showingQuickSettings, "Opened from Settings, it sits over them")
+        model.closePermissionPage()
+        precondition(!model.showingPermissions && model.showingQuickSettings, "Done goes back to Settings")
+        model.showingQuickSettings = false
+        // Stepping aside ignores what holds the panel open, since the person asked for it.
+        model.input = "half a question"
+        precondition(model.holdsOpen, "Typed text holds the panel open")
+        delegate.stepAside()
+        precondition(delegate.presentation.desired == .bar, "A window or a question opening closes the panel anyway")
+        precondition(model.input == "half a question", "Nothing in the panel is lost")
+        model.input = ""
+        // macOS answers while the panel is still rolling up (a question it never
+        // showed): the page and its message come back instead of closing with it.
+        let racing = AppDelegate()
+        racing.presentation.request(.chat)
+        let racingOpen = racing.presentation.next()!
+        racing.model.collapsed = false
+        racing.finishPresentation(racingOpen)
+        racing.model.tab = .brief
+        racing.model.openPermissionPage(.calendar)
+        racing.model.permissionPage.comeBack = { [weak racing] in racing?.permissionPageComesBack() }
+        let click = racing.model.permissionPage.beginWaiting(.calendar, state: .notAsked)
+        racing.presentation.request(.bar)
+        _ = racing.presentation.next()!
+        racing.model.permissionPage.answered(click)
+        precondition(racing.presentation.desired == .chat, "An answer during the roll-up asks for the panel back")
+        racing.model.collapsed = true
+        precondition(racing.model.showingPermissions && racing.model.permissionPage.focus == .calendar,
+                     "That roll-up's end doesn't close the page")
+        racing.model.collapsed = false
+        precondition(racing.model.showingPermissions && !racing.model.permissionPage.keepsThroughClose,
+                     "The page is back, and nothing is waiting any more")
+        racing.model.collapsed = true
+        precondition(!racing.model.showingPermissions, "The next close is an ordinary one")
+        // The same answer with the panel never closed: nothing is left waiting.
+        let stayed = AppDelegate()
+        stayed.presentation.request(.chat)
+        let stayedOpen = stayed.presentation.next()!
+        stayed.model.collapsed = false
+        stayed.finishPresentation(stayedOpen)
+        stayed.model.openPermissionPage(.calendar)
+        stayed.model.permissionPage.comeBack = { [weak stayed] in stayed?.permissionPageComesBack() }
+        stayed.model.permissionPage.answered(stayed.model.permissionPage.beginWaiting(.calendar, state: .notAsked))
+        precondition(!stayed.model.permissionPage.keepsThroughClose, "An open panel has no opening to wait for")
+        print("PASS: AppDelegate permission page opens in the notch and the panel steps aside for what it opens")
+    }
+
+    static func checkQuickSettingsSurviveCollapse() async {
+        let delegate = AppDelegate()
+        let model = delegate.model
+        let loader = delegate.settingsLoader
+        delegate.observeFullAccess()
+        delegate.presentation.request(.chat)
+        let opening = delegate.presentation.next()!
+        model.collapsed = false
+        delegate.finishPresentation(opening)
+        model.run(.settings)
+        precondition(model.showingQuickSettings, "/settings opens quick settings")
+        await loader.refreshFullAccess()
+        precondition(loader.fullAccess == nil, "An unreadable Full access flag is unconfirmed, never off")
+        precondition(loader.fullAccessExplanation.contains("hasn't been confirmed"), "Unconfirmed Full access says so")
+        loader.setFullAccess(true)
+        precondition(loader.fullAccessPending && loader.fullAccess == nil, "A change waits for the service before it shows")
+        model.collapsed = true
+        precondition(!model.showingQuickSettings, "Collapsing closes quick settings")
+        model.collapsed = false
+        for _ in 0..<100 where loader.fullAccessPending { try? await Task.sleep(for: .milliseconds(20)) }
+        precondition(!loader.fullAccessPending && loader.fullAccess == true,
+                     "A change started before the notch collapsed is confirmed after it reopens")
+        let store = delegate.harborWindow.store
+        precondition(store.fullAccessKnown && store.fullAccess, "The Harbor window's pill follows the one Full access source")
+        model.showingQuickSettings = true
+        model.tab = .brief
+        precondition(!model.showingQuickSettings, "Switching tabs closes quick settings")
+        print("PASS: AppDelegate quick settings share one loader; a Full access change survives collapse; unconfirmed is never off")
+    }
+
+    static func checkSetupCardHoldsAsk() async {
+        let delegate = AppDelegate()
+        let model = delegate.model
+        delegate.presentation.request(.chat)
+        let opening = delegate.presentation.next()!
+        model.collapsed = false
+        delegate.finishPresentation(opening)
+        model.tab = .day
+        model.showingQuickSettings = true
+        delegate.showSetupCard()
+        precondition(model.setupCard == .open && model.tab == .ask && !model.showingQuickSettings,
+                     "Setup opens the panel on Ask with the full card")
+        precondition(model.holdsOpen, "An open setup card holds the panel open")
+        delegate.scheduleCollapse()
+        try? await Task.sleep(for: .seconds(autoCollapseDelay + 0.5))
+        precondition(delegate.presentation.desired == .chat, "Auto-collapse waits for setup to be finished or set aside")
+        model.collapsed = true
+        model.tab = .research
+        model.prepareTab(byHover: true)
+        precondition(model.tab == .ask, "While setup is open, hovering reopens Ask")
+        model.setupCard = .later
+        precondition(!model.holdsOpen, "Later lets the panel collapse again")
+        model.tab = .brief
+        model.prepareTab(byHover: true)
+        precondition(model.tab == .brief, "Setup set aside leaves hover's last tab alone")
+        precondition(model.setupCard.afterReadiness(true) == .hidden, "Setup set aside leaves when Harbor is ready")
+        // A clicked notification opens Day, even from quick settings on Ask.
+        model.tab = .ask
+        model.showingQuickSettings = true
+        delegate.prepareTodayInNotch()
+        precondition(model.tab == .day && !model.showingQuickSettings, "A clicked notification lands on Day")
+        print("PASS: AppDelegate setup card opens on Ask, holds the panel until Done or Later; notifications open Day")
+    }
+
+    /// Saving a report from the notch holds the notch for as long as the dialog is
+    /// up, not just for the click, and lets go however the dialog ends.
+    static func checkReportSaveHoldsUntilAnswered() {
+        let model = AppDelegate().model
+        let draft = model.report
+        draft.open(key: "chat:save", metadata: [:])
+        var answer: (@MainActor (URL?) -> Void)?
+        var shown = 0, forward = 0, cancelled = 0
+        draft.presentSaveDialog = { _, level, answered in
+            shown += 1
+            answer = answered
+            precondition((level?.rawValue ?? 0) > DisplayGeometry.shared.layout.windowLevel.rawValue,
+                         "From the notch the dialog sits above it")
+            return ReportDraft.SaveDialog(bringForward: { forward += 1 }, cancel: { cancelled += 1; answered(nil) })
+        }
+        model.saveReport(draft)
+        precondition(model.pickingFile && model.holdsOpen && shown == 1, "The dialog's focus is not the person leaving")
+        model.saveReport(draft)
+        precondition(shown == 1 && forward == 1 && model.pickingFile, "A second click brings the open dialog forward")
+        answer?(nil)
+        precondition(!model.pickingFile, "Answering it lets go of the notch")
+        model.saveReport(draft)
+        draft.close()
+        precondition(cancelled == 1 && !model.pickingFile, "Closing the report closes its dialog and lets go")
+        model.saveReport(draft)
+        precondition(shown == 2 && !model.pickingFile, "With no report open nothing is asked or held")
+        print("PASS: AppDelegate a report's save dialog holds the notch until it ends, however it ends")
+    }
+
+    static func checkInlineReportHoldsOpen() async {
+        let delegate = AppDelegate()
+        let model = delegate.model
+        model.todayReport = delegate.todayModel.report
+        delegate.presentation.request(.chat)
+        let opening = delegate.presentation.next()!
+        model.collapsed = false
+        delegate.finishPresentation(opening)
+        model.tab = .day
+        model.reportCurrentProblem()
+        precondition(model.tab == .ask && model.report.snapshot?.key == "chat:none" && model.reportIsUnattached,
+                     "With no reply, Report a problem opens one report at the top of Ask")
+        precondition(model.holdsOpen, "An open report holds the panel open")
+        delegate.scheduleCollapse()
+        try? await Task.sleep(for: .seconds(autoCollapseDelay + 0.5))
+        precondition(delegate.presentation.desired == .chat, "Auto-collapse waits while a report is open")
+        let reply = OverlayModel.Turn(role: "assistant", text: "Hello")
+        model.turns = [OverlayModel.Turn(role: "user", text: "hi"), reply]
+        model.report.note = "a quicker reply"
+        model.reportProblem(for: reply)
+        precondition(model.report.snapshot?.key == OverlayModel.reportKey(for: reply) && !model.reportIsUnattached,
+                     "A reply's report unfolds under that reply")
+        precondition(model.report.note.isEmpty && !model.report.includeDetails
+                     && model.report.snapshot?.scrubbedDetails?["prompt"] as? String == "hi",
+                     "A new report starts with no note, details off, and the reply's prompt in its snapshot")
+        model.reset()
+        precondition(!model.report.isOpen, "A new chat closes the report on the conversation it leaves")
+        precondition(!model.holdsOpen, "Closing the report lets the panel collapse")
+        model.tab = .day
+        delegate.todayModel.reportProblem()
+        precondition(model.holdsOpen, "Today's report holds the panel open on the Day tab")
+        delegate.todayModel.report.close()
+        print("PASS: AppDelegate inline reports: one at a time, under their reply, holding the panel while open")
+    }
+
+    /// The menu bar's drop-down offers the chat debug export, through the same
+    /// notification as Settings › General's button.
+    static func checkMenuExportsDebugLog() {
+        let delegate = AppDelegate()
+        delegate.buildMenu()
+        guard let item = delegate.rightClickMenu?.items.first(where: { $0.title == exportDebugLogTitle }) else {
+            preconditionFailure("The menu bar menu has Export Chat Debug Log…")
+        }
+        precondition(item.target === delegate && item.action == #selector(exportDebugLogFromMenu),
+                     "The item runs the delegate's export action")
+        precondition(item.toolTip == SettingsView.debugLogPrivacyLine, "The item says to check the log before sharing")
+        var posted = 0
+        let observer = NotificationCenter.default.addObserver(forName: .harborExportDebugLog, object: nil, queue: nil) { _ in
+            posted += 1
+        }
+        _ = delegate.perform(item.action!, with: item)
+        NotificationCenter.default.removeObserver(observer)
+        precondition(posted == 1, "Choosing it posts the Settings button's export notification")
+        print("PASS: the menu bar menu exports the chat debug log like Settings")
+    }
+
+    /// The export never runs a modal session: the notch stays live while the notice
+    /// is up, a second click starts nothing, and the notice's OK reveals the file and
+    /// hands the notch back to its usual auto-collapse.
+    static func checkDebugExportLeavesNotchLive() async {
+        _ = NSApplication.shared
+        NSApp.setActivationPolicy(.accessory)
+        NonModalAlert.activateApp = {}
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("harbor-export-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        func written() -> [String] { (try? FileManager.default.contentsOfDirectory(atPath: folder.path))?.sorted() ?? [] }
+
+        let delegate = AppDelegate()
+        delegate.debugLogFolder = folder
+        var revealed: [URL] = []
+        delegate.revealExportedFile = { revealed.append($0) }
+        delegate.presentation.request(.chat)
+        let opening = delegate.presentation.next()!
+        delegate.model.collapsed = false
+        delegate.finishPresentation(opening)
+        delegate.model.turns = [OverlayModel.Turn(role: "user", text: "hello"),
+                                OverlayModel.Turn(role: "assistant", text: "Hi.")]
+
+        await delegate.exportDebugLog()
+        precondition(NSApp.modalWindow == nil, "The saved notice must not run a modal session")
+        guard let notice = delegate.debugLogNotice else { preconditionFailure("The saved export says so") }
+        precondition(notice.window.isVisible, "The notice is on screen without being answered")
+        precondition(notice.window.level.rawValue > DisplayGeometry.shared.layout.windowLevel.rawValue,
+                     "The notice sits above the notch, never under it")
+        precondition(written().count == 2 && written().allSatisfy { $0.hasPrefix("harbor-debug-") },
+                     "One click writes the .json and the .txt")
+        precondition(revealed.isEmpty, "Finder waits for the notice, as before")
+        precondition(delegate.presentation.desired == .chat && delegate.pendingCollapse == nil,
+                     "The export leaves an open notch where it is")
+
+        // A second click brings the notice forward and exports nothing more.
+        await delegate.exportDebugLog()
+        precondition(delegate.debugLogNotice === notice && written().count == 2, "A second click starts nothing")
+
+        notice.closeButton.performClick(nil)
+        precondition(delegate.debugLogNotice == nil && !notice.window.isVisible, "OK closes the notice")
+        precondition(revealed.map(\.pathExtension) == ["json"], "OK reveals the saved .json")
+        precondition(delegate.pendingCollapse != nil, "OK hands the open notch back to its usual auto-collapse")
+        delegate.cancelScheduledCollapse()
+
+        // With the pointer on the notch, it stays.
+        let inside = AppDelegate()
+        inside.pointerInPanel = { true }
+        inside.presentation.request(.chat)
+        let insideOpening = inside.presentation.next()!
+        inside.model.collapsed = false
+        inside.finishPresentation(insideOpening)
+        await inside.exportDebugLog()
+        precondition(NSApp.modalWindow == nil, "The nothing-to-export notice must not run a modal session")
+        inside.debugLogNotice?.closeButton.performClick(nil)
+        precondition(inside.debugLogNotice == nil && inside.pendingCollapse == nil,
+                     "Closing the notice with the pointer on the notch keeps it open")
+
+        // A failed write says so the same way, and reveals nothing.
+        let failing = AppDelegate()
+        failing.debugLogFolder = folder.appendingPathComponent("missing")
+        var failedReveal = 0
+        failing.revealExportedFile = { _ in failedReveal += 1 }
+        failing.model.turns = [OverlayModel.Turn(role: "user", text: "hello")]
+        await failing.exportDebugLog()
+        precondition(NSApp.modalWindow == nil, "The failure notice must not run a modal session")
+        failing.debugLogNotice?.closeButton.performClick(nil)
+        precondition(failing.debugLogNotice == nil && failedReveal == 0, "A failed export reveals nothing")
+        print("PASS: AppDelegate debug export runs no modal session and hands the notch back")
+    }
+
+    static func checkMenuHoldsCollapse() async {
+        let delegate = AppDelegate()
+        delegate.installMenuTrackingObservers()
+        delegate.presentation.request(.chat)
+        let opening = delegate.presentation.next()!
+        delegate.model.collapsed = false
+        delegate.finishPresentation(opening)
+        let menu = NSMenu()
+        NotificationCenter.default.post(name: NSMenu.didBeginTrackingNotification, object: menu)
+        delegate.scheduleCollapse()
+        try? await Task.sleep(for: .seconds(autoCollapseDelay + 0.5))
+        precondition(delegate.presentation.desired == .chat, "An open menu must hold auto-collapse")
+        precondition(delegate.collapseHeldForMenu, "The held collapse must be remembered")
+        // The menu closes with the pointer outside the panel: the held collapse runs.
+        NotificationCenter.default.post(name: NSMenu.didEndTrackingNotification, object: menu)
+        try? await Task.sleep(for: .seconds(autoCollapseDelay + 0.5))
+        precondition(delegate.presentation.desired == .bar, "A collapse held by a menu must re-arm when it closes")
+        // Closing with the pointer over the panel does not re-arm it.
+        let inside = AppDelegate()
+        inside.installMenuTrackingObservers()
+        inside.pointerInPanel = { true }
+        inside.presentation.request(.chat)
+        let insideOpening = inside.presentation.next()!
+        inside.model.collapsed = false
+        inside.finishPresentation(insideOpening)
+        inside.collapseHeldForMenu = true
+        inside.menuDidEndTracking()
+        precondition(inside.pendingCollapse == nil, "Closing a menu over the panel must not re-arm a collapse")
+        // A flag left by an unbalanced begin is cleared, but never while a menu is on screen.
+        delegate.menuTracking = true
+        delegate.clearStaleMenuTracking(menuOnScreen: true)
+        precondition(delegate.menuTracking, "An open menu keeps holding auto-collapse")
+        delegate.clearStaleMenuTracking(menuOnScreen: false)
+        precondition(!delegate.menuTracking, "A stale menu flag is cleared once no menu is open")
+        print("PASS: AppDelegate open menu holds auto-collapse, re-arms on close, never sticks")
+    }
+
+    static func checkDismissReopenInput() {
+        let delegate = AppDelegate()
+        delegate.presentation.request(.chat)
+        let opening = delegate.presentation.next()!
+        delegate.model.collapsed = false
+        delegate.model.input = "Old draft"
+        delegate.dismissToMenuBar()
+        delegate.expand()
+        precondition(delegate.model.input.isEmpty, "Reopen must first clear the dismissed draft")
+        delegate.model.input = "New draft after reopening"
+        delegate.finishPresentation(opening)
+        precondition(delegate.model.input == "New draft after reopening",
+                     "Opening completion cleared newly entered input")
+        precondition(delegate.presentation.settled == .chat)
+        print("PASS: AppDelegate dismiss/reopen preserves newly entered input")
+    }
+}
+#endif

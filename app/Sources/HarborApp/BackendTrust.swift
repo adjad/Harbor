@@ -1,0 +1,429 @@
+import Foundation
+import os
+import Darwin
+
+// The app talks to its backend on a fixed port (8765) and used to trust whatever
+// answered there. Every "send this email / create this event / read my mail" exchange
+// then ran against the user's real Mail, Messages and Calendar, so a sandbox backend
+// started on that port while the real app was open, a sandbox server acting as a second
+// app on its event stream, or any program that took the port, could make the real app
+// act or could receive the data it syncs.
+//
+// This file decides whether the program on the port is Harbor's OWN backend. The proof
+// comes from the kernel and from what THIS running app did, not from the program's words
+// and not from anything on disk (a same-user program can write any file Harbor can):
+//   1. it must be exactly the process this app instance spawned, recorded in memory by
+//      BackendManager (pid, kernel start time, executable path), the same BackendOwnership
+//      policy PortGuard and BackendManager use. A listener that fails this is refused
+//      WITHOUT being asked anything. With nothing recorded (the app has spawned nothing yet,
+//      or the backend is left over from an earlier launch or run by hand) it fails closed;
+//      where a program runs from is no evidence either way; and
+//   2. that backend must report mode "production" from /identity, which also refuses
+//      Harbor's own code running against a sandbox world, must be one of the listeners, and
+//      must echo the launch nonce this launch recorded. A 404 from /identity is NOT
+//      accepted: a backend this app spawned always serves it.
+//
+// WHAT THIS GUARANTEES: at the moment of each check, every listener on the port is the
+// process this app spawned, and a request is never SENT to anything else that was already
+// there (a squatter, a sandbox backend, a leftover). It is re-checked for every request.
+//
+// WHAT IT DOES NOT GUARANTEE (audit N7, accepted residual; NATIVE-A2 is NOT closed here):
+// the check inspects the listener, but the connection that then carries the request is a
+// separate one that is not itself authenticated. The listener is inspected again after the
+// identity answer, which narrows the window, but a same-user program that takes the port
+// after the final inspection and before the request connects is not detected, and a program
+// that already holds the port before this app's backend binds it is only noticed, never
+// evicted. Closing that needs an authenticated transport (a different channel or a verified
+// peer on the connection itself), which is a separate change.
+//
+// Pure policy here (testable without a network); BackendTrustGate and
+// BackendTrustProtocol below apply it to every request the app makes to that port.
+enum BackendTrust {
+    static let productionPort = 8765
+
+    struct Identity: Equatable {
+        let service: String
+        let mode: String
+        let pid: Int32
+        /// The nonce this backend was launched with (absent from older backends).
+        var launchNonce: String? = nil
+    }
+
+    /// What asking the backend "who are you?" produced.
+    enum IdentityResult: Equatable {
+        case answered(Identity)
+        /// 404: an older backend with no /identity endpoint.
+        case missing
+        /// No usable answer (connection error, timeout, malformed body).
+        case failed
+    }
+
+    enum Refusal: Equatable {
+        case cannotInspect
+        case notHarborBackend
+        case wrongMode(String)
+        case pidMismatch
+        /// Not the process this app spawned (or this app has spawned nothing). Whatever it is,
+        /// a stranger, a leftover or a sandbox, it is never contacted.
+        case unproven([PortGuard.Listener])
+        /// The launched process answered without this launch's nonce.
+        case launchMismatch
+    }
+
+    enum Verdict: Equatable {
+        case trusted(pids: [Int32])
+        /// Nothing is listening yet (or it did not answer): nothing to refuse, nothing to trust.
+        case unreachable
+        case refused(Refusal)
+
+        var isTrusted: Bool { if case .trusted = self { return true } else { return false } }
+    }
+
+    /// Pure policy. Fails closed: anything not positively proven is not trusted.
+    /// `identity` is `.failed` when nothing was (or could be) asked.
+    static func decide(listeners: [PortGuard.Listener]?,
+                       identity: IdentityResult, receipt: BackendOwnership.ReceiptState,
+                       facts: (Int32) -> BackendOwnership.ProcessFacts?) -> Verdict {
+        guard let listeners else { return .refused(.cannotInspect) }
+        if listeners.isEmpty { return .unreachable }
+        let evidence: BackendOwnership.Identity
+        switch identity {
+        case .failed: evidence = .notAsked
+        case .missing: evidence = .missing
+        case .answered(let answer): evidence = .answered(nonce: answer.launchNonce)
+        }
+        var unproven: [PortGuard.Listener] = []
+        var exited = false
+        for listener in listeners {
+            let known = facts(listener.pid)
+            switch BackendOwnership.verdict(listener: listener, receipt: receipt, facts: known,
+                                            identity: evidence) {
+            case .harborBackend: continue
+            case .notHarbor(.processGone):
+                // The kernel no longer has the listed process: it exited after the listing
+                // (Harbor's own service stopping, restarting or crashing does this). Nothing
+                // is there to refuse, and nothing is trusted. A process that exists but
+                // does not match its listing is still "couldn't check".
+                if known == nil { exited = true } else { return .refused(.cannotInspect) }
+            case .notHarbor(.nonceMismatch): return .refused(.launchMismatch)
+            case .notHarbor: unproven.append(listener)
+            }
+        }
+        if !unproven.isEmpty { return .refused(.unproven(unproven)) }
+        if exited { return .unreachable }
+        let pids = listeners.map(\.pid)
+        switch identity {
+        case .failed:
+            return .unreachable
+        case .missing:
+            // A backend this app spawned always serves /identity; a 404 proves nothing, so it is
+            // not trusted even when the listener is the exact launched incarnation.
+            return .refused(.notHarborBackend)
+        case .answered(let answer):
+            guard answer.service == "harbor-backend" else { return .refused(.notHarborBackend) }
+            guard answer.mode == "production" else { return .refused(.wrongMode(answer.mode)) }
+            guard pids.contains(answer.pid) else { return .refused(.pidMismatch) }
+            return .trusted(pids: pids)
+        }
+    }
+
+    /// Strict: anything that is not exactly the documented shape is "no identity".
+    static func parseIdentity(_ data: Data) -> Identity? {
+        guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let service = object["service"] as? String, let mode = object["mode"] as? String,
+              let pid = (object["pid"] as? NSNumber), CFGetTypeID(pid) != CFBooleanGetTypeID(),
+              pid.int64Value > 0, pid.int64Value <= Int64(Int32.max) else { return nil }
+        let nonce = object["launch_nonce"]
+        guard nonce == nil || nonce is String else { return nil }
+        return Identity(service: service, mode: mode, pid: Int32(pid.int64Value), launchNonce: nonce as? String)
+    }
+
+    /// What to tell the person. Plain language, names the program, never says "refused: 4".
+    static func describe(_ verdict: Verdict) -> String {
+        switch verdict {
+        case .trusted: return "Harbor's service is running."
+        case .unreachable: return "Harbor's service isn't running yet."
+        case .refused(let refusal):
+            let why: String
+            switch refusal {
+            case .cannotInspect:
+                why = "Harbor couldn't check which program is using it."
+            case .notHarborBackend:
+                why = "The program there doesn't identify itself as Harbor's service."
+            case .wrongMode(let mode):
+                why = "The service there is a \(mode) copy of Harbor, not the one for your real data."
+            case .pidMismatch:
+                why = "The program that answered isn't the one listening on the port."
+            case .unproven(let listeners):
+                why = "It is being used by \(PortGuard.describe(listeners)), which this Harbor didn't start, so Harbor "
+                    + "can't confirm it is its own service. It may be another program, or left over from an earlier copy of Harbor."
+            case .launchMismatch:
+                why = "The service there wasn't started by this copy of Harbor."
+            }
+            return "Harbor stopped talking to the program on port \(productionPort), so it can't act on "
+                + "your Mail, Messages or Calendar through it. \(why) Quit it and reopen Harbor."
+        }
+    }
+
+    /// What the app does with a refusal the gate has just announced.
+    enum RefusalNotice: Equatable {
+        /// Show the "Harbor isn't using its service" alert.
+        case show
+        /// Not now. Once the app can show one it asks the gate to announce again
+        /// (BackendTrustGate.announceAgain), so a refusal that still holds is shown
+        /// then, and one that was only that moment is never shown.
+        case hold
+        /// Never: the person is told another way, or Harbor is ending.
+        case drop
+    }
+
+    /// Pure. A refusal is shown only when it is news: not while Harbor is quitting, not
+    /// when the port-conflict alert already says a program Harbor didn't start holds the
+    /// port, not before the port has been judged at launch (a holder then is that
+    /// alert's to report, once), and not while Harbor is stopping or restarting its own
+    /// service. None of this changes what is trusted: a refused request is still not sent.
+    static func refusalNotice(startupJudged: Bool, changingOwnBackend: Bool,
+                              portConflict: Bool, quitting: Bool) -> RefusalNotice {
+        if quitting || portConflict { return .drop }
+        if !startupJudged || changingOwnBackend { return .hold }
+        return .show
+    }
+}
+
+extension Notification.Name {
+    /// Posted (once per change) when the app starts refusing the program on the backend
+    /// port. `userInfo["message"]` is the plain-language explanation.
+    static let harborBackendRefused = Notification.Name("harbor.backendRefused")
+    /// Settings changed a launch-time choice (Cloud inference ▸ Everything); restart the backend.
+    static let harborRestartBackend = Notification.Name("harbor.restartBackend")
+}
+
+/// Which port is enforced. Set synchronously at launch (a lock, not an actor) so no
+/// request can be judged before it. Who counts as Harbor's backend is not configured here:
+/// it is whatever BackendManager recorded in memory when it spawned one.
+enum BackendTrustConfiguration {
+    struct Value: Equatable {
+        var port = BackendTrust.productionPort
+    }
+    static let storage = OSAllocatedUnfairLock(initialState: Value())
+
+    static func set(port: Int = BackendTrust.productionPort) {
+        storage.withLock { $0 = Value(port: port) }
+    }
+    static var current: Value { storage.withLock { $0 } }
+}
+
+/// Verifies the backend anew for each request. Everything that talks to the
+/// backend goes through `BackendTrustProtocol`, which asks this first.
+actor BackendTrustGate {
+    static let shared = BackendTrustGate()
+
+    private var lastAnnounced: BackendTrust.Verdict?
+    private let verification: @Sendable (Int) async -> BackendTrust.Verdict
+
+    init(verification: @escaping @Sendable (Int) async -> BackendTrust.Verdict = {
+        await BackendTrustGate.verify(port: $0)
+    }) {
+        self.verification = verification
+    }
+
+    func verdict() async -> BackendTrust.Verdict {
+        let configured = BackendTrustConfiguration.current
+        let verification = self.verification
+        // Neither a timed verdict nor another request's in-flight check proves who
+        // owns the port for this request. Only notification wording is deduplicated.
+        let task = Task.detached { await verification(configured.port) }
+        let result = await task.value
+        guard configured == BackendTrustConfiguration.current else { return .refused(.cannotInspect) }
+        announce(result)
+        return result
+    }
+
+    private func announce(_ verdict: BackendTrust.Verdict) {
+        guard verdict != lastAnnounced else { return }
+        lastAnnounced = verdict
+        guard case .refused = verdict else { return }
+        NotificationCenter.default.post(name: .harborBackendRefused, object: nil,
+                                        userInfo: ["message": BackendTrust.describe(verdict)])
+    }
+
+    /// Forgets what was last announced, so the next check announces a refusal that
+    /// still holds. For a listener that could not show the last one (BackendTrust.RefusalNotice.hold).
+    /// Only the wording's once-per-change rule is reset; every request is checked as before.
+    func announceAgain() {
+        lastAnnounced = nil
+    }
+
+    /// A process incarnation: the kernel start time (see BackendOwnership.StartTime).
+    typealias Incarnation = BackendOwnership.StartTime
+
+    static func incarnation(pid: Int32) -> Incarnation? { BackendOwnership.startTime(pid: pid) }
+
+    /// One full check against the live system.
+    static func verify(port: Int,
+                       inspect: (() -> [PortGuard.Listener]?)? = nil,
+                       facts: (Int32) -> BackendOwnership.ProcessFacts? = BackendOwnership.processFacts(pid:),
+                       receipt: () -> BackendOwnership.ReceiptState = { BackendLaunchReceiptStore.shared.current },
+                       identity: (() async -> BackendTrust.IdentityResult)? = nil) async -> BackendTrust.Verdict {
+        let inspect = inspect ?? { PortGuard.listeners(port: port) }
+        var listeners = inspect()
+        if listeners == nil { listeners = inspect() }   // one retry under load
+        let launched = receipt()
+        func decide(_ listeners: [PortGuard.Listener]?, _ answer: BackendTrust.IdentityResult) -> BackendTrust.Verdict {
+            BackendTrust.decide(listeners: listeners, identity: answer, receipt: launched, facts: facts)
+        }
+        guard let found = listeners, !found.isEmpty else { return decide(listeners, .failed) }
+        // A stranger, or anything that is not exactly the launched process, is refused
+        // without being asked anything: nothing is sent to it.
+        let unasked = decide(found, .failed)
+        if case .refused = unasked { return unasked }
+        let seen = found.map { facts($0.pid) }
+        // A listed process the kernel no longer has exited while it was being checked.
+        guard seen.allSatisfy({ $0 != nil }) else { return .unreachable }
+        let incarnations = seen.map { $0?.start }
+        guard incarnations.allSatisfy({ $0 != nil }) else { return .refused(.cannotInspect) }
+        let answer = await (identity ?? { await fetchIdentity(port: port) })()
+        // Identity is asynchronous. Inspect again before allowing the private request,
+        // including kernel start times (a reused pid is not the same process) and the
+        // receipt itself (a launch meanwhile names a different process).
+        let current = inspect()
+        let latest = receipt()
+        guard current == found, found.map({ facts($0.pid)?.start }) == incarnations, latest == launched else {
+            // The port changed while the backend was being asked, so the answer is not
+            // trusted and the request is not sent, whatever is said below. What is said
+            // depends on what is there now, judged without asking it anything.
+            guard let current else { return .refused(.cannotInspect) }
+            // The listener went away: Harbor's own service stopping, restarting or crashing
+            // under a request. Nothing is there to refuse.
+            if current.isEmpty { return .unreachable }
+            func refusal(under receipt: BackendOwnership.ReceiptState) -> BackendTrust.Refusal? {
+                if case .refused(let why) = BackendTrust.decide(listeners: current, identity: .failed,
+                                                                receipt: receipt, facts: facts) { return why }
+                return nil
+            }
+            // A different program, or a reused pid, is refused by name. A restart
+            // meanwhile recorded a new launch: a listener that is this app's own under
+            // the launch the check began with, or under the new one, is not a stranger.
+            let underLatest = refusal(under: latest)
+            let underLaunched = latest == launched ? underLatest : refusal(under: launched)
+            if let underLatest, underLaunched != nil { return .refused(underLatest) }
+            return .unreachable
+        }
+        return decide(current, answer)
+    }
+
+    /// How long the per-request identity check waits for the backend's answer.
+    static let identityTimeout: TimeInterval = 6
+
+    static func fetchIdentity(port: Int) async -> BackendTrust.IdentityResult {
+        guard let url = URL(string: "http://127.0.0.1:\(port)/identity") else { return .failed }
+        var request = URLRequest(url: url)
+        // Generous: every request waits on this answer, and a busy backend (a
+        // Brief read, a sync) can take over a second to reach it. At 1.5 s the
+        // check timed out ~200 times a day, failing the request it guarded with
+        // "Harbor's service isn't running yet." while the service was up. A port
+        // with nothing on it still fails at once (refused), never after this wait.
+        request.timeoutInterval = identityTimeout
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        // This request IS the verification, so it must not wait on itself.
+        let marked = (request as NSURLRequest).mutableCopy() as! NSMutableURLRequest
+        URLProtocol.setProperty(true, forKey: BackendTrustProtocol.bypassKey, in: marked)
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.finishTasksAndInvalidate() }
+        guard let (data, response) = try? await session.data(for: marked as URLRequest),
+              let http = response as? HTTPURLResponse else { return .failed }
+        if http.statusCode == 404 { return .missing }
+        guard http.statusCode == 200, let identity = BackendTrust.parseIdentity(data) else { return .failed }
+        return .answered(identity)
+    }
+}
+
+/// Sits in front of every request the app makes to its backend port. A request is sent
+/// only after the program on the port was checked, just before, to be the process this app
+/// spawned; otherwise it fails here and nothing leaves the app. The check is not bound to
+/// the connection that then carries the request, so the N7 race described at the top of
+/// this file remains: this narrows who can receive a request, it does not authenticate the
+/// connection.
+final class BackendTrustProtocol: URLProtocol, URLSessionDataDelegate {
+    static let bypassKey = "harbor.backendtrust.bypass"
+    /// The port that is enforced. Anything else (the Settings QA stub, other apps) is untouched.
+    nonisolated(unsafe) static var enforcedPort = BackendTrust.productionPort
+
+    private var gateTask: Task<Void, Never>?
+    private var inner: URLSessionDataTask?
+    private var session: URLSession?
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        guard let url = request.url, url.scheme == "http", url.host == "127.0.0.1",
+              url.port == enforcedPort,
+              URLProtocol.property(forKey: bypassKey, in: request) == nil else { return false }
+        return true
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        gateTask = Task { [weak self] in
+            let verdict = await BackendTrustGate.shared.verdict()
+            guard let self, !Task.isCancelled else { return }
+            guard verdict.isTrusted else {
+                let message = BackendTrust.describe(verdict)
+                self.client?.urlProtocol(self, didFailWithError: URLError(
+                    .cannotConnectToHost, userInfo: [NSLocalizedDescriptionKey: message]))
+                return
+            }
+            self.forward()
+        }
+    }
+
+    private func forward() {
+        let marked = (request as NSURLRequest).mutableCopy() as! NSMutableURLRequest
+        URLProtocol.setProperty(true, forKey: Self.bypassKey, in: marked)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.timeoutIntervalForRequest = max(request.timeoutInterval, 1)
+        let session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
+        self.session = session
+        let task = session.dataTask(with: marked as URLRequest)
+        inner = task
+        task.resume()
+    }
+
+    override func stopLoading() {
+        gateTask?.cancel()
+        inner?.cancel()
+        session?.invalidateAndCancel()
+        inner = nil
+        session = nil
+    }
+
+    // MARK: URLSessionDataDelegate: relay the real response to the original caller.
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
+                    didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        client?.urlProtocol(self, didLoad: data)   // streamed as it arrives, so SSE stays live
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let error {
+            // A cancel we caused (stopLoading) must not be reported as a failure.
+            if (error as? URLError)?.code != .cancelled { client?.urlProtocol(self, didFailWithError: error) }
+        } else {
+            client?.urlProtocolDidFinishLoading(self)
+        }
+        session.finishTasksAndInvalidate()
+    }
+
+    /// The backend never redirects. Following one would leave the verified origin.
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
+                    completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(nil)
+    }
+}

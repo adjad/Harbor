@@ -1,0 +1,331 @@
+import Combine
+import Foundation
+
+/// One long-term reminder Harbor found in older mail (service/mail_memory), shown on the
+/// Brief only when mail suggestions are switched on ("live"). Display text only:
+/// nothing here acts until the person clicks Add to Reminders.
+struct MailSuggestion: Identifiable, Equatable {
+    let id: Int
+    let what: String
+    let due: String          // YYYY-MM-DD
+    let precision: String    // day, week or month
+    let quote: String
+    let from: String         // "you" for the person's own sent mail
+    let subject: String
+    let messageID: String
+
+    static func parse(_ reply: [String: Any]?) -> (mode: String, items: [MailSuggestion])? {
+        guard let reply, let mode = reply["mode"] as? String, let rows = reply["suggestions"] as? [[String: Any]]
+        else { return nil }
+        let items = rows.compactMap { r -> MailSuggestion? in
+            guard let id = (r["id"] as? NSNumber)?.intValue, let what = r["what"] as? String,
+                  !what.trimmingCharacters(in: .whitespaces).isEmpty,
+                  let due = r["due"] as? String, MailSuggestion.day(due) != nil,
+                  let actions = r["actions"] as? [String], actions.contains("accept"), actions.contains("dismiss")
+            else { return nil }
+            return MailSuggestion(id: id, what: what, due: due, precision: r["precision"] as? String ?? "day",
+                                  quote: r["quote"] as? String ?? "", from: r["from"] as? String ?? "",
+                                  subject: r["subject"] as? String ?? "", messageID: r["message_id"] as? String ?? "")
+        }
+        return (mode, items)
+    }
+
+    /// Why the service couldn't read Mail last time, in the person's words, or nil when
+    /// the last read went through. The code comes from the service's `health.last_error`
+    /// (service/mail_memory/runner.py note_failure): a short token, never mail text.
+    static func readError(_ reply: [String: Any]?) -> String? {
+        guard let health = reply?["health"] as? [String: Any], let code = health["last_error"] as? String,
+              !code.isEmpty else { return nil }
+        let retry = "Harbor tries again in 15 minutes."
+        switch code {
+        case "no_mail_index":
+            return "Couldn't read Mail: Harbor can't see Mail's data. Turn on Full Disk Access for Harbor in "
+                + "System Settings → Privacy & Security, and open Mail once. \(retry)"
+        case "unreadable", "index_unreadable":
+            return "Couldn't read Mail: its index wouldn't open. Check Full Disk Access for Harbor. \(retry)"
+        case "unsupported_schema":
+            return "Couldn't read Mail: this version of Mail stores mail in a way Harbor can't read yet."
+        case "app_not_connected":
+            return "Couldn't read Mail: the Harbor app wasn't connected to its service. \(retry)"
+        case "index_timeout":
+            return "Couldn't read Mail: it took too long to answer. \(retry)"
+        case "body_timeout":
+            // One slow email is retried an hour later while the queue moves on.
+            return "Couldn't read one email in time; Harbor moves on and tries it again later."
+        default:
+            if code.hasPrefix("unexpected:") {
+                return "Couldn't read Mail: something went wrong (\(code.dropFirst(11))). \(retry)"
+            }
+            if code == "other" { return "Couldn't read Mail. \(retry)" }
+            return "Couldn't read Mail (\(code)). \(retry)"
+        }
+    }
+
+    static func day(_ iso: String) -> DateComponents? {
+        let parts = iso.split(separator: "-").compactMap { Int($0) }
+        guard parts.count == 3, (1...12).contains(parts[1]), (1...31).contains(parts[2]) else { return nil }
+        return DateComponents(year: parts[0], month: parts[1], day: parts[2])
+    }
+
+    /// "Fri, Jul 2, 2027", "in October", "week of Jun 15" — in the person's calendar.
+    func dueLabel(now: Date = Date(), calendar: Calendar = .current, locale: Locale = .current) -> String {
+        guard let parts = MailSuggestion.day(due), let date = calendar.date(from: parts) else { return due }
+        let format = DateFormatter()
+        format.locale = locale
+        format.calendar = calendar
+        switch precision {
+        case "month":
+            format.setLocalizedDateFormatFromTemplate("MMMM")
+            return "in \(format.string(from: date))"
+        case "week":
+            let monday = calendar.date(byAdding: .day, value: -6, to: date) ?? date
+            format.setLocalizedDateFormatFromTemplate("MMMd")
+            return "week of \(format.string(from: monday))"
+        default:
+            let sameYear = calendar.component(.year, from: date) == calendar.component(.year, from: now)
+            format.setLocalizedDateFormatFromTemplate(sameYear ? "EEEMMMd" : "EEEMMMdyyyy")
+            return format.string(from: date)
+        }
+    }
+
+    var detail: String {
+        let source = from == "you" ? "From your email" : (from.isEmpty ? "From an email" : "From \(from)")
+        return subject.isEmpty ? source : "\(source) · “\(subject)”"
+    }
+
+    /// ASCII letters, digits and `@.-_+=$` pass through; everything else is percent-encoded.
+    private static let linkSafe = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@.-_+=$")
+
+    /// Mail's own link to this message, or nil when its Message-ID isn't known.
+    var mailURL: URL? {
+        let bare = messageID.trimmingCharacters(in: CharacterSet(charactersIn: "<> "))
+        guard !bare.isEmpty, !bare.contains(" "),
+              let encoded = bare.addingPercentEncoding(withAllowedCharacters: MailSuggestion.linkSafe)
+        else { return nil }
+        return URL(string: "message://%3C\(encoded)%3E")
+    }
+
+    static func failure(status: Int, detail: String?) -> String {
+        if let detail, !detail.isEmpty, [403, 409, 502, 503].contains(status) { return detail }
+        return status == 404 ? "That suggestion is no longer open." : "Couldn't add it. Try again."
+    }
+
+    /// What an Add did, from the service's reply. "Added to Reminders" only when Apple
+    /// Reminders took it; a Harbor-only reminder says so.
+    static func confirmation(_ body: [String: Any]?, what: String) -> String {
+        if body?["decision"] as? String == "already_on_file" { return "“\(what)” is already in Reminders or Calendar." }
+        if body?["where"] as? String == "harbor_only" { return "Saved “\(what)” in Harbor; Apple Reminders didn't take it." }
+        return "Added “\(what)” to Reminders."
+    }
+}
+
+/// The Brief's mail suggestions. Reads and answers through its own transport so
+/// checks never reach the service. Add runs only from the person's click.
+@MainActor
+final class MailMemoryModel: ObservableObject {
+    @Published private(set) var suggestions: [MailSuggestion] = []
+    @Published private(set) var mode = "shadow"
+    /// True once the service has answered, so Settings can tell "off" from "not loaded".
+    @Published private(set) var known = false
+    @Published private(set) var modeChanging = false
+    @Published private(set) var modeStatus: String?
+    /// Why the last read of Mail failed, for Settings; nil once one works.
+    @Published private(set) var readError: String?
+    @Published private(set) var answering: Int?
+    @Published private(set) var failures: [Int: String] = [:]
+    /// What the last Add did, said once under the list ("Added to Reminders.").
+    @Published private(set) var confirmation: String?
+    /// Whether Harbor learns lasting facts about the person from mail, as the service
+    /// last said (`facts.enabled`). Nil until it has, so the switch never guesses.
+    @Published private(set) var factsEnabled: Bool?
+    /// True while the facts switch or Forget what Harbor learned from mail is in flight.
+    @Published private(set) var factsChanging = false
+    @Published private(set) var factsStatus: String?
+
+    /// A confirmation older than this is gone by the next refresh.
+    static let confirmationLifetime: TimeInterval = 8
+
+    private let transport: (URLRequest) async throws -> (Data, URLResponse)
+    private let baseURL: URL
+    private let clock: () -> Date
+    private var confirmedAt: Date?
+
+    init(baseURL: URL,
+         transport: @escaping (URLRequest) async throws -> (Data, URLResponse) = { try await URLSession.shared.data(for: $0) },
+         clock: @escaping () -> Date = { Date() }) {
+        self.baseURL = baseURL
+        self.transport = transport
+        self.clock = clock
+    }
+
+    private func confirm(_ text: String?) {
+        confirmation = text
+        confirmedAt = text == nil ? nil : clock()
+    }
+
+    /// A failed read keeps what was shown. A confirmation older than eight seconds is dropped.
+    func refresh() async {
+        if let at = confirmedAt, clock().timeIntervalSince(at) > Self.confirmationLifetime { confirm(nil) }
+        var request = URLRequest(url: baseURL.appendingPathComponent("assistant/mail_memory"))
+        request.timeoutInterval = 15
+        guard let (data, response) = try? await transport(request),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let reply = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let parsed = MailSuggestion.parse(reply)
+        else { return }
+        mode = parsed.mode
+        readError = MailSuggestion.readError(reply)
+        factsEnabled = (reply["facts"] as? [String: Any])?["enabled"] as? Bool
+        known = true
+        suggestions = parsed.mode == "live" ? parsed.items : []
+        failures = failures.filter { id, _ in suggestions.contains { $0.id == id } }
+    }
+
+    static let modes = ["live", "shadow", "off"]
+
+    /// Settings' switch: "live" shows important suggestions, "shadow" records only, "off" stops.
+    func setMode(_ value: String) async {
+        guard !modeChanging, Self.modes.contains(value) else { return }
+        modeChanging = true
+        modeStatus = nil
+        defer { modeChanging = false }
+        var request = URLRequest(url: baseURL.appendingPathComponent("assistant/mail_memory/settings"))
+        request.httpMethod = "PUT"
+        request.timeoutInterval = 15
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["mode": value])
+        guard let (data, response) = try? await transport(request),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["mode"] as? String == value
+        else {
+            modeStatus = "Couldn't change it. Try again."
+            return
+        }
+        mode = value
+        known = true
+        if value != "live" { suggestions = [] }
+        await refresh()
+    }
+
+    /// Settings' "Learn facts about me from mail" switch. Off stops new facts; the
+    /// ones already saved stay until they are forgotten.
+    func setFacts(_ enabled: Bool) async {
+        guard known, !factsChanging else { return }
+        factsChanging = true
+        factsStatus = nil
+        defer { factsChanging = false }
+        var request = URLRequest(url: baseURL.appendingPathComponent("assistant/mail_memory/facts"))
+        request.httpMethod = "PUT"
+        request.timeoutInterval = 15
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["enabled": enabled])
+        guard let (data, response) = try? await transport(request),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["enabled"] as? Bool == enabled
+        else {
+            factsStatus = MailFactsText.changeFailed
+            return
+        }
+        factsEnabled = enabled
+        await refresh()
+    }
+
+    /// Settings' "Forget what Harbor learned from mail…", after the person confirmed it.
+    /// The service forgets every fact learned from mail, erases the text kept from
+    /// attachments Harbor read, and turns fact-learning off. Reminder suggestions stay.
+    /// True when the service said it did.
+    @discardableResult
+    func forgetFromMail() async -> Bool {
+        guard known, !factsChanging else { return false }
+        factsChanging = true
+        factsStatus = MailFactsText.forgetting
+        defer { factsChanging = false }
+        var request = URLRequest(url: baseURL.appendingPathComponent("assistant/mail_memory/forget_facts"))
+        request.httpMethod = "POST"
+        request.timeoutInterval = 60      // it waits for a fact pass that is saving right now
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data("{}".utf8)
+        var done = false
+        if let (data, response) = try? await transport(request),
+           (response as? HTTPURLResponse)?.statusCode == 200,
+           let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            done = body["ok"] as? Bool == true
+        }
+        if done { factsEnabled = false }
+        // Either way, show what the service now says: it turns learning off before it erases.
+        await refresh()
+        factsStatus = done ? MailFactsText.forgot : MailFactsText.forgetFailed
+        return done
+    }
+
+    func accept(_ item: MailSuggestion) async { await answer(item, action: "accept") }
+    func dismiss(_ item: MailSuggestion) async { await answer(item, action: "dismiss") }
+
+    private func answer(_ item: MailSuggestion, action: String) async {
+        guard answering == nil else { return }
+        answering = item.id
+        failures[item.id] = nil
+        confirm(nil)
+        defer { answering = nil }
+        var request = URLRequest(url: baseURL.appendingPathComponent("assistant/mail_memory/\(action)"))
+        request.httpMethod = "POST"
+        request.timeoutInterval = action == "accept" ? 30 : 15
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["id": item.id])
+        do {
+            let (data, response) = try await transport(request)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            if status == 200 {
+                if action == "accept" {
+                    confirm(MailSuggestion.confirmation(body, what: item.what))
+                }
+                suggestions.removeAll { $0.id == item.id }
+                await refresh()
+                return
+            }
+            failures[item.id] = MailSuggestion.failure(status: status, detail: body?["detail"] as? String)
+            if status == 404 { await refresh() }
+        } catch {
+            // No reply: an Add may or may not have happened, so don't invite a second one blindly.
+            failures[item.id] = action == "accept"
+                ? "Harbor didn't hear back. Check Reminders before adding it again."
+                : "Couldn't reach Harbor. Try again."
+        }
+    }
+}
+
+/// Words for Settings' "Learn facts about me from mail" switch and its forget button.
+enum MailFactsText {
+    static let title = "Learn facts about me from mail"
+    static let forgetButton = "Forget what Harbor learned from mail…"
+    static let forgetTitle = "Forget what Harbor learned from mail?"
+    static let forgetMessage = "This forgets every fact Harbor learned from your mail and erases the text it kept "
+        + "from attachments it read and the writing style it learned from your sent mail. It also turns off learning facts from mail until you turn it back on. "
+        + "Facts you told Harbor yourself, and your mail suggestions, stay."
+    static let forgetHelp = "Forgets the facts Harbor learned from your mail and erases the text it kept "
+        + "from attachments it read. Asks first."
+    static let forgetting = "Forgetting…"
+    static let forgot = "Forgotten. Learning facts from mail is now off."
+    static let forgetFailed = "Couldn't forget what Harbor learned from mail. Try again."
+    static let changeFailed = "Couldn't change it. Try again."
+
+    /// The line under the switch. `enabled` is nil when the service hasn't said;
+    /// `mode` is the mail suggestions mode, which decides whether mail is read at all.
+    static func caption(known: Bool, enabled: Bool?, mode: String) -> String {
+        guard known else { return "Checking…" }
+        guard let enabled else { return "Harbor's service didn't say whether this is on." }
+        guard enabled else {
+            return "Off. Harbor learns nothing new from your mail. Facts it already saved stay in Memory until you forget them."
+        }
+        switch mode {
+        case "live":
+            return "Picks up lasting facts from your mail, like where you work or the city you live in. "
+                + "They stay on this Mac and are listed in Memory."
+        case "shadow":
+            return "On, but no facts are saved to Memory while Mail suggestions is set to Record only."
+        default:
+            return "On, but nothing is read while Mail suggestions is off."
+        }
+    }
+}

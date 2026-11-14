@@ -1,0 +1,877 @@
+import AppKit
+import Foundation
+import EventKit
+
+/// When Calendar and Reminders are read besides on request (the backend asks,
+/// setup grants access): when EventKit says the store changed, and on a heartbeat
+/// that re-posts regardless. The heartbeat is a safety net for a missed
+/// notification, so it is as slow as the backend allows. The planner calls a
+/// source "not current" once its last sync is 180 s old (service/assistant/today.py,
+/// source_health), so it must beat that with a minute to spare: the timer is
+/// re-armed after each read (Calendar's 395-day read runs on main), and timer
+/// tolerance, App Nap and the post all add to the gap between two syncs;
+/// Calendar's and Reminders' behavior receipts count only under 1200 s
+/// (service/assistant/scheduler.py, record_sync). Without access nothing is
+/// read, only a small status is posted, so that keeps the one-minute pace that
+/// picks up a permission granted after launch.
+enum NativeSyncPace {
+    static let heartbeat: TimeInterval = 120
+    static let withoutAccess: TimeInterval = 60
+    /// Calendar waits this long after the last change before it reads.
+    static let changeDebounce: TimeInterval = 2
+    /// Calendar's change-driven reads start at least this far apart, so a store
+    /// that never stops announcing is read no more often than the old timer.
+    static let changeFloor: TimeInterval = 60
+
+    /// How long after the service comes up (and every reader posts again) the
+    /// Brief and Day look again for what those posts brought.
+    static let reachableRefreshDelay: UInt64 = 3_000_000_000
+
+    static func heartbeatInterval(authorized: Bool) -> TimeInterval {
+        authorized ? heartbeat : withoutAccess
+    }
+
+    /// Seconds to wait before a change-driven read, given when the last read began.
+    static func changeDelay(lastSyncStartedAt: TimeInterval?, now: TimeInterval) -> TimeInterval {
+        guard let last = lastSyncStartedAt, now >= last else { return changeDebounce }
+        return max(changeDebounce, changeFloor - (now - last))
+    }
+}
+
+// Mirrors Harbor reminders INTO the macOS Reminders app (EKReminder) so they
+// also appear on the user's other devices, and reads reminders back OUT —
+// items the user created directly in Reminders.app (via Siri, iPhone, typing
+// in the app itself) were previously invisible to get_upcoming, since
+// CalendarReader only ever reads EKEvent. Separate TCC grant from Calendar;
+// the backend can't touch Reminders directly, so writes go over SSE and reads
+// get pushed here, same split as Mail/Messages/Calendar.
+final class RemindersWriter {
+    private let store = EKEventStore()
+    private var timer: Timer?
+    private var historyTask: Task<Void, Never>?
+    private var changeObserver: NSObjectProtocol?
+    private var pendingChangeSync: DispatchWorkItem?
+    // Snapshot decisions and count are updated together on the main thread.
+    // A late EventKit callback cannot replace a newer snapshot's count.
+    struct SnapshotState {
+        private(set) var latestStartedAt: TimeInterval = -.infinity
+        private(set) var lastPostedReminderCount = 0
+
+        mutating func accept(startedAt: TimeInterval, authoritativeCount: Int?) -> Bool {
+            guard startedAt > latestStartedAt else { return false }
+            latestStartedAt = startedAt
+            if let authoritativeCount { lastPostedReminderCount = authoritativeCount }
+            return true
+        }
+    }
+
+    /// What to tell the backend while Reminders (or Calendar) permission is not yet granted.
+    ///
+    /// Live failure this exists for: macOS never recorded an answer
+    /// (EKAuthorizationStatus.notDetermined) yet the app reported
+    /// `syncing: true` every minute, so Reminders read "syncing" forever and
+    /// nothing told the person to grant access. "Not decided" is only a wait
+    /// while a prompt is plausibly on screen; after that it is a state with a
+    /// next step, reported as such. CalendarReader uses the same rules, so a
+    /// Calendar nobody answered for stops reading "syncing" too.
+    enum Access {
+        enum Status: Equatable { case notDetermined, authorized, deniedOrRestricted }
+
+        /// Which permission a report is about: its name in the copy, its page in
+        /// System Settings, and the `reason_kind` the Brief and Day key their
+        /// "open Settings" button on (never the wording).
+        struct Source: Equatable {
+            let name: String
+            let settingsPane: String
+            let reasonKind: String
+
+            static let reminders = Source(name: "Reminders", settingsPane: "Reminders",
+                                          reasonKind: "reminders_access")
+            static let calendar = Source(name: "Calendar", settingsPane: "Calendars",
+                                         reasonKind: "calendar_access")
+
+            var settingsPath: String { "System Settings > Privacy & Security > \(settingsPane)" }
+        }
+
+        struct Report: Equatable {
+            var authorized: Bool
+            var syncing: Bool
+            var needsRequest: Bool
+            var reason: String?
+            /// Set whenever `reason` is: the person has a step to take in Settings.
+            var reasonKind: String? = nil
+        }
+
+        /// A prompt that has been outstanding this long is not "syncing".
+        static let promptGrace: TimeInterval = 120
+        /// A finished request that left the status undecided is asked again at
+        /// most this many times per launch, after these growing waits. After
+        /// that the reason stays up and Harbor stops asking until it relaunches.
+        static let reaskDelays: [TimeInterval] = [300, 900, 2700]
+        /// The first re-ask's wait, no faster.
+        static var retryInterval: TimeInterval { reaskDelays[0] }
+
+        /// Only the first request this launch brings Harbor forward, so the
+        /// prompt isn't hidden behind other windows. A re-ask never takes focus
+        /// from whatever the person is doing.
+        static func shouldActivate(requestsMade: Int) -> Bool { requestsMade == 0 }
+
+        /// Whether the next re-ask is due: `requestsMade` counts finished and
+        /// outstanding requests this launch, the first one included.
+        static func reaskDue(requestsMade: Int, lastRequestAt: TimeInterval, now: TimeInterval) -> Bool {
+            let reasks = requestsMade - 1
+            guard reasks >= 0, reasks < reaskDelays.count else { return false }
+            return now - lastRequestAt >= reaskDelays[reasks]
+        }
+
+        static let settingsPath = Source.reminders.settingsPath
+
+        static func report(status: Status, requestOutstanding: Bool,
+                           lastRequestAt: TimeInterval?, now: TimeInterval,
+                           source: Source = .reminders, requestsMade: Int = 1) -> Report {
+            let name = source.name, path = source.settingsPath
+            func blocked(_ reason: String, needsRequest: Bool = false) -> Report {
+                Report(authorized: false, syncing: false, needsRequest: needsRequest,
+                       reason: reason, reasonKind: source.reasonKind)
+            }
+            switch status {
+            case .authorized:
+                return Report(authorized: true, syncing: false, needsRequest: false, reason: nil)
+            case .deniedOrRestricted:
+                return blocked("\(name) access is turned off for Harbor. Turn it on in \(path).")
+            case .notDetermined:
+                guard let last = lastRequestAt else {
+                    return Report(authorized: false, syncing: true, needsRequest: true, reason: nil)
+                }
+                if requestOutstanding {
+                    if now - last < promptGrace {
+                        return Report(authorized: false, syncing: true, needsRequest: false, reason: nil)
+                    }
+                    return blocked("The \(name) permission prompt is still waiting for an answer. "
+                                   + "Look for it, or allow Harbor in \(path).")
+                }
+                return blocked("macOS hasn't recorded an answer about \(name) for Harbor. "
+                               + "Allow it in \(path); if Harbor isn't listed there, quit and reopen Harbor.",
+                               needsRequest: reaskDue(requestsMade: requestsMade, lastRequestAt: last, now: now))
+            }
+        }
+
+        /// What a reader reports. Readers never ask macOS for access: the person
+        /// allows each permission by clicking its row in Harbor's setup window
+        /// (also reached from Settings › Privacy's Permissions…), so a prompt only
+        /// ever follows that click. Until then the source is unavailable, with a
+        /// reason that says where to allow it; never "syncing", never a request.
+        static func passive(status: Status, source: Source = .reminders) -> Report {
+            guard status == .notDetermined else {
+                return report(status: status, requestOutstanding: false, lastRequestAt: nil, now: 0, source: source)
+            }
+            return Report(authorized: false, syncing: false, needsRequest: false,
+                          reason: notAskedReason(source), reasonKind: source.reasonKind)
+        }
+
+        static func notAskedReason(_ source: Source) -> String {
+            "Harbor hasn't been allowed to see your \(source.name) yet. Open Harbor's Settings, "
+                + "choose Permissions… under Privacy, and click Allow next to \(source.name)."
+        }
+
+        /// The diagnostics object the backend reads (`record_sync`, sync_status).
+        static func diagnostics(for report: Report, snapshotStartedAt: TimeInterval) -> [String: Any] {
+            var out: [String: Any] = ["authorized": report.authorized, "syncing": report.syncing,
+                                      "snapshot_started_at": snapshotStartedAt]
+            if let reason = report.reason { out["reason"] = reason }
+            if let kind = report.reasonKind { out["reason_kind"] = kind }
+            return out
+        }
+
+        static func status(of raw: EKAuthorizationStatus) -> Status {
+            if #available(macOS 14.0, *) {
+                switch raw {
+                case .fullAccess: return .authorized
+                case .notDetermined: return .notDetermined
+                default: return .deniedOrRestricted
+                }
+            }
+            switch raw {
+            case .authorized: return .authorized
+            case .notDetermined: return .notDetermined
+            default: return .deniedOrRestricted
+            }
+        }
+    }
+
+    private var snapshotState = SnapshotState()
+    private var markerCleanupScheduled = false
+    private static let markerCleanupDelay: TimeInterval = 60
+    private static let markerCleanupSpacing: TimeInterval = 0.5
+    private static let maxMarkerCleanupsPerLaunch = 200
+    private var consecutiveTransientReports = 0
+    private static let maxTransientReports = 3
+
+    deinit {
+        if let changeObserver { NotificationCenter.default.removeObserver(changeObserver) }
+        pendingChangeSync?.cancel()
+        timer?.invalidate()
+    }
+
+    static func eligibleForIncompleteSync(calendarID: String?,
+                                      reminderCalendarIDs: Set<String>,
+                                      completed: Bool, hasDueDate: Bool) -> Bool {
+        guard let calendarID else { return false }
+        return reminderCalendarIDs.contains(calendarID) && !completed && hasDueDate
+    }
+
+    /// An incomplete reminder in a current list that has NO due date. These are not
+    /// commitments (nothing is scheduled), so they ride a separate list and never
+    /// enter the time-windowed store; they exist so "what is on my reminders" is
+    /// not blind to the reminders a person keeps without a date.
+    static func eligibleForUndatedSync(calendarID: String?,
+                                       reminderCalendarIDs: Set<String>,
+                                       completed: Bool, hasDueDate: Bool) -> Bool {
+        guard !hasDueDate else { return false }
+        return eligibleForIncompleteSync(calendarID: calendarID,
+                                         reminderCalendarIDs: reminderCalendarIDs,
+                                         completed: completed, hasDueDate: true)
+    }
+
+    /// Bound on how many undated titles one snapshot carries.
+    static let maxUndatedReminders = 200
+
+    /// The undated list as it travels: at most `maxUndatedReminders` entries plus the TRUE
+    /// number of eligible reminders, so the backend can tell a complete list from one that
+    /// was cut at the cap instead of presenting a prefix as everything.
+    /// Newest first, so when the cap cuts the list it drops the oldest reminders (the ones
+    /// the backend treats as stale anyway) rather than fresh ones. Entries without a
+    /// creation date sort last; the backend treats their age as unknown, never as stale.
+    static func undatedPayload(_ eligible: [[String: Any]]) -> (items: [[String: Any]], total: Int) {
+        let ordered = eligible.enumerated().sorted { a, b in
+            let x = a.element["created_ts"] as? Double, y = b.element["created_ts"] as? Double
+            switch (x, y) {
+            case let (x?, y?) where x != y: return x > y
+            case (.some, .none): return true
+            case (.none, .some): return false
+            default: return a.offset < b.offset
+            }
+        }.map(\.element)
+        return (Array(ordered.prefix(maxUndatedReminders)), eligible.count)
+    }
+
+    /// The backend stores an undated title as Python's `title.strip()[:500] or "(untitled)"`
+    /// (store.parse_undated_snapshot). Sending the title already in that form, computed here,
+    /// makes the backend's step a no-op, so the title it later hands back for a Delete equals
+    /// `undatedTitle(item.title)` exactly. Whitespace is Python's `str.isspace` set and the cut
+    /// counts Unicode scalars, as Python counts code points; the second trim keeps the result
+    /// stable under Python's strip-then-cut.
+    static let maxUndatedTitleScalars = 500
+    private static let pythonWhitespace: Set<UInt32> = Set(
+        [0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x1C, 0x1D, 0x1E, 0x1F, 0x20, 0x85, 0xA0, 0x1680,
+         0x2028, 0x2029, 0x202F, 0x205F, 0x3000] + Array(0x2000...0x200A))
+
+    static func undatedTitle(_ raw: String?) -> String {
+        func trimmed(_ scalars: ArraySlice<Unicode.Scalar>) -> ArraySlice<Unicode.Scalar> {
+            var slice = scalars
+            while let first = slice.first, pythonWhitespace.contains(first.value) { slice = slice.dropFirst() }
+            while let last = slice.last, pythonWhitespace.contains(last.value) { slice = slice.dropLast() }
+            return slice
+        }
+        let once = trimmed(ArraySlice((raw ?? "").unicodeScalars)).prefix(maxUndatedTitleScalars)
+        let result = trimmed(once)
+        guard !result.isEmpty else { return "(untitled)" }
+        var view = String.UnicodeScalarView()
+        view.append(contentsOf: result)
+        return String(view)
+    }
+
+    /// The title a dated reminder or a Calendar event is synced with: its own, unchanged,
+    /// or "(untitled)" when it has none. EventKit reads a missing title back as "", not
+    /// nil, and the service keeps no row with an empty title, so an untitled meeting was
+    /// missing from the day and its time read as free. Blank is what Python's `strip()`
+    /// leaves empty, the service's own test.
+    static func syncedTitle(_ raw: String?) -> String {
+        guard let raw, raw.unicodeScalars.contains(where: { !pythonWhitespace.contains($0.value) })
+        else { return "(untitled)" }
+        return raw
+    }
+
+    /// What an exact update/complete/delete targets. A missing expected due time (JSON null)
+    /// means "a reminder with no due date", which only a delete may target; any other value
+    /// must be a real time. Nothing stands in for null, so a bad or missing number can never
+    /// turn a dated target into an undated one.
+    enum ExactTarget: Equatable { case dated(Double), allDay(String), undated }
+
+    static func exactTarget(kind: String, expectedDueTs: Double?, expectedDueDate: String = "") -> ExactTarget? {
+        guard ["update_reminder", "complete_reminder", "delete_reminder"].contains(kind) else { return nil }
+        guard let due = expectedDueTs else { return kind == "delete_reminder" && expectedDueDate.isEmpty ? .undated : nil }
+        // Same bound as the backend's verified_reminders._timestamp (before year 10000), so
+        // `Int(due / 60)` can never trap on a huge finite value.
+        guard due.isFinite && due > 0 && due < 253402300800 else { return nil }
+        if !expectedDueDate.isEmpty {
+            return allDayComponents(expectedDueDate) != nil ? .allDay(expectedDueDate) : nil
+        }
+        return .dated(due)
+    }
+
+    /// One undated entry as it travels. `created_ts` is EventKit's creationDate when it
+    /// has one; the backend ages undated reminders from it to decide when to ask about them.
+    static func undatedEntry(id: String, title: String?, list: String, created: Date?) -> [String: Any] {
+        var entry: [String: Any] = ["source_id": id, "title": undatedTitle(title), "context": list]
+        if let created, created.timeIntervalSince1970.isFinite, created.timeIntervalSince1970 > 0 {
+            entry["created_ts"] = created.timeIntervalSince1970
+        }
+        return entry
+    }
+
+    /// No reminder lists at all, right after a snapshot that had rows, is more
+    /// likely a transient EventKit read than every list being deleted. Report
+    /// it as unavailable instead of an authoritative empty set, so missing data
+    /// never reads as completion or deletion.
+    static func reminderListsLookTransientlyMissing(calendarCount: Int,
+                                                    previousRowCount: Int) -> Bool {
+        calendarCount == 0 && previousRowCount > 0
+    }
+
+    private func scheduleChangeSync() {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.scheduleChangeSync() }
+            return
+        }
+        // Reminders.app can emit several store changes for one edit. Coalesce
+        // them, then fetch a new complete snapshot instead of reusing objects.
+        pendingChangeSync?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.sync() }
+        pendingChangeSync = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
+    }
+
+    // These actions are called only after the service has persisted an exclusive claim.
+    // What finds a creation again after a lost reply, and what remembers its kind, is the
+    // private ledger (ReminderActionLedger.swift): new reminders carry no text of Harbor's.
+    private let ledger = ReminderActionLedger()
+
+    private func commitmentKind(_ reminder: EKReminder) -> String {
+        ReminderMarkerNotes.legacyKind(reminder.notes)
+            ?? ledger.entry(sourceID: reminder.calendarItemIdentifier,
+                            externalID: reminder.calendarItemExternalIdentifier)?.kind
+            ?? "reminder"
+    }
+
+    private func row(_ reminder: EKReminder) -> ReminderRow {
+        func stamp(_ date: Date?) -> String { date.map { String($0.timeIntervalSince1970) } ?? "-" }
+        func parts(_ c: DateComponents?) -> String {
+            guard let c else { return "-" }
+            return [c.year, c.month, c.day, c.hour, c.minute, c.second].map { $0.map(String.init) ?? "-" }.joined(separator: ",")
+        }
+        return ReminderRow(
+            id: reminder.calendarItemIdentifier, externalID: reminder.calendarItemExternalIdentifier,
+            title: reminder.title, notes: reminder.notes, dueMinute: dueMinute(reminder),
+            allDayDate: allDayDate(reminder), alarmCount: reminder.alarms?.count ?? 0,
+            isCompleted: reminder.isCompleted,
+            listID: reminder.calendar?.calendarIdentifier,
+            otherFacts: [
+                parts(reminder.dueDateComponents), parts(reminder.startDateComponents),
+                stamp(reminder.completionDate), String(reminder.priority),
+                reminder.url?.absoluteString ?? "-", reminder.location ?? "-",
+                reminder.timeZone?.identifier ?? "-", stamp(reminder.creationDate),
+                String(reminder.recurrenceRules?.count ?? 0),
+                (reminder.alarms ?? []).map { "\(stamp($0.absoluteDate))/\($0.relativeOffset)" }.joined(separator: ";"),
+            ])
+    }
+
+    private func createdResult(_ row: ReminderRow, dueTs: Double, title: String, dueDate: String) -> [String: Any] {
+        if !dueDate.isEmpty {
+            return ["ok": true, "status": "succeeded", "error": "", "source_id": row.id,
+                    "title": row.title ?? "", "all_day": true, "due_date": row.allDayDate ?? ""]
+        }
+        return ["ok": true, "status": "succeeded", "error": "", "source_id": row.id,
+                "title": title, "due_ts": Double(Int(dueTs / 60) * 60)]
+    }
+
+    private func dueMinute(_ reminder: EKReminder) -> Int? {
+        guard let components = reminder.dueDateComponents,
+              let date = Calendar.current.date(from: components) else { return nil }
+        return Int(date.timeIntervalSince1970 / 60)
+    }
+
+    static func allDayComponents(_ value: String) -> DateComponents? {
+        guard value.range(of: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$", options: .regularExpression) != nil else { return nil }
+        let parts = value.split(separator: "-").compactMap { Int($0) }
+        guard parts.count == 3, parts[0] > 0 else { return nil }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let fields = DateComponents(year: parts[0], month: parts[1], day: parts[2])
+        guard let date = calendar.date(from: fields) else { return nil }
+        let roundtrip = calendar.dateComponents([.year, .month, .day], from: date)
+        guard roundtrip.year == parts[0], roundtrip.month == parts[1], roundtrip.day == parts[2] else { return nil }
+        // No hour, timezone or absolute alarm: this is a floating calendar date.
+        return DateComponents(calendar: Calendar(identifier: .gregorian),
+                              year: parts[0], month: parts[1], day: parts[2])
+    }
+
+    private func allDayDate(_ reminder: EKReminder) -> String? {
+        guard let due = reminder.dueDateComponents, due.hour == nil, due.minute == nil,
+              due.second == nil, let year = due.year, let month = due.month, let day = due.day else { return nil }
+        let value = String(format: "%04d-%02d-%02d", year, month, day)
+        return Self.allDayComponents(value) == nil ? nil : value
+    }
+
+    private func failure(_ message: String, uncertain: Bool = false) -> [String: Any] {
+        ["ok": false, "status": uncertain ? "unknown" : "failed", "error": message]
+    }
+
+    /// Execute one exact, claimed native action and return only values read
+    /// back from EventKit. A save without matching readback stays uncertain.
+    func performVerified(kind: String, actionID: String, sourceID: String = "",
+                         expectedTitle: String = "", expectedDueTs: Double? = nil,
+                         title: String = "", dueTs: Double = 0,
+                         commitmentKind: String = "reminder", dueDate: String = "", expectedDueDate: String = "") -> [String: Any] {
+        // EventKit does not announce this store's own writes to itself.
+        defer { scheduleChangeSync() }
+        guard isAuthorized else { return failure("Reminders access is unavailable") }
+        guard ReminderMarkerNotes.isValidActionID(actionID) else { return failure("Invalid reminder action identity") }
+
+        if kind == "create_reminder" {
+            guard !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  (dueDate.isEmpty ? (dueTs.isFinite && dueTs > 0) : Self.allDayComponents(dueDate) != nil),
+                  ["reminder", "assignment", "exam", "meeting", "event"].contains(commitmentKind),
+                  let list = store.defaultCalendarForNewReminders() else {
+                return failure("Reminder title, due date, or destination is unavailable")
+            }
+            let target = ReminderCreateTarget(title: title, dueTs: dueTs, dueDate: dueDate, kind: commitmentKind)
+            let item = EKReminder(eventStore: store)
+            item.title = title
+            item.calendar = list
+            if let components = Self.allDayComponents(dueDate) {
+                item.dueDateComponents = components
+            } else {
+                let due = Date(timeIntervalSince1970: dueTs)
+                item.dueDateComponents = Calendar.current.dateComponents(
+                    [.year, .month, .day, .hour, .minute], from: due)
+                item.addAlarm(EKAlarm(absoluteDate: due))
+            }
+            let outcome = ReminderCreationFlow.run(
+                ledger: ledger, actionID: actionID, target: target, plannedID: item.calendarItemIdentifier,
+                save: {
+                    try store.save(item, commit: true)
+                    return (item.calendarItemIdentifier, item.calendarItemExternalIdentifier)
+                },
+                readback: { id in (store.calendarItem(withIdentifier: id) as? EKReminder).map(row) })
+            switch outcome {
+            case .refused(let message): return failure(message)
+            case .uncertain(let message): return failure(message, uncertain: true)
+            case .created(let created): return createdResult(created, dueTs: dueTs, title: title, dueDate: dueDate)
+            }
+        }
+
+        // An undated target (expected due time null) is allowed only for delete_reminder and
+        // only while the reminder still has no due date and is still incomplete. Its title is
+        // compared in the normalised form the undated sync sent (undatedTitle).
+        guard let target = Self.exactTarget(kind: kind, expectedDueTs: expectedDueTs, expectedDueDate: expectedDueDate),
+              !sourceID.isEmpty, !expectedTitle.isEmpty
+        else { return failure("Invalid exact reminder target") }
+        guard let item = store.calendarItem(withIdentifier: sourceID) as? EKReminder else {
+            return failure("Exact reminder ID was not found; nothing changed")
+        }
+        switch target {
+        case .undated:
+            guard Self.undatedTitle(item.title) == expectedTitle, item.dueDateComponents == nil,
+                  !item.isCompleted else {
+                return failure("Reminder changed since selection; nothing changed")
+            }
+        case .allDay(let expectedDate):
+            guard item.title == expectedTitle, allDayDate(item) == expectedDate else {
+                return failure("Reminder date or mode changed since selection; nothing changed")
+            }
+        case .dated(let expectedDue):
+            guard item.title == expectedTitle, allDayDate(item) == nil,
+                  dueMinute(item) == Int(expectedDue / 60) else {
+                return failure("Reminder changed since selection; nothing changed")
+            }
+        }
+
+        if kind == "update_reminder" {
+            guard !item.isCompleted else {
+                return failure("Reminder was completed since selection; nothing changed")
+            }
+            guard !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  (dueDate.isEmpty ? (dueTs.isFinite && dueTs > 0) : Self.allDayComponents(dueDate) != nil)
+            else { return failure("Invalid reminder update") }
+            item.title = title
+            for alarm in item.alarms ?? [] { item.removeAlarm(alarm) }
+            if let components = Self.allDayComponents(dueDate) {
+                item.dueDateComponents = components
+            } else {
+                let due = Date(timeIntervalSince1970: dueTs)
+                item.dueDateComponents = Calendar.current.dateComponents(
+                    [.year, .month, .day, .hour, .minute], from: due)
+                item.addAlarm(EKAlarm(absoluteDate: due))
+            }
+            do { try store.save(item, commit: true) }
+            catch { return failure("Native reminder update outcome is unknown", uncertain: true) }
+            guard let readback = store.calendarItem(withIdentifier: sourceID) as? EKReminder,
+                  !readback.isCompleted, readback.title == title,
+                  (dueDate.isEmpty ? (dueMinute(readback) == Int(dueTs / 60) && allDayDate(readback) == nil)
+                                   : (allDayDate(readback) == dueDate && (readback.alarms ?? []).isEmpty)) else {
+                return failure("Updated reminder could not be read back", uncertain: true)
+            }
+            if !dueDate.isEmpty {
+                return ["ok": true, "status": "succeeded", "error": "", "source_id": sourceID,
+                        "title": readback.title ?? "", "all_day": true, "due_date": allDayDate(readback)!]
+            }
+            return ["ok": true, "status": "succeeded", "error": "", "source_id": sourceID,
+                    "title": title, "due_ts": Double(Int(dueTs / 60) * 60)]
+        }
+
+        if kind == "complete_reminder" {
+            item.isCompleted = true
+            do { try store.save(item, commit: true) }
+            catch { return failure("Native reminder completion outcome is unknown", uncertain: true) }
+            guard let readback = store.calendarItem(withIdentifier: sourceID) as? EKReminder,
+                  readback.isCompleted else {
+                return failure("Completed reminder could not be read back", uncertain: true)
+            }
+            return ["ok": true, "status": "succeeded", "error": "", "source_id": sourceID,
+                    "is_completed": true]
+        }
+
+        do { try store.remove(item, commit: true) }
+        catch { return failure("Native reminder deletion outcome is unknown", uncertain: true) }
+        guard store.calendarItem(withIdentifier: sourceID) == nil else {
+            return failure("Deleted reminder remains present", uncertain: true)
+        }
+        return ["ok": true, "status": "succeeded", "error": "", "source_id": sourceID,
+                "is_absent": true]
+    }
+
+    /// Read-only recovery for a claimed write whose native reply was lost.
+    /// Creation looks in the ledger, then for an old action marker; every other
+    /// operation uses the exact EventKit ID. No negative search result authorizes a retry.
+    func reconcileVerified(kind: String, actionID: String, sourceID: String = "",
+                           title: String = "", dueTs: Double = 0,
+                           commitmentKind expectedKind: String = "reminder", dueDate: String = "") async -> [String: Any] {
+        guard isAuthorized else { return failure("Reminders access is unavailable", uncertain: true) }
+        if kind == "create_reminder" {
+            let found: [EKReminder]? = await withCheckedContinuation { continuation in
+                let predicate = store.predicateForReminders(in: nil)
+                store.fetchReminders(matching: predicate) { items in continuation.resume(returning: items) }
+            }
+            guard let found else { return failure("Reminder reconciliation read failed", uncertain: true) }
+            let target = ReminderCreateTarget(title: title, dueTs: dueTs, dueDate: dueDate, kind: expectedKind)
+            guard let hit = ReminderRecovery.find(actionID: actionID, target: target,
+                                                  rows: found.map(row), ledger: ledger) else {
+                return failure("Reminder creation remains uncertain", uncertain: true)
+            }
+            if hit.proof == .exactID {
+                ledger.resolve(actionID: actionID, sourceID: hit.row.id, externalID: hit.row.externalID)
+            }
+            return createdResult(hit.row, dueTs: dueTs, title: title, dueDate: dueDate)
+        }
+        guard !sourceID.isEmpty else { return failure("Exact reminder ID unavailable", uncertain: true) }
+        let item = store.calendarItem(withIdentifier: sourceID) as? EKReminder
+        if kind == "delete_reminder" {
+            // After a crash, an absent ID could also mean EventKit changed its
+            // identifier. Only the immediate remove + readback can verify it.
+            return failure("Reminder deletion remains uncertain", uncertain: true)
+        }
+        guard let item else { return failure("Reminder readback unavailable", uncertain: true) }
+        if kind == "complete_reminder" {
+            guard item.isCompleted else { return failure("Reminder completion remains uncertain", uncertain: true) }
+            return ["ok": true, "status": "succeeded", "error": "", "source_id": sourceID,
+                    "is_completed": true]
+        }
+        guard kind == "update_reminder", !item.isCompleted, item.title == title,
+              (dueDate.isEmpty ? (dueMinute(item) == Int(dueTs / 60) && allDayDate(item) == nil)
+                               : (allDayDate(item) == dueDate && (item.alarms ?? []).isEmpty)) else {
+            return failure("Reminder update remains uncertain", uncertain: true)
+        }
+        if !dueDate.isEmpty {
+            return ["ok": true, "status": "succeeded", "error": "", "source_id": sourceID,
+                    "title": item.title ?? "", "all_day": true, "due_date": allDayDate(item)!]
+        }
+        return ["ok": true, "status": "succeeded", "error": "", "source_id": sourceID,
+                "title": title, "due_ts": Double(Int(dueTs / 60) * 60)]
+    }
+
+    var isAuthorized: Bool {
+        let s = EKEventStore.authorizationStatus(for: .reminder)
+        if #available(macOS 14.0, *) { return s == .fullAccess }
+        return s == .authorized
+    }
+
+    // Start reading incomplete reminders back into the
+    // commitment store (source="reminders" — kept separate from Calendar's
+    // "calendar" source since sync_source REPLACES a source's whole active
+    // set on each post; mixing the two would let one wipe the other).
+    func start() {
+        changeObserver = NotificationCenter.default.addObserver(
+            forName: .EKEventStoreChanged, object: store, queue: .main
+        ) { [weak self] _ in self?.scheduleChangeSync() }
+        // Reads only what macOS already allows: it never asks (Access.passive).
+        DispatchQueue.main.async { [weak self] in self?.sync() }
+        for delay in [1.0, 3.0, 6.0, 12.0, 25.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.sync()
+            }
+        }
+        DispatchQueue.main.async { [weak self] in self?.scheduleHeartbeat() }
+    }
+
+    // The change observer above is the real trigger; this re-reads regardless
+    // (NativeSyncPace) in case a notification was missed.
+    private func scheduleHeartbeat() {
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: NativeSyncPace.heartbeatInterval(authorized: isAuthorized),
+                                     repeats: false) { [weak self] _ in
+            self?.sync()
+            self?.scheduleHeartbeat()
+        }
+    }
+
+    func sync() {
+        // The list buffer and snapshot fence share main-thread state, including
+        // when an on-demand backend request arrives on a background queue.
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.sync() }
+            return
+        }
+        // Capture before the asynchronous fetch: receipt order is not snapshot order.
+        let snapshotStartedAt = Date().timeIntervalSince1970
+        guard isAuthorized else {
+            // Never asks: see Access.passive.
+            let report = Access.passive(status: Access.status(of: EKEventStore.authorizationStatus(for: .reminder)))
+            post(reminders: [], diagnostics: Access.diagnostics(for: report, snapshotStartedAt: snapshotStartedAt),
+                 startedAt: snapshotStartedAt, authoritative: false)
+            return
+        }
+        // Incomplete reminders WITH a due date become time-windowed commitments (get_upcoming's
+        // whole model is time-windowed). Incomplete reminders with NO due date are not
+        // commitments; they travel separately as the undated list (see undatedPayload).
+        // Restrict the query to calendars EventKit currently reports for the
+        // reminder entity, then check membership again after the async fetch.
+        // This does not classify Recently Deleted rows that retain an original
+        // calendar ID; EventKit documents no deleted-state field here.
+        // A partial read is reported as unavailable, never as an empty set.
+        let postUnavailable: (String) -> Void = { [weak self] reason in
+            self?.post(reminders: [], diagnostics: ["authorized": true, "available": false,
+                 "snapshot_started_at": snapshotStartedAt, "reason": reason],
+                 startedAt: snapshotStartedAt, authoritative: false)
+        }
+        let calendars = store.calendars(for: .reminder)
+        startCompletedHistoryScan()
+        ledger.flush()
+        scheduleMarkerCleanup()
+        if Self.reminderListsLookTransientlyMissing(
+            calendarCount: calendars.count,
+            previousRowCount: snapshotState.lastPostedReminderCount),
+           consecutiveTransientReports < Self.maxTransientReports {
+            consecutiveTransientReports += 1
+            postUnavailable("EventKit reported no reminder lists")
+            return
+        }
+        // Persistent zero lists (sign-out, every list deleted) become authoritative
+        // only after their fetch succeeds. Keep the previous count while it is pending.
+        if !calendars.isEmpty { consecutiveTransientReports = 0 }
+        let reminderCalendarIDs = Set(calendars.map(\.calendarIdentifier))
+        let predicate = store.predicateForIncompleteReminders(
+            withDueDateStarting: nil, ending: nil, calendars: calendars)
+        store.fetchReminders(matching: predicate) { [weak self] reminders in
+            guard let self else { return }
+            guard let reminders else {
+                postUnavailable("The Reminders store did not return a result")
+                return
+            }
+            let payload: [[String: Any]] = reminders.compactMap { r in
+                guard let calendar = r.calendar,
+                      Self.eligibleForIncompleteSync(
+                          calendarID: calendar.calendarIdentifier,
+                          reminderCalendarIDs: reminderCalendarIDs,
+                          completed: r.isCompleted,
+                          hasDueDate: r.dueDateComponents != nil),
+                      let due = r.dueDateComponents,
+                      let date = Calendar.current.date(from: due)
+                else { return nil }
+                return [
+                    "source_id": r.calendarItemIdentifier,
+                    "kind": self.commitmentKind(r),
+                    "title": Self.syncedTitle(r.title),
+                    "context": calendar.title,
+                    "when_ts": (self.allDayDate(r) != nil
+                        ? (Calendar.current.date(byAdding: .day, value: 1, to: date)?.addingTimeInterval(-60) ?? date)
+                        : date).timeIntervalSince1970,
+                    "all_day": self.allDayDate(r) != nil,
+                    "due_date": self.allDayDate(r) as Any? ?? NSNull(),
+                    "location": "",
+                ]
+            }
+            let undated: [[String: Any]] = reminders.compactMap { r in
+                guard let calendar = r.calendar,
+                      Self.eligibleForUndatedSync(
+                          calendarID: calendar.calendarIdentifier,
+                          reminderCalendarIDs: reminderCalendarIDs,
+                          completed: r.isCompleted,
+                          hasDueDate: r.dueDateComponents != nil)
+                else { return nil }
+                return Self.undatedEntry(id: r.calendarItemIdentifier, title: r.title,
+                                         list: calendar.title, created: r.creationDate)
+            }
+            let undatedPayload = Self.undatedPayload(undated)
+            self.post(reminders: payload,
+                              diagnostics: ["authorized": true, "count": payload.count,
+                                            "snapshot_started_at": snapshotStartedAt],
+                              startedAt: snapshotStartedAt, authoritative: true,
+                              undated: undatedPayload.items, undatedTotal: undatedPayload.total)
+        }
+    }
+
+    // Old reminders lose Harbor's two note lines once per launch, one at a time, a while
+    // after launch so this never competes with the first reads.
+    private func scheduleMarkerCleanup() {
+        guard !markerCleanupScheduled, !ledger.cleanupHalted, ledger.readable else { return }
+        markerCleanupScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.markerCleanupDelay) { [weak self] in
+            self?.startMarkerCleanup()
+        }
+    }
+
+    private func startMarkerCleanup() {
+        guard isAuthorized else { markerCleanupScheduled = false; return }
+        let calendars = store.calendars(for: .reminder)
+        let writable = Set(calendars.filter(\.allowsContentModifications).map(\.calendarIdentifier))
+        guard !calendars.isEmpty else { return }
+        store.fetchReminders(matching: store.predicateForReminders(in: calendars)) { [weak self] items in
+            guard let self, let items else { return }
+            let found = ReminderMarkerCleanup.candidates(items.map(self.row), writableLists: writable)
+            DispatchQueue.main.async { self.cleanMarkers(Array(found.prefix(Self.maxMarkerCleanupsPerLaunch))) }
+        }
+    }
+
+    private func cleanMarkers(_ rows: [ReminderRow]) {
+        guard let next = rows.first else { return }
+        let step = ReminderMarkerCleanup.clean(next, ledger: ledger) { expected, notes in
+            guard let item = store.calendarItem(withIdentifier: expected.id) as? EKReminder,
+                  row(item) == expected else { return .changedSinceRead }
+            item.notes = notes
+            do { try store.save(item, commit: true) } catch { return .failed }
+            guard let readback = store.calendarItem(withIdentifier: expected.id) as? EKReminder else { return .failed }
+            return .saved(row(readback))
+        }
+        guard step == .cleaned || step == .skipped else {
+            NSLog("[Harbor] Reminder note cleanup stopped: \(step)")
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.markerCleanupSpacing) { [weak self] in
+            self?.cleanMarkers(Array(rows.dropFirst()))
+        }
+    }
+
+    /// Completed history is sent only to the behavior store. It cannot reopen
+    /// reminders, replace the active feed, or create an agenda item.
+    private func startCompletedHistoryScan() {
+        guard historyTask == nil else { return }
+        historyTask = Task { @MainActor [weak self] in
+            defer { self?.historyTask = nil }
+            guard self?.isAuthorized == true else { return }
+            guard let job = await HarborClient.behaviorNativeHistoryRequest("GET", "behavior/history/completed_reminders/next"),
+                  job["state"] as? String == "scanning",
+                  let start = job["page_start"] as? Double,
+                  let end = job["page_end"] as? Double else { return }
+            let capture: ([[String: Any]]?, String) = await Task.detached(priority: .utility) {
+                let source = EKEventStore()
+                guard EKEventStore.authorizationStatus(for: .reminder) == .fullAccess,
+                      !source.calendars(for: .reminder).isEmpty else { return (nil,"access_unavailable") }
+                let predicate = source.predicateForCompletedReminders(
+                    withCompletionDateStarting: Date(timeIntervalSince1970: start),
+                    ending: Date(timeIntervalSince1970: end), calendars: nil)
+                let reminders: [EKReminder]? = await withCheckedContinuation { continuation in
+                    source.fetchReminders(matching: predicate) { continuation.resume(returning: $0) }
+                }
+                guard let reminders,
+                      EKEventStore.authorizationStatus(for: .reminder) == .fullAccess else { return (nil,"access_unavailable") }
+                guard reminders.count <= 10000 else { return (nil,"row_limit") }
+                var result: [[String: Any]] = []
+                for r in reminders {
+                    guard r.isCompleted, let completed = r.completionDate,
+                          !r.calendarItemIdentifier.isEmpty else { return (nil,"invalid_record") }
+                    let stamp = completed.timeIntervalSince1970
+                    // Native bounds may be inclusive. Backend intervals are half-open.
+                    guard stamp >= start && stamp < end else { continue }
+                    guard let row = Self.historyCompletionRow(id: r.calendarItemIdentifier,
+                        title: r.title ?? "(untitled)", completedAt: stamp, list: r.calendar?.title ?? "") else { return (nil,"invalid_record") }
+                    result.append(row)
+                }
+                return (result,"")
+            }.value
+            let rows = capture.0
+            _ = await HarborClient.behaviorNativeHistoryBatch("completed_reminders", job: job, rows: rows ?? [],
+                complete: rows != nil, reason: capture.1)
+        }
+    }
+
+    static func historyCompletionRow(id: String, title: String, completedAt: Double?,
+                                      list: String) -> [String: Any]? {
+        guard !id.isEmpty, id.count <= 1000, let completedAt, completedAt.isFinite else { return nil }
+        return ["source_id": id, "title": String((title.isEmpty ? "(untitled)" : title).prefix(1000)),
+                "context": list, "completion_ts": completedAt]
+    }
+
+    private func post(reminders: [[String: Any]], diagnostics: [String: Any],
+                              startedAt: TimeInterval, authoritative: Bool,
+                              undated: [[String: Any]]? = nil, undatedTotal: Int? = nil) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self,
+                  self.snapshotState.accept(
+                      startedAt: startedAt,
+                      authoritativeCount: authoritative ? reminders.count : nil
+                  ) else { return }
+            if authoritative { self.consecutiveTransientReports = 0 }
+            self.post(reminders: reminders, diagnostics: diagnostics, undated: undated,
+                      undatedTotal: undatedTotal)
+        }
+    }
+
+    // `undated` is sent only with an authoritative read; an unavailable or empty-by-error
+    // post omits the key so the backend keeps the last good list.
+    private func post(reminders: [[String: Any]], diagnostics: [String: Any],
+                      undated: [[String: Any]]? = nil, undatedTotal: Int? = nil) {
+        let url = HarborClient.baseURL.appendingPathComponent("assistant/sync/calendar")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        var body: [String: Any] = [
+            "source": "reminders", "events": reminders, "diagnostics": diagnostics,
+        ]
+        if let undated, let undatedTotal {
+            body["undated"] = undated
+            body["undated_total"] = undatedTotal
+        }
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        URLSession.shared.dataTask(with: req).resume()
+    }
+}
+
+// The native readers need only the base URL, preserving their isolated contract
+// harnesses. Transport follows the same app-wide trusted URLSession protocol.
+extension HarborClient {
+    static func behaviorNativeHistoryRequest(_ method: String, _ path: String,
+                                             body: [String: Any]? = nil) async -> [String: Any]? {
+        var request = URLRequest(url: baseURL.appendingPathComponent(path))
+        request.httpMethod = method
+        request.timeoutInterval = 60
+        if let body {
+            guard let data = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = data
+        }
+        guard let (data,response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+
+    static func behaviorNativeHistoryBatch(_ source: String, job: [String: Any], rows: [[String: Any]],
+                                          complete: Bool, reason: String) async -> Bool {
+        guard ["calendar", "completed_reminders"].contains(source),
+              let scanID = job["scan_id"] as? String, let first = job["page_start"],
+              let last = job["page_end"] else { return false }
+        return await behaviorNativeHistoryRequest("POST", "behavior/history/\(source)/batch", body: [
+            "scan_id": scanID, "start_ts": first, "end_ts": last, "rows": rows,
+            "complete": complete, "reason": reason]) != nil
+    }
+}
