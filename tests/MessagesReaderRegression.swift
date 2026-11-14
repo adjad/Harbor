@@ -1,0 +1,651 @@
+// Synthetic SQLite only. Compile with MessagesReader.swift and -lsqlite3.
+import Foundation
+import AppKit
+import SQLite3
+
+enum HarborClient {
+    static let baseURL = URL(string: "http://127.0.0.1:1")!
+}
+
+@main
+enum MessagesReaderRegression {
+    static func main() throws {
+        let fixtureBase = ProcessInfo.processInfo.environment["HARBOR_MESSAGES_TEST_ROOT"]
+            .map { URL(fileURLWithPath: $0, isDirectory: true) }
+            ?? FileManager.default.temporaryDirectory
+        let root = fixtureBase
+            .appendingPathComponent("harbor-messages-test-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let path = root.appendingPathComponent("chat.db").path
+        let reader = MessagesReader(dbPath: path)
+        precondition(reader.readRecentMessages() == nil, "Missing db is unavailable")
+        // Why it failed comes from the error itself: a missing file is not a
+        // Full Disk Access problem, so the user isn't sent to that setting.
+        precondition(reader.lastFailure?.kind == .missing, "Missing db is reported as missing")
+        precondition(reader.lastFailure?.diagnostics["reason_kind"] as? String == "missing"
+                     && reader.lastFailure?.diagnostics["available"] as? Bool == false)
+        checkFailureClassification()
+
+        var db: OpaquePointer?
+        precondition(sqlite3_open(path, &db) == SQLITE_OK)
+        defer { sqlite3_close(db) }
+        func sql(_ statement: String) {
+            precondition(sqlite3_exec(db, statement, nil, nil, nil) == SQLITE_OK,
+                         "Fixture SQL failed: \(statement)")
+        }
+        precondition(reader.readRecentMessages() == nil, "Missing schema is unavailable")
+        precondition(reader.lastFailure?.kind == .unreadable
+                     && reader.lastFailure?.reason.contains("no such table") == true,
+                     "A missing schema keeps SQLite's own reason, not a permissions claim")
+        sql("CREATE TABLE message (date INTEGER, text TEXT, attributedBody BLOB, " +
+            "is_from_me INTEGER, handle_id INTEGER, is_read INTEGER, " +
+            "associated_message_type INTEGER, guid TEXT, date_edited INTEGER)")
+        sql("CREATE TABLE handle (id TEXT)")
+        sql("CREATE TABLE chat (display_name TEXT, chat_identifier TEXT, guid TEXT)")
+        sql("CREATE TABLE chat_message_join (chat_id INTEGER, message_id INTEGER)")
+        sql("CREATE TABLE chat_handle_join (chat_id INTEGER, handle_id INTEGER)")
+        precondition(reader.readRecentMessages()?.lines.isEmpty == true,
+                     "Empty readable store is ready")
+        precondition(reader.lastFailure == nil, "A successful read clears the last failure")
+        sql("INSERT INTO handle VALUES ('+15555550100')")
+        sql("INSERT INTO chat VALUES ('Project', 'chat1', 'chat-guid-1')")
+        sql("INSERT INTO chat_handle_join VALUES (1, 1)")
+        let date = Int64((Date().timeIntervalSince1970 - 978307200 - 60) * 1_000_000_000)
+        sql("INSERT INTO message VALUES (\(date), " +
+            "'Schedule at https://schedule.example.test/meet?slot=3 and example.test' || " +
+            "char(13) || char(8232) || char(8233) || 'More', " +
+            "NULL, 0, 1, 0, 0, 'message-guid-1', 0)")
+        sql("INSERT INTO chat_message_join VALUES (1, 1)")
+
+        let edited = NSMutableAttributedString(string: "Edited: book a time")
+        edited.addAttribute(.link, value: URL(string: "https://calendar.example.test/booking")!,
+                            range: NSRange(location: 8, length: 4))
+        let blob = try NSKeyedArchiver.archivedData(withRootObject: edited, requiringSecureCoding: true)
+        var stmt: OpaquePointer?
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        precondition(sqlite3_prepare_v2(db, "INSERT INTO message VALUES (?, 'Old version', ?, 1, 1, 1, 0, ?, 1)",
+                                        -1, &stmt, nil) == SQLITE_OK)
+        sqlite3_bind_int64(stmt, 1, date - 1_000_000_000)
+        _ = blob.withUnsafeBytes { bytes in
+            sqlite3_bind_blob(stmt, 2, bytes.baseAddress, Int32(blob.count), transient)
+        }
+        sqlite3_bind_text(stmt, 3, "message-guid-2", -1, transient)
+        precondition(sqlite3_step(stmt) == SQLITE_DONE)
+        sqlite3_finalize(stmt)
+        sql("INSERT INTO chat_message_join VALUES (1, 2)")
+        sql("INSERT INTO message VALUES (\(date - 2_000_000_000), '', NULL, 0, 1, 0, 0, 'bad', 0)")
+        let crossing = String(repeating: "x", count: 8180) +
+            " https://calendar.example.test/?token=123456789ABCDEFGHIJK"
+        var crossingStmt: OpaquePointer?
+        precondition(sqlite3_prepare_v2(db,
+            "INSERT INTO message (date, text, is_from_me, is_read, associated_message_type, guid) " +
+            "VALUES (?, ?, 0, 1, 0, 'boundary-guid')", -1, &crossingStmt, nil) == SQLITE_OK)
+        sqlite3_bind_int64(crossingStmt, 1, date - 3_000_000_000)
+        _ = crossing.withCString { sqlite3_bind_text(crossingStmt, 2, $0, -1, transient) }
+        precondition(sqlite3_step(crossingStmt) == SQLITE_DONE)
+        sqlite3_finalize(crossingStmt)
+
+        let modified = try FileManager.default.attributesOfItem(atPath: path)[.modificationDate] as! Date
+        let scan = reader.readRecentMessages()!
+        precondition(scan.attempted == 4 && scan.skipped == 1
+                     && scan.lines.count == 3 && scan.structured.count == 3)
+        precondition(scan.lines[0].contains("message: 1") == false)
+        precondition(scan.lines[0].contains("Schedule at https://schedule.example.test/meet?slot=3"))
+        precondition(!scan.lines[0].contains("\r") && !scan.lines[0].contains("\u{2028}")
+                     && !scan.lines[0].contains("\u{2029}"), "V2 bodies cannot add wire lines")
+        precondition(scan.lines[1].contains("Edited: book a time")
+                     && !scan.lines[1].contains("Old version"), "Edited attributedBody won over stale text")
+        let rows = try scan.structured.map { line -> [String: Any] in
+            precondition(line.hasPrefix("V3 | "))
+            return try JSONSerialization.jsonObject(with: Data(line.dropFirst(5).utf8)) as! [String: Any]
+        }
+        let first = rows[0]["record"] as! [String: Any]
+        precondition(first["guid"] as? String == "message-guid-1")
+        precondition(first["conversation"] as? String == "chat-guid-1")
+        precondition(first["direction"] as? String == "incoming")
+        let firstLinks = first["links"] as! [[String: String]]
+        precondition(firstLinks.count == 1 && firstLinks[0]["provenance"] == "literal_text")
+        precondition(firstLinks[0]["url"] == "https://schedule.example.test/meet?slot=3")
+        let second = rows[1]["record"] as! [String: Any]
+        precondition(second["guid"] as? String == "message-guid-2")
+        precondition(second["direction"] as? String == "outgoing")
+        let secondLinks = second["links"] as! [[String: String]]
+        precondition(secondLinks.contains { $0["url"] == "https://calendar.example.test/booking"
+            && $0["provenance"] == "attributed_link" }, "Explicit attributed link survived")
+        let source = rows[0]["source"] as! [String: Any]
+        precondition(source["chat_guid"] as? String == "chat-guid-1"
+                     && source["navigation_url"] is NSNull)
+        let boundary = rows[2]["record"] as! [String: Any]
+        precondition(boundary["guid"] as? String == "boundary-guid")
+        precondition((boundary["links"] as! [[String: String]]).isEmpty,
+                     "A URL crossing the text clip cannot become a shorter source link")
+        let boundaryCoverage = rows[2]["coverage"] as! [String: String]
+        precondition(boundaryCoverage["text"] == "partial" && boundaryCoverage["links"] == "partial")
+        let after = try FileManager.default.attributesOfItem(atPath: path)[.modificationDate] as! Date
+        precondition(after == modified, "Read-only scan did not change the database")
+
+        let limited = reader.readRecentMessages(limit: 1)!
+        precondition(limited.attempted == 1 && limited.structured.count == 1)
+        // How a message was delivered: unknown while the store has no such column, then the
+        // message's own value. The service acts on an iMessage only, so a guess here would matter.
+        precondition(source["service"] is NSNull, "No service column: the service is unknown")
+        sql("ALTER TABLE message ADD COLUMN service TEXT")
+        sql("UPDATE message SET service = 'iMessage'")
+        let delivered = reader.readRecentMessages()!
+        let deliveredRow = try JSONSerialization.jsonObject(
+            with: Data(delivered.structured[0].dropFirst(5).utf8)) as! [String: Any]
+        precondition((deliveredRow["source"] as! [String: Any])["service"] as? String == "iMessage",
+                     "The message's own service reaches the record")
+        sql("UPDATE message SET service = 'SMS'")
+        let overSMS = reader.readRecentMessages()!
+        let smsRow = try JSONSerialization.jsonObject(
+            with: Data(overSMS.structured[0].dropFirst(5).utf8)) as! [String: Any]
+        precondition((smsRow["source"] as! [String: Any])["service"] as? String == "SMS")
+        sql("UPDATE message SET service = NULL")
+        let divergent = NSMutableAttributedString(string: "OLD: tap")
+        divergent.addAttribute(.link, value: URL(string: "https://old.example.test/secret")!,
+                               range: NSRange(location: 5, length: 3))
+        let divergentBlob = try NSKeyedArchiver.archivedData(
+            withRootObject: divergent, requiringSecureCoding: true)
+        var divergentStmt: OpaquePointer?
+        precondition(sqlite3_prepare_v2(db,
+            "INSERT INTO message (date, text, attributedBody, is_from_me, handle_id, is_read, " +
+            "associated_message_type, guid, date_edited) " +
+            "VALUES (?, 'NEW: no link', ?, 0, 1, 1, 0, 'divergent-body-guid', 0)",
+            -1, &divergentStmt, nil) == SQLITE_OK)
+        sqlite3_bind_int64(divergentStmt, 1, date - 3_500_000_000)
+        _ = divergentBlob.withUnsafeBytes { bytes in
+            sqlite3_bind_blob(divergentStmt, 2, bytes.baseAddress, Int32(divergentBlob.count), transient)
+        }
+        precondition(sqlite3_step(divergentStmt) == SQLITE_DONE)
+        sqlite3_finalize(divergentStmt)
+        sql("INSERT INTO chat_message_join VALUES (1, \(sqlite3_last_insert_rowid(db)))")
+        var matchingStmt: OpaquePointer?
+        precondition(sqlite3_prepare_v2(db,
+            "INSERT INTO message (date, text, attributedBody, is_from_me, handle_id, is_read, " +
+            "associated_message_type, guid, date_edited) " +
+            "VALUES (?, 'OLD: tap', ?, 0, 1, 1, 0, 'matching-body-guid', 0)",
+            -1, &matchingStmt, nil) == SQLITE_OK)
+        sqlite3_bind_int64(matchingStmt, 1, date - 3_750_000_000)
+        _ = divergentBlob.withUnsafeBytes { bytes in
+            sqlite3_bind_blob(matchingStmt, 2, bytes.baseAddress, Int32(divergentBlob.count), transient)
+        }
+        precondition(sqlite3_step(matchingStmt) == SQLITE_DONE)
+        sqlite3_finalize(matchingStmt)
+        sql("INSERT INTO chat_message_join VALUES (1, \(sqlite3_last_insert_rowid(db)))")
+        let literalCases = [
+            ("balanced-wrapper-guid", "(https://example.test/part_(one)).",
+             "https://example.test/part_(one)"),
+            ("wrapped-end-guid", "(https://example.test/a)",
+             "https://example.test/a"),
+            ("wrapped-sentence-guid", "(https://example.test/a)! Now",
+             "https://example.test/a"),
+            ("quoted-bang-guid", "Open \"https://example.test/search?q=hello!\" now",
+             "https://example.test/search?q=hello!"),
+            ("quoted-period-guid", "Open \"https://example.test/report.\" now",
+             "https://example.test/report."),
+            ("quoted-comma-guid", "Open \"https://example.test/list,a,\" now",
+             "https://example.test/list,a,"),
+            ("quoted-semicolon-guid", "Open \"https://example.test/query;x;\" now",
+             "https://example.test/query;x;"),
+            ("angle-bang-guid", "Open <https://example.test/search?q=hello!> now",
+             "https://example.test/search?q=hello!"),
+            ("parenthesis-bang-guid", "Open (https://example.test/search?q=hello!).",
+             "https://example.test/search?q=hello!"),
+            ("nested-wrapper-guid", "((https://example.test/report)).",
+             "https://example.test/report"),
+            ("nested-path-guid", "((https://example.test/A_(B))).",
+             "https://example.test/A_(B)"),
+            ("square-bang-guid", "[https://example.test/search?q=hello!]",
+             "https://example.test/search?q=hello!"),
+            ("query-scheme-guid", "See https://redirect.test/?to=https://other.test/path",
+             "https://redirect.test/?to=https://other.test/path"),
+            ("apostrophe-guid", "See https://example.test/O'Reilly today",
+             "https://example.test/O'Reilly"),
+            ("single-quoted-apostrophe-guid", "Open 'https://example.test/O'Reilly' now",
+             "https://example.test/O'Reilly"),
+            ("double-quoted-apostrophe-guid", "Open \"https://example.test/O'Reilly\" now",
+             "https://example.test/O'Reilly"),
+            ("query-comma-scheme-guid",
+             "See https://redirect.test/?next=https://other.test/a,https://third.test/b",
+             "https://redirect.test/?next=https://other.test/a,https://third.test/b"),
+            ("quoted-query-comma-guid",
+             "Open \"https://redirect.test/?next=https://other.test/a,https://third.test/b\" now",
+             "https://redirect.test/?next=https://other.test/a,https://third.test/b"),
+            ("fragment-comma-scheme-guid",
+             "See https://redirect.test/#next=https://other.test/a,https://third.test/b",
+             "https://redirect.test/#next=https://other.test/a,https://third.test/b"),
+            ("quoted-fragment-comma-guid",
+             "Open \"https://redirect.test/#next=https://other.test/a,https://third.test/b\" now",
+             "https://redirect.test/#next=https://other.test/a,https://third.test/b"),
+        ]
+        for (index, fixture) in literalCases.enumerated() {
+            var literalStmt: OpaquePointer?
+            precondition(sqlite3_prepare_v2(db,
+                "INSERT INTO message (date, text, is_from_me, is_read, associated_message_type, guid) " +
+                "VALUES (?, ?, 0, 1, 0, ?)", -1, &literalStmt, nil) == SQLITE_OK)
+            sqlite3_bind_int64(literalStmt, 1, date - Int64(index + 4) * 1_000_000_000)
+            _ = fixture.1.withCString { sqlite3_bind_text(literalStmt, 2, $0, -1, transient) }
+            _ = fixture.0.withCString { sqlite3_bind_text(literalStmt, 3, $0, -1, transient) }
+            precondition(sqlite3_step(literalStmt) == SQLITE_DONE)
+            sqlite3_finalize(literalStmt)
+        }
+        sql("INSERT INTO message (date, text, is_from_me, is_read, associated_message_type, guid) " +
+            "VALUES (\(date - Int64(literalCases.count + 4) * 1_000_000_000), " +
+            "'(https://example.test/a),(https://example.test/b)', 0, 1, 0, 'adjacent-guid')")
+        sql("INSERT INTO message (date, text, is_from_me, is_read, associated_message_type, guid) " +
+            "VALUES (\(date - Int64(literalCases.count + 9) * 1_000_000_000), " +
+            "'(https://example.test/a);(https://example.test/b)', 0, 1, 0, 'adjacent-semicolon-guid')")
+        sql("INSERT INTO message (date, text, is_from_me, is_read, associated_message_type, guid) " +
+            "VALUES (\(date - Int64(literalCases.count + 7) * 1_000_000_000), " +
+            "'https://example.test/a,https://example.test/b', 0, 1, 0, 'unwrapped-adjacent-guid')")
+        sql("INSERT INTO message (date, text, is_from_me, is_read, associated_message_type, guid) " +
+            "VALUES (\(date - Int64(literalCases.count + 5) * 1_000_000_000), " +
+            "'prefixhttps://example.test/not-a-link', 0, 1, 0, 'embedded-prefix-guid')")
+        sql("INSERT INTO message (date, text, is_from_me, is_read, associated_message_type, guid) " +
+            "VALUES (\(date - Int64(literalCases.count + 6) * 1_000_000_000), " +
+            "'(https://example.test/unclosed', 0, 1, 0, 'unclosed-guid')")
+        sql("INSERT INTO message (date, text, is_from_me, is_read, associated_message_type, guid) " +
+            "VALUES (\(date - Int64(literalCases.count + 8) * 1_000_000_000), " +
+            "'https://example.test/O''', 0, 1, 0, 'ambiguous-quote-guid')")
+        let ambiguousCases = [
+            ("path-comma-guid", "https://example.test/a,https://other.test/b"),
+            ("quoted-path-comma-guid", "\"https://example.test/a,https://other.test/b\""),
+            ("interior-apostrophe-query-guid",
+             "See 'https://example.test/?q=authors'&sort=asc' now"),
+            ("interior-apostrophe-path-guid", "See 'https://example.test/O'!Reilly' now"),
+            ("ambiguous-apostrophe-suffix-guid", "See 'https://example.test/O'!Reilly now"),
+            ("balanced-guid", "See https://en.wikipedia.org/wiki/Function_(mathematics)."),
+            ("unbalanced-guid", "See https://example.test/report)."),
+            ("nested-uri-guid", "See https://example.test/f_(a_(b))."),
+            ("unwrapped-bang-guid", "Open https://example.test/report! now"),
+            ("early-wrapper-closer-guid", "See (https://example.test/a)b) now"),
+            ("early-wrapper-punctuation-guid", "See (https://example.test/a)!b) now"),
+            ("unclosed-wrapper-suffix-guid", "See (https://example.test/a)b now"),
+            ("bare-adjacent-wrapper-comma-guid",
+             "See (https://example.test/a),https://other.test/b) now"),
+            ("bare-adjacent-wrapper-semicolon-guid",
+             "See (https://example.test/a);https://other.test/b) now"),
+            ("bare-adjacent-wrapper-query-guid",
+             "See (https://example.test/?q=a),https://other.test/b) now"),
+        ]
+        for (index, fixture) in ambiguousCases.enumerated() {
+            var ambiguousStmt: OpaquePointer?
+            precondition(sqlite3_prepare_v2(db,
+                "INSERT INTO message (date, text, is_from_me, is_read, associated_message_type, guid) " +
+                "VALUES (?, ?, 0, 1, 0, ?)", -1, &ambiguousStmt, nil) == SQLITE_OK)
+            sqlite3_bind_int64(ambiguousStmt, 1,
+                              date - Int64(literalCases.count + 10 + index) * 1_000_000_000)
+            _ = fixture.1.withCString { sqlite3_bind_text(ambiguousStmt, 2, $0, -1, transient) }
+            _ = fixture.0.withCString { sqlite3_bind_text(ambiguousStmt, 3, $0, -1, transient) }
+            precondition(sqlite3_step(ambiguousStmt) == SQLITE_DONE)
+            sqlite3_finalize(ambiguousStmt)
+        }
+        let punctuationScan = reader.readRecentMessages(limit: 48)!
+        let punctuationRecords = try punctuationScan.structured.map { line in
+            try JSONSerialization.jsonObject(with: Data(line.dropFirst(5).utf8)) as! [String: Any]
+        }
+        let divergentRow = punctuationRecords.first {
+            ($0["record"] as? [String: Any])?["guid"] as? String == "divergent-body-guid"
+        }!
+        let divergentRecord = divergentRow["record"] as! [String: Any]
+        let divergentCoverage = divergentRow["coverage"] as! [String: String]
+        precondition(divergentRecord["text"] as? String == "NEW: no link"
+                     && (divergentRecord["links"] as! [[String: String]]).isEmpty
+                     && divergentCoverage["text"] == "complete"
+                     && divergentCoverage["links"] == "partial",
+                     "Attributed metadata from a different body must not become a current link")
+        let matchingRow = punctuationRecords.first {
+            ($0["record"] as? [String: Any])?["guid"] as? String == "matching-body-guid"
+        }!
+        let matchingLinks = (matchingRow["record"] as! [String: Any])["links"] as! [[String: String]]
+        precondition(matchingLinks == [["url": "https://old.example.test/secret",
+                                        "provenance": "attributed_link"]]
+                     && (matchingRow["coverage"] as! [String: String])["links"] == "complete",
+                     "Attributed link from the selected body must remain source-backed")
+        for (guid, _, expected) in literalCases {
+            let record = punctuationRecords.compactMap { $0["record"] as? [String: Any] }
+                .first { $0["guid"] as? String == guid }!
+            let links = record["links"] as! [[String: String]]
+            precondition(links.count == 1 && links[0]["url"] == expected,
+                         "Literal URL delimiters must remain source-exact: \(guid)")
+            if guid.contains("apostrophe") || guid.contains("query-comma")
+                    || guid.contains("fragment-comma") {
+                let coverage = punctuationRecords.first {
+                    ($0["record"] as? [String: Any])?["guid"] as? String == guid
+                }!["coverage"] as! [String: String]
+                precondition(coverage["links"] == "complete",
+                             "Exact quoted or query URL must retain complete link coverage: \(guid)")
+            }
+        }
+        let adjacent = punctuationRecords.compactMap { $0["record"] as? [String: Any] }
+            .first { $0["guid"] as? String == "adjacent-guid" }!
+        let adjacentLinks = adjacent["links"] as! [[String: String]]
+        precondition(adjacentLinks.map { $0["url"]! } == ["https://example.test/a", "https://example.test/b"],
+                     "Adjacent wrapped URLs must remain two source links")
+        let adjacentSemicolon = punctuationRecords.compactMap { $0["record"] as? [String: Any] }
+            .first { $0["guid"] as? String == "adjacent-semicolon-guid" }!
+        let semicolonLinks = adjacentSemicolon["links"] as! [[String: String]]
+        precondition(semicolonLinks.map { $0["url"]! } == ["https://example.test/a", "https://example.test/b"],
+                     "Semicolon-separated wrapped URLs must remain two source links")
+        for guid in ["embedded-prefix-guid", "unclosed-guid", "ambiguous-quote-guid",
+                     "unwrapped-adjacent-guid"] + ambiguousCases.map({ $0.0 }) {
+            let row = punctuationRecords.first { ($0["record"] as? [String: Any])?["guid"] as? String == guid }!
+            let record = row["record"] as! [String: Any]
+            let coverage = row["coverage"] as! [String: String]
+            precondition((record["links"] as! [[String: String]]).isEmpty
+                         && coverage["links"] == "partial", "Ambiguous source URL must be omitted: \(guid)")
+        }
+        if let wirePath = ProcessInfo.processInfo.environment["HARBOR_MESSAGES_WIRE_OUTPUT"] {
+            let coverage: [String: Any] = [
+                "version": 1, "kind": "coverage", "attempted": punctuationScan.attempted,
+                "emitted": punctuationScan.structured.count, "skipped": punctuationScan.skipped,
+                "truncated": punctuationScan.truncated, "limit": 2000,
+                "byte_limit": 4_000_000, "window_days": 365, "row_limit": 20000,
+                "reached_row_limit": false,
+            ]
+            let header = "V3 | " + String(data: try JSONSerialization.data(withJSONObject: coverage),
+                                          encoding: .utf8)!
+            try ([header] + punctuationScan.structured + punctuationScan.lines)
+                .joined(separator: "\n")
+                .write(toFile: wirePath, atomically: false, encoding: .utf8)
+        }
+        sql("WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x<2001) " +
+            "INSERT INTO message (date, text, is_from_me, is_read, associated_message_type, guid) " +
+            "SELECT \(date) - (x+3)*1000000000, 'Synthetic row', 0, 1, 0, 'bulk-'||x FROM seq")
+        let bounded = reader.readRecentMessages(limit: 5000)!
+        precondition(bounded.attempted == 2028 + literalCases.count && bounded.skipped == 1
+                     && bounded.structured.count == 2000
+                     && bounded.truncated >= 27 + literalCases.count,
+                     "Structured carrier has an explicit row cap and partial coverage")
+        try checkTypedStream(root: root)
+        checkDelivery(root: root)
+        checkBackendRetry()
+        print("MessagesReader: synthetic read-only regression passed")
+    }
+
+    // Real typedstream bodies, as NSArchiver writes them (captured from
+    // NSArchiver.archivedData(withRootObject:) on macOS with synthetic text).
+    // Messages stores most attributedBody blobs in this format; neither keyed
+    // unarchiver path reads it, so rows with NULL text used to be skipped.
+    static let typedHello: [UInt8] = [
+        0x04, 0x0b, 0x73, 0x74, 0x72, 0x65, 0x61, 0x6d, 0x74, 0x79, 0x70, 0x65, 0x64, 0x81,
+        0xe8, 0x03, 0x84, 0x01, 0x40, 0x84, 0x84, 0x84, 0x12, 0x4e, 0x53, 0x41, 0x74, 0x74,
+        0x72, 0x69, 0x62, 0x75, 0x74, 0x65, 0x64, 0x53, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x00,
+        0x84, 0x84, 0x08, 0x4e, 0x53, 0x4f, 0x62, 0x6a, 0x65, 0x63, 0x74, 0x00, 0x85, 0x92,
+        0x84, 0x84, 0x84, 0x08, 0x4e, 0x53, 0x53, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x01, 0x94,
+        0x84, 0x01, 0x2b, 0x0b, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x74, 0x68, 0x65, 0x72,
+        0x65, 0x86, 0x84, 0x02, 0x69, 0x49, 0x01, 0x0b, 0x92, 0x84, 0x84, 0x84, 0x0c, 0x4e,
+        0x53, 0x44, 0x69, 0x63, 0x74, 0x69, 0x6f, 0x6e, 0x61, 0x72, 0x79, 0x00, 0x94, 0x84,
+        0x01, 0x69, 0x00, 0x86, 0x86
+    ]
+    // NSMutableAttributedString "Link https://example.test ok" with an NSLink run.
+    static let typedMutableLink: [UInt8] = [
+        0x04, 0x0b, 0x73, 0x74, 0x72, 0x65, 0x61, 0x6d, 0x74, 0x79, 0x70, 0x65, 0x64, 0x81,
+        0xe8, 0x03, 0x84, 0x01, 0x40, 0x84, 0x84, 0x84, 0x19, 0x4e, 0x53, 0x4d, 0x75, 0x74,
+        0x61, 0x62, 0x6c, 0x65, 0x41, 0x74, 0x74, 0x72, 0x69, 0x62, 0x75, 0x74, 0x65, 0x64,
+        0x53, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x00, 0x84, 0x84, 0x12, 0x4e, 0x53, 0x41, 0x74,
+        0x74, 0x72, 0x69, 0x62, 0x75, 0x74, 0x65, 0x64, 0x53, 0x74, 0x72, 0x69, 0x6e, 0x67,
+        0x00, 0x84, 0x84, 0x08, 0x4e, 0x53, 0x4f, 0x62, 0x6a, 0x65, 0x63, 0x74, 0x00, 0x85,
+        0x92, 0x84, 0x84, 0x84, 0x0f, 0x4e, 0x53, 0x4d, 0x75, 0x74, 0x61, 0x62, 0x6c, 0x65,
+        0x53, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x01, 0x84, 0x84, 0x08, 0x4e, 0x53, 0x53, 0x74,
+        0x72, 0x69, 0x6e, 0x67, 0x01, 0x95, 0x84, 0x01, 0x2b, 0x1c, 0x4c, 0x69, 0x6e, 0x6b,
+        0x20, 0x68, 0x74, 0x74, 0x70, 0x73, 0x3a, 0x2f, 0x2f, 0x65, 0x78, 0x61, 0x6d, 0x70,
+        0x6c, 0x65, 0x2e, 0x74, 0x65, 0x73, 0x74, 0x20, 0x6f, 0x6b, 0x86, 0x84, 0x02, 0x69,
+        0x49, 0x01, 0x05, 0x92, 0x84, 0x84, 0x84, 0x0c, 0x4e, 0x53, 0x44, 0x69, 0x63, 0x74,
+        0x69, 0x6f, 0x6e, 0x61, 0x72, 0x79, 0x00, 0x95, 0x84, 0x01, 0x69, 0x00, 0x86, 0x99,
+        0x02, 0x14, 0x92, 0x84, 0x9a, 0x9b, 0x01, 0x92, 0x84, 0x98, 0x98, 0x06, 0x4e, 0x53,
+        0x4c, 0x69, 0x6e, 0x6b, 0x86, 0x92, 0x84, 0x84, 0x84, 0x05, 0x4e, 0x53, 0x55, 0x52,
+        0x4c, 0x00, 0x95, 0x84, 0x01, 0x63, 0x00, 0x92, 0x84, 0x98, 0x98, 0x14, 0x68, 0x74,
+        0x74, 0x70, 0x73, 0x3a, 0x2f, 0x2f, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e,
+        0x74, 0x65, 0x73, 0x74, 0x86, 0x86, 0x86, 0x99, 0x01, 0x03, 0x86
+    ]
+    /// The same NSAttributedString layout with 100 "é" (200 UTF-8 bytes), which
+    /// takes the 0x81 two-byte length. Spliced from typedHello exactly as
+    /// NSArchiver writes the longer string.
+    static var typedLong: [UInt8] {
+        let tag = typedHello.firstIndex(of: 0x2b)!
+        var suffix = Array(typedHello[(tag + 2 + 11)...])
+        suffix[6] = 100   // the attribute run length, in characters
+        return Array(typedHello[...tag]) + [0x81, 0xc8, 0x00]
+            + Array(String(repeating: "\u{e9}", count: 100).utf8) + suffix
+    }
+
+    static func checkTypedStream(root: URL) throws {
+        typealias T = TypedStreamText
+        precondition(T.decode(Data(typedHello)) == "Hello there")
+        precondition(T.decode(Data(typedMutableLink)) == "Link https://example.test ok")
+        precondition(T.decode(Data(typedLong)) == String(repeating: "\u{e9}", count: 100))
+        // Anything off the layout is nil, never a guess.
+        let tag = typedHello.firstIndex(of: 0x2b)!
+        var overlong = typedHello
+        overlong[tag + 1] = 0x7f
+        precondition(T.decode(Data(overlong)) == nil, "a length past the end is refused")
+        var badUTF8 = Array(typedHello[...tag]) + [0x02, 0xff, 0xfe] + Array(typedHello[(tag + 2 + 11)...])
+        precondition(T.decode(Data(badUTF8)) == nil, "invalid UTF-8 is refused")
+        badUTF8[0] = 0x05
+        precondition(T.decode(Data(badUTF8)) == nil, "no typedstream header, no scan")
+        precondition(T.decode(Data(Array(typedHello[..<tag]))) == nil, "a cut-off stream is refused")
+        precondition(T.decode(Data("NSString+\u{05}Hello".utf8)) == nil, "the header is required")
+
+        // Every length form and tag, on the real layout: bytes up to "+", then
+        // the length field under test, then the body and the real tail.
+        let head = Array(typedHello[...tag]), tail = Array(typedHello[(tag + 2 + 11)...])
+        func stream(_ length: [UInt8], _ body: [UInt8]) -> Data { Data(head + length + body + tail) }
+        let word = Array("Hello there".utf8)
+        precondition(T.decode(stream([0x0b], word)) == "Hello there", "one-byte length")
+        precondition(T.decode(stream([0x81, 0x0b, 0x00], word)) == "Hello there", "0x81: 2-byte length")
+        precondition(T.decode(stream([0x82, 0x0b, 0x00, 0x00, 0x00], word)) == "Hello there", "0x82: 4-byte length")
+        let big = Array(String(repeating: "a", count: 70_000).utf8)
+        precondition(T.decode(stream([0x82, 0x70, 0x11, 0x01, 0x00], big)) == String(repeating: "a", count: 70_000),
+                     "0x82 carries a length past 65535")
+        precondition(T.decode(Data(head + [0x81, 0x0b])) == nil, "a 0x81 length cut off mid-field")
+        precondition(T.decode(Data(head + [0x82, 0x0b, 0x00, 0x00])) == nil, "a 0x82 length cut off mid-field")
+        precondition(T.decode(Data(head + [0x81])) == nil && T.decode(Data(head + [0x82])) == nil,
+                     "a length tag with nothing after it")
+        precondition(T.decode(stream([0x82, 0xff, 0xff, 0xff, 0x7f], word)) == nil, "a huge 0x82 length is refused")
+        precondition(T.decode(stream([0x82, 0xff, 0xff, 0xff, 0xff], word)) == nil, "a 0xFFFFFFFF length is refused")
+        precondition(T.decode(stream([0x80], word)) == nil, "0x80 is not a length")
+        precondition(T.decode(stream([0x83], word)) == nil, "0x83 (a float tag) is not a length")
+        precondition(T.decode(stream([0x84], word)) == nil, "an object tag is not a length")
+        precondition(T.decode(stream([0x00], word)) == nil, "a zero length is not a message")
+        precondition(T.decode(Data(head)) == nil, "the stream ends right after the + tag")
+        var noPlus = typedHello
+        noPlus[tag] = 0x2a
+        precondition(T.decode(Data(noPlus)) == nil, "no + tag within reach of NSString, no text")
+        precondition(T.decode(Data(Array(typedHello[...(tag - 5)]))) == nil, "a stream that ends at the class name")
+
+        // Through the reader: NULL text plus a typedstream body is now a message.
+        let path = root.appendingPathComponent("typedstream.db").path
+        var db: OpaquePointer?
+        precondition(sqlite3_open(path, &db) == SQLITE_OK)
+        defer { sqlite3_close(db) }
+        for statement in [
+            "CREATE TABLE message (date INTEGER, text TEXT, attributedBody BLOB, is_from_me INTEGER, " +
+                "handle_id INTEGER, is_read INTEGER, associated_message_type INTEGER, guid TEXT, date_edited INTEGER)",
+            "CREATE TABLE handle (id TEXT)",
+            "CREATE TABLE chat (display_name TEXT, chat_identifier TEXT, guid TEXT)",
+            "CREATE TABLE chat_message_join (chat_id INTEGER, message_id INTEGER)",
+            "CREATE TABLE chat_handle_join (chat_id INTEGER, handle_id INTEGER)",
+        ] { precondition(sqlite3_exec(db, statement, nil, nil, nil) == SQLITE_OK) }
+        let now = Int64((Date().timeIntervalSince1970 - 978307200 - 60) * 1_000_000_000)
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        let rows: [(String, [UInt8])] = [
+            ("typed-hello", typedHello), ("typed-link", typedMutableLink), ("typed-long", typedLong),
+            ("typed-overlong", overlong), ("typed-garbage", Array("not an archive".utf8)),
+        ]
+        for (offset, row) in rows.enumerated() {
+            var stmt: OpaquePointer?
+            precondition(sqlite3_prepare_v2(db, "INSERT INTO message VALUES (?, NULL, ?, 0, 0, 1, 0, ?, 0)",
+                                            -1, &stmt, nil) == SQLITE_OK)
+            sqlite3_bind_int64(stmt, 1, now - Int64(offset) * 1_000_000_000)
+            _ = row.1.withUnsafeBytes { sqlite3_bind_blob(stmt, 2, $0.baseAddress, Int32(row.1.count), transient) }
+            sqlite3_bind_text(stmt, 3, row.0, -1, transient)
+            precondition(sqlite3_step(stmt) == SQLITE_DONE)
+            sqlite3_finalize(stmt)
+        }
+        let scan = MessagesReader(dbPath: path).readRecentMessages()!
+        precondition(scan.attempted == 5 && scan.skipped == 2 && scan.lines.count == 3,
+                     "typedstream rows are read; only the undecodable ones are skipped")
+        precondition(scan.lines[0].hasSuffix("Unknown: Hello there"))
+        precondition(scan.lines[1].hasSuffix("Unknown: Link https://example.test ok"))
+        precondition(scan.lines[2].hasSuffix(String(repeating: "\u{e9}", count: 100)))
+        let records = try scan.structured.map {
+            try JSONSerialization.jsonObject(with: Data($0.dropFirst(5).utf8)) as! [String: Any]
+        }
+        let link = records[1]
+        let record = link["record"] as! [String: Any]
+        let links = record["links"] as! [[String: String]]
+        precondition(links.count == 1 && links[0]["url"] == "https://example.test"
+                     && links[0]["provenance"] == "literal_text", "the text's own link is still found")
+        let coverage = link["coverage"] as! [String: String]
+        precondition(coverage["text"] == "complete" && coverage["links"] == "partial",
+                     "typedstream recovers text, not NSLink attributes, so links stay partial")
+    }
+
+    /// Only "nothing is listening" is retried, on a bounded, growing schedule.
+    // What the app reads back after handing Messages a text.
+    static func checkDelivery(root: URL) {
+        let path = root.appendingPathComponent("delivery.db").path
+        typealias Check = MessageDeliveryCheck
+        precondition(Check.read(dbPath: path, to: "22821", text: "hi", sinceNs: 0).state == .unknown,
+                     "A store that can't be opened is unknown")
+        var db: OpaquePointer?
+        precondition(sqlite3_open(path, &db) == SQLITE_OK)
+        defer { sqlite3_close(db) }
+        func sql(_ statement: String) {
+            precondition(sqlite3_exec(db, statement, nil, nil, nil) == SQLITE_OK,
+                         "Fixture SQL failed: \(statement)")
+        }
+        sql("CREATE TABLE message (date INTEGER, text TEXT, attributedBody BLOB, is_from_me INTEGER, " +
+            "handle_id INTEGER, is_sent INTEGER, is_delivered INTEGER, error INTEGER, service TEXT)")
+        sql("CREATE TABLE handle (id TEXT)")
+        sql("INSERT INTO handle VALUES ('22821'), ('+16505550100'), ('pat@example.test')")
+        let now = Check.storeDate(Date())
+        let since = now - 5_000_000_000
+        func state(_ to: String, _ text: String) -> Check.State {
+            Check.read(dbPath: path, to: to, text: text, sinceNs: since).state
+        }
+        precondition(state("22821", "Harbor test 1") == .unknown, "No row is unknown")
+        // What the real app hit: accepted, then Not Delivered.
+        sql("INSERT INTO message VALUES (\(now), 'Harbor test 1', NULL, 1, 1, 0, 0, 22, 'iMessage')")
+        let failed = Check.read(dbPath: path, to: "22821", text: "Harbor test 1 ", sinceNs: since)
+        precondition(failed == Check.Reading(state: .failed, service: "iMessage"), "An error on the row is a failure")
+        precondition(Check.settle(dbPath: path, to: "22821", text: "Harbor test 1", sinceNs: since,
+                                  window: 1, step: 0.2) == failed, "A failure ends the wait at once")
+        precondition(state("22821", "Some other text") == .unknown, "Another text is not this message")
+        precondition(state("22822", "Harbor test 1") == .unknown, "Another short code is not this recipient")
+        precondition(Check.read(dbPath: path, to: "22821", text: "Harbor test 1", sinceNs: now + 1).state == .unknown,
+                     "A row from before the send is not this message")
+        // Country code or not, and the display form, name the same number.
+        sql("INSERT INTO message VALUES (\(now), 'pending', NULL, 1, 2, 0, 0, 0, 'SMS')")
+        sql("INSERT INTO message VALUES (\(now), 'sent', NULL, 1, 2, 1, 0, 0, 'SMS')")
+        sql("INSERT INTO message VALUES (\(now), 'delivered', NULL, 1, 2, 1, 1, 0, 'iMessage')")
+        sql("INSERT INTO message VALUES (\(now), 'both', NULL, 1, 2, 1, 1, 4, 'iMessage')")
+        sql("INSERT INTO message VALUES (\(now), 'theirs', NULL, 0, 2, 1, 1, 0, 'iMessage')")
+        precondition(state("(650) 555-0100", "pending") == .pending)
+        precondition(state("+1 650 555 0100", "sent") == .sent)
+        precondition(state("6505550100", "delivered") == .delivered)
+        precondition(state("6505550100", "both") == .failed, "An error wins over the flags")
+        precondition(state("6505550100", "theirs") == .unknown, "A message from them is not ours")
+        precondition(state("0100", "sent") == .unknown, "A few trailing digits name no one")
+        // Still pending when the window ends is unknown; a plain sent stays sent.
+        precondition(Check.settle(dbPath: path, to: "6505550100", text: "pending", sinceNs: since,
+                                  window: 0.6, step: 0.2).state == .unknown)
+        precondition(Check.settle(dbPath: path, to: "6505550100", text: "sent", sinceNs: since,
+                                  window: 0.6, step: 0.2, sentGrace: 0.2)
+                     == Check.Reading(state: .sent, service: "SMS"))
+        sql("INSERT INTO message VALUES (\(now), 'mail handle', NULL, 1, 3, 1, 1, 0, 'iMessage')")
+        precondition(state("Pat@Example.test", "mail handle") == .delivered)
+        precondition(state("at@example.test", "mail handle") == .unknown)
+        // A body kept only as a typedstream is read; one that can't be read is not taken.
+        var stmt: OpaquePointer?
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        precondition(sqlite3_prepare_v2(db, "INSERT INTO message VALUES (\(now), NULL, ?, 1, 1, 1, 0, 0, 'SMS')",
+                                        -1, &stmt, nil) == SQLITE_OK)
+        let junk = Data("not a typedstream".utf8)
+        _ = junk.withUnsafeBytes { sqlite3_bind_blob(stmt, 1, $0.baseAddress, Int32(junk.count), transient) }
+        precondition(sqlite3_step(stmt) == SQLITE_DONE)
+        sqlite3_finalize(stmt)
+        precondition(state("22821", "not a typedstream") == .unknown)
+    }
+
+    static func checkBackendRetry() {
+        typealias R = NativeBackendRetry
+        precondition(R.isBackendUnreachable(URLError(.cannotConnectToHost)))
+        precondition(R.isBackendUnreachable(NSError(domain: NSURLErrorDomain, code: NSURLErrorNetworkConnectionLost)))
+        precondition(!R.isBackendUnreachable(nil))
+        precondition(!R.isBackendUnreachable(URLError(.cancelled)), "a cancelled request is not an outage")
+        precondition(!R.isBackendUnreachable(URLError(.badServerResponse)))
+        precondition(!R.isBackendUnreachable(NSError(domain: NSPOSIXErrorDomain, code: Int(ECONNREFUSED))))
+        let retry = R()
+        var delays: [TimeInterval] = []
+        while let delay = retry.nextDelay() {
+            precondition(retry.nextDelay() == nil, "one retry pending at a time")
+            delays.append(delay)
+            retry.fired()
+        }
+        precondition(delays == [3, 8, 20, 60, 60, 60, 60] && delays.reduce(0, +) < 330,
+                     "about five minutes, then the reader's own timer")
+        retry.reached()
+        precondition(retry.nextDelay() == 3, "a completed request starts the schedule over")
+        precondition(!R.isBackendUnreachable(URLError(.timedOut)),
+                     "a timeout means something answered; it is not the backend being down")
+        // A completed request, a cancelled one or a timeout schedules nothing.
+        var ran = false
+        R().handle(error: nil) { ran = true }
+        R().handle(error: URLError(.cancelled)) { ran = true }
+        R().handle(error: URLError(.timedOut)) { ran = true }
+        // The real path: handle() with nothing listening runs the retry on the
+        // main queue, once, even when asked twice while it is pending.
+        let short = R(delays: [0.01, 0.01])
+        var runs = 0
+        short.handle(error: URLError(.cannotConnectToHost)) { runs += 1 }
+        short.handle(error: URLError(.cannotConnectToHost)) { runs += 1 }
+        func spin(until done: () -> Bool) {
+            let deadline = Date().addingTimeInterval(5)
+            while !done() && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.01)) }
+        }
+        spin { runs == 1 }
+        precondition(runs == 1 && !ran, "one retry ran for two failures while pending")
+        short.handle(error: URLError(.networkConnectionLost)) { runs += 1 }
+        spin { runs == 2 }
+        precondition(runs == 2, "the second scheduled retry ran")
+        short.handle(error: URLError(.cannotConnectToHost)) { runs += 1 }
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+        precondition(runs == 2, "a spent schedule schedules nothing more")
+        // Seen reachable again: a later outage gets the whole schedule.
+        short.handle(error: nil) { runs += 1 }
+        short.handle(error: URLError(.cannotConnectToHost)) { runs += 1 }
+        spin { runs == 3 }
+        precondition(runs == 3, "the schedule resets once the backend answers")
+    }
+
+    /// Full Disk Access only when the error says so: macOS refused the file
+    /// (EPERM) or SQLite reports "authorization denied".
+    static func checkFailureClassification() {
+        let denied = MessagesReadFailure.classify(systemErrno: EPERM, sqliteCode: SQLITE_CANTOPEN,
+                                                  sqliteMessage: "unable to open database file")
+        precondition(denied.kind == .fullDiskAccess && denied.reason == MessagesReadFailure.fullDiskAccessReason)
+        precondition(denied.reason.contains("Full Disk Access") && denied.reason.contains("turn on Harbor"))
+        precondition(MessagesReadFailure.classify(systemErrno: 0, sqliteCode: SQLITE_AUTH,
+                                                  sqliteMessage: "authorization denied").kind == .fullDiskAccess)
+        precondition(MessagesReadFailure.classify(systemErrno: 0, sqliteCode: SQLITE_ERROR,
+                                                  sqliteMessage: "Authorization denied").kind == .fullDiskAccess)
+        // A plain Unix permission error (a mode-000 file is EACCES; macOS reports
+        // a privacy denial as EPERM), a busy or corrupt store, or an unknown
+        // failure keeps its own reason. Not exercised on a real mode-000 file:
+        // the gate's sandbox refuses to create one.
+        let mode = MessagesReadFailure.classify(systemErrno: EACCES, sqliteCode: SQLITE_CANTOPEN,
+                                                sqliteMessage: "unable to open database file")
+        precondition(mode.kind == .unreadable && mode.reason == "Couldn't read Messages: unable to open database file.")
+        precondition(MessagesReadFailure.classify(systemErrno: 0, sqliteCode: SQLITE_BUSY,
+                                                  sqliteMessage: "database is locked").kind == .unreadable)
+        let blank = MessagesReadFailure.classify(systemErrno: EIO, sqliteCode: SQLITE_IOERR, sqliteMessage: "")
+        precondition(blank.kind == .unreadable && blank.reason.hasPrefix("Couldn't read Messages: ")
+                     && !blank.reason.contains("Full Disk Access"))
+        precondition(MessagesReadFailure.classify(systemErrno: ENOENT, sqliteCode: SQLITE_CANTOPEN,
+                                                  sqliteMessage: "unable to open database file").kind == .missing)
+    }
+}

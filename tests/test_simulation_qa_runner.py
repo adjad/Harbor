@@ -1,0 +1,770 @@
+"""Regression contracts for Simulation QA reporting and child isolation."""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import sys
+import threading
+import time
+
+import pytest
+
+from scripts import run_simulation_qa as simqa
+
+
+def test_full_manifest_covers_the_reviewed_deterministic_test_tree() -> None:
+    discovered = {
+        str(path.relative_to(simqa.ROOT))
+        for path in (simqa.ROOT / "tests").rglob("test_*.py")
+    }
+
+    assert set(simqa._selected_tests(["full"])) == discovered
+    assert "tests/test_assistant_migrations.py" in simqa.PROFILE_TESTS["reliability"]
+    assert "tests/test_assistant_recovery.py" in simqa.PROFILE_TESTS["reliability"]
+    assert "tests/test_broad_web_search.py" in simqa.PROFILE_TESTS["reliability"]
+    assert "tests/test_inference_providers.py" in simqa.PROFILE_TESTS["reliability"]
+    assert "tests/test_broad_web_search.py" in simqa.PROFILE_TESTS["research"]
+    assert "tests/test_email_digest_presentation.py" in simqa.PROFILE_TESTS["sources"]
+    assert "tests/test_privacy_sync.py" in simqa.PROFILE_TESTS["sources"]
+    assert "tests/test_schedule_presentation.py" in simqa.PROFILE_TESTS["sources"]
+    assert "tests/test_scheduled_send_preview.py" in simqa.PROFILE_TESTS["outbound"]
+    assert "tests/test_regression_gate.py" in simqa.PROFILE_TESTS["reliability"]
+    assert "tests/test_current_web_routing.py" in simqa.PROFILE_TESTS["routing"]
+    assert "tests/test_routing_contract_regressions.py" in simqa.PROFILE_TESTS["routing"]
+    assert "tests/test_shell_boundary.py" in simqa.PROFILE_TESTS["safety"]
+
+
+def test_native_manifest_automates_the_privacy_revocation_contract(tmp_path: Path) -> None:
+    gates = dict(simqa._native_gates(tmp_path))
+
+    compile_command = gates["native/privacy-sync-compile"]
+    assert compile_command[0] == simqa.TRUSTED_SWIFTC
+    assert all(Path(command[0]).is_absolute() for command in gates.values())
+    assert "app/Sources/HarborApp/BrowserHistoryReader.swift" in compile_command
+    assert "app/Sources/HarborApp/ContactsReader.swift" in compile_command
+    assert "tests/PrivacySyncChecks.swift" in compile_command
+    assert simqa._NATIVE_GATE_DEPENDENCIES["native/privacy-sync-contract"] == (
+        "native/privacy-sync-compile"
+    )
+
+
+def test_source_text_cannot_reclassify_an_ordinary_pytest_module(
+        monkeypatch, tmp_path: Path) -> None:
+    path = tmp_path / "tests" / "test_adversarial.py"
+    path.parent.mkdir()
+    path.write_text(
+        "# sys.exit(0) and if __name__ == '__main__' are fixture text\n"
+        "def test_real_case(): assert True\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(simqa, "ROOT", tmp_path)
+
+    assert simqa._python_command("tests/test_adversarial.py")[:3] == (
+        [sys.executable, "-m", "pytest"]
+    )
+
+
+def test_legacy_script_cannot_pass_without_reporting_a_test_count() -> None:
+    result = simqa._run(
+        "fixture/empty-legacy",
+        [sys.executable, "-c", "pass"],
+        require_nonzero_count=True,
+    )
+
+    assert simqa._gate_status(result) == "FAIL"
+    assert "did not report a nonzero test count" in result.stderr
+
+
+def test_full_manifest_rejects_an_unreviewed_test_file(
+        monkeypatch, tmp_path: Path) -> None:
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_reviewed.py").write_text("", encoding="utf-8")
+    (tests / "test_unreviewed.py").write_text("", encoding="utf-8")
+    monkeypatch.setattr(simqa, "ROOT", tmp_path)
+    monkeypatch.setattr(simqa, "SAFE_FULL_TESTS", {"tests/test_reviewed.py"})
+
+    with pytest.raises(RuntimeError, match=r"unclassified tests: \['tests/test_unreviewed.py'\]"):
+        simqa._selected_tests(["full"])
+
+
+def test_full_manifest_recursively_rejects_an_unreviewed_nested_test(
+        monkeypatch, tmp_path: Path) -> None:
+    nested = tmp_path / "tests" / "nested"
+    nested.mkdir(parents=True)
+    (nested / "test_unreviewed.py").write_text("def test_case(): pass\n", encoding="utf-8")
+    monkeypatch.setattr(simqa, "ROOT", tmp_path)
+    monkeypatch.setattr(simqa, "SAFE_FULL_TESTS", set())
+
+    with pytest.raises(
+            RuntimeError,
+            match=r"unclassified tests: \['tests/nested/test_unreviewed.py'\]",
+    ):
+        simqa._selected_tests(["full"])
+
+
+def test_obsolete_air_tests_are_not_part_of_the_release_manifest(
+        monkeypatch, tmp_path: Path) -> None:
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    air = tmp_path / "air" / "tests"
+    air.mkdir(parents=True)
+    (air / "test_air.py").write_text("", encoding="utf-8")
+    monkeypatch.setattr(simqa, "ROOT", tmp_path)
+    monkeypatch.setattr(simqa, "SAFE_FULL_TESTS", set())
+
+    assert simqa._selected_tests(["full"]) == []
+
+
+def test_option_shaped_base_sha_is_rejected_before_git_execution(
+        monkeypatch, tmp_path: Path) -> None:
+    marker = tmp_path / "must-not-exist"
+    report = tmp_path.with_name(f"{tmp_path.name}-report.json")
+    monkeypatch.setattr(simqa, "ROOT", tmp_path)
+    monkeypatch.setattr(sys, "argv", [
+        "run_simulation_qa.py",
+        "--expected-sha", "a" * 40,
+        "--base-sha", f"--output={marker}",
+        "--only-native",
+        "--report", str(report),
+    ])
+
+    with pytest.raises(SystemExit, match="2"):
+        simqa.main()
+    assert not marker.exists()
+
+
+def test_unittest_skip_event_leaves_parent_pass_count_unknown() -> None:
+    output = (
+        ".....s.......\n"
+        "----------------------------------------------------------------------\n"
+        "Ran 13 tests in 0.052s\n\n"
+        "OK (skipped=1)\n"
+    )
+    assert simqa._counts(output, 0) == (None, 0, 1)
+
+
+def test_unittest_failures_errors_and_expected_outcomes_are_accounted() -> None:
+    output = (
+        "Ran 7 tests in 0.100s\n\n"
+        "FAILED (failures=1, errors=1, skipped=1, expected failures=1, "
+        "unexpected successes=1)\n"
+    )
+    assert simqa._counts(output, 1) == (None, 3, 2)
+
+
+def test_unittest_subtest_failures_do_not_invent_parent_pass_count() -> None:
+    output = "Ran 2 tests in 0.010s\n\nFAILED (failures=2)\n"
+    assert simqa._counts(output, 1) == (None, 2, 0)
+
+
+def test_unittest_failed_status_without_details_is_incomplete() -> None:
+    output = "Ran 2 tests in 0.010s\n\nFAILED\n"
+    assert simqa._counts(output, 1) == (None, None, 0)
+
+
+def test_actual_unittest_skipped_subtests_are_incomplete() -> None:
+    fixture = """
+import unittest
+
+class Fixture(unittest.TestCase):
+    def test_skipped_subtests(self):
+        for item in range(2):
+            with self.subTest(item=item):
+                self.skipTest('fixture skip')
+
+    def test_passing_parent(self):
+        self.assertTrue(True)
+
+unittest.main()
+"""
+    result = simqa._run(
+        "fixture/skipped-subtests", [sys.executable, "-c", fixture]
+    )
+    assert (result.passed, result.failed, result.skipped) == (None, 0, 2)
+    totals = simqa._totals([result], 0.0)
+    assert totals["counts_complete"] is False
+    assert totals["incomplete_gates"] == 1
+
+
+def test_pytest_summary_accepts_any_outcome_order() -> None:
+    assert simqa._counts("2 failed, 14 passed, 1 skipped in 0.39s\n", 1) == (14, 2, 1)
+    assert simqa._counts("31 passed, 1 skipped in 0.29s\n", 0) == (31, 0, 1)
+
+
+def test_partial_pytest_summary_does_not_invent_failed_count() -> None:
+    assert simqa._counts("14 passed\nINTERNALERROR> collection aborted\n", 3) == (14, None, 0)
+
+
+def test_legacy_counter_and_native_check_summaries_are_counted() -> None:
+    assert simqa._counts("29 passed, 0 failed\n", 0) == (29, 0, 0)
+    assert simqa._counts("ok: 85 prompts validated (47 intercepted cases)\n", 0) == (
+        85, 0, 0,
+    )
+    assert simqa._counts("Research Library: 95 native checks passed\n", 0) == (95, 0, 0)
+    assert simqa._counts("PrivacySync: 14 synthetic contract scenarios passed\n", 0) == (
+        14, 0, 0,
+    )
+
+
+def test_commands_without_a_count_contract_are_explicitly_unreported() -> None:
+    assert simqa._counts("Build complete!\n", 0) == (None, None, None)
+    result = simqa.GateResult("compile", ["fixture"], 0, 0.1, None, None, None, "", "")
+    totals = simqa._totals([result], 0.1)
+    assert totals == {
+        "gates": 1, "passed_gates": 1, "failed_gates": 0, "blocked_gates": 0,
+        "reported_gates": 0, "unreported_gates": 1, "incomplete_gates": 1,
+        "counts_complete": False,
+        "passed": 0, "failed": 0, "skipped": 0, "duration_s": 0.1,
+    }
+
+
+def test_child_process_uses_fake_home_and_strips_host_harbor_overrides(
+        monkeypatch, tmp_path: Path) -> None:
+    # Prefix forwarding has its own positive contract; this probe covers the
+    # remaining host overrides independently of its caller's sandbox prefix.
+    monkeypatch.delenv("HARBOR_BUILD_FIXTURE_PREFIX", raising=False)
+    hostile_home = tmp_path / "host-home"
+    hostile_template = hostile_home / "installed-template.jinja"
+    hostile_template.parent.mkdir()
+    hostile_template.write_text("host template must not be read")
+    monkeypatch.setenv("HOME", str(hostile_home))
+    monkeypatch.setenv("CODEX_HOME", str(hostile_home / ".codex"))
+    monkeypatch.setenv("HARBOR_LING_TEMPLATE", str(hostile_template))
+    monkeypatch.setenv("HARBOR_LIVE_REMINDER_TEST", "1")
+    monkeypatch.setenv("HARBOR_MAIL_REPLY_LIVE", "1")
+    monkeypatch.setenv("HARBOR_QA_SEED", "1")
+    monkeypatch.setenv("HARBOR_SANDBOX_HOME", str(hostile_home / "sandbox"))
+    monkeypatch.setenv("HARBOR_BRAVE_SEARCH_API_KEY", "host-secret")
+    monkeypatch.setenv("HARBOR_OPENALEX_API_KEY", "host-secret")
+    monkeypatch.setenv("PYTHONOPTIMIZE", "1")
+    monkeypatch.setenv("BASH_ENV", str(hostile_home / "bash-env.sh"))
+    monkeypatch.setenv("ENV", str(hostile_home / "sh-env.sh"))
+    monkeypatch.setenv("ZDOTDIR", str(hostile_home / "zsh"))
+    monkeypatch.setenv("SHELLOPTS", "xtrace")
+    monkeypatch.setenv("BASH_FUNC_printf%%", "() { builtin printf inherited; }")
+
+    probe = (
+        "import json, os, sys; from pathlib import Path; "
+        "print(json.dumps({'home': str(Path.home()), 'home_exists': Path.home().is_dir(), "
+        "'harbor_home': os.environ['HARBOR_HOME'], 'harborair_home': os.environ['HARBORAIR_HOME'], "
+        "'optimize': sys.flags.optimize, 'optimize_env': os.environ.get('PYTHONOPTIMIZE'), "
+        "'startup_env': sorted(k for k in ('BASH_ENV', 'ENV', 'ZDOTDIR', 'SHELLOPTS') "
+        "if k in os.environ), "
+        "'exported_functions': sorted(k for k in os.environ if k.startswith('BASH_FUNC_')), "
+        "'present': sorted(k for k in os.environ if k.startswith('HARBOR_') or k == 'CODEX_HOME')}))"
+    )
+    result = simqa._run("fixture/environment", [sys.executable, "-c", probe])
+    payload = json.loads(result.stdout)
+    assert result.returncode == 0
+    assert (result.passed, result.failed, result.skipped) == (None, None, None)
+    assert payload["home_exists"]
+    assert payload["home"] != str(hostile_home)
+    assert Path(payload["harbor_home"]).parent == Path(payload["home"]).parent
+    assert Path(payload["harborair_home"]).parent == Path(payload["home"]).parent
+    assert payload["present"] == ["HARBOR_HOME", "HARBOR_TEST_PYTHON"]
+    assert payload["optimize"] == 0
+    assert payload["optimize_env"] == "0"
+    assert payload["startup_env"] == []
+    assert payload["exported_functions"] == []
+
+
+def test_child_environment_drops_host_path_plugins_loaders_and_generic_secrets(
+        monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("PATH", str(tmp_path / "host-shims"))
+    monkeypatch.setenv("PYTEST_PLUGINS", "host_plugin")
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "host-python"))
+    monkeypatch.setenv("DYLD_INSERT_LIBRARIES", str(tmp_path / "host.dylib"))
+    monkeypatch.setenv("LD_PRELOAD", str(tmp_path / "host.so"))
+    monkeypatch.setenv("SIMQA_FAKE_SECRET", "must-not-leak")
+    monkeypatch.setenv("NODE_OPTIONS", "--require=/private/host-hook.js")
+    monkeypatch.setenv("NODE_PATH", "/private/host-modules")
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    env = simqa._child_environment(state_dir, include_node_runtime=True)
+
+    assert env["PATH"] == simqa.TRUSTED_PATH
+    assert env["PYTHONPATH"] == str(simqa.ROOT)
+    assert env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] == "1"
+    assert env["QA_NODE_RUNTIME"] == str(simqa.resolve_node_runtime())
+    for key in (
+        "PYTEST_PLUGINS", "DYLD_INSERT_LIBRARIES", "LD_PRELOAD", "SIMQA_FAKE_SECRET", "NODE_OPTIONS", "NODE_PATH",
+    ):
+        assert key not in env
+    assert simqa.TRUSTED_GIT == "/usr/bin/git"
+
+
+def test_node_runtime_pin_rejects_arbitrary_path(monkeypatch, tmp_path):
+    monkeypatch.setenv("QA_NODE_RUNTIME", str(tmp_path / "attacker-node"))
+    with pytest.raises(RuntimeError, match="validated selection"):
+        simqa._child_environment(tmp_path, include_node_runtime=True)
+
+
+def test_missing_node_is_a_reportable_failed_gate_and_unrelated_gates_run(monkeypatch, tmp_path):
+    def missing(*args):
+        raise simqa.NodeRuntimeError("Node is required")
+    monkeypatch.setattr(simqa, "resolve_node_runtime", missing)
+    result = simqa._run("tests/browser_dom/test_page_extractor.py",
+        [sys.executable, "-c", "raise AssertionError('must not launch')"])
+    assert simqa._gate_status(result) == "FAIL"
+    assert result.returncode is None
+    assert "Node is required" in result.launch_error
+    # Same serializable record used in the final QA JSON report.
+    from dataclasses import asdict
+    report = json.loads(json.dumps(asdict(result)))
+    assert "Node is required" in report["launch_error"]
+    unrelated = simqa._run("fixture/unrelated", [sys.executable, "-c", "print('1 passed')"])
+    assert simqa._gate_status(unrelated) == "PASS"
+    assert "QA_NODE_RUNTIME" not in simqa._child_environment(tmp_path)
+
+
+def test_node_selection_has_fixed_order_and_requires_execute_permission(monkeypatch):
+    import io
+    import os
+    choices = ("/usr/local/bin/node", "/opt/homebrew/bin/node")
+    original_resolve = Path.resolve
+    original_open = Path.open
+    monkeypatch.setattr(Path, "is_file", lambda p: str(p) in choices)
+    monkeypatch.setattr(Path, "resolve", lambda p, *a, **k: p if str(p) in choices else original_resolve(p, *a, **k))
+    monkeypatch.setattr(Path, "open", lambda p, *a, **k: io.BytesIO(b"\xcf\xfa\xed\xfe") if str(p) in choices else original_open(p, *a, **k))
+    monkeypatch.setattr(os, "access", lambda p, mode: str(p) == choices[1])
+    assert str(simqa.resolve_node_runtime()) == choices[1]
+    monkeypatch.setattr(os, "access", lambda p, mode: True)
+    assert str(simqa.resolve_node_runtime()) == choices[0]
+    monkeypatch.setattr(Path, "open", lambda p, *a, **k: io.BytesIO(b"#!/bin/sh"))
+    with pytest.raises(RuntimeError, match="native macOS executable"):
+        simqa.resolve_node_runtime()
+
+
+def test_python_assertions_remain_enabled_under_host_optimization(
+        monkeypatch) -> None:
+    monkeypatch.setenv("PYTHONOPTIMIZE", "1")
+    result = simqa._run(
+        "fixture/assertions",
+        [sys.executable, "-c", "assert False, 'must execute'"],
+    )
+    assert simqa._gate_status(result) == "FAIL"
+    assert result.returncode == 1
+    assert "AssertionError: must execute" in result.stderr
+
+
+def test_bash_startup_hook_is_removed_before_child_launch(
+        monkeypatch, tmp_path: Path) -> None:
+    marker = tmp_path / "outside-child-home.marker"
+    hook = tmp_path / "host-bash-env.sh"
+    hook.write_text(f"printf inherited > {marker}\n", encoding="utf-8")
+    monkeypatch.setenv("BASH_ENV", str(hook))
+
+    result = simqa._run("fixture/bash", ["bash", "-c", "printf safe"])
+
+    assert simqa._gate_status(result) == "PASS"
+    assert result.stdout == "safe"
+    assert not marker.exists()
+
+
+def test_exported_bash_function_is_removed_before_child_launch(
+        monkeypatch, tmp_path: Path) -> None:
+    marker = tmp_path / "outside-child-home.marker"
+    monkeypatch.setenv(
+        "BASH_FUNC_printf%%",
+        f'() {{ builtin printf inherited > {marker}; builtin printf "$@"; }}',
+    )
+
+    hostile = simqa._run(
+        "fixture/exported-bash-function", ["/bin/bash", "-c", "printf safe"]
+    )
+    monkeypatch.delenv("BASH_FUNC_printf%%")
+    clean = simqa._run(
+        "fixture/no-exported-bash-function", ["/bin/bash", "-c", "printf safe"]
+    )
+
+    assert simqa._gate_status(hostile) == "PASS"
+    assert hostile.stdout == "safe"
+    assert simqa._gate_status(clean) == "PASS"
+    assert clean.stdout == "safe"
+    assert not marker.exists()
+
+
+def _fake_git_state(*, expected: str, ending: str | None = None,
+                    ending_dirty: str = ""):
+    revs = iter((expected, ending or expected))
+    statuses = iter(("", ending_dirty))
+
+    def fake_git(*args: str) -> str:
+        if args[:2] == ("rev-parse", "HEAD"):
+            return next(revs)
+        if args[:2] == ("status", "--porcelain"):
+            return next(statuses)
+        raise AssertionError(args)
+
+    return fake_git
+
+
+def test_report_destination_inside_candidate_is_rejected(
+        monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(simqa, "ROOT", tmp_path)
+    monkeypatch.setattr(sys, "argv", [
+        "run_simulation_qa.py", "--expected-sha", "a" * 40,
+        "--only-native", "--report", str(tmp_path / "report.json"),
+    ])
+
+    with pytest.raises(SystemExit, match="2"):
+        simqa.main()
+
+
+def test_main_fails_and_reports_when_gate_dirties_checkout(
+        monkeypatch, tmp_path: Path) -> None:
+    expected = "a" * 40
+    report = tmp_path / "dirty-report.json"
+    monkeypatch.setattr(
+        simqa, "_git",
+        _fake_git_state(expected=expected, ending_dirty=" M tracked.txt"),
+    )
+    monkeypatch.setattr(simqa, "_native_gates", lambda _build: [])
+    monkeypatch.setattr(sys, "argv", [
+        "run_simulation_qa.py", "--expected-sha", expected,
+        "--only-native", "--report", str(report),
+    ])
+
+    assert simqa.main() == 1
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    assert payload["status"] == "FAIL"
+    assert payload["sha_stable"] is True
+    assert payload["worktree_clean"] is False
+    assert payload["ending_dirty"] == [" M tracked.txt"]
+
+
+def test_main_fails_and_reports_when_head_changes(
+        monkeypatch, tmp_path: Path) -> None:
+    expected = "a" * 40
+    ending = "b" * 40
+    report = tmp_path / "sha-report.json"
+    monkeypatch.setattr(
+        simqa, "_git", _fake_git_state(expected=expected, ending=ending),
+    )
+    monkeypatch.setattr(simqa, "_native_gates", lambda _build: [])
+    monkeypatch.setattr(sys, "argv", [
+        "run_simulation_qa.py", "--expected-sha", expected,
+        "--only-native", "--report", str(report),
+    ])
+
+    assert simqa.main() == 1
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    assert payload["status"] == "FAIL"
+    assert payload["sha_stable"] is False
+    assert payload["ending_sha"] == ending
+    assert payload["worktree_clean"] is True
+
+
+@pytest.mark.parametrize("jobs", ["1", "4"])
+def test_native_launch_error_is_reported_and_dependent_gate_is_blocked(
+        monkeypatch, tmp_path: Path, jobs: str) -> None:
+    expected = "a" * 40
+    report = tmp_path / "launch-report.json"
+    missing_compiler = tmp_path / "missing-compiler"
+    missing_binary = tmp_path / "missing-binary"
+    monkeypatch.setattr(simqa, "_git", _fake_git_state(expected=expected))
+    monkeypatch.setattr(simqa, "_native_gates", lambda _build: [
+        ("native/mail-db-compile", [str(missing_compiler)]),
+        ("native/mail-db-contract", [str(missing_binary)]),
+    ])
+    monkeypatch.setattr(sys, "argv", [
+        "run_simulation_qa.py", "--expected-sha", expected,
+        "--only-native", "--report", str(report), "--jobs", jobs,
+    ])
+
+    assert simqa.main() == 1
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 3
+    assert payload["status"] == "FAIL"
+    assert payload["worktree_clean"] is True
+    assert payload["totals"]["failed_gates"] == 1
+    assert payload["totals"]["blocked_gates"] == 1
+    compile_gate, contract_gate = payload["results"]
+    assert compile_gate["status"] == "FAIL"
+    assert compile_gate["returncode"] is None
+    assert compile_gate["launch_error"].startswith("FileNotFoundError:")
+    assert contract_gate["status"] == "BLOCKED"
+    assert contract_gate["blocked_by"] == "native/mail-db-compile"
+    assert contract_gate["launch_error"] is None
+
+
+def test_child_environment_preserves_only_valid_native_fixture_prefix(monkeypatch, tmp_path):
+    monkeypatch.setenv("HARBOR_BUILD_FIXTURE_PREFIX", "harborqa-owned-run_123")
+    monkeypatch.setenv("HARBOR_BUILD_OTHER_SECRET", "must-not-leak")
+    env = simqa._child_environment(tmp_path)
+    assert env["HARBOR_BUILD_FIXTURE_PREFIX"] == "harborqa-owned-run_123"
+    assert "HARBOR_BUILD_OTHER_SECRET" not in env
+
+
+@pytest.mark.parametrize("prefix", ["", "diagnostic-checks", "harborqa-../outside", "harborqa-a/b",
+                                    "harborqa-a\n", "harborqa-a;exit", "harborqa-" + "a" * 65])
+def test_child_environment_refuses_invalid_native_fixture_prefix(monkeypatch, tmp_path, prefix):
+    monkeypatch.setenv("HARBOR_BUILD_FIXTURE_PREFIX", prefix)
+    with pytest.raises(RuntimeError, match="Invalid native fixture prefix"):
+        simqa._child_environment(tmp_path)
+
+
+def test_run_forwards_valid_fixture_prefix_to_native_contract(monkeypatch):
+    monkeypatch.setenv("HARBOR_BUILD_FIXTURE_PREFIX", "harborqa-owned-run_123")
+    result = simqa._run("fixture/native-prefix", [sys.executable, "-c",
+        "import os; assert os.environ['HARBOR_BUILD_FIXTURE_PREFIX'] == 'harborqa-owned-run_123'; print('1 passed')"])
+    assert simqa._gate_status(result) == "PASS"
+    assert result.passed == 1
+
+
+# --- Parallel scheduling -----------------------------------------------------
+
+def _fixture_report(monkeypatch, tmp_path: Path, jobs: str, name: str) -> tuple[int, dict]:
+    """Run main() over real child processes whose finish order is reversed."""
+    expected = "a" * 40
+    tests = [f"tests/test_fixture_{index}.py" for index in range(6)]
+    # Earlier modules sleep longer, so a parallel run finishes them last.
+    sleeps = {path: 0.05 * (len(tests) - index) for index, path in enumerate(tests)}
+    outcomes = {path: ("print('1 failed, 2 passed'); raise SystemExit(1)" if index == 2
+                       else f"print('{index + 1} passed, 1 skipped')")
+                for index, path in enumerate(tests)}
+    monkeypatch.setattr(simqa, "_git", _fake_git_state(expected=expected))
+    monkeypatch.setattr(simqa, "_selected_tests", lambda _profiles: list(tests))
+    monkeypatch.setattr(simqa, "_dependencies", lambda: {})
+    monkeypatch.setattr(simqa, "_python_command", lambda path: [
+        sys.executable, "-c", f"import time; time.sleep({sleeps[path]}); {outcomes[path]}"])
+    ok = [sys.executable, "-c", "print('3 checks passed')"]
+    monkeypatch.setattr(simqa, "_native_gates", lambda _build: [
+        ("native/a-compile", [sys.executable, "-c", "raise SystemExit(2)"]),
+        ("native/a-contract", ok),
+        ("native/b-compile", [sys.executable, "-c", "pass"]),
+        ("native/b-contract", ok),
+    ])
+    monkeypatch.setitem(simqa._NATIVE_GATE_DEPENDENCIES, "native/a-contract", "native/a-compile")
+    monkeypatch.setitem(simqa._NATIVE_GATE_DEPENDENCIES, "native/b-contract", "native/b-compile")
+    report = tmp_path / f"{name}.json"
+    monkeypatch.setattr(sys, "argv", [
+        "run_simulation_qa.py", "--expected-sha", expected, "--report", str(report), "--jobs", jobs,
+    ])
+    code = simqa.main()
+    return code, json.loads(report.read_text(encoding="utf-8"))
+
+
+def _without_timings(report: dict) -> dict:
+    report = json.loads(json.dumps(report))
+    report["totals"].pop("duration_s")
+    for item in report["results"]:
+        item.pop("duration_s")
+    return report
+
+
+def test_parallel_report_is_identical_to_sequential_apart_from_timings(
+        monkeypatch, tmp_path: Path) -> None:
+    sequential_code, sequential = _fixture_report(monkeypatch, tmp_path, "1", "sequential")
+    parallel_code, parallel = _fixture_report(monkeypatch, tmp_path, "4", "parallel")
+
+    assert sequential_code == parallel_code == 1
+    assert _without_timings(parallel) == _without_timings(sequential)
+    assert list(parallel) == list(sequential)                            # same schema, same key order
+    assert [item["name"] for item in parallel["results"]] == [
+        *(f"tests/test_fixture_{index}.py" for index in range(6)),
+        "native/a-compile", "native/a-contract", "native/b-compile", "native/b-contract",
+    ]
+    statuses = {item["name"]: item["status"] for item in parallel["results"]}
+    assert statuses["tests/test_fixture_2.py"] == "FAIL"
+    assert statuses["native/a-contract"] == "BLOCKED"                   # dependency kept under concurrency
+    assert statuses["native/b-contract"] == "PASS"
+    assert parallel["totals"]["failed_gates"] == 2 and parallel["totals"]["blocked_gates"] == 1
+    assert parallel["status"] == "FAIL"
+
+
+def test_parallel_jobs_run_gates_concurrently_through_the_patched_runner(monkeypatch) -> None:
+    # simulation.py substitutes _run; the pool must still call the substitute.
+    barrier = threading.Barrier(3, timeout=10)
+
+    def fake_run(name, command, cwd=simqa.ROOT, *, require_nonzero_count=False):
+        barrier.wait()                                                      # only passes if 3 run at once
+        return simqa.GateResult(name, command, 0, 0.0, 1, 0, 0, "", "")
+
+    monkeypatch.setattr(simqa, "_run", fake_run)
+    results = simqa._run_gates(["tests/c.py", "tests/a.py", "tests/b.py"], False, 3)
+
+    assert [item.name for item in results] == ["tests/c.py", "tests/a.py", "tests/b.py"]
+
+
+def test_one_job_runs_every_gate_sequentially_in_selection_order(monkeypatch) -> None:
+    order, active, peak = [], [0], [0]
+    lock = threading.Lock()
+
+    def fake_run(name, command, cwd=simqa.ROOT, *, require_nonzero_count=False):
+        with lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+            order.append(name)
+        time.sleep(0.01)
+        with lock:
+            active[0] -= 1
+        return simqa.GateResult(name, command, 0, 0.0, 1, 0, 0, "", "")
+
+    monkeypatch.setattr(simqa, "_run", fake_run)
+    monkeypatch.setattr(simqa, "_native_gates", lambda _build: [("native/x", ["x"]), ("native/y", ["y"])])
+    results = simqa._run_gates(["tests/b.py", "tests/a.py"], True, 1)
+
+    assert peak[0] == 1
+    assert order == [item.name for item in results] == ["tests/b.py", "tests/a.py", "native/x", "native/y"]
+
+
+def test_default_jobs_is_one_per_cpu_and_never_zero(monkeypatch) -> None:
+    monkeypatch.setattr(simqa.os, "cpu_count", lambda: 3)
+    assert simqa.default_jobs() == 3
+    monkeypatch.setattr(simqa.os, "cpu_count", lambda: None)
+    assert simqa.default_jobs() == 1
+
+
+@pytest.mark.parametrize("jobs", ["0", "-1"])
+def test_jobs_must_be_positive(monkeypatch, tmp_path: Path, jobs: str) -> None:
+    monkeypatch.setattr(sys, "argv", [
+        "run_simulation_qa.py", "--expected-sha", "a" * 40, "--only-native",
+        "--report", str(tmp_path / "report.json"), "--jobs", jobs,
+    ])
+    with pytest.raises(SystemExit, match="2"):
+        simqa.main()
+
+
+# --- Regression gate: parallelism and pull-request dedupe --------------------
+
+def _regression_fixture(monkeypatch, tmp_path: Path):
+    from scripts import test_replay_failure_fixes as gate
+    tests = tmp_path / "tests"
+    tests.mkdir(exist_ok=True)
+    paths = []
+    for index in range(5):
+        path = tests / f"test_case_{index}.py"
+        path.write_text("", encoding="utf-8")
+        paths.append(path)
+    monkeypatch.setattr(gate, "ROOT", tmp_path)
+    # Earlier modules finish last; module 3 fails.
+    monkeypatch.setattr(gate, "_command", lambda path: [
+        sys.executable, "-c",
+        f"import time; time.sleep({0.05 * (5 - paths.index(path))}); "
+        f"raise SystemExit({1 if path.name == 'test_case_3.py' else 0})"])
+    return gate, paths
+
+
+def _summary(output: str) -> list[str]:
+    return [line for line in output.splitlines()
+            if line.startswith(("Regression gate: ", "REGRESSION: ", "KNOWN FAILURE", "BASELINE"))
+            and "parallel jobs" not in line]
+
+
+def test_parallel_regression_gate_matches_the_sequential_verdict(monkeypatch, tmp_path, capfd) -> None:
+    gate, _paths = _regression_fixture(monkeypatch, tmp_path)
+
+    assert gate.main(["--jobs", "1"]) == 1
+    sequential = _summary(capfd.readouterr().out)
+    assert gate.main(["--jobs", "4"]) == 1
+    parallel = _summary(capfd.readouterr().out)
+
+    assert sequential == parallel == [
+        "Regression gate: 4/5 test modules passed", "REGRESSION: tests/test_case_3.py"]
+
+
+def test_regression_gate_rejects_nonpositive_jobs(monkeypatch, tmp_path) -> None:
+    gate, _paths = _regression_fixture(monkeypatch, tmp_path)
+    with pytest.raises(SystemExit, match="2"):
+        gate.main(["--jobs", "0"])
+
+
+def test_pull_request_regressions_run_exactly_what_simulation_qa_does_not(
+        monkeypatch, tmp_path, capfd) -> None:
+    gate, paths = _regression_fixture(monkeypatch, tmp_path)
+    covered = {f"tests/{path.name}" for path in paths if path.name != "test_case_3.py"}
+    monkeypatch.setattr(simqa, "SAFE_FULL_TESTS", covered)
+
+    assert gate._outside_simulation_qa(paths) == [tmp_path / "tests/test_case_3.py"]
+    assert gate.main(["--only-outside-simulation-qa", "--jobs", "2"]) == 1   # the uncovered failure still blocks
+    output = capfd.readouterr().out
+    assert "Regression gate: 0/1 test modules passed" in output
+    assert "REGRESSION: tests/test_case_3.py" in output
+
+    monkeypatch.setattr(simqa, "SAFE_FULL_TESTS", covered | {"tests/test_case_3.py"})
+    assert gate.main(["--only-outside-simulation-qa"]) == 0
+    assert "Regression gate: 0/0 test modules passed" in capfd.readouterr().out
+
+
+def test_pull_request_supplement_keeps_socket_branches_and_uncovered_modules(
+        monkeypatch, tmp_path) -> None:
+    from scripts import test_replay_failure_fixes as gate
+    monkeypatch.setattr(gate, "ROOT", tmp_path)
+    names = ["tests/test_covered.py", "tests/test_bundled_engine.py",
+             "tests/test_uncovered.py", "tests/test_bundled_attribution.py"]
+    paths = [tmp_path / name for name in names]
+    monkeypatch.setattr(simqa, "SAFE_FULL_TESTS", set(names) - {"tests/test_uncovered.py"})
+
+    selected = gate._outside_simulation_qa(paths)
+    assert selected == paths[1:]  # Stable order, including already-listed socket modules.
+    assert len(selected) == len(set(selected))
+    # A socket module missing from the sandbox manifest is still selected once.
+    monkeypatch.setattr(simqa, "SAFE_FULL_TESTS", {"tests/test_covered.py"})
+    assert gate._outside_simulation_qa(paths) == selected
+
+
+def test_real_manifest_runs_unrestricted_engine_socket_branches_on_pull_requests() -> None:
+    from scripts import test_replay_failure_fixes as gate
+    discovered = gate._tests()
+    selected = {str(path.relative_to(gate.ROOT))
+                for path in gate._outside_simulation_qa(discovered)}
+    expected = {"tests/test_bundled_attribution.py", "tests/test_bundled_engine.py"}
+    assert gate.UNSANDBOXED_SOCKET_TESTS == expected
+    assert selected == expected
+    assert expected <= set(simqa.SAFE_FULL_TESTS)
+
+
+def test_parallel_start_hint_changes_only_scheduling(monkeypatch) -> None:
+    started = []
+    lock = threading.Lock()
+
+    def fake_run(name, command, cwd=simqa.ROOT, *, require_nonzero_count=False):
+        with lock:
+            started.append(name)
+        return simqa.GateResult(name, command, 0, 0.0, 1, 0, 0, "", "")
+
+    monkeypatch.setattr(simqa, "_run", fake_run)
+    monkeypatch.setattr(simqa, "_START_FIRST", ("tests/z.py", "tests/not-selected.py"))
+    tests = ["tests/a.py", "tests/m.py", "tests/z.py"]
+    results = simqa._run_gates(tests, False, 1)
+    assert started == tests                                                 # --jobs 1: historical order
+    started.clear()
+    results = simqa._run_gates(tests, False, 2)
+    assert sorted(started) == sorted(tests)                                 # nothing added or dropped
+    assert [item.name for item in results] == tests                         # report keeps selection order
+    assert simqa._submission_order(tests) == ["tests/z.py", "tests/a.py", "tests/m.py"]   # long pole queued first
+
+
+def test_timing_budget_modules_run_alone_after_the_pool(monkeypatch) -> None:
+    events, lock, active = [], threading.Lock(), [0]
+
+    def fake_run(name, command, cwd=simqa.ROOT, *, require_nonzero_count=False):
+        with lock:
+            active[0] += 1
+            events.append((name, active[0]))
+        time.sleep(0.02)
+        with lock:
+            active[0] -= 1
+        return simqa.GateResult(name, command, 0, 0.0, 1, 0, 0, "", "")
+
+    monkeypatch.setattr(simqa, "_run", fake_run)
+    monkeypatch.setattr(simqa, "_native_gates", lambda _build: [("native/x", ["x"])])
+    monkeypatch.setattr(simqa, "RUN_ALONE_TESTS", frozenset({"tests/b.py"}))
+    tests = ["tests/a.py", "tests/b.py", "tests/c.py", "tests/d.py"]
+    results = simqa._run_gates(tests, True, 4)
+
+    assert [item.name for item in results] == [*tests, "native/x"]
+    assert events[-1] == ("tests/b.py", 1)                                  # last, and alone
+
+
+def test_regression_gate_runs_timing_budget_modules_alone(monkeypatch, tmp_path, capfd) -> None:
+    gate, paths = _regression_fixture(monkeypatch, tmp_path)
+    monkeypatch.setattr(gate, "RUN_ALONE_TESTS", frozenset({"tests/test_case_0.py"}))
+    assert gate.main(["--jobs", "4"]) == 1
+    output = capfd.readouterr().out
+    running = [line for line in output.splitlines() if line.startswith("Running: ")]
+    assert len(running) == 5 and "test_case_0.py" not in " ".join(running[:4])
+    assert _summary(output) == ["Regression gate: 4/5 test modules passed", "REGRESSION: tests/test_case_3.py"]

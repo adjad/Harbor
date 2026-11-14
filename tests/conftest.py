@@ -1,0 +1,71 @@
+"""Credential recovery checks always use per-test synthetic state."""
+import sys
+
+import pytest
+
+
+# These suites exercise the supported legacy rollback path and its original
+# router/task/provider contracts. New default-on/model-led suites are excluded.
+LEGACY_ROUTER_SUITES = frozenset({
+    "test_diagnostics.py", "test_approval_routing.py", "test_super_model_routing.py",
+    "test_turn_engine_calls.py", "test_agent_disconnect.py",
+    "test_read_context_continuations.py", "test_local_provider_settings.py",
+    "test_lazy_inference_readiness.py", "test_outbound_content_provenance.py",
+    "test_typed_task_engine.py", "test_typed_reminder_operations.py",
+    "test_workflow_engine.py", "test_web_response_followup.py",
+    "test_replay_failure_fixes.py",
+    "test_fast_path_intent.py", "test_router_everyday_prompts.py",
+})
+
+
+@pytest.fixture(autouse=True)
+def explicit_legacy_router_for_rollback_suites(request, monkeypatch):
+    if request.path.name in LEGACY_ROUTER_SUITES:
+        monkeypatch.setenv("HARBOR_MODEL_LED_ROUTING", "0")
+        # Since 0.5.0-rc3 the packaged model_only is on, and it forces
+        # model-led discovery whatever HARBOR_MODEL_LED_ROUTING says. The
+        # rollback these suites cover is the documented HARBOR_MODEL_ONLY=false.
+        monkeypatch.setenv("HARBOR_MODEL_ONLY", "0")
+
+
+@pytest.fixture(autouse=True)
+def isolated_user_hours(tmp_path, monkeypatch):
+    # service/user_hours.py seeds its file on the first read, from the store beside
+    # it. A subfolder here, so no test reaches ~/.moe or a test's own assistant.db.
+    from service import user_hours
+    monkeypatch.setattr(user_hours, "path", lambda: tmp_path / "user-hours-state" / "user_hours.json")
+    # Delivery reads the wall clock, so no test's events should depend on when it runs.
+    # tests/test_quiet_hold.py turns this back on.
+    from service import quiet_hold
+    monkeypatch.setattr(quiet_hold, "_quiet_now", lambda: False)
+
+
+@pytest.fixture(autouse=True)
+def no_chat_left_over(monkeypatch):
+    # A turn a test ran stays on service/idle's clock, and brief_pace reads that as a chat
+    # still going for 3 minutes, so a later test's Brief wouldn't start.
+    from service import idle
+    monkeypatch.setattr(idle, "_foreground_turns", 0)
+    monkeypatch.setattr(idle, "_last_turn", None)
+    # Only if some test imported them: no module here needs to load for this.
+    saver = sys.modules.get("service.memory_saver")
+    if saver is not None:
+        monkeypatch.setattr(saver._state, "last_intent", None)
+    pace = sys.modules.get("service.brief_pace")
+    if pace is not None:
+        pace._holds.clear()
+
+
+@pytest.fixture(autouse=True)
+def no_real_brief_in_schedule_reads(monkeypatch):
+    # get_upcoming merges the Brief's dated to-dos from the real proactive
+    # store; tests that want them turn this back on with a fake snapshot.
+    monkeypatch.setenv("HARBOR_SCHEDULE_BRIEF_ITEMS", "0")
+
+
+@pytest.fixture(autouse=True)
+def isolated_credential_quarantine(tmp_path, monkeypatch):
+    from service.config import quarantine, credentials
+    gate = quarantine.RecoveryGate(home=lambda: tmp_path)
+    gate.callbacks.append(credentials._VALUES.clear)
+    monkeypatch.setattr(quarantine, "_gate", gate)

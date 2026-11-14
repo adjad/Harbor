@@ -1,0 +1,749 @@
+"""Tool-subset scoping — regression tests.
+
+Two facts drive this file.
+
+1. A long tool list measurably degrades tool SELECTION. The project's own
+   measurement, same prompt and decoding: 5-7 domain tools -> 3/3 correct calls,
+   all 44 -> 2/3, and it reached for an unrelated tool. Scoping is a reliability
+   measure first and a token saving second.
+
+2. Before this, 24 of 55 registered tools — 44% of the registry — were reachable
+   ONLY by falling through to the undifferentiated full-toolset route. Device
+   control, apps and media, and live-web lookups were the three big clusters
+   with no home of their own, so every "what's my battery", "play some music"
+   and "what's the weather" paid ~13,300 tokens of fixed overhead and got the
+   worst selection accuracy available.
+
+What must keep holding:
+  * every registered tool is reachable through SOME scoped route, a
+    demonstrated final route, or retrieval aliases;
+  * the ambiguous fallback offers the core set, not the whole registry, and
+    still includes installed SKILL tools — those are directly callable, so a
+    static core silently breaks skill invocation;
+  * a request naming the user's own data keeps the full toolset when the intent
+    is genuinely two-way ("open my calendar" could be open_app or get_upcoming);
+  * the warm read-out voice (_LIGHT_READ_STYLE) is applied to personal-data
+    reads ONLY — never to device control, web lookups, or the fallback.
+
+    .venv/bin/python tests/test_router_scoping.py
+"""
+from __future__ import annotations
+
+import asyncio
+import os
+import sys
+
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from service import skills  # noqa: E402
+from service.skills import load as load_skills  # noqa: E402
+
+import service.router.router as R  # noqa: E402
+from service.router.router import route  # noqa: E402
+from service.router.tool_aliases import apply as apply_aliases  # noqa: E402
+from service.tools import tool_schemas  # noqa: E402
+from service.tools.registry import REGISTRY  # noqa: E402
+
+
+@pytest.fixture(scope="module", autouse=True)
+def isolated_skill_registry():
+    """Load skill tools for these routes without leaking them into other files."""
+    original_registry = REGISTRY.copy()
+    original_aliases = {name: list(tool.aliases)
+                        for name, tool in original_registry.items()}
+    original_skills = skills._skills
+    original_tools_module = sys.modules.get("service.skills.tools")
+    original_registered = (set(original_tools_module._registered)
+                           if original_tools_module else set())
+    had_tools_attribute = hasattr(skills, "tools")
+    original_tools_attribute = getattr(skills, "tools", None)
+
+    try:
+        load_skills()  # register use_skill + the user's installed skill tools
+        # The runtime applies this table before retrieval. Alias-only tools
+        # would otherwise appear unreachable in this registry-level check.
+        apply_aliases()
+        yield
+    finally:
+        REGISTRY.clear()
+        REGISTRY.update(original_registry)
+        for name, tool in original_registry.items():
+            tool.aliases = original_aliases[name]
+        skills._skills = original_skills
+
+        if original_tools_module is None:
+            sys.modules.pop("service.skills.tools", None)
+        else:
+            original_tools_module._registered.clear()
+            original_tools_module._registered.update(original_registered)
+        if had_tools_attribute:
+            skills.tools = original_tools_attribute
+        else:
+            skills.__dict__.pop("tools", None)
+
+PASS, FAIL = 0, 0
+
+
+def check(name: str, cond: bool, detail: str = "") -> None:
+    global PASS, FAIL
+    if cond:
+        PASS += 1
+        print(f"  ok   {name}")
+    else:
+        FAIL += 1
+        print(f"  FAIL {name} {detail}")
+
+
+def dec(prompt: str):
+    return asyncio.run(route(prompt))
+
+
+def subset(prompt: str) -> list[str]:
+    return dec(prompt).tool_subset or []
+
+
+# --------------------------------------------------------------------------
+
+def test_every_tool_has_a_scoped_home() -> None:
+    print("\nevery tool is reachable through some scoped route")
+    reachable: set[str] = set()
+    # _DOCUMENT_TOOLS / _SYSTEM_CONTROL_TOOLS / _APPS_MEDIA_TOOLS are gone
+    # (2026-08-21) — those three routes still claim their phrasings (the
+    # regexes are unchanged), but now fill tool_subset by the SAME semantic
+    # retrieval this test's own "unreachable" check already trusts for every
+    # OTHER orphaned tool below, rather than a hand-written list. Nothing to
+    # union in here for them any more; their tools just need aliases, like
+    # anything else retrieval covers.
+    for group in (R._ALL_SOURCES, R._MEMORY_TOOLS,
+                  R._SCHEDULED_SEND_TOOLS, R._WEB_TOOLS, R._core_tools(),
+                  ["get_recent_activity", *R._ALL_SOURCES],   # recency sweep route
+                  ["view_messages", "summarize_messages"],
+                  ["view_emails", "summarize_emails"],
+                  ["get_upcoming"], ["get_past_events"], ["search_notes"],
+                  ["add_reminder", "add_calendar_event", "get_upcoming"],
+                  ["create_tool", "write_file"]):
+        reachable |= set(group)
+    for group in R._DOMAIN_WRITE_TOOLS.values():
+        reachable |= set(group)
+    # Missing aliases do not prove a tool is unreachable: retrieval also
+    # indexes its name/description. Count only targets actually demonstrated
+    # by a final route, not every incidental tool in the returned menu.
+    for prompt, target in (
+            ("What should I work on tomorrow?", "collect_task_evidence"),
+            ("search my chat history for an old project", "search_conversations"),
+            ("Save a knowledge note titled Project:\nBring blue folder.", "save_knowledge"),
+            ("Read my saved knowledge notes.", "read_knowledge"),
+            ("Update knowledge " + "a"*32 + " titled Project:\nBring red folder.", "edit_knowledge"),
+            ("Delete knowledge " + "a"*32, "delete_knowledge"),
+            ("Plan a 30 minute meeting after my exam tomorrow.", "plan_meeting"),
+            ("Add a private calendar block for a 30 minute meeting after my exam tomorrow.",
+             "commit_private_meeting")):
+        offered = subset(prompt)
+        check(f"{target} has a demonstrated final route", target in offered,
+              f"{prompt!r} -> {offered}")
+        if target in offered:
+            reachable.add(target)
+        if target in {'save_knowledge','read_knowledge','edit_knowledge','delete_knowledge',
+                      'plan_meeting','commit_private_meeting'}:
+            d = dec(prompt)
+            if target in {'plan_meeting','commit_private_meeting'}:
+                expected = {'plan_meeting','get_upcoming','find_free_time'}
+                if target == 'commit_private_meeting':
+                    expected.add('commit_private_meeting')
+                check(f'{target} has only checked meeting tools', set(offered) == expected)
+            else:
+                check(f'{target} has a bounded knowledge menu', len(offered) <= 2)
+            check(f'{target} has no direct effect', not d.direct_calls)
+            if target in {'edit_knowledge','delete_knowledge'}:
+                check(f'{target} reads the exact ID before effect selection',
+                      d.force_first_tool == 'read_knowledge'
+                      and d.required_tool_groups == (frozenset({'read_knowledge'}),)
+                      and d.tool_argument_bindings['read_knowledge'] == {'record_id':'a'*32}
+                      and 'expected_revision' not in d.tool_argument_bindings[target])
+    meeting = dec('Plan a 30 minute meeting after my exam tomorrow.')
+    check('generic meeting plans cannot commit or send invitations',
+          set(meeting.tool_subset) == {'plan_meeting','get_upcoming','find_free_time'}
+          and not meeting.direct_calls
+          and {'commit_private_meeting','send_email','send_message','schedule_send'} <= meeting.forbidden_tools)
+    check('knowledge reads offer no mutation or live-source adapters',
+          subset('Read my saved knowledge notes.') == ['read_knowledge'])
+    for prompt in ['Do not delete knowledge ' + 'a'*32,
+                   'Explain "Delete knowledge ' + 'a'*32 + '".',
+                   'Do not save a knowledge note titled Project:\nBring blue folder.']:
+        d = dec(prompt)
+        check(f'{prompt!r} cannot activate knowledge writes',
+              not {'save_knowledge','edit_knowledge','delete_knowledge'} & set(d.tool_subset or [])
+              and not d.direct_calls and not d.force_first_tool
+              and not d.required_tool_groups and not d.tool_argument_bindings)
+    read_tools = subset("show my saved memories")
+    check("a memory read does not offer filesystem deletion",
+          not any(REGISTRY[n].category == "fs_delete" for n in read_tools),
+          f"-> {read_tools}")
+    registered = {s["function"]["name"] for s in tool_schemas(None)}
+    orphans = registered - reachable
+
+    # A tool outside every regex subset is no longer stranded: since semantic
+    # retrieval replaced the unscoped fallback, ANY registered tool can be
+    # offered. So the invariant this test protects has changed shape — the
+    # question is no longer "is it in a hand-written subset" but "can retrieval
+    # actually find it". Aliases provide retrieval evidence for the remaining
+    # orphans; the aliasless tools above instead require actual route proofs.
+    #
+    # Tools are added to the registry WITHOUT regex routes on purpose now (the
+    # Capability Atlas rollout order): they surface through retrieval, and only
+    # the ones measured to be hot or to miss get promoted to a hand-tuned route.
+    # Asserting the old invariant would forbid exactly that.
+    unreachable = {n for n in orphans if not REGISTRY[n].aliases}
+    check("every tool has a scoped route, demonstrated route, or retrieval aliases",
+          not unreachable, f"no demonstrated route or aliases: {sorted(unreachable)}")
+
+
+def test_device_apps_and_web_are_scoped() -> None:
+    print("\nthe three clusters that used to fall through are now scoped")
+    for prompt, tool in (("how much battery do I have", "system_status"),
+                         ("turn off my wifi", "toggle_setting"),
+                         ("what's on my clipboard", "clipboard_read"),
+                         ("open safari", "open_app"),
+                         ("open Safari", "open_app"),
+                         ("quit spotify", "quit_app"),
+                         ("what's the weather in Tokyo", "get_weather"),
+                         ("what's the price of bitcoin", "web_fetch")):
+        s = subset(prompt)
+        # PROPORTIONAL, not a fixed number — a fixed ceiling needed manual
+        # bumps (13 -> 20) every time the Capability Atlas rollout legitimately
+        # grew _SYSTEM_CONTROL_TOOLS/_APPS_MEDIA_TOOLS (their own broad regexes
+        # already claim these tools' phrasings, see router.py's comments on
+        # both), which is exactly the kind of test-maintenance tax that gets
+        # silently skipped under time pressure. What this actually asserts —
+        # "still meaningfully less than the full registry, never silently
+        # unscoped" — scales with the registry on its own if stated as a
+        # fraction instead of a constant.
+        ceiling = max(15, len(REGISTRY) // 4)
+        check(f"{prompt!r} -> scoped, offers {tool}",
+              bool(s) and tool in s and len(s) <= ceiling,
+              f"-> {len(s)} tools (ceiling {ceiling}): {s or 'UNSCOPED'}")
+
+    d = dec("what's the weather in Tokyo")
+    check('Tokyo weather has exact provider scope and arguments',
+          d.tool_subset == ['get_weather']
+          and d.direct_calls == [('get_weather',{'location':'Tokyo','period':''})]
+          and d.tool_argument_bindings == {'get_weather':{'location':'Tokyo','period':''}})
+
+
+def test_ambiguous_gets_core_not_everything() -> None:
+    print("\nthe ambiguous fallback gets the core set, not the registry")
+    registered = {s["function"]["name"] for s in tool_schemas(None)}
+    # "tell me a joke" used to be the example here; it is now answered with no
+    # tools at all (router _no_tool_claim), which is stricter than the core set.
+    for prompt in ("what?", "can you help me with something",
+                   "anything from earlier today?"):
+        s = subset(prompt)
+        check(f"{prompt!r} is scoped", bool(s), "-> UNSCOPED")
+        check(f"{prompt!r} is much smaller than the registry",
+              len(s) < len(registered) / 2, f"{len(s)} of {len(registered)}")
+    # run_shell is the deliberate escape hatch; destructive tools are not here.
+    core = subset("what?")
+    check("run_shell is offered as the escape hatch", "run_shell" in core)
+    for banned in ("send_email", "send_message", "create_tool"):
+        check(f"{banned} is NOT in the core set", banned not in core)
+
+
+def test_core_includes_installed_skill_tools() -> None:
+    print("\ninstalled skill tools stay callable from the fallback")
+    from service.tools.registry import REGISTRY
+    skill_tools = {n for n, t in REGISTRY.items() if t.category == "skill_tool"}
+    if not skill_tools:
+        check("(no skills installed — nothing to check)", True)
+        return
+    core = set(R._core_tools())
+    check(f"all {len(skill_tools)} skill tools are in the core set",
+          skill_tools <= core, f"missing={sorted(skill_tools - core)}")
+    check("use_skill is offered too", "use_skill" in core)
+
+
+def test_data_nouns_keep_the_full_toolset() -> None:
+    print("\na genuinely two-way request keeps the whole toolset")
+    # "open my calendar" could mean open_app OR get_upcoming; the model should
+    # still get to choose, so the device/apps rules must decline it.
+    for prompt in ("open my calendar", "open my email"):
+        d = dec(prompt)
+        check(f"{prompt!r} is not narrowed to apps/media",
+              d.tool_subset is None or "get_upcoming" in (d.tool_subset or [])
+              or "summarize_emails" in (d.tool_subset or []),
+              f"-> {d.tool_subset}")
+    # and a FILE gets the document tools rather than only app control.
+    #
+    # This assertion used to pass VACUOUSLY: the route was unscoped, so
+    # `subset()` returned [] and "open_app" not in [] was trivially true — the
+    # thing it claims to check was never actually exercised. Now that the route
+    # retrieves a real subset, check the property that was always meant: the
+    # tools that can act on a FILE are present. open_app may also be retrieved
+    # ("open" is genuinely ambiguous) and that is fine, as long as it is not the
+    # only option on the table.
+    s = subset("open the pdf in my downloads")
+    check("'open the pdf…' can reach the file tools",
+          bool({"read_file", "find_files", "list_dir"} & set(s)),
+          f"-> {s or 'UNSCOPED'}")
+
+
+def test_light_read_voice_is_only_for_personal_data() -> None:
+    print("\nthe warm read-out voice is only used for personal-data reads")
+    for prompt in ("what's on my calendar", "summarize my messages",
+                   "what's in my notes"):
+        check(f"{prompt!r} keeps the warm voice", dec(prompt).light_read,
+              "light_read=False")
+    for prompt in ("turn off my wifi", "how much battery do I have",
+                   "open safari", "what's the weather in Tokyo",
+                   "tell me a joke", "what?"):
+        check(f"{prompt!r} does NOT get the warm voice",
+              not dec(prompt).light_read, "light_read=True")
+
+
+
+def test_confirmation_inherits_the_previous_domain() -> None:
+    print("\na bare 'yes' inherits the previous turn's domain, not the registry")
+    # Verified failure 2026-08-09: "yes archive them", right after Harbor listed
+    # emails, was routed with NO subset — all 55 tools, the configuration this
+    # project measured as worst at selection. It called view_emails again and
+    # never archive_email (now email_triage), on the one turn where the user had already said
+    # "do it".
+    d = asyncio.run(route("yes archive them",
+                          last_assistant="Would you like me to archive these emails to keep your inbox clean?",
+                          last_tools="view_emails,summarize_emails"))
+    sub = d.tool_subset or []
+    check("scoped rather than the full registry", bool(sub) and len(sub) < 20,
+          f"-> {len(sub) if sub else 'UNSCOPED'}")
+    check("email_triage (archive) is actually offered", "email_triage" in sub, f"-> {sub}")
+    check("it does not force a tool call", d.expect_tool_first is False)
+
+    d = asyncio.run(route("go ahead", last_assistant="Want me to send that text to Mom?",
+                          last_tools="view_messages,lookup_contact"))
+    check("a messages confirmation offers send_message",
+          "send_message" in (d.tool_subset or []), f"-> {d.tool_subset}")
+
+    d = asyncio.run(route("yes please", last_assistant="Should I add that to your calendar?",
+                          last_tools="get_upcoming"))
+    check("a calendar confirmation offers add_calendar_event",
+          "add_calendar_event" in (d.tool_subset or []), f"-> {d.tool_subset}")
+
+    # Nothing to INHERIT — but "the full toolset" stopped being the honest
+    # answer once the registry grew: it is ~15,000 tokens at 78 tools and the
+    # configuration measured worst at selection. The confirmation now retrieves
+    # against the ASSISTANT'S OFFER, which describes the action in full where
+    # the user's "do it" describes nothing. So the assertion is no longer "is it
+    # unscoped" but "did it find the tool the offer implies".
+    d = asyncio.run(route("do it", last_assistant="Shall I run it?\n```bash\nls\n```",
+                          last_tools=None))
+    check("no previous tools -> retrieves against the offer",
+          "run_shell" in (d.tool_subset or []),
+          f"-> {d.tool_subset}")
+
+
+
+def test_update_someone_is_a_send() -> None:
+    print("\n'give my mom an update' is a SEND, not a lookup")
+    # Verified failure 2026-08-09: "give an update to my mom via messages about
+    # what I did this month" contained none of send/reply/draft, so it routed
+    # read-only and send_message was never offered. The model was asked to send
+    # and structurally could not.
+    # Split by whether the user NAMED a channel, because the two now have
+    # different (and both correct) outcomes. The 2026-08-09 bug being guarded
+    # here was that these weren't recognized as SENDS AT ALL — they routed
+    # read-only with no write intent. That still must not happen. What changed
+    # on 2026-08-10 is that an unnamed channel no longer picks one silently
+    # (see test_ambiguous_channel_withholds_every_outbound_tool).
+    print("  channel NAMED -> can send straight away")
+    for prompt in ("give an update to my mom via messages about what I did this month",
+                   "give my mom an update via messages"):
+        s = subset(prompt)
+        check(f"{prompt[:44]!r} can send",
+              "send_message" in s or "send_email" in s, f"-> {s or 'UNSCOPED'}")
+
+    print("  channel NOT named -> recognized as a send, but asks which one first")
+    for prompt in ("let dad know I'll be late",
+                   "tell Mom that I'm on my way",
+                   "update my mom on my week",
+                   "give Kriste a heads up about tomorrow"):
+        d = dec(prompt)
+        offered = set(d.tool_subset or [])
+        check(f"{prompt[:44]!r} is recognized as a send", d.clarify_channel,
+              f"reason={d.reason}")
+        check(f"{prompt[:44]!r} can resolve the recipient",
+              "lookup_contact" in offered, f"-> {sorted(offered)}")
+        check(f"{prompt[:44]!r} cannot commit to a channel yet",
+              not (offered & R._CHANNEL_OUTBOUND_TOOLS),
+              f"-> {sorted(offered & R._CHANNEL_OUTBOUND_TOOLS)}")
+
+    print("  …but talking to HARBOR about the user is still a read")
+    for prompt in ("tell me what's on my calendar", "give me an update on my inbox",
+                   "tell me about myself", "summarize my messages"):
+        s = subset(prompt)
+        check(f"{prompt[:44]!r} does not arm a send",
+              "send_message" not in s and "send_email" not in s, f"-> {s}")
+
+
+def test_multi_round_flags_the_sequential_routes() -> None:
+    print("\nmulti_round is set on routes whose tools are sequential, not alternatives")
+    # These four MUST carry multi_round=True — it's what stops the agent loop's
+    # "broad" narration mode from treating one source answering as "done" on a
+    # route that genuinely needs several. See router.RouteDecision.multi_round
+    # and agent/loop.run_agent's multi_round parameter.
+    for prompt in ("what do I need to do", "help me plan my day"):
+        d = dec(prompt)
+        check(f"{prompt!r} (aggregate to-do) is multi_round", d.multi_round,
+              f"subset={d.tool_subset}")
+        if prompt == 'what do I need to do':
+            args = {'period':'today', 'include_overdue':True, 'include_undated':True,
+                    **{f'include_{source}':True for source in ('calendar','reminders','email','messages','notes')}}
+            check('priority requires the exact source collector before narration',
+                  d.tool_subset == ['collect_task_evidence']
+                  and d.required_tool_groups == (frozenset({'collect_task_evidence'}),)
+                  and d.tool_argument_bindings == {'collect_task_evidence':args}
+                  and d.direct_calls == [('collect_task_evidence',args)]
+                  and d.force_first_tool is None and d.expect_tool_first
+                  and REGISTRY['collect_task_evidence'].category == 'assistant_read')
+        else:
+            check(f"{prompt!r} keeps aggregate source coverage",
+                  set(d.tool_subset or []) >= {'get_upcoming','search_reminders',
+                      'summarize_messages','summarize_emails','search_notes'}, f"-> {d.tool_subset}")
+    d = dec("summarize the PDF in my downloads")
+    check("document route (list_dir THEN read_file) is multi_round", d.multi_round,
+          f"subset={d.tool_subset}")
+    d = dec("what did I have last week and what's next")
+    check("a calendar+past-tense question is multi_round", d.multi_round,
+          f"subset={d.tool_subset}")
+    d = dec("what?")
+    check("the ambiguous core fallback is multi_round (heterogeneous tools)",
+          d.multi_round, f"subset={d.tool_subset}")
+
+
+def test_narration_after_names_each_multi_round_route_requirement() -> None:
+    print("\nnarration_after names what makes each multi_round route done")
+    # multi_round alone is a whole-TURN veto on the narration gate, which is
+    # stronger than the risk it guards. narration_after says which tools, once
+    # answered, mean the requirement is met. See RouteDecision.narration_after.
+    aggregate = {'get_upcoming','search_reminders','summarize_messages','summarize_emails','search_notes'}
+    for prompt in ("what do I need to do", "help me plan my day"):
+        d = dec(prompt)
+        expected = {'collect_task_evidence'} if prompt == 'what do I need to do' else aggregate
+        check(f"{prompt!r} releases only after each required source",
+              set(d.narration_after) == expected, f"-> {sorted(d.narration_after)}")
+    d = dec("summarize the PDF in my downloads")
+    check("document route releases after read_file, not list_dir",
+          set(d.narration_after) == {"read_file"}, f"-> {sorted(d.narration_after)}")
+    d = dec("what did I have on my calendar last week")
+    check("calendar+past releases only after BOTH directions",
+          set(d.narration_after) == {"get_upcoming", "get_past_events"},
+          f"-> {sorted(d.narration_after)}")
+    # The one multi_round route with no knowable required set must stay
+    # conservative: empty means "never narrate", i.e. exactly today's behavior.
+    d = dec("what?")
+    check("the heterogeneous core fallback names NO required set (stays conservative)",
+          not d.narration_after, f"-> {sorted(d.narration_after)}")
+
+    print("  …and a non-multi_round route never needs one")
+    for prompt in ("what's on my calendar", "summarize my messages",
+                   "how much battery do I have"):
+        d = dec(prompt)
+        check(f"{prompt!r} has no narration_after", not d.narration_after,
+              f"-> {sorted(d.narration_after)}")
+
+    print("  …and every narration_after tool is actually IN its route's subset")
+    # A required tool the route never offers could never be answered, which
+    # would silently make narration_after unsatisfiable — the same bug class as
+    # multi_round's blanket veto, just harder to see.
+    for prompt in ("what do I need to do", "help me plan my day",
+                   "summarize the PDF in my downloads",
+                   "what did I have on my calendar last week"):
+        d = dec(prompt)
+        check(f"{prompt[:38]!r} requires only tools it offers",
+              set(d.narration_after) <= set(d.tool_subset or []),
+              f"required={sorted(d.narration_after)} offered={d.tool_subset}")
+
+    print("  …but ordinary alternative-tool routes are NOT")
+    for prompt in ("what's on my calendar", "summarize my messages",
+                   "what's in my inbox", "how much battery do I have",
+                   "what do you remember about me", "look up dan's contact",
+                   "open safari", "what's the weather in tokyo"):
+        d = dec(prompt)
+        check(f"{prompt!r} is NOT multi_round", not d.multi_round,
+              f"subset={d.tool_subset}")
+
+
+def test_compose_widening_is_not_blocked_by_an_incidental_domain() -> None:
+    print("\na send naming a recipient still gets send tools even when another "
+          "domain noun (schedule/notes/etc.) matches too")
+    # VERIFIED FAILURE 2026-08-10: "tell my mom about my schedule for this
+    # week" matches _COMPOSE_RE (a send naming a recipient, no channel) AND
+    # "schedule" trips the calendar domain. The calendar branch filled `subset`
+    # first, so the old `if not subset and writing and _COMPOSE_RE...` gate —
+    # keyed on subset being EMPTY — never fired, and send_message/send_email
+    # were silently never offered. Real debug export: the model's own
+    # reasoning said "I don't have a messaging tool", which was true given
+    # what it was offered — it was not forgetting a capability, the router
+    # never granted it.
+    s = subset("I need you to tell my mom about my schedule for this week "
+              "since we plan to go on a vacation")
+    check("get_upcoming is still offered (the calendar half)",
+          "get_upcoming" in s, f"-> {s}")
+    # The send half is now expressed as "it reached the send ROUTE and can
+    # resolve the recipient", not "send_message is on the table" — an unnamed
+    # channel withholds the outbound tools until the user picks one. The bug
+    # this guards is the route never gaining send intent at all, which is
+    # exactly what clarify_channel records.
+    d = dec("I need you to tell my mom about my schedule for this week "
+           "since we plan to go on a vacation")
+    check("it is recognized as a send (was: calendar-only, no send intent)",
+          d.clarify_channel, f"reason={d.reason}")
+    check("and can resolve the recipient",
+          "lookup_contact" in (d.tool_subset or []), f"-> {d.tool_subset}")
+
+    print("  …the same shape holds for other incidental-domain sends")
+    for prompt in ("tell dad about my notes on the project",
+                   "let mom know what's on my calendar today"):
+        d = dec(prompt)
+        check(f"{prompt!r} reaches the send route",
+              d.clarify_channel, f"reason={d.reason}")
+        check(f"{prompt!r} can resolve the recipient",
+              "lookup_contact" in (d.tool_subset or []), f"-> {d.tool_subset}")
+
+
+def test_clarify_channel_fires_only_when_genuinely_ambiguous() -> None:
+    print("\nclarify_channel: ask which app, but only when neither was named")
+    d = dec("I need you to tell my mom about my schedule for this week "
+           "since we plan to go on a vacation")
+    check("no channel named -> clarify_channel True", d.clarify_channel,
+          f"reason={d.reason}")
+    d = dec("send this to mom tonight")
+    check("a send naming no channel -> clarify_channel True (pre-existing route)",
+          d.clarify_channel, f"reason={d.reason}")
+
+    print("  …but not when a channel WAS named")
+    for prompt in ("email mom about my schedule this week",
+                   "text mom about my schedule this week",
+                   "email and text mom about my schedule"):
+        d = dec(prompt)
+        check(f"{prompt!r} -> clarify_channel False (channel is explicit)",
+              not d.clarify_channel, f"reason={d.reason}")
+
+    print("  …and not on routes with no send intent at all")
+    for prompt in ("what is on my calendar this week",
+                   "add a dentist appointment tomorrow at 3pm",
+                   "summarize my messages", "what's in my inbox"):
+        d = dec(prompt)
+        check(f"{prompt!r} -> clarify_channel False (no send)",
+              not d.clarify_channel, f"reason={d.reason}")
+
+
+def test_ambiguous_channel_withholds_every_outbound_tool() -> None:
+    print("\nchannel unknown -> the send/draft tools are not on the table at all")
+    # VERIFIED FAILURE 2026-08-10, the most serious bug found so far. Asked to
+    # "send an update to my mom" with no channel named, clarify_channel was set
+    # and the system prompt told the model to ask first — and it called
+    # draft_message anyway, without asking. draft_message then typed the whole
+    # message into an UNRELATED GROUP CHAT the user's mother is not even in
+    # (the Messages targeting had silently failed, see OutboundSender.swift),
+    # and reported success naming a recipient it never reached.
+    #
+    # A prompt is not a constraint on a 4B model; the offered toolset is. So
+    # the channel-committing tools are withheld until the user names a channel.
+    for prompt in ("send an update to my mom with my schedule for this week",
+                   "I need you to tell my mom about my schedule for this week",
+                   "send this to mom tonight"):
+        d = dec(prompt)
+        offered = set(d.tool_subset or [])
+        check(f"{prompt[:42]!r} offers NO outbound tool",
+              not (offered & R._CHANNEL_OUTBOUND_TOOLS),
+              f"-> {sorted(offered & R._CHANNEL_OUTBOUND_TOOLS)}")
+        check(f"{prompt[:42]!r} still keeps its source and contact lookup",
+              ("lookup_contact" in offered
+               and ("get_upcoming" in offered or len(offered) >= 4)),
+              f"-> {sorted(offered)}")
+
+    print("  …but naming a channel outright still arms that channel immediately")
+    s_txt = subset("text mom my schedule this week")
+    check("'text mom …' can send_message", "send_message" in s_txt, f"-> {s_txt}")
+    s_eml = subset("email mom my schedule this week")
+    check("'email mom …' can send_email", "send_email" in s_eml, f"-> {s_eml}")
+
+
+def test_answering_the_channel_question_restores_the_right_tools() -> None:
+    print("\nanswering 'text or email?' arms exactly that channel")
+    # Without this the fix above would be a dead end: a bare "text"/"email"
+    # routes to a read-only 2-tool lookup, so answering the question Harbor had
+    # just asked left it unable to act on the answer. Verified on all of these.
+    ASKED = ("Would you like me to send this to your mom via text message "
+             "or email? Which would you prefer?")
+    LT = "get_upcoming,view_messages,summarize_messages"
+    for prompt in ("text", "text her", "imessage", "send it as a text", "message her"):
+        d = asyncio.run(route(prompt, last_assistant=ASKED, last_tools=LT))
+        offered = set(d.tool_subset or [])
+        check(f"{prompt!r} -> send_message armed", "send_message" in offered, f"-> {sorted(offered)}")
+        check(f"{prompt!r} -> does NOT arm email", "send_email" not in offered, f"-> {sorted(offered)}")
+    for prompt in ("email", "via email", "mail"):
+        d = asyncio.run(route(prompt, last_assistant=ASKED, last_tools=LT))
+        offered = set(d.tool_subset or [])
+        check(f"{prompt!r} -> send_email armed", "send_email" in offered, f"-> {sorted(offered)}")
+        check(f"{prompt!r} -> does NOT arm messages", "send_message" not in offered, f"-> {sorted(offered)}")
+
+    print("  …but only when Harbor actually ASKED — otherwise it's a plain read")
+    for prompt in ("email", "text"):
+        d = dec(prompt)
+        offered = set(d.tool_subset or [])
+        check(f"bare {prompt!r} with no question before it stays read-only",
+              not (offered & R._CHANNEL_OUTBOUND_TOOLS), f"-> {sorted(offered)}")
+    # A previous assistant turn that mentions only ONE channel isn't the
+    # question, so its answer must not be treated as one.
+    d = asyncio.run(route("email", last_assistant="Want me to check your inbox?",
+                          last_tools="summarize_emails"))
+    check("a one-channel previous turn doesn't count as the question",
+          not (set(d.tool_subset or []) & R._CHANNEL_OUTBOUND_TOOLS), f"-> {d.reason}")
+
+
+def test_topic_lookup_forces_get_upcoming_before_a_compose_guesses() -> None:
+    print("\nunresolved topic in a compose sentence -> get_upcoming forced first")
+    # VERIFIED FAILURE 2026-08-24 (two of the user's debug exports, same day).
+    # "send mom a message reminder her about my move in date" got get_upcoming
+    # into its subset ONLY because "reminder" (a typo for "remind") happens to
+    # match _CALENDAR_NOUN_RE — an accident, not real domain detection. The
+    # retry, phrased naturally with no typo ("send a message to mom with my
+    # college move in date"), matched no calendar/notes noun at all and never
+    # offered get_upcoming — the model settled for "I don't have that date"
+    # and asked, even AFTER a system-prompt rule told it to search first
+    # (tool_digest still showed only lookup_contact — a prompt can't make the
+    # model call a tool that was never offered).
+    for prompt in ("send a message to mom with my college move in date",
+                   "I need you to send mom a message reminder her about my move in date"):
+        d = dec(prompt)
+        offered = set(d.tool_subset or [])
+        check(f"{prompt[:46]!r} offers get_upcoming", "get_upcoming" in offered,
+              f"-> {sorted(offered)}")
+        check(f"{prompt[:46]!r} offers search_notes", "search_notes" in offered,
+              f"-> {sorted(offered)}")
+        check(f"{prompt[:46]!r} forces get_upcoming first",
+              d.force_first_tool == "get_upcoming", f"-> {d.force_first_tool}")
+        check(f"{prompt[:46]!r} keeps its send tool reachable",
+              bool(offered & {"send_message", "send_email"}), f"-> {sorted(offered)}")
+
+    # A generic topic should be grounded too, but a project is not a calendar
+    # payload.  Search personal notes/conversations rather than inventing a
+    # reason to query the calendar.
+    prompt = "email my boss about the project I have been working on"
+    d = dec(prompt)
+    offered = set(d.tool_subset or [])
+    check("generic project topic offers search_notes", "search_notes" in offered,
+          f"-> {sorted(offered)}")
+    check("generic project topic offers conversations",
+          "search_conversations" in offered, f"-> {sorted(offered)}")
+    check("generic project topic forces a grounding source first",
+          d.force_first_tool == "search_notes", f"-> {d.force_first_tool}")
+    check("generic project topic keeps email reachable",
+          "send_email" in offered, f"-> {sorted(offered)}")
+
+    print("  …but a message with nothing to look up is untouched")
+    for prompt in ("tell her I will be late", "text mom happy birthday",
+                   "send Dan a thumbs up"):
+        d = dec(prompt)
+        check(f"{prompt!r} does not force get_upcoming",
+              d.force_first_tool != "get_upcoming", f"-> {d.force_first_tool}")
+
+
+def test_person_said_routes_to_message_and_mail_reads() -> None:
+    print("\n'what did <person> say' reads messages (and mail), not the ambiguous route")
+    # Verified failure 2026-10-08: "what did kriste say" named no channel, fell to
+    # the 22-tool retrieved route, which had view_messages but not
+    # summarize_messages; the model gave up with "couldn't produce a reliable
+    # answer".
+    for prompt in ("what did kriste say", "what did my mom say", "what has Dan sent me",
+                   "what did my mom say yesterday", "wat did dad say"):
+        s = set(subset(prompt))
+        check(f"{prompt!r} offers summarize_messages + view_messages",
+              {"summarize_messages", "view_messages"} <= s, f"-> {sorted(s) or 'UNSCOPED'}")
+        check(f"{prompt!r} offers no send tool",
+              not (s & {"send_message", "send_email"}), f"-> {sorted(s)}")
+    print("  a SAVED contact is private even with a time word (else web_search)")
+    import service.tools.imessage_tools as msg_mod
+    saved = dict(msg_mod._contacts)
+    msg_mod._contacts.update({"+15550001": "Krista Marlow", "+15550002": "Dan Smith"})
+    try:
+        for prompt in ("what did kriste say yesterday", "what did Dan say today"):
+            s = set(subset(prompt))
+            check(f"{prompt!r} reads messages, not the web",
+                  "summarize_messages" in s and "web_search" not in s, f"-> {sorted(s)}")
+        s = set(subset("what did Trump say today"))
+        check("an unsaved name keeps the web reading", "web_search" in s, f"-> {sorted(s)}")
+    finally:
+        msg_mod._contacts.clear(); msg_mod._contacts.update(saved)
+    print("  …but not for public figures, pronouns, or objects")
+    for prompt in ("what did Trump say about tariffs", "what did you say", "what did I say",
+                   "what did the report say", "what did he say"):
+        s = set(subset(prompt))
+        check(f"{prompt!r} is not claimed as a message read",
+              "summarize_messages" not in s or "view_emails" not in s, f"-> {sorted(s)}")
+
+
+def test_conversation_match_tolerates_name_spelling() -> None:
+    print("\nconversation names match despite a spelling difference")
+    from service.tools.imessage_tools import _match_conversation
+    records = [(1.0, "chat1", "Krista Marlow", "Krista Marlow: hi", False),
+               (2.0, "chat2", "Dan Smith", "Dan Smith: yo", False)]
+    for query, want in (("kriste", "Krista Marlow"), ("krista", "Krista Marlow"), ("dan", "Dan Smith")):
+        match, error = _match_conversation(records, query)
+        check(f"{query!r} -> {want}", match is not None and match[1] == want, f"-> {match} {error}")
+    match, error = _match_conversation(records, "zebedee")
+    check("an unrelated name still reports no match", match is None and "No conversation" in (error or ""))
+
+
+
+def test_conversation_match_requires_resolved_identity_after_fuzzy_selection() -> None:
+    print("\nexact, substring and fuzzy matches require resolved conversation identities")
+    from service.tools.imessage_tools import _match_conversation
+    refresh = "Messages are refreshing conversation identities. Please try again in a moment."
+    unresolved = [(1.0, None, "Krista Marlow", "Krista Marlow: hi", False)]
+    for query in ("Krista Marlow", "krista", "kriste"):
+        match, error = _match_conversation(unresolved, query)
+        check(f"unresolved {query!r} requests an identity refresh",
+              match is None and error == refresh, f"-> {match} {error}")
+
+    mixed = unresolved + [(2.0, "chat1", "Krista Marlow", "Krista Marlow: hello", False)]
+    for query in ("Krista Marlow", "krista", "kriste"):
+        match, error = _match_conversation(mixed, query)
+        check(f"mixed unresolved/resolved {query!r} cannot select a conversation",
+              match is None and error == refresh, f"-> {match} {error}")
+
+    resolved = [(1.0, "chat1", "Krista Marlow", "Krista Marlow: hi", False)]
+    match, error = _match_conversation(resolved, "kriste")
+    check("a unique resolved fuzzy match retains its exact identity",
+          match == ("chat1", "Krista Marlow") and error is None, f"-> {match} {error}")
+
+    ambiguous = resolved + [(2.0, "chat2", "Krista Marlow", "Krista Marlow: hello", False)]
+    for query in ("Krista Marlow", "krista", "kriste"):
+        match, error = _match_conversation(ambiguous, query)
+        check(f"multiple resolved {query!r} require disambiguation",
+              match is None and "More than one conversation matched" in (error or ""),
+              f"-> {match} {error}")
+
+
+if __name__ == "__main__":
+    test_every_tool_has_a_scoped_home()
+    test_device_apps_and_web_are_scoped()
+    test_ambiguous_gets_core_not_everything()
+    test_core_includes_installed_skill_tools()
+    test_data_nouns_keep_the_full_toolset()
+    test_light_read_voice_is_only_for_personal_data()
+    test_confirmation_inherits_the_previous_domain()
+    test_update_someone_is_a_send()
+    test_multi_round_flags_the_sequential_routes()
+    test_narration_after_names_each_multi_round_route_requirement()
+    test_compose_widening_is_not_blocked_by_an_incidental_domain()
+    test_clarify_channel_fires_only_when_genuinely_ambiguous()
+    test_ambiguous_channel_withholds_every_outbound_tool()
+    test_answering_the_channel_question_restores_the_right_tools()
+    test_topic_lookup_forces_get_upcoming_before_a_compose_guesses()
+    test_person_said_routes_to_message_and_mail_reads()
+    test_conversation_match_tolerates_name_spelling()
+    test_conversation_match_requires_resolved_identity_after_fuzzy_selection()
+    print(f"\n{PASS} passed, {FAIL} failed")
+    sys.exit(1 if FAIL else 0)

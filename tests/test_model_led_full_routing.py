@@ -1,0 +1,777 @@
+"""Full request ownership; model output is scripted, never an accuracy score."""
+import asyncio
+import json
+import pytest
+
+from service import main
+from service.agent import loop
+from service.config.endpoints import Target
+from service.router.model_led import model_led_enabled, personal_communication_request
+from service.tools import registry
+from tests.test_model_led_entrypoint import FakeClient, endpoint, tool_call
+from tests.test_model_led_integration import synthetic, run, call, discover
+from service.tasks.reply_engine import prepare_task_turn_async as real_task_recovery
+from service.workflows.engine import prepare_turn as real_workflow_recovery
+
+
+def waiting_title(endpoint):
+    from datetime import datetime, timedelta
+    from service.tasks.models import TaskPlan, TemporalValue
+    sid = endpoint.store.create_session()
+    plan = TaskPlan(temporal=TemporalValue(absolute_iso=(datetime.now() + timedelta(days=2)).isoformat(timespec="minutes")))
+    plan.recompute_status()
+    endpoint.store.save_workflow(sid, plan.to_dict())
+    return sid, plan
+
+
+def waiting_reply(endpoint):
+    from service.tasks.models import TaskPlan, SlotValue
+    sid = endpoint.store.create_session()
+    plan = TaskPlan(kind="task.email.reply", intent="email.reply", channel=SlotValue("email", "explicit"),
+                    parameters={"reply_all": SlotValue(False)},
+                    resolved_references={"reply.target": {"fields": {"message_id": "fixture-message", "account": "Fixture"}}})
+    plan.recompute_status()
+    endpoint.store.save_workflow(sid, plan.to_dict())
+    return sid, plan
+
+
+def continuation_response(plan, decision="continue", **changes):
+    return json.dumps({"decision": decision, "owner_id": plan.id,
+                       "revision": plan.revision, **changes})
+
+
+def interpreted_continuation(endpoint, plan, prompt):
+    from service.tasks.reply_engine import interpret_owner_continuation
+    client = FakeClient(endpoint.target, [continuation_response(plan)])
+    admission, verdict = asyncio.run(interpret_owner_continuation(
+        client, endpoint.target.model, plan.to_dict(), prompt))
+    assert verdict == "continue" and admission is not None
+    assert client.requests[0]["messages"][-1]["content"] == prompt
+    assert client.requests[0]["tools"] == []
+    asyncio.run(client.aclose())
+    return admission
+
+
+@pytest.fixture
+def owner_recovery_path(monkeypatch):
+    """Model-led owner recovery (a free-form reply interpreted against a typed
+    task still waiting for input) runs only while model_only is off. Since
+    0.5.0-rc3 model_only is on by default, so these tests pin it off; the
+    model_only behaviour with a pending owner is pinned in
+    test_model_only_never_advances_or_executes_a_pending_owner."""
+    monkeypatch.setenv("HARBOR_MODEL_ONLY", "0")
+
+
+@pytest.mark.parametrize("prompt", ["Pick up groceries", "Let me see tomorrow's events"])
+def test_model_only_never_advances_or_executes_a_pending_owner(endpoint, monkeypatch, prompt):
+    # model_only (the rc3 default) never runs a typed task or interprets a reply
+    # against one: a task left waiting from rc2 stays exactly as it was, nothing
+    # executes it or touches its native capability, and the model gets the turn.
+    from service.tasks import engine
+    monkeypatch.delenv("HARBOR_MODEL_ONLY", raising=False)
+    monkeypatch.setattr("service.tasks.reply_engine.prepare_task_turn_async", real_task_recovery)
+    monkeypatch.setattr(main, "prepare_turn", real_workflow_recovery)
+    def no_native(*args, **kwargs):
+        raise AssertionError("model_only touched an old owner's native capability")
+    async def no_execution(*args, **kwargs):
+        no_native()
+    async def no_interpretation(*args, **kwargs):
+        raise AssertionError("model_only interpreted a reply against an old owner")
+    monkeypatch.setattr(engine, "_default_contacts_resolver", no_native)
+    monkeypatch.setattr(main, "execute_task", no_execution)
+    monkeypatch.setattr("service.tasks.reply_engine.interpret_owner_continuation", no_interpretation)
+    sid, plan = waiting_title(endpoint)
+    before = endpoint.store.active_task(sid)
+    events = endpoint.request(prompt, sid)
+    assert endpoint.store.active_task(sid) == before
+    assert not any(e["type"] in {"task_plan", "workflow"} for e in events)
+    assert not endpoint.effects and not endpoint.baseline_calls
+    call = endpoint.agent_calls[0]
+    assert call["model_led_discovery"] is True and call["claim_effect"] is not None
+    assert call["messages"][-1]["content"] == prompt
+
+
+@pytest.mark.parametrize("mode", [None, "1"])
+@pytest.mark.parametrize("prompt,recovery_admitted", [
+    ("summarize my messages", False), ("read my messages", False), ("list my calendar", False),
+    ("please sumarize my messages", False), ("could you please read my messages", False),
+    ("reed my messages", False), ("Give me an overview of my calendar", False),
+    ("Walk me through my schedule tomorrow", False), ("Bring me up to date on my messages", False),
+    ("I'd like to know what's on this weej", False), ("My calendar needs a quick overview", False),
+    ("Let me see tomorrow's events", True),
+])
+@pytest.mark.usefixtures("owner_recovery_path")
+def test_new_reads_do_not_fill_or_execute_waiting_reminder(endpoint, monkeypatch, mode, prompt, recovery_admitted):
+    from service.tasks import engine
+    if mode is None:
+        monkeypatch.setenv("HARBOR_MODEL_LED_ROUTING", "true")  # opt-in since 1.3.0
+    async def recovery(*args, **kwargs):
+        assert recovery_admitted, "Private-source turn entered old task recovery"
+        return await real_task_recovery(*args, **kwargs)
+    monkeypatch.setattr("service.tasks.reply_engine.prepare_task_turn_async", recovery)
+    monkeypatch.setattr(main, "prepare_turn", real_workflow_recovery)
+    def no_native(*args, **kwargs):
+        raise AssertionError("Unrelated turn touched an old owner's native capability")
+    async def no_execution(*args, **kwargs):
+        no_native()
+    monkeypatch.setattr(engine, "_default_contacts_resolver", no_native)
+    monkeypatch.setattr(main, "execute_task", no_execution)
+    sid, plan = waiting_title(endpoint)
+    endpoint.script = [continuation_response(plan, "new_request")]
+    before = endpoint.store.active_task(sid)
+    events = endpoint.request(prompt, sid)
+    assert endpoint.store.active_task(sid) == before
+    assert not endpoint.effects and not endpoint.baseline_calls
+    assert endpoint.agent_calls[0]["messages"][-1]["content"] == prompt
+    if recovery_admitted:
+        assert len(endpoint.owned[0].requests) == 1
+        interpretation = endpoint.owned[0].requests[0]
+        assert interpretation["tools"] == [] and interpretation["messages"][-1]["content"] == prompt
+    else:
+        assert endpoint.owned[0].requests == []
+        assert {"web_search", "web_fetch", "http_request", "run_shell"} <= set(
+            endpoint.agent_calls[0]["forbidden_tools"])
+    assert any(e.get("route_source") == "model_led_discovery" for e in events)
+
+
+def test_literal_title_still_finishes_exact_waiting_owner(endpoint, monkeypatch):
+    from service.tasks import engine
+    sid, plan = waiting_title(endpoint)
+    def no_contact(*args):
+        raise AssertionError("A literal local reminder title triggered a contact read")
+    turn = engine.prepare_task_turn(endpoint.store, sid, "Pick up groceries", assistant_store=None,
+                                    owner_only=True, contacts_resolver=no_contact,
+                                    owner_admission=interpreted_continuation(endpoint, plan, "Pick up groceries"))
+    assert turn.executable and turn.plan.id == plan.id
+    assert turn.plan.steps[0].args["title"] == "Pick up groceries"
+
+
+@pytest.mark.parametrize("mode", [None, "1"])
+@pytest.mark.parametrize("prompt", ["do not read Mail; explain quantum mechanics",
+                                   "do not read email; summarize my messages", "please read my messages"])
+def test_pending_reply_never_warms_excluded_or_unrelated_mail(endpoint, monkeypatch, mode, prompt):
+    if mode is None:
+        monkeypatch.setenv("HARBOR_MODEL_LED_ROUTING", "true")  # opt-in since 1.3.0
+    monkeypatch.setattr("service.tasks.reply_engine.prepare_task_turn_async", real_task_recovery)
+    monkeypatch.setattr(main, "prepare_turn", real_workflow_recovery)
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Excluded/unrelated reply recovery source was touched")
+    async def forbidden_async(*args, **kwargs):
+        forbidden()
+    monkeypatch.setattr("service.tools.email_tools.ensure_reply_source", forbidden_async)
+    monkeypatch.setattr("service.tasks.source_readers.current_mail_reader", forbidden)
+    monkeypatch.setattr("service.tools.action_tools.prepare_reply_args", forbidden_async)
+    monkeypatch.setattr(main, "execute_task", forbidden_async)
+    sid, _ = waiting_reply(endpoint)
+    before = endpoint.store.active_task(sid)
+    endpoint.request(prompt, sid)
+    assert endpoint.store.active_task(sid) == before and not endpoint.effects
+    assert endpoint.agent_calls and not endpoint.baseline_calls
+    if "do not read" in prompt:
+        assert "view_emails" in endpoint.agent_calls[0]["forbidden_tools"]
+
+
+def test_allowed_literal_reply_body_preserves_bound_source_without_native_effect(endpoint):
+    import asyncio
+    sid, plan = waiting_reply(endpoint)
+    turn = asyncio.run(real_task_recovery(endpoint.store, sid, "Thanks for the update.",
+        assistant_store=None, owner_only=True, mail_reader=object(), allow_native=False,
+        owner_admission=interpreted_continuation(endpoint, plan, "Thanks for the update.")))
+    assert turn.plan.id == plan.id and turn.plan.subject.value == "Thanks for the update."
+    assert turn.plan.resolved_references == plan.resolved_references
+    assert turn.event == "reply_prepare" and not turn.executable
+
+
+@pytest.mark.parametrize("mode", [None, "1"])
+@pytest.mark.usefixtures("owner_recovery_path")
+def test_literal_title_is_model_interpreted_before_exact_owner_execution(endpoint, monkeypatch, mode):
+    from types import SimpleNamespace
+    if mode is None:
+        monkeypatch.setenv("HARBOR_MODEL_LED_ROUTING", "true")  # opt-in since 1.3.0
+    monkeypatch.setattr("service.tasks.reply_engine.prepare_task_turn_async", real_task_recovery)
+    monkeypatch.setattr(main, "prepare_turn", real_workflow_recovery)
+    sid, plan = waiting_title(endpoint)
+    endpoint.script = [continuation_response(plan)]
+    async def execute(task, *args, **kwargs):
+        assert task.id == plan.id
+        assert task.steps[0].tool == "add_reminder"
+        assert task.steps[0].args["title"] == "Pick up groceries"
+        endpoint.effects.append((task.id, task.steps[0].args.copy()))
+        return SimpleNamespace(finalize=True, status="completed", response="Synthetic reminder completed.", tool_calls=[])
+    monkeypatch.setattr(main, "execute_task", execute)
+    events = endpoint.request("Pick up groceries", sid)
+    assert len(endpoint.effects) == 1 and not endpoint.agent_calls and not endpoint.baseline_calls
+    assert len(endpoint.owned) == 1 and endpoint.owned[0].closed
+    assert endpoint.owned[0].requests[0]["messages"][-1]["content"] == "Pick up groceries"
+    assert any(event.get("event") == "execution_started" for event in events)
+
+
+@pytest.mark.parametrize("prompt", ["Pick up groceries", '"Buy milk"', "Give me an overview of my calendar"])
+def test_direct_owner_recovery_requires_model_binding_for_free_form_text(endpoint, prompt):
+    from service.tasks import engine
+    sid, _ = waiting_title(endpoint)
+    before = endpoint.store.active_task(sid)
+    assert engine.prepare_task_turn(endpoint.store, sid, prompt, assistant_store=None, owner_only=True) is None
+    assert asyncio.run(real_task_recovery(endpoint.store, sid, prompt, assistant_store=None,
+                                         owner_only=True, allow_native=False)) is None
+    assert endpoint.store.active_task(sid) == before
+
+
+@pytest.mark.parametrize("defect", ["owner", "revision", "slots", "prompt"])
+def test_stale_or_retargeted_continuation_binding_does_not_advance_owner(endpoint, defect):
+    from dataclasses import replace
+    from service.tasks import engine
+    sid, plan = waiting_title(endpoint)
+    admission = interpreted_continuation(endpoint, plan, "Pick up groceries")
+    changes = {"owner": {"owner_id": "another-owner"}, "revision": {"revision": plan.revision + 1},
+               "slots": {"missing_slots": ("recipient",)}, "prompt": {"prompt": "Buy milk"}}
+    before = endpoint.store.active_task(sid)
+    assert engine.prepare_task_turn(endpoint.store, sid, "Pick up groceries", assistant_store=None,
+        owner_only=True, owner_admission=replace(admission, **changes[defect])) is None
+    assert endpoint.store.active_task(sid) == before
+
+
+@pytest.mark.parametrize("reply", ["not JSON", "{}", '```json\n{}\n```', "tool_call", "wrong_owner", "boolean_revision", "ambiguous"])
+@pytest.mark.usefixtures("owner_recovery_path")
+def test_unclear_model_continuation_keeps_owner_and_mutations_closed(endpoint, monkeypatch, reply):
+    from service.tasks import engine
+    monkeypatch.setattr("service.tasks.reply_engine.prepare_task_turn_async", real_task_recovery)
+    monkeypatch.setattr(main, "prepare_turn", real_workflow_recovery)
+    async def no_execution(*args, **kwargs):
+        raise AssertionError("Unclear model decision constructed an old effect")
+    monkeypatch.setattr(main, "execute_task", no_execution)
+    monkeypatch.setattr(engine, "_default_contacts_resolver", lambda *a: (_ for _ in ()).throw(AssertionError("Native lookup")))
+    async def fake_mutation(**args):
+        raise AssertionError("Unclear continuation admitted a mutation")
+    fake_mutation.__module__ = "service.tools.assistant_tools"
+    registry.REGISTRY["add_reminder"] = registry.Tool("add_reminder", "Synthetic mutation", {"type": "object"},
+                                                   "assistant_write", fake_mutation)
+    sid, plan = waiting_title(endpoint)
+    before = endpoint.store.active_task(sid)
+    answers = {"tool_call": [tool_call("add_reminder", title="Wrong")],
+               "wrong_owner": continuation_response(plan, owner_id="different"),
+               "boolean_revision": continuation_response(plan, revision=True),
+               "ambiguous": continuation_response(plan, "ambiguous")}
+    endpoint.script = [answers.get(reply, reply)]
+    endpoint.request("Pick up groceries", sid)
+    assert endpoint.store.active_task(sid) == before
+    assert not endpoint.effects and endpoint.agent_calls and not endpoint.baseline_calls
+    assert "add_reminder" in endpoint.agent_calls[0]["forbidden_tools"]
+    assert any("Ask whether" in message.get("content", "") for message in endpoint.agent_calls[0]["messages"])
+
+
+@pytest.mark.parametrize("mode", [None, "1"])
+@pytest.mark.parametrize("member,order", [
+    ("decision", "invalid_first"), ("decision", "invalid_last"),
+    ("owner_id", "invalid_first"), ("owner_id", "invalid_last"),
+    ("revision", "invalid_first"), ("revision", "invalid_last"),
+    ("decision", "same_value"), ("owner_id", "same_value"), ("revision", "same_value"),
+])
+@pytest.mark.usefixtures("owner_recovery_path")
+def test_duplicate_continuation_json_never_advances_owner(endpoint, monkeypatch, mode, member, order):
+    from service.tasks import engine
+    if mode is None:
+        monkeypatch.setenv("HARBOR_MODEL_LED_ROUTING", "true")  # opt-in since 1.3.0
+    monkeypatch.setattr("service.tasks.reply_engine.prepare_task_turn_async", real_task_recovery)
+    monkeypatch.setattr(main, "prepare_turn", real_workflow_recovery)
+    async def no_execution(*args, **kwargs):
+        raise AssertionError("Contradictory JSON reached legacy execution or native preparation")
+    monkeypatch.setattr(main, "execute_task", no_execution)
+    monkeypatch.setattr("service.tools.email_tools.ensure_reply_source", no_execution)
+    def no_contact(*args, **kwargs):
+        raise AssertionError("Contradictory JSON reached native contact lookup")
+    monkeypatch.setattr(engine, "_default_contacts_resolver", no_contact)
+    async def no_mutation(**args):
+        raise AssertionError("Contradictory JSON admitted a fallback mutation")
+    no_mutation.__module__ = "service.tools.assistant_tools"
+    registry.REGISTRY["add_reminder"] = registry.Tool("add_reminder", "Synthetic mutation", {"type": "object"},
+                                                   "assistant_write", no_mutation)
+    sid, plan = waiting_title(endpoint)
+    before = endpoint.store.active_task(sid)
+    unique = {"decision": "continue", "owner_id": plan.id, "revision": plan.revision}
+    invalid = {"decision": "ambiguous", "owner_id": "different-owner", "revision": plan.revision + 1}
+    pairs = []
+    for key, value in unique.items():
+        if key != member:
+            pairs.append((key, value))
+        elif order == "invalid_first":
+            pairs.extend([(key, invalid[key]), (key, value)])
+        elif order == "invalid_last":
+            pairs.extend([(key, value), (key, invalid[key])])
+        else:
+            pairs.extend([(key, value), (key, value)])
+    endpoint.script = ["{" + ",".join(json.dumps(key) + ":" + json.dumps(value) for key, value in pairs) + "}"]
+    events = endpoint.request("Pick up groceries", sid)
+    assert endpoint.store.active_task(sid) == before
+    assert not endpoint.effects and not endpoint.baseline_calls
+    assert len(endpoint.owned[0].requests) == 1 and endpoint.owned[0].requests[0]["tools"] == []
+    assert endpoint.agent_calls[0]["messages"][-1]["content"] == "Pick up groceries"
+    assert "add_reminder" in endpoint.agent_calls[0]["forbidden_tools"]
+    assert any("Ask whether" in message.get("content", "") for message in endpoint.agent_calls[0]["messages"])
+    assert any(event.get("route_source") == "model_led_discovery" for event in events)
+
+
+@pytest.mark.parametrize("decision", ["continue", "new_request", "ambiguous"])
+def test_unique_continuation_decision_retains_strict_contract(endpoint, decision):
+    from service.tasks.reply_engine import interpret_owner_continuation
+    _, plan = waiting_title(endpoint)
+    client = FakeClient(endpoint.target, [continuation_response(plan, decision)])
+    admission, verdict = asyncio.run(interpret_owner_continuation(
+        client, endpoint.target.model, plan.to_dict(), "Pick up groceries"))
+    assert verdict == decision
+    if decision == "continue":
+        assert admission.owner_id == plan.id and admission.revision == plan.revision
+        assert admission.prompt == "Pick up groceries" and admission.missing_slots == ("subject",)
+    else:
+        assert admission is None
+    assert client.requests[0]["tools"] == []
+    asyncio.run(client.aclose())
+
+
+@pytest.mark.parametrize("control", ["cancel", "retry"])
+def test_exact_existing_owner_controls_need_no_model_guess(endpoint, control):
+    from service.tasks import engine
+    sid, plan = waiting_title(endpoint)
+    turn = engine.prepare_task_turn(endpoint.store, sid, control, assistant_store=None, owner_only=True)
+    if control == "cancel":
+        assert turn and turn.plan.id == plan.id and turn.plan.status == "cancelled"
+    else:
+        assert turn and not turn.executable and turn.plan.id == plan.id
+        assert turn.plan.subject.value is None and turn.plan.missing_slots == ["subject"]
+        assert endpoint.store.active_task(sid)["id"] == plan.id
+
+
+@pytest.mark.parametrize("mode", [None, "1"])
+@pytest.mark.usefixtures("owner_recovery_path")
+def test_revision_changed_during_interpretation_keeps_fallback_mutations_closed(endpoint, monkeypatch, mode):
+    from service.tasks import reply_engine
+    if mode is None:
+        monkeypatch.setenv("HARBOR_MODEL_LED_ROUTING", "true")  # opt-in since 1.3.0
+    original_interpretation = reply_engine.interpret_owner_continuation
+    monkeypatch.setattr(reply_engine, "prepare_task_turn_async", real_task_recovery)
+    monkeypatch.setattr(main, "prepare_turn", real_workflow_recovery)
+    sid, plan = waiting_title(endpoint)
+    endpoint.script = [continuation_response(plan)]
+    changed = []
+    async def revise_while_waiting(*args, **kwargs):
+        result = await original_interpretation(*args, **kwargs)
+        newer = endpoint.store.active_task(sid)
+        newer["revision"] += 1
+        endpoint.store.save_workflow(sid, newer)
+        changed.append(endpoint.store.active_task(sid))
+        return result
+    monkeypatch.setattr(reply_engine, "interpret_owner_continuation", revise_while_waiting)
+    async def no_execution(*args, **kwargs):
+        raise AssertionError("Stale continuation triggered execution")
+    monkeypatch.setattr(main, "execute_task", no_execution)
+    async def no_mutation(**args):
+        raise AssertionError("Stale continuation admitted a new effect")
+    no_mutation.__module__ = "service.tools.assistant_tools"
+    registry.REGISTRY["add_reminder"] = registry.Tool("add_reminder", "Synthetic mutation", {"type": "object"},
+                                                   "assistant_write", no_mutation)
+    endpoint.request("Pick up groceries", sid)
+    assert changed and endpoint.store.active_task(sid) == changed[0]
+    assert endpoint.store.active_task(sid)["subject"]["value"] is None
+    assert endpoint.agent_calls[0]["messages"][-1]["content"] == "Pick up groceries"
+    assert "add_reminder" in endpoint.agent_calls[0]["forbidden_tools"]
+    assert not endpoint.effects and not endpoint.baseline_calls
+
+
+@pytest.mark.parametrize("mode", [None, "1"])
+def test_cancelled_uncertain_legacy_owner_keeps_model_action_envelope_closed(endpoint, monkeypatch, mode):
+    from service.workflows.models import WorkflowPlan
+    if mode is None:
+        monkeypatch.setenv("HARBOR_MODEL_LED_ROUTING", "true")  # opt-in since 1.3.0
+    async def forbidden_shell(**args):
+        raise AssertionError("An unresolved effect admitted another mutation")
+    forbidden_shell.__module__ = "service.tools.builtin"
+    registry.REGISTRY["run_shell"] = registry.Tool("run_shell", "Synthetic mutation",
+        {"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]},
+        "shell", forbidden_shell)
+    sid = endpoint.store.create_session()
+    plan = WorkflowPlan(status="running", sources=["messages"], recipient="Fixture", channel="messages", revision=1)
+    endpoint.store.save_workflow(sid, plan.to_dict())
+    assert endpoint.store.claim_workflow_effect(sid, plan.id, f"workflow_effect:{plan.id}", revision=1)
+    assert real_workflow_recovery(endpoint.store, sid, "cancel", owner_only=True).plan.status == "cancelled"
+    monkeypatch.setattr(main, "prepare_turn", real_workflow_recovery)
+    endpoint.request("send a new message to another person", sid)
+    assert endpoint.store.unresolved_action(sid)
+    assert "run_shell" in endpoint.agent_calls[0]["forbidden_tools"]
+    assert not endpoint.effects
+
+
+def test_enabled_routes_through_configured_model_even_after_rename(endpoint, monkeypatch):
+    monkeypatch.setenv("HARBOR_MODEL_LED_ROUTING", "true")  # opt-in since 1.3.0
+    endpoint.target = Target("agent", endpoint.target.endpoint, "renamed-trained-model")
+    endpoint.request("what is up this weej")
+    assert endpoint.agent_calls[0]["model"] == "renamed-trained-model"
+    assert not endpoint.baseline_calls
+
+
+@pytest.mark.parametrize("prompt", ["yes", "Messages", "and tomorrow?", "what did mom say today", "what is up this weej"])
+def test_model_interprets_followups_without_positive_router_or_new_compiler(endpoint, monkeypatch, prompt):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Positive host selection ran")
+    async def forbidden_async(*args, **kwargs):
+        forbidden()
+    monkeypatch.setattr(main, "route", forbidden_async)
+    monkeypatch.setattr("service.tasks.reply_engine.prepare_task_turn_async", forbidden_async)
+    monkeypatch.setattr("service.workflows.reads.compile_read", forbidden)
+    monkeypatch.setattr(main, "prepare_turn", forbidden)
+    sid = endpoint.store.create_session()
+    endpoint.store.add_turn(sid, "assistant", "Messages or email?")
+    endpoint.request(prompt, sid)
+    assert endpoint.agent_calls[0]["messages"][-1]["content"] == prompt
+
+
+def test_family_communication_never_admits_public_egress(endpoint):
+    endpoint.request("what did mom say today")
+    assert {"web_search", "web_fetch", "run_shell", "http_request"} <= set(
+        endpoint.agent_calls[0]["forbidden_tools"])
+
+
+@pytest.mark.parametrize("prompt", ["search the web for what Mom said", "What did Einstein's mother say?",
+                                      'Explain the phrase "what did mom say"'])
+def test_public_or_quoted_text_is_not_a_personal_communication_guard(prompt):
+    assert not personal_communication_request(prompt)
+
+
+@pytest.mark.parametrize("mode", ["1", None])
+def test_mom_lookup_uses_selected_synthetic_schema_and_fresh_evidence(endpoint, monkeypatch, mode):
+    if mode is None:
+        monkeypatch.setenv("HARBOR_MODEL_LED_ROUTING", "true")  # opt-in since 1.3.0
+    monkeypatch.setattr(main, "run_agent", loop.run_agent)
+    monkeypatch.setattr(loop, "_BLOCKS_CACHE", None)
+    monkeypatch.setattr(loop, "narration_mode", lambda: "off")
+    monkeypatch.setattr(loop, "no_thinking_kwargs", lambda *args, **kwargs: {})
+    monkeypatch.setattr("service.memory.identity.identity_prompt_block", lambda **kwargs: "")
+    monkeypatch.setattr("service.skills.skills_context_block", lambda *args: "")
+    monkeypatch.setattr("service.safety.grants.check", lambda *args: None)
+    monkeypatch.setattr("service.safety.policy._FULL_ACCESS", False)
+    monkeypatch.setattr("service.safety.policy._READ_ONLY", False)
+    async def messages(**args):
+        endpoint.effects.append(("view_messages", args))
+        return "[Thu Oct 8, 1:00 PM] Mom — Mom: meet at six."
+    messages.__module__ = "service.tools.imessage_tools"
+    registry.REGISTRY["view_messages"] = registry.Tool("view_messages", "Synthetic messages read",
+        {"type": "object", "properties": {"query": {"type": "string"},
+         "period": {"type": "string"}}, "required": ["query", "period"]}, "messages_read", messages)
+    endpoint.script = [[tool_call("get_tool_schemas", families=["messages_contacts"], tools=["view_messages"])],
+                       [tool_call("view_messages", query="Mom", period="today")], "Mom said: meet at six."]
+    sid = endpoint.store.create_session()
+    endpoint.store.add_turn(sid, "assistant", "Yesterday's old synthetic summary.")
+    events = endpoint.request("what did mom say today", sid)
+    assert endpoint.effects == [("view_messages", {"query": "Mom", "period": "today"})]
+    assert any(e.get("text") == "Mom said: meet at six." for e in events)
+    assert not endpoint.baseline_calls
+
+
+@pytest.mark.parametrize("value", ["", "probably", "enabled"])
+def test_invalid_mode_override_never_silently_uses_rules(value):
+    with pytest.raises(ValueError):
+        model_led_enabled(value)
+
+
+def test_current_personal_answer_without_fresh_read_is_replaced_by_clarification(synthetic):
+    _, _, answer = run(["Mom said the old stale thing."], prompt="what did mom say today",
+                       require_fresh_personal=True)
+    assert "old stale" not in answer and answer.endswith("?")
+
+
+def test_source_failure_or_unrelated_public_result_does_not_ground_personal_answer(synthetic):
+    _, register = synthetic
+    register("web_search", "web_tools", "web_read")
+    _, _, answer = run([[discover("public_web", "web_search")], [call("web_search")],
+                       "Mom said public synthetic news."], prompt="what did mom say today",
+                       require_fresh_personal=True)
+    assert "public synthetic news" not in answer and answer.endswith("?")
+
+
+def test_personal_clarification_can_be_asked_without_reading(synthetic):
+    _, _, answer = run(["Which channel should I check?"], require_fresh_personal=True)
+    assert answer == "Which channel should I check?"
+
+
+def test_existing_owner_only_task_mode_never_compiles_new_request(endpoint, monkeypatch):
+    import asyncio
+    from service.tasks import compiler, engine, reply_engine
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Fresh positive task compilation")
+    monkeypatch.setattr(compiler, "compile_task", forbidden)
+    monkeypatch.setattr(engine, "compile_task", forbidden)
+    sid = endpoint.store.create_session()
+    result = asyncio.run(reply_engine.prepare_task_turn_async(endpoint.store, sid,
+        "reply to the newest email", assistant_store=None, owner_only=True, allow_native=False))
+    assert result is None
+
+
+def test_existing_owner_only_workflow_mode_never_compiles_new_request(endpoint, monkeypatch):
+    from service.workflows import engine
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Fresh positive workflow compilation")
+    monkeypatch.setattr(engine, "compile_new", forbidden)
+    sid = endpoint.store.create_session()
+    assert engine.prepare_turn(endpoint.store, sid, "send my calendar to Mom", owner_only=True) is None
+
+
+def test_rollback_cannot_bypass_uncertain_model_action(endpoint, monkeypatch):
+    sid = endpoint.store.create_session()
+    claim = endpoint.store.claim_model_effect(sid, "prior", "send_message", {"to": "fixture"}, outbound=True)
+    endpoint.store.finish_model_effect(sid, claim, verified=False)
+    # The rc3 rollback needs HARBOR_MODEL_ONLY=false too: the packaged
+    # model_only would otherwise keep this turn model-led.
+    monkeypatch.setenv("HARBOR_MODEL_LED_ROUTING", "0")
+    monkeypatch.setenv("HARBOR_MODEL_ONLY", "false")
+    events = endpoint.request("send that to another person", sid)
+    assert not endpoint.baseline_calls and not endpoint.agent_calls and not endpoint.effects
+    assert any("unverified outcome" in e.get("text", "") for e in events)
+
+
+def test_memory_exclusion_removes_automatic_memory_context(endpoint):
+    endpoint.request("what did mom say today but do not use memory")
+    assert endpoint.agent_calls[0]["include_memory_context"] is False
+    assert {"recall", "search_conversations", "remember", "forget", "clear_memory"} <= set(
+        endpoint.agent_calls[0]["forbidden_tools"])
+
+
+def test_memory_exclusion_with_typographic_apostrophe(endpoint):
+    endpoint.request("what did mom say today, don\u2019t use my memory")
+    assert endpoint.agent_calls[0]["include_memory_context"] is False
+    assert {"recall", "search_conversations", "remember", "forget", "clear_memory"} <= set(
+        endpoint.agent_calls[0]["forbidden_tools"])
+
+
+@pytest.mark.parametrize("apostrophe", ["'", "\u2019", "\u2018", "\u02bc", "\uff07"])
+def test_memory_excluded_folds_typographic_apostrophes(apostrophe):
+    from service.router.model_led import memory_excluded
+    assert memory_excluded(f"Don{apostrophe}t use my memory, what's a good gift for my sister?")
+    assert memory_excluded(f"don{apostrophe}t check your memory")
+    # A quoted instruction is source text, with either kind of double quote.
+    assert not memory_excluded(f'what does "don{apostrophe}t use my memory" mean?')
+    assert not memory_excluded(f"what does \u201cdon{apostrophe}t use my memory\u201d mean?")
+    assert not memory_excluded(f"I don{apostrophe}t remember, what did mom say today")
+
+
+@pytest.mark.parametrize("apostrophe", ["'", "\u2019", "\u2018", "\u02bc", "\uff07"])
+def test_bare_decline_with_typographic_apostrophe_stays_baseline(apostrophe):
+    from service.router.model_led import continuation_requires_baseline
+    assert continuation_requires_baseline(f"Don{apostrophe}t.", "Should I send it?")
+    assert not continuation_requires_baseline(f"don{apostrophe}t forget tomorrow", "Your calendar today")
+
+
+def test_active_reminder_cannot_hijack_new_personal_question(endpoint, monkeypatch):
+    from service.tasks import engine
+    sid = endpoint.store.create_session()
+    old = engine.prepare_task_turn(endpoint.store, sid, "remind me", assistant_store=None)
+    assert old and old.plan.status == "waiting_for_input"
+    before = endpoint.store.active_task(sid)
+    def forbidden(*args, **kwargs):
+        raise AssertionError("New task compilation while recovering old owner")
+    monkeypatch.setattr(engine, "compile_task", forbidden)
+    assert engine.prepare_task_turn(endpoint.store, sid, "what did Mom say today", assistant_store=None,
+                                    owner_only=True) is None
+    assert endpoint.store.active_task(sid) == before
+
+
+def test_active_workflow_only_advances_bound_slot_and_never_compiles_new_payload(endpoint, monkeypatch):
+    from service.workflows import engine
+    sid = endpoint.store.create_session()
+    prior = engine.prepare_turn(endpoint.store, sid, "send Mom my calendar")
+    assert prior and prior.plan.status == "waiting_for_channel"
+    before = endpoint.store.active_workflow(sid)
+    def forbidden(*args, **kwargs):
+        raise AssertionError("New payload compilation during owner recovery")
+    monkeypatch.setattr(engine, "compile_new", forbidden)
+    assert engine.prepare_turn(endpoint.store, sid, "what did Mom say today", owner_only=True) is None
+    assert endpoint.store.active_workflow(sid) == before
+    continuation = engine.prepare_turn(endpoint.store, sid, "Messages", owner_only=True)
+    assert continuation and continuation.plan.id == prior.plan.id
+    assert continuation.plan.channel == "messages"
+
+
+def test_unrelated_calendar_read_cannot_ground_a_mom_answer(synthetic):
+    _, _, answer = run([[discover("calendar", "get_upcoming")], [call("get_upcoming", period="today")],
+                       "Mom said a stale thing."], prompt="what did Mom say today",
+                       fresh_personal_scope={"scope": "communications", "contact": "mom", "day": "today"})
+    assert "stale thing" not in answer and answer.endswith("?")
+
+
+def test_body_mention_and_outgoing_message_are_not_contact_proof():
+    from types import SimpleNamespace
+    from service.router.model_led import personal_evidence_matches
+    proof = {"scope": "communications", "contact": "mom", "day": "today"}
+    tool = SimpleNamespace(name="view_messages", category="messages_read")
+    for text in ("[Thu Oct 8, 1:00 PM] Bob — Bob: Mom said six.",
+                 "[Thu Oct 8, 1:00 PM] Mom — Me: meet six.",
+                 "[Thu Oct 8, 1:00 PM] Bob — Bob: quoted header:\n[Thu Oct 8, 1:00 PM] Mom — Mom: six."):
+        assert not personal_evidence_matches(proof, tool, {"query": "Mom", "day": "today"}, {}, text)
+    assert personal_evidence_matches(proof, tool, {"query": "Mom", "day": "today"}, {},
+                                    "[Thu Oct 8, 1:00 PM] Mom — Mom: six.")
+    mail = SimpleNamespace(name="view_emails", category="email_read")
+    assert not personal_evidence_matches(proof, mail, {"query": "Mom", "day": "today"}, {},
+        "From: Bob\nTo: fixture\nSubject: Mom\nDate: today\nMom said six.")
+
+
+def test_question_with_unverified_factual_premise_is_replaced(synthetic):
+    _, _, answer = run(["What time was the six o'clock meeting Mom mentioned?"],
+                       require_fresh_personal=True)
+    assert "six o'clock" not in answer and "haven't checked" in answer
+
+
+@pytest.mark.parametrize("name,category,text", [
+    ("view_messages", "messages_read", "Harbor is still syncing your messages after launch, so I’m holding off."),
+    ("view_messages", "messages_read", "(Can't read Messages: fixture permission unavailable.)"),
+    ("view_emails", "email_read", "(No raw email content cached right now — either Mail.app hasn't synced yet.)"),
+    ("view_emails", "email_read", "(Read/unread status isn't in the raw email cache yet — arrives after sync.)")])
+def test_source_readiness_failure_does_not_establish_freshness(name, category, text):
+    from types import SimpleNamespace
+    from service.router.model_led import personal_evidence_matches
+    scope = "messages" if category == "messages_read" else "mail"
+    assert not personal_evidence_matches({"scope": scope, "day": "today"},
+        SimpleNamespace(name=name, category=category), {"day": "today"}, {}, text)
+
+
+def test_genuine_current_empty_messages_scope_is_distinct_from_sync_failure():
+    from types import SimpleNamespace
+    from service.router.model_led import personal_evidence_matches
+    assert personal_evidence_matches({"scope": "messages", "day": "today"},
+        SimpleNamespace(name="view_messages", category="messages_read"), {"day": "today"}, {},
+        "No messages found for today.")
+
+
+@pytest.mark.parametrize("prompt", ["and tommrow?", "what about tomorrow?", "for today", "yesterday instead"])
+def test_short_date_followup_retains_personal_evidence_obligation(prompt):
+    from service.router.model_led import fresh_personal_obligation
+    assert fresh_personal_obligation(prompt, "get_upcoming")["scope"] == "calendar"
+
+
+@pytest.mark.parametrize("prompt", ["what is the weather tomorrow?", "tell me tomorrow's news",
+                                   "calculate tomorrow's sales projection", "what did Einstein say yesterday?"])
+def test_new_topic_does_not_inherit_prior_calendar_date_obligation(prompt):
+    from service.router.model_led import fresh_personal_obligation
+    assert fresh_personal_obligation(prompt, "get_upcoming") == {}
+
+
+
+@pytest.mark.parametrize("prompt", [
+    "How do I share my calendar with Sam?", "how do I export my calendar to a file",
+    "how do I back up my messages", "How to clean up my inbox",
+    "why won't my email sync", "why won\u2019t my email sync", "Why can't I open my messages?",
+    "why is my calendar not syncing with my phone",
+    "my calendar app is broken, any ideas?", "My inbox is overflowing, any tips?",
+    "my email app keeps crashing"])
+def test_how_to_or_troubleshooting_that_names_a_source_sets_no_obligation(prompt):
+    from service.router.model_led import fresh_personal_obligation
+    assert fresh_personal_obligation(prompt) == {}
+
+
+@pytest.mark.parametrize("prompt,scope", [
+    ("what's on my calendar tomorrow", "calendar"), ("summarize my inbox", "mail"),
+    ("how many meetings are on my calendar today", "calendar"),
+    ("How many events are on my calendar", "calendar"),
+    ("How much of my inbox is unread?", "mail"), ("how busy is my calendar", "calendar"),
+    ("How does my calendar look this week", "calendar"), ("show my messages", "messages"),
+    # A named day is a request about that day's records, whatever the shape.
+    ("How can I fit a workout into my calendar tomorrow?", "calendar"),
+    ("what does my calendar app say for tomorrow", "calendar"),
+    # "Why" about what a source holds is still a question about its records.
+    ("why is my inbox empty", "mail"),
+    ("why isn't my meeting with Sam on my calendar", "calendar"),
+    ("what did mom say today", "communications")])
+def test_data_request_that_names_a_source_keeps_its_obligation(prompt, scope):
+    from service.router.model_led import fresh_personal_obligation
+    assert fresh_personal_obligation(prompt)["scope"] == scope
+
+
+@pytest.mark.parametrize("mode", [None, "1"])
+def test_private_read_with_pending_owner_keeps_shell_unavailable_at_actual_executor(endpoint, monkeypatch, mode):
+    from tests.test_model_led_entrypoint import _private_shell_endpoint
+    io, invocations = _private_shell_endpoint(endpoint, monkeypatch)
+    if mode is None:
+        monkeypatch.setenv("HARBOR_MODEL_LED_ROUTING", "true")  # opt-in since 1.3.0
+    sid, plan = waiting_title(endpoint)
+    before = endpoint.store.active_task(sid)
+    endpoint.script = [
+        [tool_call("get_tool_schemas", families=["calendar"], tools=["get_upcoming"])],
+        [tool_call("get_upcoming", days=1, calendar_only=True)],
+        [tool_call("get_tool_schemas", families=["automation"], tools=["run_shell"])],
+        [tool_call("run_shell", cmd="pwd")],
+        "Synthetic current calendar reply.",
+    ]
+    events = endpoint.request("list my calendar", sid)
+    assert endpoint.store.active_task(sid) == before
+    assert endpoint.effects == [("get_upcoming", {"days": 1, "calendar_only": True})]
+    assert invocations[-1]["has_owner"], "Real main claim/finish hooks must be present"
+    assert not io, "Even original safe pwd must stay unavailable with this pending owner"
+    requests = endpoint.owned[0].requests
+    assert any(any(c.get("name") == "get_upcoming" for c in [t.get("function", {}) for t in r.get("tools") or []]) for r in requests)
+    assert all("run_shell" not in {t["function"]["name"] for t in r.get("tools") or []} for r in requests)
+    # Attempted discovery AND an actual scripted direct call must be refused,
+    # rather than the test passing because the model did not select the tool.
+    assert len(requests) >= 4
+    assert any(e.get("type") == "tool_result" and "run_shell was not run" in str(e.get("result", "")).lower() for e in events)
+    assert not any(e.get("type") == "tool_call" and e.get("name") == "run_shell" for e in events)
+    assert not any(json.loads(r[0]).get("kind") == "model_led_effect" for r in
+                   endpoint.store._db.execute("SELECT state_json FROM workflows WHERE session_id=?", (sid,)))
+
+
+def test_withheld_actions_are_explained_and_lifted_by_resolution(endpoint, monkeypatch):
+    """0.5.0-rc3 audit M2: a legacy task with a consumed claim withholds every
+    action tool on a model-led turn. The user is told why in one sentence, and
+    the existing resolve endpoint lifts it."""
+    from service.workflows.models import WorkflowPlan
+    monkeypatch.delenv("HARBOR_MODEL_ONLY", raising=False)
+    sid = endpoint.store.create_session()
+    plan = WorkflowPlan(status="running", channel="email", recipient="Fixture", revision=1)
+    endpoint.store.save_workflow(sid, plan.to_dict())
+    assert endpoint.store.claim_effect_call(plan.id, "legacy-call", revision=1)
+    async def no_mutation(**args):
+        raise AssertionError("withheld action ran")
+    no_mutation.__module__ = "service.tools.assistant_tools"
+    registry.REGISTRY["add_reminder"] = registry.Tool("add_reminder", "Synthetic mutation", {"type": "object"},
+                                                   "assistant_write", no_mutation)
+    events = endpoint.request("remind me to call Sam at 5", sid)
+    texts = [e["text"] for e in events if e["type"] == "text"]
+    assert texts[0] == main.UNRESOLVED_ACTION_NOTICE + "\n\nSynthetic answer."
+    assert "add_reminder" in endpoint.agent_calls[0]["forbidden_tools"]
+    # A plain read in the same held chat is answered without the notice, and
+    # the action tools stay withheld all the same.
+    for question in ("is there any email about class enrollment", "what's on my calendar today?"):
+        events = endpoint.request(question, sid)
+        assert not any(main.UNRESOLVED_ACTION_NOTICE in e.get("text", "") for e in events), question
+        assert "add_reminder" in endpoint.agent_calls[-1]["forbidden_tools"]
+    # Anything that is not plainly a read still gets it, and so does a question
+    # about the held action's own outcome (review of 137397ba): the notice is its answer.
+    for request in ("try that again", "yes", "ok do it", "send it now", "can you text Sam the plan",
+                    "did it send?", "did my email to Sam go through?", "was the forward sent?",
+                    "check that it sent", "what's the status?", "did that work?", "has it been delivered"):
+        events = endpoint.request(request, sid)
+        texts = [e["text"] for e in events if e["type"] == "text"]
+        assert texts and texts[0].startswith(main.UNRESOLVED_ACTION_NOTICE), request
+    assert endpoint.store.resolve_model_effects(sid) == 1
+    events = endpoint.request("remind me to call Sam at 5", sid)
+    assert not any(main.UNRESOLVED_ACTION_NOTICE in e.get("text", "") for e in events)
+    assert "add_reminder" not in endpoint.agent_calls[-1]["forbidden_tools"]
+
+
+def test_a_question_about_an_earlier_action_is_never_a_plain_read():
+    about = ["did it send?", "did my email to Sam go through?", "was the forward sent?", "check that it sent",
+             "what's the status?", "did that work?", "is it done?", "did Sam get it?", "has it been delivered",
+             "what happened to my email", "did the reply go out", "was it successful", "what was the result",
+             # Delta review: whether the other side has the user's own message.
+             "did Sam get my email?", "did Sam see my text?", "is my message out?",
+             "any word from the mail app?", "has Dana read my message", "did this work", "what is this",
+             # "fall", "spring" and "term" are not date words here: these ask after the action.
+             "did that fall through", "did it fall through?", "did the forward fall through",
+             "did that spring a problem", "what was that term"]
+    plain = ["is there any email about class enrollment", "what's on my calendar today?", "any new texts",
+             "what did mom say", "show my reminders", "who emailed me today",
+             # Delta review: a date word after this/that, and "done" alone, are ordinary reads.
+             "what's on my calendar this week?", "what homework do I have to get done?",
+             "what's on my calendar that day", "show my reminders for this weekend",
+             "read my latest email", "what's in my email today"]
+    assert not any(main._plain_read_request(text) for text in about)
+    assert all(main._plain_read_request(text) for text in plain)
+    # has_write_intent alone would have let most of these through.
+    from service.router.router import has_write_intent
+    assert not has_write_intent("did my email to Sam go through?") and not has_write_intent("what's the status?")

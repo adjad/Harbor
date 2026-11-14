@@ -1,0 +1,327 @@
+"""The app's routine event-stream reconnect must not fail native actions, and a
+turn that stops on a failed or denied write must still end with `done`.
+
+Regression for debug export 2026-10-12: an approved add_calendar_event landed
+in the app's 3s re-subscribe gap and failed as "Harbor app is not connected";
+the loop then returned without `done`, so the app replaced the honest failure
+text with "The assistant didn't respond."
+"""
+from __future__ import annotations
+
+import asyncio
+from copy import deepcopy
+from dataclasses import replace
+from datetime import datetime
+import json
+import socket
+import subprocess
+import time
+
+import pytest
+
+from service.agent import loop
+from service.assistant import outbox
+import service.assistant.hub  # noqa: E402
+import sys
+from service.assistant.hub import Hub
+from service.inference.omlx_client import OMLXClient
+from service.memory import identity
+from service.safety import grants, policy
+from service.tools import assistant_tools  # noqa: F401  register before fakes
+from service.tools.registry import REGISTRY
+
+
+# --- reconnect grace -------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_never_connected_fails_immediately():
+    hub = Hub(store=object())
+    started = time.monotonic()
+    assert await outbox.app_connected(grace=5, via=hub) is False
+    assert time.monotonic() - started < 0.5
+
+
+@pytest.mark.asyncio
+async def test_resubscribe_inside_grace_counts_as_connected():
+    hub = Hub(store=object())
+    hub.unsubscribe(hub.subscribe())  # the app's periodic stream rotation
+
+    async def reconnect():
+        await asyncio.sleep(0.1)
+        hub.subscribe()
+
+    task = asyncio.create_task(reconnect())
+    assert await outbox.app_connected(grace=2, via=hub) is True
+    await task
+
+
+@pytest.mark.asyncio
+async def test_no_resubscribe_within_grace_still_fails():
+    hub = Hub(store=object())
+    hub.unsubscribe(hub.subscribe())
+    started = time.monotonic()
+    assert await outbox.app_connected(grace=0.2, via=hub) is False
+    assert time.monotonic() - started < 1
+
+
+@pytest.mark.asyncio
+async def test_long_gone_app_is_not_waited_for(monkeypatch):
+    hub = Hub(store=object())
+    hub.unsubscribe(hub.subscribe())
+    monkeypatch.setattr(sys.modules["service.assistant.hub"], "RECONNECT_WINDOW_S", 0.0)
+    await asyncio.sleep(0.01)
+    started = time.monotonic()
+    assert await outbox.app_connected(grace=5, via=hub) is False
+    assert time.monotonic() - started < 0.5
+
+
+@pytest.mark.asyncio
+async def test_calendar_request_waits_out_the_gap(monkeypatch):
+    hub = Hub(store=object())
+    hub.unsubscribe(hub.subscribe())
+    published = []
+
+    async def publish(event, **metadata):
+        published.append(event)
+        outbox.complete(event["action_id"], {"ok": True})
+        return event
+
+    monkeypatch.setattr(hub, "publish", publish)
+    monkeypatch.setattr(outbox, "hub", hub)
+    monkeypatch.setattr(outbox, "RECONNECT_GRACE_S", 2.0)
+
+    async def reconnect():
+        await asyncio.sleep(0.1)
+        hub.subscribe()
+
+    task = asyncio.create_task(reconnect())
+    result = await outbox._request("create_calendar_event", {"title": "Fixture"}, timeout=2)
+    await task
+    assert result == {"ok": True}
+    assert [event["type"] for event in published] == ["create_calendar_event"]
+
+
+# --- the Mail bridge in the same gap ---------------------------------------------
+
+class _MailApp:
+    """Plays the app for the Mail bridge: re-subscribes after `after` seconds, then answers
+    every `mail_memory_read` it is sent with `reply`."""
+
+    def __init__(self, hub, reply, after=0.1):
+        self.hub, self.reply, self.after, self.seen = hub, reply, after, []
+        self.task = asyncio.create_task(self._run())
+
+    async def _run(self):
+        from service.mail_memory import bridge
+        await asyncio.sleep(self.after)
+        queue = self.hub.subscribe()
+        while True:
+            event = await queue.get()
+            self.seen.append(event)
+            if self.reply is not None:
+                bridge.deliver({"request_id": event["request_id"], "kind": event["kind"], **self.reply})
+
+    async def close(self):
+        self.task.cancel()
+        await asyncio.gather(self.task, return_exceptions=True)
+
+
+@pytest.fixture
+def mail_hub(monkeypatch):
+    hub = Hub(store=object())
+    monkeypatch.setattr(sys.modules["service.assistant.hub"], "hub", hub)
+    return hub
+
+
+@pytest.mark.asyncio
+async def test_sent_mail_read_waits_out_the_gap(mail_hub):
+    from service.mail_memory import bridge
+    mail_hub.unsubscribe(mail_hub.subscribe())  # the stream's routine rotation
+    app = _MailApp(mail_hub, {"ok": True, "rows": [{"ts": 1_800_000_000.0, "subject": "Lunch",
+                                                    "to": ["dana@example.com"], "recipients": 1}]})
+    try:
+        rows, capped = await bridge.read_sent(7, timeout=2.0)
+    finally:
+        await app.close()
+    assert [r["subject"] for r in rows] == ["Lunch"] and capped is False
+    assert [(e["type"], e["kind"]) for e in app.seen] == [("mail_memory_read", "sent")]
+    assert bridge._pending == {}
+
+
+@pytest.mark.asyncio
+async def test_text_recognition_waits_out_the_gap(mail_hub):
+    from service.mail_memory import bridge
+    mail_hub.unsubscribe(mail_hub.subscribe())
+    app = _MailApp(mail_hub, {"ok": True, "text": "TOTAL 12.50", "confidence": 0.9})
+    try:
+        assert await bridge.recognize_text(b"\xff\xd8\xff\xe0" + b"0" * 16, timeout=2.0) == ("TOTAL 12.50", 0.9)
+    finally:
+        await app.close()
+
+
+@pytest.mark.asyncio
+async def test_mail_bridge_fails_at_once_without_an_app(mail_hub, monkeypatch):
+    from service.mail_memory import bridge
+    published = []
+
+    async def publish(event, **metadata):
+        published.append(event)
+        return event
+
+    monkeypatch.setattr(mail_hub, "publish", publish)
+    started = time.monotonic()
+    with pytest.raises(bridge.BridgeError, match="app_not_connected"):     # never connected
+        await bridge.read_sent(7, timeout=5.0)
+    assert time.monotonic() - started < 0.5
+
+    mail_hub.unsubscribe(mail_hub.subscribe())                              # left long ago
+    monkeypatch.setattr(sys.modules["service.assistant.hub"], "RECONNECT_WINDOW_S", 0.0)
+    await asyncio.sleep(0.01)
+    started = time.monotonic()
+    with pytest.raises(bridge.BridgeError, match="app_not_connected"):
+        await bridge.read_attachment_index([], 0, 0, [], timeout=5.0)
+    assert time.monotonic() - started < 0.5
+    assert published == [] and bridge._pending == {}
+
+
+@pytest.mark.asyncio
+async def test_mail_bridge_wait_stays_inside_the_requests_own_time(mail_hub):
+    from service.mail_memory import bridge
+    mail_hub.unsubscribe(mail_hub.subscribe())
+    started = time.monotonic()
+    with pytest.raises(bridge.BridgeError, match="app_not_connected"):     # the app never comes back
+        await bridge.read_sent(7, timeout=0.2)
+    assert 0.15 < time.monotonic() - started < 1.0
+
+    app = _MailApp(mail_hub, None, after=0.2)                               # comes back, never answers
+    mail_hub.unsubscribe(mail_hub.subscribe())
+    started = time.monotonic()
+    try:
+        with pytest.raises(bridge.BridgeError, match="sent_timeout"):
+            await bridge.read_sent(7, timeout=0.5)
+    finally:
+        await app.close()
+    # The half second covers the wait for the app AND its answer, not one after the other.
+    assert 0.4 < time.monotonic() - started < 0.68
+    assert len(app.seen) == 1 and bridge._pending == {}
+
+
+# --- server-owned stream rotation ----------------------------------------------
+
+def _store():
+    from types import SimpleNamespace
+    return SimpleNamespace(pending_events=lambda: [])
+
+
+@pytest.mark.asyncio
+async def test_server_rotation_hands_over_queued_sends_then_unsubscribes():
+    """A send queued when the rotation deadline passes is delivered, not lost."""
+    hub = Hub(store=_store())
+    stream = hub.events(rotate_after=0.1)
+    first_read = asyncio.create_task(anext(stream))
+    await asyncio.sleep(0)
+    assert hub.has_subscribers
+    await hub.publish({"type": "send_message", "action_id": "a"}, durable=False)
+    await hub.publish({"type": "send_message", "action_id": "b"}, durable=False)
+    assert (await first_read)["action_id"] == "a"
+    await asyncio.sleep(0.15)  # deadline passes while "c" is still queued
+    await hub.publish({"type": "send_message", "action_id": "c"}, durable=False)
+    assert (await anext(stream))["action_id"] == "b"
+    assert not hub.has_subscribers  # new publishers wait for the reconnect
+    assert (await anext(stream))["action_id"] == "c"
+    with pytest.raises(StopAsyncIteration):
+        await anext(stream)
+    assert await outbox.app_connected(grace=0.05, via=hub) is False
+
+
+@pytest.mark.asyncio
+async def test_rotation_ends_an_idle_stream_without_waiting_for_a_heartbeat():
+    hub = Hub(store=_store())
+    started = time.monotonic()
+    assert [event async for event in hub.events(rotate_after=0.1)] == []
+    assert time.monotonic() - started < 1
+    assert not hub.has_subscribers
+
+
+def test_app_does_not_cut_the_event_stream_itself():
+    from pathlib import Path
+    source = (Path(__file__).resolve().parents[1]
+              / "app/Sources/HarborApp/HarborClient.swift").read_text()
+    body = source[source.index("func assistantEvents("):]
+    body = body[:body.index("\n    }\n")]
+    assert "timeIntervalSince" not in body and "return }" not in body.split("for try await")[1]
+
+
+# --- terminal `done` on early write exits -------------------------------------
+
+WHEN_ISO = datetime(2036, 9, 28, 12, 0).astimezone().isoformat(timespec="seconds")
+
+
+class OneCallClient:
+    def __init__(self):
+        self.steps = 0
+
+    async def ensure_only(self, *args, **kwargs):
+        pass
+
+    async def stream_events(self, model, messages, *, tools=None, **kwargs):
+        self.steps += 1
+        assert self.steps == 1, "a failed write must not go back to the model"
+        yield {"kind": "final", "message": {
+            "role": "assistant", "content": "",
+            "tool_calls": [{"id": "create", "function": {
+                "name": "add_calendar_event",
+                "arguments": json.dumps({"title": "Fixture", "when_iso": WHEN_ISO,
+                                         "duration_min": 60})}}]}}
+
+
+class FixedApprover:
+    def __init__(self, verdict):
+        self.verdict = verdict
+
+    async def confirm(self, action):
+        return self.verdict
+
+
+@pytest.fixture
+def inert(monkeypatch, tmp_path):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("real side effect attempted")
+
+    monkeypatch.setattr(socket.socket, "connect", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    monkeypatch.setattr(OMLXClient, "stream_events", forbidden)
+    monkeypatch.setattr(outbox, "request", forbidden)
+    monkeypatch.setattr(identity, "_full_name", "Fixture User")
+    monkeypatch.setattr(grants, "GRANTS_PATH", tmp_path / "grants.json")
+    monkeypatch.setattr(grants, "_CACHE", {})
+    monkeypatch.setattr(policy, "_FULL_ACCESS", False)
+    monkeypatch.setattr(loop, "audit", lambda *args, **kwargs: None)
+
+    def fake(**args):
+        return "(error: Harbor app is not connected; Calendar was not changed.)"
+
+    monkeypatch.setitem(REGISTRY, "add_calendar_event",
+                        replace(REGISTRY["add_calendar_event"], func=fake))
+
+
+@pytest.mark.parametrize("approved, expected", [
+    (True, "did not return a verified success"),
+    (False, "approval was denied"),
+])
+@pytest.mark.asyncio
+async def test_stopped_write_turn_ends_with_done(inert, approved, expected):
+    events = []
+
+    async def emit(event):
+        events.append(deepcopy(event))
+
+    text = await loop.run_agent(
+        OneCallClient(), "fixture-model",
+        [{"role": "user", "content": "Add Fixture to my calendar Thursday at noon."}],
+        emit, FixedApprover(approved), tools=["add_calendar_event"],
+        max_steps=3, include_memory_context=False, debug=False)
+    assert expected in text
+    types = [event["type"] for event in events]
+    assert types.count("done") == 1 and types[-1] == "done"
+    assert [e for e in events if e["type"] == "text"][-1]["text"] == text

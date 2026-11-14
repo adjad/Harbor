@@ -1,0 +1,2940 @@
+from __future__ import annotations
+
+from argparse import Namespace
+from contextlib import ExitStack, contextmanager
+import hashlib
+import json
+import os
+from pathlib import Path
+import plistlib
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+import zipfile
+
+ROOT = Path(__file__).resolve().parents[2]
+GOOGLE_CLIENT_SECRET_LINE = "HARBOR_GOOGLE_OAUTH_CLIENT: ${{ secrets.HARBOR_GOOGLE_OAUTH_CLIENT }}"
+sys.path.insert(0, str(ROOT / "build-support"))
+import pipeline as p
+import engine_licenses
+import release
+
+
+class PipelineTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.meta = {"version": p.CONFIG["version"], "build_number": "12", "commit": "a" * 40,
+                     "source_epoch": 1700000000, "dirty": False, "architecture": "arm64", "minimum_macos": "14.0"}
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    @contextmanager
+    def synthetic_profile_metadata(self):
+        """Unit tests generate policy without querying tools inside Seatbelt.
+
+        The separate check_* entry points still query the host and execute real
+        sandbox probes before the full QA sandbox is entered.
+        """
+        def query(command, **kwargs):
+            if command == ["xcode-select", "-p"]:
+                return str(self.root / "developer")
+            if command == ["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"]:
+                return str(self.root / "os-temp")
+            raise AssertionError("Unexpected profile metadata query")
+        def git(*args):
+            return ".git" if args == ("rev-parse", "--git-common-dir") else "a" * 40
+        with patch.object(p, "git", side_effect=git), patch.object(p.subprocess, "check_output", side_effect=query):
+            yield
+
+    def fixture(self):
+        bundle = self.root / "Harbor.app"
+        for rel in ("Contents/MacOS/Harbor", "Contents/Resources/AppIcon.icns", "Contents/Resources/build-info.json",
+                    "Contents/Resources/backend/.venv/bin/python3", "Contents/Resources/backend/service/main.py",
+                    "Contents/Resources/backend/service/config/models.yaml", "Contents/Resources/backend/service/config/policy.yaml",
+                    "Contents/Resources/backend/service/skills/bundled/interview-me/SKILL.md",
+                    "Contents/Resources/backend/service/skills/bundled/idea-refine/SKILL.md",
+                    "Contents/Resources/backend/service/skills/bundled/humanizer/SKILL.md",
+                    "Contents/Resources/backend/service/skills/bundled/mac-controls/SKILL.md",
+                    "Contents/Resources/backend/service/skills/bundled/mac-controls/controls.sh"):
+            path = bundle / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("fixture")
+        corpus = bundle / "Contents/Resources/assistant-task-corpus-v1.jsonl"
+        corpus.write_bytes((ROOT / "training/assistant-task-corpus-v1/cases.jsonl").read_bytes())
+        (bundle / "Contents/MacOS/Harbor").chmod(0o755)
+        (bundle / "Contents/Resources/backend/.venv/bin/python3").chmod(0o755)
+        (bundle / "Contents/Resources/backend/.venv/bin/python").symlink_to("python3")
+        (bundle / "Contents/Info.plist").write_bytes(plistlib.dumps(p.plist(self.meta)))
+        return bundle
+
+    def engine_fixture(self, bundle):
+        # Dummy vendor bytes target structure/licence contracts. Tests that
+        # bypass the overlay explicitly do so at their validation call only.
+        engine = bundle / p.engine_build.ENGINE_DIR
+        for rel in ("py/bin/python3.11", "omlx/server.py", "omlx/cli.py", "omlx_web/index.html",
+                    "sp/mlx/core.cpython-311-darwin.so", "sp/mlx/lib/mlx.metallib"):
+            path = engine / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            is_native = rel in ("py/bin/python3.11", "sp/mlx/core.cpython-311-darwin.so")
+            path.write_bytes(b"\xcf\xfa\xed\xfe" + b"fixture" if is_native else b"fixture")
+        (engine / "py/bin/python3.11").chmod(0o755)
+        (engine / "py/bin/python3").symlink_to("python3.11")
+        for component in engine_licenses.load_reviewed()["components"]:   # licence files the notice copies
+            path = engine / component["path"]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("licence text")
+        p.json_write(engine / "ENGINE.json", {
+            "schema": 1, "minimum_macos": "26.2", "signing_identifier": p.engine_build.ENGINE_SIGNING_ID,
+            "dropped": []})
+        return engine
+
+    def test_valid_bundle(self):
+        p.validate_structure(self.fixture(), self.meta)
+
+    def test_bundle_rejects_corpus_that_differs_from_training_rows(self):
+        bundle = self.fixture()
+        corpus = bundle / "Contents/Resources/assistant-task-corpus-v1.jsonl"
+        corpus.write_bytes(corpus.read_bytes() + b"\n")
+        with self.assertRaisesRegex(p.BuildError, "Packaged assistant task corpus differs"):
+            p.validate_structure(bundle, self.meta)
+
+    def test_engine_json_requires_all_engine_pieces(self):
+        bundle = self.fixture()
+        engine = self.engine_fixture(bundle)
+        (engine / "omlx/server.py").unlink()
+        with patch.object(p.engine_build.guard_overlay, "verify", return_value=None), \
+                self.assertRaisesRegex(p.BuildError, "Engine is missing omlx/server.py"):
+            p.validate_structure(bundle, self.meta)
+
+    def add_engine_package(self, engine, name, version, licence, text):
+        dist_info = engine / "sp" / f"{name}-{version}.dist-info"
+        dist_info.mkdir(parents=True)
+        (dist_info / "METADATA").write_text(f"Metadata-Version: 2.4\nName: {name}\nVersion: {version}\n"
+                                            f"License-Expression: {licence}\n")
+        (dist_info / "LICENSE").write_text(text)
+
+    def test_engine_json_accepts_complete_engine(self):
+        bundle = self.fixture()
+        engine = self.engine_fixture(bundle)
+        self.add_engine_package(engine, "fixturepkg", "1.0", "MIT", "Permission is hereby granted, free of charge")
+        engine_licenses.write_notices(bundle)
+        with patch.object(p.engine_build.guard_overlay, "verify", return_value=None):
+            p.validate_structure(bundle, self.meta)
+
+    def test_engine_json_requires_guard_overlay_without_fixture_stub(self):
+        bundle = self.fixture()
+        self.engine_fixture(bundle)
+        engine_licenses.write_notices(bundle)
+        with self.assertRaisesRegex(p.BuildError, "guard overlay is missing or changed"):
+            p.validate_structure(bundle, self.meta)
+
+    def test_engine_bundle_requires_third_party_notices(self):
+        bundle = self.fixture()
+        self.engine_fixture(bundle)
+        with patch.object(p.engine_build.guard_overlay, "verify", return_value=None), \
+                self.assertRaisesRegex(p.BuildError, "Missing third-party notice"):
+            p.validate_structure(bundle, self.meta)
+
+    def test_engine_notice_must_list_every_shipped_package(self):
+        bundle = self.fixture()
+        engine = self.engine_fixture(bundle)
+        engine_licenses.write_notices(bundle)
+        self.add_engine_package(engine, "latecomer", "2.0", "MIT", "Permission is hereby granted, free of charge")
+        with patch.object(p.engine_build.guard_overlay, "verify", return_value=None), \
+                self.assertRaisesRegex(p.BuildError, "does not list latecomer"):
+            p.validate_structure(bundle, self.meta)
+
+    def test_unreviewed_copyleft_package_fails_the_licence_gate(self):
+        bundle = self.fixture()
+        engine = self.engine_fixture(bundle)
+        self.add_engine_package(engine, "newgpl", "1.0", "GPL-3.0-only", "GNU GENERAL PUBLIC LICENSE\nVersion 3")
+        with self.assertRaisesRegex(engine_licenses.LicenseError, "Unreviewed strong-copyleft licence: newgpl"):
+            engine_licenses.write_notices(bundle)
+
+    def test_missing_resource(self):
+        bundle = self.fixture()
+        (bundle / "Contents/Resources/backend/service/config/policy.yaml").unlink()
+        with self.assertRaisesRegex(p.BuildError, "Missing"):
+            p.validate_structure(bundle, self.meta)
+
+    def test_absolute_symlink(self):
+        bundle = self.fixture()
+        (bundle / "escape").symlink_to("/usr/bin/python3")
+        with self.assertRaisesRegex(p.BuildError, "symlink"):
+            p.validate_structure(bundle, self.meta)
+
+    def test_relative_symlink_escape(self):
+        bundle = self.fixture()
+        (self.root / "outside").write_text("outside")
+        (bundle / "escape").symlink_to("../outside")
+        with self.assertRaisesRegex(p.BuildError, "symlink"):
+            p.validate_structure(bundle, self.meta)
+
+    def test_reject_state_credentials_and_host_venv(self):
+        for name in ("private.db", "identity.p12", "AuthKey.p8", "pyvenv.cfg", ".env"):
+            with self.subTest(name=name):
+                bundle = self.fixture() if not (self.root / "Harbor.app").exists() else self.root / "Harbor.app"
+                path = bundle / name
+                path.write_text("must be rejected")
+                with self.assertRaisesRegex(p.BuildError, "Unwanted"):
+                    p.validate_structure(bundle, self.meta)
+                path.unlink()
+
+    def test_version_mismatch(self):
+        bundle = self.fixture()
+        with self.assertRaisesRegex(p.BuildError, "Info.plist mismatch"):
+            p.validate_structure(bundle, dict(self.meta, version="999.0.0"))
+
+    # --- built-in Google OAuth client (synthetic values only) ---------------
+
+    FAKE_GOOGLE_CLIENT = {"client_id": "fake-id.apps.googleusercontent.com",
+                          "client_secret": "FAKE-not-a-real-secret"}
+
+    def test_google_client_is_absent_without_env_or_file(self):
+        self.assertIsNone(p.google_oauth_client(environ={}))
+        # A fork pull request sees the secret as an empty string.
+        self.assertIsNone(p.google_oauth_client(environ={p.GOOGLE_OAUTH_CLIENT_ENV: ""}))
+
+    def test_google_client_env_is_canonical_consumed_and_never_printed(self):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        environ = {p.GOOGLE_OAUTH_CLIENT_ENV: json.dumps(self.FAKE_GOOGLE_CLIENT, indent=2), "PATH": "/usr/bin"}
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            value = p.google_oauth_client(environ=environ)
+        self.assertEqual(json.loads(value), self.FAKE_GOOGLE_CLIENT)
+        self.assertEqual(value, json.dumps(self.FAKE_GOOGLE_CLIENT, separators=(",", ":"), sort_keys=True).encode())
+        self.assertNotIn(p.GOOGLE_OAUTH_CLIENT_ENV, environ)   # no later step can inherit it
+        self.assertEqual(out.getvalue() + err.getvalue(), "")
+        with patch.dict(os.environ, {p.GOOGLE_OAUTH_CLIENT_ENV: "x"}):
+            self.assertNotIn(p.GOOGLE_OAUTH_CLIENT_ENV, p.clean_env())
+
+    def test_google_client_accepts_the_console_download_shape(self):
+        environ = {p.GOOGLE_OAUTH_CLIENT_ENV: json.dumps({"installed": self.FAKE_GOOGLE_CLIENT})}
+        self.assertEqual(json.loads(p.google_oauth_client(environ=environ)), self.FAKE_GOOGLE_CLIENT)
+
+    def test_google_client_errors_never_echo_the_value(self):
+        for raw in ('{"client_id": "fake-id", "client_secret": FAKE-not-a-real-secret',
+                    json.dumps({"client_id": "fake-id"}), json.dumps({"client_secret": "FAKE-not-a-real-secret"}),
+                    json.dumps(["FAKE-not-a-real-secret"])):
+            with self.subTest(raw=raw), self.assertRaises(p.BuildError) as caught:
+                p.google_oauth_client(environ={p.GOOGLE_OAUTH_CLIENT_ENV: raw})
+            self.assertNotIn("FAKE-not-a-real-secret", str(caught.exception))
+            self.assertNotIn("fake-id", str(caught.exception))
+
+    def test_google_client_local_file_wins_and_must_be_readable(self):
+        path = self.root / "client.json"
+        path.write_text(json.dumps(self.FAKE_GOOGLE_CLIENT))
+        other = json.dumps({"client_id": "other.apps.googleusercontent.com", "client_secret": "FAKE-other"})
+        value = p.google_oauth_client(path, environ={p.GOOGLE_OAUTH_CLIENT_ENV: other})
+        self.assertEqual(json.loads(value), self.FAKE_GOOGLE_CLIENT)
+        with self.assertRaisesRegex(p.BuildError, "Could not read"):
+            p.google_oauth_client(self.root / "missing.json", environ={})
+        (self.root / "empty.json").write_text("  ")
+        with self.assertRaisesRegex(p.BuildError, "empty"):
+            p.google_oauth_client(self.root / "empty.json", environ={})
+
+    def test_bundle_ships_the_google_client_only_when_given(self):
+        bundle = self.fixture()
+        meta = dict(self.meta)
+        p.write_google_oauth_client(bundle, meta, None)
+        self.assertIs(meta["google_oauth_client"], False)
+        self.assertFalse((bundle / p.GOOGLE_OAUTH_CLIENT_BUNDLE).exists())
+        p.validate_structure(bundle, meta)
+        value = p.google_oauth_client(environ={p.GOOGLE_OAUTH_CLIENT_ENV: json.dumps(self.FAKE_GOOGLE_CLIENT)})
+        meta = dict(self.meta)
+        p.write_google_oauth_client(bundle, meta, value)
+        self.assertIs(meta["google_oauth_client"], True)
+        self.assertEqual((bundle / p.GOOGLE_OAUTH_CLIENT_BUNDLE).read_bytes(), value)
+        p.validate_structure(bundle, meta)
+        # The file and build-info must agree, both ways.
+        with self.assertRaisesRegex(p.BuildError, "does not declare"):
+            p.validate_structure(bundle, dict(meta, google_oauth_client=False))
+        (bundle / p.GOOGLE_OAUTH_CLIENT_BUNDLE).unlink()
+        with self.assertRaisesRegex(p.BuildError, "Missing bundled Google OAuth client"):
+            p.validate_structure(bundle, meta)
+        # Tracked source can never smuggle one in.
+        (bundle / p.GOOGLE_OAUTH_CLIENT_BUNDLE).write_bytes(value)
+        with self.assertRaisesRegex(p.BuildError, "Tracked source"):
+            p.write_google_oauth_client(bundle, dict(self.meta), None)
+
+    def test_google_client_path_matches_the_backend_lookup(self):
+        self.assertEqual(p.GOOGLE_OAUTH_CLIENT_BUNDLE,
+                         "Contents/Resources/backend/service/google_oauth_client.json")
+        source = (ROOT / "service/gmail_source.py").read_text()
+        self.assertIn('BUILTIN_CLIENT_PATH = Path(__file__).with_name("google_oauth_client.json")', source)
+        self.assertIn("service/google_oauth_client.json", (ROOT / ".gitignore").read_text().splitlines())
+
+    # --- bundled uv (fake tarballs only; nothing is downloaded) -------------
+
+    @staticmethod
+    def fake_uv_tarball(files=None, extra=None, link=False):
+        import io, tarfile
+        files = files if files is not None else {"uv": b"\xcf\xfa\xed\xfe fake uv", "uvx": b"\xcf\xfa\xed\xfe fake uvx"}
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+            info = tarfile.TarInfo("uv-aarch64-apple-darwin")
+            info.type, info.mode = tarfile.DIRTYPE, 0o755
+            tar.addfile(info)
+            for name, data in {**files, **(extra or {})}.items():
+                info = tarfile.TarInfo("uv-aarch64-apple-darwin/" + name)
+                info.size, info.mode = len(data), 0o755
+                tar.addfile(info, io.BytesIO(data))
+            if link:
+                info = tarfile.TarInfo("uv-aarch64-apple-darwin/uvx")
+                info.type, info.linkname = tarfile.SYMTYPE, "/usr/bin/true"
+                tar.addfile(info)
+        return buffer.getvalue()
+
+    def fake_uv_fetch(self, payload, calls):
+        def fetch(url, destination, limit):
+            calls.append((url, limit))
+            Path(destination).write_bytes(payload)
+        return fetch
+
+    def test_uv_pin_is_a_real_release_digest(self):
+        uv = p.uv_tool
+        self.assertRegex(uv.UV_VERSION, r"^\d+\.\d+\.\d+$")
+        self.assertRegex(uv.UV_SHA256, r"^[0-9a-f]{64}$")
+        self.assertEqual(uv.UV_URL, f"https://github.com/astral-sh/uv/releases/download/{uv.UV_VERSION}/"
+                                    "uv-aarch64-apple-darwin.tar.gz")
+        self.assertGreater(uv.UV_SIZE, 1_000_000)
+
+    def test_uv_download_is_verified_cached_and_reverified(self):
+        uv = p.uv_tool
+        payload, calls = self.fake_uv_tarball(), []
+        pin = dict(size=len(payload), sha256=hashlib.sha256(payload).hexdigest())
+        cache = self.root / "uv-cache"
+        archive = uv.verified_archive(cache, fetch=self.fake_uv_fetch(payload, calls), **pin)
+        self.assertEqual(archive.read_bytes(), payload)
+        self.assertEqual([url for url, _ in calls], [uv.UV_URL])
+        # A cached, matching archive is reused without a download, offline too.
+        self.assertEqual(uv.verified_archive(cache, offline=True, **pin), archive)
+        self.assertEqual(len(calls), 1)
+        # A tampered cache entry is discarded, never reused.
+        archive.write_bytes(payload[:-1] + b"x")
+        with self.assertRaisesRegex(uv.UVToolError, "offline"):
+            uv.verified_archive(cache, offline=True, **pin)
+        self.assertFalse(archive.exists())
+
+    def test_uv_download_that_differs_from_the_pin_fails_the_build(self):
+        uv = p.uv_tool
+        payload, calls = self.fake_uv_tarball(), []
+        cache = self.root / "uv-cache"
+        with self.assertRaisesRegex(uv.UVToolError, "does not match the pinned size and SHA-256"):
+            uv.verified_archive(cache, fetch=self.fake_uv_fetch(payload, calls),
+                                size=len(payload), sha256="0" * 64)
+        with self.assertRaisesRegex(uv.UVToolError, "does not match"):
+            uv.verified_archive(cache, fetch=self.fake_uv_fetch(payload, calls),
+                                size=len(payload) + 1, sha256=hashlib.sha256(payload).hexdigest())
+        self.assertEqual(list(cache.iterdir()), [])      # nothing partial is left to reuse
+        # The real pin refuses the fake outright.
+        with self.assertRaises(uv.UVToolError):
+            uv.verified_archive(cache, fetch=self.fake_uv_fetch(payload, calls))
+
+    def test_uv_archive_contents_are_exact(self):
+        uv = p.uv_tool
+        good = self.root / "good.tar.gz"
+        good.write_bytes(self.fake_uv_tarball())
+        self.assertEqual(set(uv.binaries(good)), {"uv", "uvx"})
+        for name, payload in (("extra", self.fake_uv_tarball(extra={"install.sh": b"#!/bin/sh"})),
+                              ("missing", self.fake_uv_tarball(files={"uv": b"\xcf\xfa\xed\xfe uv"})),
+                              ("link", self.fake_uv_tarball(files={"uv": b"\xcf\xfa\xed\xfe uv"}, link=True)),
+                              ("not macho", self.fake_uv_tarball(files={"uv": b"#!/bin/sh", "uvx": b"#!/bin/sh"})),
+                              ("garbage", b"not a tarball")):
+            with self.subTest(name=name):
+                bad = self.root / (name.replace(" ", "-") + ".tar.gz")
+                bad.write_bytes(payload)
+                with self.assertRaises(uv.UVToolError):
+                    uv.binaries(bad)
+
+    def test_bundle_ships_executable_uv_only_when_built_with_it(self):
+        uv = p.uv_tool
+        archive = self.root / "uv.tar.gz"
+        archive.write_bytes(self.fake_uv_tarball())
+        bundle = self.fixture()
+        meta = dict(self.meta, uv=uv.stage(bundle, archive))
+        self.assertEqual(meta["uv"]["version"], uv.UV_VERSION)
+        self.assertEqual(meta["uv"]["sha256"], uv.UV_SHA256)
+        for name in ("uv", "uvx"):
+            path = bundle / "Contents/Resources/bin" / name
+            self.assertTrue(os.access(path, os.X_OK), name)
+        p.validate_structure(bundle, meta)
+        self.assertIn("Contents/Resources/bin/uvx", p.inventory(bundle))
+        with self.assertRaisesRegex(p.BuildError, "does not declare"):
+            p.validate_structure(bundle, dict(meta, uv=None))
+        with self.assertRaisesRegex(p.BuildError, "pinned release"):
+            p.validate_structure(bundle, dict(meta, uv=dict(meta["uv"], sha256="0" * 64)))
+        (bundle / "Contents/Resources/bin/uvx").chmod(0o644)
+        with self.assertRaisesRegex(p.BuildError, "non-executable"):
+            p.validate_structure(bundle, meta)
+        # A --no-uv build declares none and ships none; old metadata is not judged.
+        clean = self.root / "clean"
+        clean.mkdir()
+        self.root, saved = clean, self.root
+        try:
+            bare = self.fixture()
+            p.validate_structure(bare, dict(self.meta, uv=None))
+            p.validate_structure(bare, dict(self.meta))
+        finally:
+            self.root = saved
+
+    def test_no_uv_flag_and_loud_failure_are_wired(self):
+        source = (ROOT / "build-support/pipeline.py").read_text()
+        self.assertIn('p.add_argument("--no-uv", action="store_true"', source)
+        self.assertIn('uv_tool.verified_archive(STATE / "uv-tool-cache", offline=args.offline)', source)
+        self.assertIn("Pass --no-uv to build without the bundled uv.", source)
+
+    def test_mode_validation(self):
+        bundle = self.fixture()
+        (bundle / "Contents/MacOS/Harbor").chmod(0o644)
+        with self.assertRaisesRegex(p.BuildError, "not executable"):
+            p.validate_structure(bundle, self.meta)
+
+    def test_archive_is_repeatable_and_preserves_symlinks(self):
+        bundle = self.fixture()
+        first, second = self.root / "a.zip", self.root / "b.zip"
+        p.archive(bundle, first, self.meta["source_epoch"])
+        os.utime(bundle / "Contents/Info.plist", (1800000000, 1800000000))
+        p.archive(bundle, second, self.meta["source_epoch"])
+        self.assertEqual(p.digest(first), p.digest(second))
+        with zipfile.ZipFile(first) as z:
+            info = z.getinfo("Harbor.app/Contents/Resources/backend/.venv/bin/python")
+            self.assertTrue(stat.S_ISLNK(info.external_attr >> 16))
+            self.assertEqual(z.read(info), b"python3")
+
+    RELEASE_FEATURES = {"google_oauth_client": True,
+                        "uv": {"version": p.uv_tool.UV_VERSION, "asset": p.uv_tool.UV_ASSET,
+                               "sha256": p.uv_tool.UV_SHA256, "path": p.uv_tool.BUNDLE_DIR}}
+
+    def ship_release_features(self, bundle):
+        """Fake the built-in client and uv files a release build ships, as self.meta declares."""
+        if self.meta.get("google_oauth_client"):
+            (bundle / p.GOOGLE_OAUTH_CLIENT_BUNDLE).write_bytes(p._google_oauth_client_json(
+                json.dumps(self.FAKE_GOOGLE_CLIENT)))
+        if self.meta.get("uv"):
+            for name in p.uv_tool.BINARIES:
+                path = bundle / p.uv_tool.BUNDLE_DIR / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("fake")
+                path.chmod(0o755)
+
+    def artifact(self):
+        bundle = self.fixture()
+        self.ship_release_features(bundle)
+        p.json_write(self.root / "simulation-qa.json", self.qa_report())
+        p.json_write(self.root / "provenance.json", {"source": self.meta, "signature": "ad-hoc", "notarized": False,
+            "simulation_sha256": p.digest(self.root / "simulation-qa.json")})
+        p.json_write(self.root / "bundle-manifest.json", p.inventory(bundle))
+        p.archive(bundle, self.root / "Harbor.zip", self.meta["source_epoch"])
+        p.checksums(self.root)
+        return bundle
+
+    def qa_report(self):
+        from native_peer_gate import MODULE, EXPECTED
+        native={'schema_version':1,'scope':'reserved-disposable-loopback-and-native-inspection',
+                'candidate_sha':self.meta['commit'],'ending_sha':self.meta['commit'],
+                'clean_start':True,'clean_end':True,'dirty_allowed':False,'status':'PASS','returncode':0,
+                'ports':list(range(51001,51008)),
+                'cases':{'collected':len(EXPECTED),'exitstatus':0,'rows':[
+                    {'nodeid':node,'phase':phase,'outcome':'passed','xfail':False}
+                    for node in sorted(EXPECTED) for phase in ('setup','call','teardown')]}}
+        from browser_bridge_gate import MODULE as BROWSER_MODULE, EXPECTED as BROWSER_EXPECTED, PROBES
+        browser = dict(schema_version=1, scope='disposable-signed-af-unix',
+            candidate_sha=self.meta['commit'], ending_sha=self.meta['commit'], clean_start=True,
+            clean_end=True, dirty_allowed=False, status='PASS', returncode=0,
+            probes={name: True for name in PROBES},
+            cases=dict(collected=len(BROWSER_EXPECTED), exitstatus=0, rows=[
+                dict(nodeid=node, phase=phase, outcome='passed', xfail=False)
+                for node in sorted(BROWSER_EXPECTED) for phase in ('setup', 'call', 'teardown')]))
+        from release_performance_gate import MODULE as BENCHMARK_MODULE, EXPECTED as BENCHMARK_EXPECTED, PROBES as BENCHMARK_PROBES
+        benchmark = dict(schema_version=1, scope="offline-benchmark-reserved-loopback",
+            candidate_sha=self.meta["commit"], ending_sha=self.meta["commit"], clean_start=True,
+            clean_end=True, dirty_allowed=False, status="PASS", returncode=0, port=51010,
+            probes={name: True for name in BENCHMARK_PROBES},
+            cases=dict(collected=len(BENCHMARK_EXPECTED), exitstatus=0, rows=[
+                dict(nodeid=node, phase=phase, outcome="passed", xfail=False)
+                for node in sorted(BENCHMARK_EXPECTED) for phase in ("setup", "call", "teardown")]))
+        return {"schema_version": 3, "status": "PASS", "candidate_sha": self.meta["commit"],
+                "ending_sha": self.meta["commit"], "sha_stable": True, "worktree_clean": True,
+                "dirty_allowed": False, "profiles": ["full"], "safety_mode": "offline",
+                "native_mode": "included", "totals": {"gates": 3, "passed_gates": 3,
+                "failed_gates": 0, "blocked_gates": 0},
+                'results':[{'name':MODULE,'status':'PASS','returncode':0,'passed':9,'failed':0,'skipped':0,
+                            'stdout':json.dumps({'native_gate':native})},
+                           {'name':BROWSER_MODULE,'status':'PASS','returncode':0,'passed':len(BROWSER_EXPECTED),'failed':0,'skipped':0,
+                            'stdout':json.dumps({'browser_bridge_gate':browser})},
+                           {"name":BENCHMARK_MODULE,"status":"PASS","returncode":0,"passed":len(BENCHMARK_EXPECTED),"failed":0,"skipped":0,
+                            "stdout":json.dumps({"benchmark_gate":benchmark})}]}
+
+    def test_native_peer_evidence_is_mandatory_and_exact(self):
+        from native_peer_gate import validate
+        report=self.qa_report()
+        with self.assertRaises(p.BuildError):p.validate_simulation({**report,'results':[]},self.meta['commit'])
+        native=json.loads(report['results'][0]['stdout'])['native_gate']
+        for mutation in ('missing','duplicate','skip','xfail','stale','port8000'):
+            changed=json.loads(json.dumps(native))
+            if mutation=='missing':changed['cases']['rows'].pop()
+            if mutation=='duplicate':changed['cases']['rows'].append(changed['cases']['rows'][0])
+            if mutation=='skip':changed['cases']['rows'][0]['outcome']='skipped'
+            if mutation=='xfail':changed['cases']['rows'][0]['xfail']=True
+            if mutation=='stale':changed['ending_sha']='b'*40
+            if mutation=='port8000':changed['ports'][0]=8000
+            with self.subTest(mutation=mutation),self.assertRaises(ValueError):validate(changed,self.meta['commit'])
+
+    def test_browser_bridge_evidence_is_mandatory_in_artifact_verification(self):
+        from browser_bridge_gate import validate, load_pinned
+        report = self.qa_report()
+        browser = json.loads(report['results'][1]['stdout'])['browser_bridge_gate']
+        for mutation in ('missing', 'duplicate', 'skip', 'xfail', 'stale', 'dirty', 'probe', 'count'):
+            changed = json.loads(json.dumps(browser))
+            if mutation == 'missing': changed['cases']['rows'].pop()
+            if mutation == 'duplicate': changed['cases']['rows'].append(changed['cases']['rows'][0])
+            if mutation == 'skip': changed['cases']['rows'][0]['outcome'] = 'skipped'
+            if mutation == 'xfail': changed['cases']['rows'][0]['xfail'] = True
+            if mutation == 'stale': changed['ending_sha'] = 'b' * 40
+            if mutation == 'dirty': changed['clean_end'] = False
+            if mutation == 'probe': changed['probes'].pop('dedicated_ip_denied')
+            if mutation == 'count': changed['cases']['collected'] = len(browser['cases']['rows']) // 3 - 1
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                validate(changed, self.meta['commit'])
+        evidence = self.root / 'browser.json'
+        evidence.write_text(json.dumps(browser))
+        load_pinned(evidence, p.digest(evidence), self.meta['commit'])
+        with self.assertRaises(ValueError):
+            load_pinned(evidence, '0' * 64, self.meta['commit'])
+        with self.assertRaises(FileNotFoundError):
+            load_pinned(self.root / 'absent', '0' * 64, self.meta['commit'])
+        self.artifact()
+        # Rehash the damaged combined report: the mandatory evidence validator
+        # must reject it even when the outer artifact hashes are self-consistent.
+        report['results'].pop(1)
+        p.json_write(self.root / 'simulation-qa.json', report)
+        provenance = json.loads((self.root / 'provenance.json').read_text())
+        provenance['simulation_sha256'] = p.digest(self.root / 'simulation-qa.json')
+        p.json_write(self.root / 'provenance.json', provenance)
+        p.checksums(self.root)
+        with self.assertRaisesRegex(p.BuildError, 'browser bridge'):
+            p.verify_artifacts(self.root)
+        report = self.qa_report()
+        report['results'].append(report['results'][1])
+        with self.assertRaises(p.BuildError):
+            p.validate_simulation(report, self.meta['commit'])
+
+    def test_benchmark_fixture_evidence_is_mandatory_complete_and_sha_bound(self):
+        from release_performance_gate import validate, load_pinned
+        report = self.qa_report()
+        benchmark = json.loads(report["results"][2]["stdout"])["benchmark_gate"]
+        for mutation in ("missing", "duplicate", "skip", "xfail", "stale", "dirty", "probe", "port8000", "renamed"):
+            changed = json.loads(json.dumps(benchmark))
+            if mutation == "missing": changed["cases"]["rows"].pop()
+            if mutation == "duplicate": changed["cases"]["rows"].append(changed["cases"]["rows"][0])
+            if mutation == "skip": changed["cases"]["rows"][0]["outcome"] = "skipped"
+            if mutation == "xfail": changed["cases"]["rows"][0]["xfail"] = True
+            if mutation == "stale": changed["ending_sha"] = "b" * 40
+            if mutation == "dirty": changed["clean_end"] = False
+            if mutation == "probe": changed["probes"]["denied_loopback"] = False
+            if mutation == "port8000": changed["port"] = 8000
+            if mutation == "renamed": changed["cases"]["rows"][0]["nodeid"] = "different::case"
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                validate(changed, self.meta["commit"])
+        evidence = self.root / "benchmark.json"
+        evidence.write_text(json.dumps(benchmark))
+        load_pinned(evidence, p.digest(evidence), self.meta["commit"])
+        with self.assertRaises(ValueError):
+            load_pinned(evidence, "0" * 64, self.meta["commit"])
+        report["results"].pop(2)
+        with self.assertRaisesRegex(p.BuildError, "benchmark"):
+            p.validate_simulation(report, self.meta["commit"])
+
+    def test_benchmark_fixture_profile_preserves_generic_network_and_home_denials(self):
+        import release_performance_gate as gate
+        native_git = self.root / "developer/usr/bin/git"
+        native_git.parent.mkdir(parents=True)
+        native_git.write_text("synthetic native git")
+        native_git.chmod(0o700)
+        native_git = native_git.resolve()
+        with patch.object(gate.subprocess, "run", return_value=Namespace(stdout=str(native_git))) as selection:
+            selected = gate.select_native_git()
+            with self.synthetic_profile_metadata():
+                policy = gate.profile(self.root, Path(sys.executable), 51010, self.root / "canary", selected)
+            with patch.object(sys, "path", [str(ROOT), *sys.path]):
+                env = gate.fixture_environment(self.root, selected)
+        selection.assert_called_once_with(["/usr/bin/xcrun", "--find", "git"], check=True,
+            env={"PATH": "/usr/bin:/bin"}, capture_output=True, text=True, timeout=10)
+        self.assertEqual(selected, native_git)
+        self.assertEqual(gate.shutil.which("git", path=env["PATH"]), str(selected))
+        self.assertTrue(env["PATH"].startswith(str(selected.parent) + os.pathsep))
+        self.assertNotIn("DEVELOPER_DIR", env)
+        self.assertIn("(deny network*)", policy)
+        self.assertIn('(allow network-outbound (remote ip "localhost:51010"))', policy)
+        self.assertIn('(allow network-bind network-inbound (local ip "localhost:51010"))', policy)
+        self.assertNotIn('localhost:8000', policy)
+        execution = next(line for line in policy.splitlines() if line.startswith("(allow process-exec "))
+        self.assertNotIn("subpath", execution)
+        for prohibited in ("/bin/sh", "/bin/bash", "/usr/bin/env", "/bin/rm", "/usr/bin/swiftc", str(self.root)):
+            self.assertNotIn('(literal ' + json.dumps(prohibited) + ')', execution)
+        self.assertNotIn('(literal "/usr/bin/git")', execution)
+        self.assertIn('(literal ' + json.dumps(str(selected)) + ')', execution)
+        self.assertNotIn("xcodebuild", execution)
+        self.assertIn('(literal ' + json.dumps(str(Path(sys.executable).resolve())) + ')', execution)
+        self.assertNotIn('(subpath ' + json.dumps(str(p.STATE.resolve())) + ')', policy)
+        for invalid in (8000, 0, "51010", True):
+            with self.assertRaises(ValueError): gate.profile(self.root, Path(sys.executable), invalid, self.root / "canary", selected)
+        with patch.object(gate.subprocess, "run", return_value=Namespace(stdout="/usr/bin/git")):
+            with self.assertRaisesRegex(ValueError, "benchmark_fixture_git_invalid"):
+                gate.select_native_git()
+
+    def test_native_fixture_timeout_closes_descendant_descriptors(self):
+        import select
+        from native_peer_gate import fixture_process
+        reader,writer=os.pipe()
+        child="import os,signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);os.write(int(__import__('sys').argv[1]),b'ready');time.sleep(60)"
+        parent="import subprocess,sys,time;subprocess.Popen([sys.executable,'-I','-c',sys.argv[1],sys.argv[2]],pass_fds=(int(sys.argv[2]),));time.sleep(60)"
+        try:
+            result=fixture_process([sys.executable,'-I','-c',parent,child,str(writer)],timeout=3,
+                pass_fds=(writer,),stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+            self.assertEqual(result.returncode,124)
+            os.close(writer);writer=None
+            self.assertTrue(select.select([reader],[],[],1)[0])
+            self.assertEqual(os.read(reader,5),b'ready')
+            self.assertTrue(select.select([reader],[],[],1)[0])
+            self.assertEqual(os.read(reader,1),b'')  # No surviving writer, including the TERM-ignoring descendant.
+        finally:
+            os.close(reader)
+            if writer is not None:os.close(writer)
+
+    def test_candidate_rejects_partial_stale_or_dirty_qa(self):
+        for change in ({"candidate_sha": "b" * 40}, {"status": "FAIL"},
+                       {"native_mode": "skip"}, {"profiles": ["routing"]},
+                       {"dirty_allowed": True}, {"worktree_clean": False},
+                       {"totals": {"gates": 2, "passed_gates": 1, "failed_gates": 0, "blocked_gates": 1}}):
+            with self.subTest(change=change), self.assertRaises(p.BuildError):
+                p.validate_simulation(dict(self.qa_report(), **change), self.meta["commit"])
+
+    def test_archive_roundtrip_never_calls_release_signing(self):
+        bundle = self.fixture()
+        archive = self.root / "Harbor.zip"
+        p.archive(bundle, archive, self.meta["source_epoch"])
+        calls = []
+        class FakeRunner:
+            logs = self.root
+            def run(inner, label, command):
+                calls.append(command)
+                if label == "extract-distribution":
+                    import shutil
+                    shutil.copytree(bundle, Path(command[-1]) / "Harbor.app", symlinks=True)
+        with patch.object(p, "relocation_smoke"), patch.object(p, "verify_bundle_signature") as verify:
+            runner = FakeRunner()
+            p.distribution_roundtrip(runner, archive, bundle, self.meta)
+            verify.assert_called_once()
+            self.assertEqual(verify.call_args.args[1], "ad-hoc")
+        self.assertFalse(any("--sign" in c for c in calls))
+
+    def check_adhoc_sign_seals_bundle_for_strict_verification(self):
+        import shutil
+        bundle = self.fixture()
+        # A real Mach-O main executable; the fixture's placeholder text cannot be sealed.
+        shutil.copyfile("/bin/echo", bundle / "Contents/MacOS/Harbor")
+        (bundle / "Contents/MacOS/Harbor").chmod(0o755)
+
+        class DirectRunner:
+            logs = self.root
+
+            def run(inner, label, command, **kwargs):
+                result = subprocess.run([str(c) for c in command], check=True, env=p.clean_env(),
+                                        capture_output=True, text=True)
+                log = self.root / (label + ".log")
+                log.write_text(result.stdout + result.stderr)
+                return 0, log
+
+        # Fails loudly if the bundle cannot be sealed or strictly verified.
+        p.sign_adhoc(DirectRunner(), bundle)
+        self.assertTrue((bundle / "Contents/_CodeSignature/CodeResources").is_file())
+        subprocess.run(["codesign", "--verify", "--deep", "--strict", str(bundle)], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        described = subprocess.run(["codesign", "-dvv", str(bundle)], capture_output=True, text=True).stderr
+        self.assertIn("Signature=adhoc", described)
+        self.assertNotIn("Sealed Resources=none", described)
+        self.assertNotIn("TeamIdentifier=", described.replace("TeamIdentifier=not set", ""))
+
+    def test_signing_permission_is_separate_from_general_simulation(self):
+        python = Path(sys.executable)
+        with patch.object(p, "git", return_value=".git"), patch.object(p.subprocess, "check_output",
+                side_effect=lambda command, **kwargs: "/Library/Developer/CommandLineTools" if command[0] == "xcode-select" else str(self.root)):
+            normal = p.simulation_profile(self.root, python)
+            signing = p.simulation_profile(self.root, python, local_signing=True)
+        self.assertNotIn('(literal "/usr/bin/codesign")', normal)
+        self.assertIn('(literal "/usr/bin/openssl")', normal)
+        self.assertEqual(signing.replace(' (literal "/usr/bin/codesign")', ''), normal)
+        for rule in ('(deny network*)', '(deny appleevent-send)', '(deny process-exec)', '(deny file-write*)'):
+            self.assertIn(rule, signing)
+        self.assertNotIn('(literal "/usr/bin/security")', signing)
+
+    def test_simulation_requires_fixed_node_runtime(self):
+        original = Path.is_file
+        def without_node(path):
+            return False if str(path) in ("/usr/local/bin/node", "/opt/homebrew/bin/node") else original(path)
+        with self.synthetic_profile_metadata(), patch.object(Path, "is_file", without_node):
+            with self.assertRaisesRegex(p.BuildError, "Node is required"):
+                p.simulation_profile(self.root, Path(sys.executable), node_runtime="/usr/local/bin/node")
+
+    def test_simulation_node_permission_is_one_literal_not_a_directory(self):
+        with self.synthetic_profile_metadata():
+            profile = p.simulation_profile(self.root, Path(sys.executable), node_runtime=str(p._qa_node_runtime()))
+        selected = next(path for path in (Path("/usr/local/bin/node"), Path("/opt/homebrew/bin/node"))
+                        if path.is_file() and os.access(path, os.X_OK)).resolve()
+        self.assertIn('(literal ' + json.dumps(str(selected)) + ')', profile)
+        for prefix in ("/usr/local", "/usr/local/bin", "/opt/homebrew", "/opt/homebrew/bin"):
+            self.assertNotIn('(subpath ' + json.dumps(prefix) + ')', profile)
+        for rule in ('(deny network*)', '(deny appleevent-send)', '(deny process-exec)', '(deny file-write*)'):
+            self.assertIn(rule, profile)
+
+    def test_simulation_rejects_node_alias_outside_approved_prefix(self):
+        original = Path.resolve
+        def resolve(path, *args, **kwargs):
+            if str(path) in ("/usr/local/bin/node", "/opt/homebrew/bin/node"):
+                return self.root / "untrusted" / "node"
+            return original(path, *args, **kwargs)
+        with self.synthetic_profile_metadata(), patch.object(Path, "resolve", resolve):
+            with self.assertRaisesRegex(p.BuildError, "approved installation prefix"):
+                p.simulation_profile(self.root, Path(sys.executable), node_runtime="/usr/local/bin/node")
+
+    def test_native_only_simulation_does_not_require_or_authorize_node(self):
+        import native_peer_gate
+        import browser_bridge_gate
+        import release_performance_gate
+        calls = []
+        class FakeRunner:
+            logs = self.root
+            env = {"PATH": "/usr/bin:/bin", "QA_NODE_RUNTIME": "/untrusted/inherited/node"}
+            def run(inner, label, command, **kwargs):
+                calls.append((label, command, kwargs))
+                if "--report" in command:
+                    Path(command[command.index("--report") + 1]).write_text("{}")
+                return 0, self.root / "unused.log"
+        with self.synthetic_profile_metadata(), patch.object(p, "_qa_node_runtime", side_effect=p.BuildError("Node is required")) as resolver, \
+                patch.object(native_peer_gate, "validate"), patch.object(browser_bridge_gate, "validate"), patch.object(release_performance_gate, "validate"), patch.object(p, "validate_simulation"):
+            p.simulation_tests(FakeRunner(), Path(sys.executable), native_only=True)
+        resolver.assert_not_called()
+        self.assertNotIn("node-sandbox-contract", [label for label, _, _ in calls])
+        _, command, kwargs = next(call for call in calls if call[0] == "simulation-qa")
+        self.assertIn("--only-native", command)
+        self.assertNotIn("QA_NODE_RUNTIME", kwargs["env"])
+        profile = command[command.index("-p") + 1]
+        for candidate in ("/usr/local/bin/node", "/opt/homebrew/bin/node"):
+            self.assertNotIn('(literal ' + json.dumps(str(Path(candidate).resolve())) + ')', profile)
+
+    def test_full_simulation_requires_node_before_launching_gates(self):
+        from unittest.mock import Mock
+        runner = Mock()
+        with patch.object(p, "_qa_node_runtime", side_effect=p.BuildError("Node is required")):
+            with self.assertRaisesRegex(p.BuildError, "Node is required"):
+                p.simulation_tests(runner, Path(sys.executable))
+        runner.run.assert_not_called()
+
+    def test_full_simulation_pins_runtime_and_requires_node_preflight(self):
+        import native_peer_gate
+        import browser_bridge_gate
+        import release_performance_gate
+        calls = []
+        selected = str(p._qa_node_runtime())
+        class FakeRunner:
+            logs = self.root
+            env = {"PATH": "/usr/bin:/bin", "QA_NODE_RUNTIME": "/untrusted/inherited/node"}
+            def run(inner, label, command, **kwargs):
+                calls.append((label, command, kwargs))
+                if "--report" in command:
+                    Path(command[command.index("--report") + 1]).write_text("{}")
+                return 0, self.root / "unused.log"
+        with self.synthetic_profile_metadata(), patch.object(native_peer_gate, "validate"), patch.object(browser_bridge_gate, "validate"), patch.object(release_performance_gate, "validate"), patch.object(p, "validate_simulation"):
+            p.simulation_tests(FakeRunner(), Path(sys.executable))
+        names = [label for label, _, _ in calls]
+        self.assertLess(names.index("node-sandbox-contract"), names.index("simulation-qa"))
+        self.assertLess(names.index("browser-disposable-transport-security"), names.index("simulation-qa"))
+        for label, command, kwargs in calls:
+            if label in ("node-sandbox-contract", "simulation-qa"):
+                self.assertEqual(kwargs["env"]["QA_NODE_RUNTIME"], selected)
+                self.assertEqual(kwargs["env"]["PATH"], "/usr/bin:/bin")
+            if label == "simulation-qa":
+                self.assertIn("BENCHMARK_GATE_REPORT", kwargs["env"])
+                self.assertEqual(len(kwargs["env"]["BENCHMARK_GATE_SHA256"]), 64)
+                self.assertIn("BROWSER_BRIDGE_GATE_REPORT", kwargs["env"])
+                self.assertEqual(len(kwargs["env"]["BROWSER_BRIDGE_GATE_SHA256"]), 64)
+                self.assertNotIn("--only-native", command)
+                profile = command[command.index("-p") + 1]
+                self.assertIn('(literal ' + json.dumps(selected) + ')', profile)
+
+    def test_node_only_profile_grants_no_shell_or_executable_subpaths(self):
+        selected = str(p._qa_node_runtime())
+        with self.synthetic_profile_metadata():
+            profile = p.simulation_profile(self.root, Path(sys.executable), node_runtime=selected, node_only=True)
+        rule = next(line for line in profile.splitlines() if line.startswith("(allow process-exec "))
+        self.assertEqual(rule, '(allow process-exec (literal ' + json.dumps(selected) + '))')
+        for rule in ('(deny network*)', '(deny appleevent-send)', '(deny process-exec)', '(deny file-write*)'):
+            self.assertIn(rule, profile)
+        with self.assertRaises(p.BuildError):
+            p.simulation_profile(self.root, Path(sys.executable), node_only=True)
+        with self.assertRaises(p.BuildError):
+            p.simulation_profile(self.root, Path(sys.executable), node_runtime=selected, node_only=True, local_signing=True)
+
+    def test_node_only_write_rule_is_scratch_only(self):
+        scratch = self.root / "scratch"
+        selected = str(p._qa_node_runtime())
+        with self.synthetic_profile_metadata(), patch.object(p, "STATE", self.root / "build-state"):
+            narrow = p.simulation_profile(scratch, Path(sys.executable), node_runtime=selected, node_only=True)
+            generic = p.simulation_profile(scratch, Path(sys.executable))
+        rule = next(line for line in narrow.splitlines() if line.startswith("(allow file-write* "))
+        self.assertEqual(rule, '(allow file-write* (subpath ' + json.dumps(str(scratch.resolve())) + '))')
+        # Preserve the independently qualified legacy profile's existing rights.
+        generic_rule = next(line for line in generic.splitlines() if line.startswith("(allow file-write* "))
+        self.assertIn('(subpath ' + json.dumps(str((self.root / "build-state").resolve())) + ')', generic_rule)
+
+    def check_local_signing_sandbox(self):
+        # Required separate native gate: never grants codesign to general Python QA.
+        python = Path(sys.executable)
+        normal = p.simulation_profile(self.root, python)
+        signing = p.simulation_profile(self.root, python, local_signing=True)
+        # Use only executables allowed by the profile, and never consult the
+        # runner's private Git config when creating disposable fixture repos.
+        env = dict(p.clean_env(), TMPDIR=str(self.root), PATH="/usr/bin:/bin:/usr/sbin:/sbin",
+                   GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
+        # The native contract cold-compiles Swift; slow hosted runners have
+        # needed more than 120 s for it, so allow 300 s.
+        def run(profile, args):
+            return subprocess.run(["/usr/bin/sandbox-exec", "-p", profile, str(python), "-B", *args],
+                                  env=env, capture_output=True, text=True, timeout=300)
+        probe = "import subprocess; subprocess.run(['/usr/bin/codesign','--version'],check=True)"
+        self.assertNotEqual(run(normal, ["-c", probe]).returncode, 0)
+        result = run(signing, [str(Path(__file__).resolve()),
+                              "PipelineTests.check_adhoc_sign_seals_bundle_for_strict_verification", "-q"])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        native = run(signing, [str(ROOT / "tests/build_pipeline/managed_live_qa_checks.py"),
+            "ManagedQAStagingTests.test_native_unavailable_contract_compiles_runs_and_blocks_without_child",
+            "ManagedQAStagingTests.test_compiled_native_inventory_rejects_special_mode_mutations", "-q"])
+        self.assertEqual(native.returncode, 0, native.stdout + native.stderr)
+        self.assertNotIn("codesign unavailable", native.stderr)
+        crypto = run(normal, ["-m", "pytest", "-q",
+                              str(ROOT / "tests/test_artifact_signature.py") + "::test_valid_signature"])
+        self.assertEqual(crypto.returncode, 0, crypto.stdout + crypto.stderr)
+        network = run(normal, ["-c", "import socket\ntry:\n socket.create_connection(('127.0.0.1',1),timeout=1)\n"
+                               "except PermissionError:\n pass\nelse:\n raise AssertionError('network was not denied')"])
+        self.assertEqual(network.returncode, 0, network.stdout + network.stderr)
+        for profile in (normal, signing):
+            for denied in ("/usr/bin/security", "/usr/bin/true"):
+                result = run(profile, ["-c", "import subprocess; subprocess.run([" + repr(denied) + "],check=True)"])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("PermissionError", result.stderr)
+
+    def check_node_sandbox(self):
+        self.check_browser_fixtures_with_real_home()
+        python = Path(sys.executable)
+        node = p._qa_node_runtime(os.environ.get("QA_NODE_RUNTIME"))
+        scratch = self.root / "node-scratch"
+        scratch.mkdir()
+        private_home = self.root / "private-home"
+        private_home.mkdir()
+        sentinel = private_home / "sentinel"
+        sentinel.write_text("synthetic private data")
+        build_state = self.root / "build-state"
+        build_state.mkdir()
+        state_existing = build_state / "existing"
+        state_existing.write_text("must remain unchanged")
+        synthetic_os_temp = self.root / "native-temp"
+        native_temp = synthetic_os_temp / "TemporaryItems"
+        native_temp.mkdir(parents=True)
+        native_replacement = native_temp / "NSIRD_harborqa-scratch-fixture_123"
+        native_replacement.mkdir()
+        (scratch / "outside-link").symlink_to(build_state, target_is_directory=True)
+        import shutil
+        scratch_executable = scratch / "not-node"
+        shutil.copyfile("/bin/echo", scratch_executable)
+        scratch_executable.chmod(0o755)
+        original_check_output = p.subprocess.check_output
+        def metadata(command, **kwargs):
+            if command == ["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"]:
+                return str(synthetic_os_temp)
+            return original_check_output(command, **kwargs)
+        with patch.object(Path, "home", return_value=private_home), patch.object(p, "STATE", build_state), \
+                patch.object(p.subprocess, "check_output", side_effect=metadata):
+            profile = p.simulation_profile(scratch, python, node_runtime=str(node), node_only=True)
+        env = dict(p.clean_env(), HOME=str(private_home), TMPDIR=str(scratch),
+                   PATH="/usr/bin:/bin:/usr/sbin:/sbin")
+        suite = subprocess.run(["/usr/bin/sandbox-exec", "-p", profile, str(node),
+            "--test", "--test-reporter=tap", str(ROOT / "tests/browser_dom/page-extractor.test.cjs")],
+            env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(suite.returncode, 0, suite.stdout + suite.stderr)
+        self.assertIn("# fail 0", suite.stdout)
+        self.assertRegex(suite.stdout, r"# tests [1-9][0-9]*")
+        script = """
+const fs = require('node:fs'), net = require('node:net'), cp = require('node:child_process');
+function denied(fn) { try { fn(); } catch (e) { if (e.code === 'EPERM' || e.code === 'EACCES') return; throw e; } throw Error('boundary opened'); }
+denied(() => fs.readFileSync(process.argv[1]));
+denied(() => fs.writeFileSync(process.argv[2], 'forbidden'));
+const writeTargets = JSON.parse(process.argv[5]);
+for (const target of writeTargets) denied(() => fs.writeFileSync(target, 'forbidden'));
+denied(() => fs.unlinkSync(process.argv[6]));
+denied(() => fs.linkSync(process.argv[6], process.argv[7] + '.hardlink'));
+denied(() => fs.renameSync(process.argv[6], process.argv[7] + '.renamed'));
+fs.writeFileSync(process.argv[7], 'scratch allowed');
+if (fs.readFileSync(process.argv[7], 'utf8') !== 'scratch allowed') throw Error('scratch unavailable');
+for (const [binary, args] of [['/bin/sh', ['-c', 'true']], ['/bin/bash', ['-c', 'true']],
+  ['/usr/bin/env', ['/bin/sh', '-c', 'true']], ['/bin/date', []],
+  [process.argv[3], ['-c', 'pass']], [process.argv[4], ['synthetic']]]) {
+  const other = cp.spawnSync(binary, args);
+  if (!other.error || !['EPERM', 'EACCES'].includes(other.error.code)) throw Error('other exec opened: ' + binary);
+}
+const server = net.createServer();
+server.on('error', e => { if (!['EPERM', 'EACCES'].includes(e.code)) throw e; });
+server.listen(0, '127.0.0.1', () => { server.close(); throw Error('network opened'); });
+"""
+        probe = subprocess.run(["/usr/bin/sandbox-exec", "-p", profile, str(node), "-e", script,
+            str(sentinel), str(self.root / "forbidden-write"), str(python), str(scratch_executable),
+            json.dumps([str(build_state / "marker"), str(state_existing), str(native_temp / "marker"),
+                        str(native_replacement / "marker"), str(scratch / "outside-link" / "escape")]),
+            str(state_existing), str(scratch / "allowed-write")], env=env,
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(probe.returncode, 0, probe.stdout + probe.stderr)
+        self.assertFalse((self.root / "forbidden-write").exists())
+        self.assertEqual(state_existing.read_text(), "must remain unchanged")
+        self.assertEqual(sorted(path.name for path in build_state.iterdir()), ["existing"])
+        self.assertFalse((native_temp / "marker").exists())
+        self.assertFalse((native_replacement / "marker").exists())
+        self.assertEqual((scratch / "allowed-write").read_text(), "scratch allowed")
+
+    def check_browser_fixtures_with_real_home(self):
+        # Keep the real HOME ancestor denied: a temporary HOME hides Node's
+        # package-scope lookup above this checkout before fixture code runs.
+        node = p._qa_node_runtime(os.environ.get("QA_NODE_RUNTIME"))
+        profile = p.simulation_profile(self.root, Path(sys.executable), node_runtime=str(node))
+        env = dict(p.clean_env(), TMPDIR=str(self.root), QA_NODE_RUNTIME=str(node),
+                   PATH="/usr/bin:/bin:/usr/sbin:/sbin")
+        # HOME always exists; HOME/package.json need not exist on CI runners.
+        denied = """
+try { require('node:fs').readdirSync(process.argv[1]); }
+catch (e) { if (['EPERM', 'EACCES'].includes(e.code)) process.exit(0); throw e; }
+throw Error('private HOME directory became readable');
+"""
+        probe = subprocess.run(["/usr/bin/sandbox-exec", "-p", profile, str(node), "-e", denied,
+                                str(Path.home())], cwd=ROOT, env=env,
+                               capture_output=True, text=True, timeout=30)
+        self.assertEqual(probe.returncode, 0, probe.stdout + probe.stderr)
+        result = subprocess.run(["/usr/bin/sandbox-exec", "-p", profile, sys.executable,
+            "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider",
+            "tests/browser_dom/test_page_extractor.py", "tests/browser_dom/test_live_capture.py",
+            "tests/browser_chrome/test_chrome_acquisition.py",
+            "tests/browser_actions/test_action_executor.py"], cwd=ROOT, env=env,
+            capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_bootstrap_rejects_corrupt_downloads(self):
+        import bootstrap_uv
+        with patch.object(bootstrap_uv, "download", return_value=b"corrupt"), patch.object(bootstrap_uv.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "archive checksum"):
+                bootstrap_uv.ensure_uv(p.CONFIG, self.root)
+            with self.assertRaisesRegex(RuntimeError, "archive checksum"):
+                bootstrap_uv.ensure_python_archive(p.CONFIG, self.root)
+
+    def test_runtime_extractor_rejects_traversal_and_escaping_links(self):
+        import bootstrap_uv
+        import tarfile
+        state = self.root / "state"
+        archive = state / "python-downloads/fixture/runtime.tar.gz"
+        archive.parent.mkdir(parents=True)
+        for name, target in (("../escape", None), ("python/link", "../../escape")):
+            with self.subTest(name=name):
+                with tarfile.open(archive, "w:gz") as tar:
+                    member = tarfile.TarInfo(name)
+                    if target:
+                        member.type = tarfile.SYMTYPE
+                        member.linkname = target
+                    tar.addfile(member)
+                config = dict(p.CONFIG, python_build="fixture",
+                              python_archive_url="https://example.invalid/runtime.tar.gz",
+                              python_archive_sha256=p.digest(archive))
+                with self.assertRaisesRegex(RuntimeError, "Unsafe Python archive"):
+                    bootstrap_uv.unpack_runtime(config, state, self.root / "runtime")
+                self.assertFalse((self.root / "runtime").exists())
+                self.assertFalse((self.root / "escape").exists())
+
+    def runtime_archive(self, entries):
+        import io
+        import tarfile
+        archive = self.root / "state/python-downloads/fixture/runtime.tar.gz"
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(archive, "w:gz") as tar:
+            for name, kind, value in entries:
+                member = tarfile.TarInfo(name)
+                member.mode = 0o755
+                member.type = kind
+                if kind == tarfile.REGTYPE:
+                    data = value.encode()
+                    member.size = len(data)
+                    tar.addfile(member, io.BytesIO(data))
+                else:
+                    member.linkname = value
+                    tar.addfile(member)
+        return dict(p.CONFIG, python_build="fixture",
+                    python_archive_url="https://example.invalid/runtime.tar.gz",
+                    python_archive_sha256=p.digest(archive))
+
+    def test_runtime_symlink_graph_rejects_chained_escape_before_writes(self):
+        import bootstrap_uv
+        import tarfile
+        config = self.runtime_archive([
+            *[(name, tarfile.DIRTYPE, "") for name in ("python", "python/a", "python/x", "python/bin")],
+            ("python/a/b", tarfile.SYMTYPE, "../x"),
+            ("python/unsafe", tarfile.SYMTYPE, "a/b/../../outside"),
+            ("python/bin/python3", tarfile.SYMTYPE, "../a/b/../../outside"),
+        ])
+        with patch.object(bootstrap_uv.tempfile, "TemporaryDirectory") as scratch:
+            with self.assertRaisesRegex(RuntimeError, "escaping symlink chain"):
+                bootstrap_uv.unpack_runtime(config, self.root / "state", self.root / "runtime")
+            scratch.assert_not_called()
+        self.assertFalse((self.root / "runtime").exists())
+        self.assertFalse((self.root / "outside").exists())
+
+    def test_runtime_graph_rejects_missing_loop_special_and_link_parent(self):
+        import bootstrap_uv
+        import tarfile
+        cases = [
+            [("python/a", tarfile.SYMTYPE, "missing")],
+            [("python/a", tarfile.SYMTYPE, "/absolute")],
+            [("python/a", tarfile.SYMTYPE, "")],
+            [("python/a", tarfile.SYMTYPE, "a")],
+            [("python/a", tarfile.SYMTYPE, "b"), ("python/b", tarfile.SYMTYPE, "a")],
+            [("python/a", tarfile.FIFOTYPE, ""), ("python/b", tarfile.SYMTYPE, "a")],
+            [("python/a", tarfile.CHRTYPE, "")],
+            [("python/a", tarfile.LNKTYPE, "python/b")],
+            [("python/a", tarfile.SYMTYPE, "x"), ("python/a/child", tarfile.REGTYPE, "fixture")],
+            [("python/a", tarfile.REGTYPE, "fixture"), ("python/b", tarfile.SYMTYPE, "a/../a")],
+            [("python/a", tarfile.REGTYPE, "first"), ("python/./a", tarfile.REGTYPE, "second")],
+        ]
+        for entries in cases:
+            with self.subTest(entries=entries):
+                config = self.runtime_archive(entries)
+                with patch.object(bootstrap_uv.tempfile, "TemporaryDirectory") as scratch:
+                    with self.assertRaisesRegex(RuntimeError, "Unsafe Python archive"):
+                        bootstrap_uv.unpack_runtime(config, self.root / "state", self.root / "runtime")
+                    scratch.assert_not_called()
+
+    def test_runtime_preserves_relative_chains_without_tar_extraction_filters(self):
+        import bootstrap_uv
+        import tarfile
+        config = self.runtime_archive([
+            ("python/a", tarfile.DIRTYPE, ""),
+            ("python/x", tarfile.DIRTYPE, ""),
+            ("python/bin/python3", tarfile.SYMTYPE, "../a/b/../real"),
+            ("python/a/b", tarfile.SYMTYPE, "../x"),
+            ("python/bin/python", tarfile.SYMTYPE, "python3"),
+            ("python/real", tarfile.REGTYPE, "fixture interpreter bytes"),
+        ])
+        with patch.object(tarfile.TarFile, "extractall", side_effect=AssertionError("version-dependent extraction")):
+            bootstrap_uv.unpack_runtime(config, self.root / "state", self.root / "runtime")
+        runtime = self.root / "runtime"
+        self.assertEqual(os.readlink(runtime / "bin/python3"), "../a/b/../real")
+        self.assertEqual((runtime / "bin/python").read_text(), "fixture interpreter bytes")
+        self.assertEqual((runtime / "bin/python").resolve(), (runtime / "real").resolve())
+        self.assertTrue(os.access(runtime / "bin/python", os.X_OK))
+
+    def test_interpreter_read_roots_refuses_a_home_wide_prefix(self):
+        home = self.root / "home"
+        python = home / "bin/python"
+        python.parent.mkdir(parents=True)
+        python.write_text("fixture, never executed")
+        with patch.object(Path, "home", return_value=home):
+            with self.assertRaisesRegex(p.BuildError, "dedicated runtime prefix"):
+                p.interpreter_read_roots(python)
+
+    def test_external_virtualenv_is_readable_without_opening_private_home(self):
+        self.external_virtualenv_contract(execute=False)
+
+    def check_external_virtualenv_sandbox(self):
+        # Explicit integration entry point: Seatbelt cannot be nested. The build
+        # driver requires this check before starting the sandboxed full QA run.
+        self.external_virtualenv_contract(execute=True)
+
+    def external_virtualenv_contract(self, *, execute):
+        home = self.root / "home"
+        venv = home / "external-venv"
+        scratch = self.root / "qa-scratch"
+        scratch.mkdir()
+        subprocess.run([sys.executable, "-I", "-B", "-m", "venv", "--without-pip", str(venv)],
+                       check=True, capture_output=True)
+        packages = venv / "lib" / ("python%d.%d" % sys.version_info[:2]) / "site-packages"
+        (packages / "harbor_prefix_fixture.py").write_text("VALUE = 'fixture-only'\n")
+        (home / "private.txt").write_text("must remain unreadable")
+        alias = home / "venv-alias"
+        alias.symlink_to(venv, target_is_directory=True)
+        selected = alias / "bin/python"
+        self.assertTrue(selected.is_symlink())
+        metadata = lambda command, **kwargs: str(self.root / ("developer" if command[0] == "xcode-select" else "os-temp"))
+        with patch.object(Path, "home", return_value=home), patch.object(p, "git", return_value=str(ROOT / ".git")), patch.object(p.subprocess, "check_output", side_effect=metadata):
+            profile = p.simulation_profile(scratch, selected)
+            roots = p.interpreter_read_roots(selected)
+            launcher = home / "launcher"
+            launcher.symlink_to(venv / "bin/python")
+            self.assertIn(venv.resolve(), p.interpreter_read_roots(launcher))
+        self.assertIn(venv.resolve(), roots)
+        self.assertNotIn(home.resolve(), roots)
+        for rule in ("(deny network*)", "(deny appleevent-send)", "(deny file-write*)"):
+            self.assertIn(rule, profile)
+        if not execute:
+            return
+        probe = f"""
+from pathlib import Path
+import sys, harbor_prefix_fixture
+assert harbor_prefix_fixture.VALUE == 'fixture-only'
+assert Path(sys.prefix).resolve() == Path({str(venv)!r}).resolve()
+assert (Path(sys.prefix)/'pyvenv.cfg').read_text()
+for action in (lambda: Path({str(home / 'private.txt')!r}).read_text(),
+               lambda: Path({str(venv / 'forbidden-write')!r}).write_text('forbidden')):
+    try: action()
+    except PermissionError: pass
+    else: raise AssertionError('sandbox boundary opened')
+Path({str(scratch / 'allowed-write')!r}).write_text('fixture')
+print('external venv readable; private home and writes denied')
+"""
+        result = subprocess.run(["/usr/bin/sandbox-exec", "-p", profile, str(selected), "-I", "-B", "-c", probe],
+                                env=p.clean_env(), text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((venv / "forbidden-write").exists())
+        self.assertTrue((scratch / "allowed-write").exists())
+
+    def signing_fixture(self):
+        bundle = self.fixture()
+        for name in ("Contents/MacOS/Harbor", "Contents/Resources/backend/.venv/bin/python3",
+                     "Contents/Frameworks/Helper.app/Contents/MacOS/Helper",
+                     "Contents/Frameworks/Helper.app/Contents/Frameworks/Example.framework/Versions/A/Example"):
+            path = bundle / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"\xcf\xfa\xed\xfe" + b"fixture")
+        return bundle
+
+    def signing_runner(self, failure=None):
+        root = self.root
+        class FakeRunner:
+            logs = root
+            records = []
+            env = p.clean_env()
+            def __init__(inner):
+                inner.calls = []
+            def run(inner, label, command):
+                inner.calls.append(command)
+                if failure and failure in label:
+                    raise p.BuildError("fixture signing failure")
+                log = root / (label + ".log")
+                log.write_text("Signature=adhoc\nTeamIdentifier=not set\n" if "--display" in command else "")
+                return 0, log
+        return FakeRunner()
+
+    def test_adhoc_signing_is_nested_first_credential_free_and_verified(self):
+        bundle = self.signing_fixture()
+        with patch.dict(os.environ, {"HARBOR_SIGNING_IDENTITY": "FORBIDDEN", "GH_TOKEN": "FORBIDDEN"}):
+            runner = self.signing_runner()
+            p.sign_adhoc(runner, bundle)
+        signs = [command for command in runner.calls if "--sign" in command]
+        targets = [command[-1] for command in signs]
+        self.assertEqual(targets[-1], bundle)
+        self.assertEqual(len(targets), len(set(targets)))
+        for target in targets:
+            for ancestor in targets:
+                if target != ancestor and target.is_relative_to(ancestor):
+                    self.assertLess(targets.index(target), targets.index(ancestor))
+        for command in signs:
+            self.assertEqual(command[0], "/usr/bin/codesign")
+            self.assertEqual(command[command.index("--sign") + 1], "-")
+            self.assertIn("--timestamp=none", command)
+            self.assertNotIn("--keychain", command)
+            self.assertNotIn("FORBIDDEN", command)
+        self.assertNotIn("GH_TOKEN", runner.env)
+        self.assertNotIn("HARBOR_SIGNING_IDENTITY", runner.env)
+        self.assertIn("--verify", runner.calls[-2])
+        self.assertIn("--deep", runner.calls[-2])
+        self.assertIn("--strict", runner.calls[-2])
+
+    def test_adhoc_signing_identifier_is_only_for_engine_interpreter(self):
+        bundle = self.signing_fixture()
+        engine = self.engine_fixture(bundle)
+        runner = self.signing_runner()
+        p.sign_adhoc(runner, bundle)
+        signs = [command for command in runner.calls if "--sign" in command]
+        identified = [command for command in signs if "-i" in command]
+        self.assertEqual(len(identified), 1)
+        self.assertEqual(identified[0][identified[0].index("-i") + 1], "com.harbor.engine.python3")
+        self.assertEqual(identified[0][-1], engine / "py/bin/python3.11")
+
+    def test_signing_failure_stops_before_parent_and_verification(self):
+        bundle = self.signing_fixture()
+        runner = self.signing_runner(failure="adhoc-sign-0")
+        with self.assertRaisesRegex(p.BuildError, "signing failure"):
+            p.sign_adhoc(runner, bundle)
+        self.assertEqual(len(runner.calls), 1)
+        self.assertNotEqual(runner.calls[0][-1], bundle)
+
+    def test_strict_signature_failure_and_provenance_mismatch_fail_closed(self):
+        descriptions = [("ad-hoc", "Signature=adhoc\nTeamIdentifier=not set", True),
+                        ("ad-hoc", "Authority=Developer ID Application: Fixture\nTeamIdentifier=TEAM", False),
+                        ("Developer ID Application", "Signature=adhoc\nTeamIdentifier=not set", False),
+                        ("Developer ID Application", "Authority=Developer ID Application: Fixture\nTeamIdentifier=TEAM", True)]
+        for expected, description, allowed in descriptions:
+            results = [subprocess.CompletedProcess([], 0, "", ""), subprocess.CompletedProcess([], 0, "", description)]
+            with self.subTest(expected=expected, description=description), patch.object(p.subprocess, "run", side_effect=results) as run:
+                if allowed:
+                    p.verify_bundle_signature(self.root, expected)
+                else:
+                    with self.assertRaisesRegex(p.BuildError, "differs from provenance"):
+                        p.verify_bundle_signature(self.root, expected)
+                self.assertIn("--deep", run.call_args_list[0].args[0])
+                self.assertIn("--strict", run.call_args_list[0].args[0])
+        with patch.object(p.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "invalid seal")):
+            with self.assertRaisesRegex(p.BuildError, "Strict bundle"):
+                p.verify_bundle_signature(self.root, "ad-hoc")
+
+    def test_adhoc_artifact_cannot_claim_notarization(self):
+        self.artifact()
+        provenance = json.loads((self.root / "provenance.json").read_text())
+        provenance["notarized"] = True
+        p.json_write(self.root / "provenance.json", provenance)
+        p.checksums(self.root)
+        with self.assertRaisesRegex(p.BuildError, "must not claim notarization"):
+            p.verify_artifacts(self.root)
+
+    def test_host_path_scan_rejects_macho_leaks_in_multiple_encodings(self):
+        bundle = self.signing_fixture()
+        executable = bundle / "Contents/MacOS/Harbor"
+        for marker in (str(ROOT), "/Users/fixture/Desktop/OtherRepo", "/home/runner/work/repo", "/private/var/folders/fixture"):
+            for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
+                with self.subTest(marker=marker, encoding=encoding):
+                    executable.write_bytes(b"\xcf\xfa\xed\xfe" + marker.encode(encoding))
+                    with self.assertRaisesRegex(p.BuildError, "Host build path"):
+                        p.scan_host_paths(bundle)
+        executable.write_bytes(b"\xcf\xfa\xed\xfe/harbor/source/app/Sources/main.swift")
+        p.scan_host_paths(bundle)
+
+    def test_host_checkout_scan_covers_nested_dependencies(self):
+        bundle = self.signing_fixture()
+        native = bundle / "Contents/Resources/dependency.so"
+        for marker in (str(ROOT), "/Users/you/private-checkout", "/Users/you/Desktop/MOE_Project"):
+            native.write_bytes(b"\xcf\xfa\xed\xfe" + marker.encode())
+            with self.assertRaisesRegex(p.BuildError, "Host build path"):
+                p.scan_host_paths(bundle)
+
+    def test_native_cleanup_strips_before_signing_and_rejects_unsafe_rpaths(self):
+        bundle = self.signing_fixture()
+        runner = self.signing_runner()
+        original = runner.run
+        def run(label, command):
+            code, log = original(label, command)
+            if "signing-load-commands" in label:
+                log.write_text("cmd LC_RPATH\ncmdsize 40\npath /build/deps (offset 12)\n"
+                               "cmd LC_LOAD_DYLIB\ncmdsize 40\nname @rpath/libcustom.dylib (offset 24)\n")
+            return code, log
+        runner.run = run
+        with self.assertRaisesRegex(p.BuildError, "non-system dependencies"):
+            p.prepare_native_for_signing(runner, bundle)
+        self.assertEqual(runner.calls[0][:2], ["/usr/bin/strip", "-S"])
+        self.assertFalse(any("--sign" in command or "-delete_rpath" in command for command in runner.calls))
+
+    def rpath_runner(self, loads):
+        runner = self.signing_runner()
+        original = runner.run
+        def run(label, command):
+            code, log = original(label, command)
+            if "signing-load-commands" in label and p.engine_build.ENGINE_DIR in str(command[-1]):
+                log.write_text("cmd LC_RPATH\ncmdsize 40\npath /build/deps (offset 12)\n"
+                               + "".join(f"cmd LC_LOAD_DYLIB\ncmdsize 40\nname {name} (offset 24)\n" for name in loads))
+            return code, log
+        runner.run = run
+        return runner
+
+    def test_engine_kernel_with_only_rpath_dependencies_loses_its_dead_absolute_rpath(self):
+        bundle = self.signing_fixture()
+        engine = self.engine_fixture(bundle)
+        runner = self.rpath_runner(["@rpath/libmlx.dylib", "/usr/lib/libc++.1.dylib"])
+        p.prepare_native_for_signing(runner, bundle)
+        deletes = [command for command in runner.calls if "-delete_rpath" in command]
+        self.assertTrue(any(command[-1] == engine / "sp/mlx/core.cpython-311-darwin.so" for command in deletes))
+        self.assertTrue(all(command[-2] == "/build/deps" for command in deletes))
+
+    def test_engine_kernel_with_an_absolute_library_keeps_the_refusal(self):
+        bundle = self.signing_fixture()
+        self.engine_fixture(bundle)
+        runner = self.rpath_runner(["@rpath/libmlx.dylib", "/opt/homebrew/lib/libfoo.dylib"])
+        with self.assertRaisesRegex(p.BuildError, "non-system dependencies"):
+            p.prepare_native_for_signing(runner, bundle)
+        self.assertFalse(any("-delete_rpath" in command for command in runner.calls))
+
+    def test_native_cleanup_skips_engine_but_strips_app_machos(self):
+        bundle = self.signing_fixture()
+        engine = self.engine_fixture(bundle)
+        runner = self.signing_runner()
+        p.prepare_native_for_signing(runner, bundle)
+        stripped = [command[-1] for command in runner.calls if command[:2] == ["/usr/bin/strip", "-S"]]
+        self.assertIn(bundle / "Contents/MacOS/Harbor", stripped)
+        self.assertTrue(stripped)
+        self.assertNotIn(engine / "py/bin/python3.11", stripped)
+        self.assertNotIn(engine / "sp/mlx/core.cpython-311-darwin.so", stripped)
+
+    def test_release_notes_describe_built_in_engine_only_when_staged(self):
+        meta = dict(self.meta, preview=False)
+        with patch.object(p.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "")), \
+                patch.object(p, "git", return_value="- fixture change"):
+            engine_notes = p.notes(dict(meta, engine={"minimum_macos": "26.2"}))
+            external_notes = p.notes(meta)
+        self.assertIn("Includes a built-in AI engine (macOS 26.2 or newer for the engine)", engine_notes)
+        self.assertNotIn("separately installed oMLX", engine_notes)
+        self.assertIn("Requires a separately installed oMLX server and models.", external_notes)
+        self.assertNotIn("built-in AI engine", external_notes)
+
+    def test_relocation_smoke_skips_engine_import_only_on_a_host_below_the_engine_minimum(self):
+        bundle = self.fixture()
+        self.engine_fixture(bundle)
+
+        class Runner:
+            logs = self.root
+            calls = []
+
+            def run(inner, label, command, **kwargs):
+                inner.calls.append(label)
+                log = self.root / (label + ".log")
+                log.write_text("")
+                return 0, log
+
+        for host, expect_run in (("15.5", False), ("26.2", True), ("27.0", True)):
+            with self.subTest(host=host), patch.object(p, "guarded", return_value=0), \
+                    patch.object(p.engine_build, "_host_macos", return_value=host), \
+                    patch.object(p, "engine_smoke") as smoke, patch("builtins.print"):
+                p.relocation_smoke(Runner(), bundle)
+                self.assertEqual(smoke.called, expect_run)
+                if not expect_run:
+                    self.assertIn("older than the engine's minimum 26.2",
+                                  (self.root / "relocated-engine-smoke.log").read_text())
+
+    def test_release_notes_say_when_the_engine_smoke_was_skipped(self):
+        meta = dict(self.meta, preview=False, engine={"minimum_macos": "26.2"})
+        skipped = dict(meta, engine_smoke={"mode": "skip", "reason": "host macOS 15.5 is older than the engine's minimum 26.2"})
+        with patch.object(p.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "")), \
+                patch.object(p, "git", return_value="- fixture change"):
+            self.assertIn("import smoke test was not run on the build host", p.notes(skipped))
+            self.assertIn("verified against the pinned oMLX release", p.notes(skipped))
+            self.assertNotIn("not run on the build host", p.notes(dict(meta, engine_smoke={"mode": "run"})))
+
+    def test_fetch_engine_and_engine_app_are_mutually_exclusive(self):
+        with patch.object(sys, "argv", ["pipeline.py", "preview", "--fetch-engine", "--engine-app", "/x/oMLX.app"]), \
+                self.assertRaises(SystemExit) as raised, patch("sys.stderr"):
+            p.main()
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_engine_source_pin_matches_the_engine_lock(self):
+        source = p.engine_build.load_source()
+        self.assertEqual(source["omlx_version"], p.engine_build.load_lock()["omlx_version"])
+
+    def test_engine_smoke_requires_success_status_and_marker(self):
+        bundle = self.fixture()
+        self.engine_fixture(bundle)
+
+        class FakeRunner:
+            logs = self.root
+
+            def __init__(inner, status, output):
+                inner.status = status
+                inner.output = output
+                inner.calls = []
+
+            def run(inner, label, command, **kwargs):
+                inner.calls.append((label, command, kwargs))
+                log = self.root / (label + ".log")
+                log.write_text(inner.output)
+                return inner.status, log
+
+        for status, output in ((1, "engine-import-ok"), (0, "imports completed")):
+            with self.subTest(status=status, output=output), self.assertRaisesRegex(p.BuildError, "import smoke test"):
+                p.engine_smoke(FakeRunner(status, output), bundle)
+        runner = FakeRunner(0, "engine-import-ok\n")
+        p.engine_smoke(runner, bundle)
+        self.assertEqual(len(runner.calls), 1)
+        self.assertEqual(runner.calls[0][0], "relocated-engine-smoke")
+
+    def test_production_staging_removes_only_development_fallback(self):
+        path = ROOT / "app/Sources/HarborApp/BackendManager.swift"
+        before = path.read_text()
+        after = p.production_backend_source(before)
+        self.assertNotIn("let devRoot", after)
+        self.assertNotIn("/Users/", after)
+        self.assertIn('Bundle.main.resourceURL?.appendingPathComponent("backend")', after)
+        self.assertEqual(path.read_text(), before)
+        with self.assertRaisesRegex(p.BuildError, "expected one development fallback"):
+            p.production_backend_source(after)
+
+    def test_protected_signing_replaces_adhoc_signatures_in_same_order(self):
+        bundle = self.signing_fixture()
+        identity = "Developer ID Application: Fixture (TEAM)"
+        keychain = self.root / "fixture.keychain"
+        empty = release.canonical_entitlements({})
+        app = release.canonical_entitlements(
+            {"com.apple.security.automation.apple-events": True})
+        class Entitlements:
+            expected = {"app": app, "python": empty}
+            def argument(inner, role):
+                descriptor = 91 if role == "app" else 92
+                return f"/dev/fd/{descriptor}", descriptor
+        def extracted(target):
+            return (app if release.entitlement_role(bundle, target) == "app"
+                    else empty)
+        with patch.object(release, "secret_run") as sign, \
+                patch.object(release, "verify_bundle_signature") as verify, \
+                patch.object(release, "signed_entitlements", side_effect=extracted):
+            release.developer_sign(self.signing_runner(), bundle, identity, keychain,
+                                   Entitlements())
+        self.assertEqual([call.args[0][-1] for call in sign.call_args_list], p.signing_targets(bundle))
+        for call in sign.call_args_list:
+            command = call.args[0]
+            self.assertIn("--force", command)
+            self.assertEqual(command[command.index("--sign") + 1], identity)
+            self.assertIn(keychain, command)
+            self.assertIn("--timestamp", command)
+            self.assertIn("runtime", command)
+            entitlement = command[command.index("--entitlements") + 1]
+            self.assertEqual(call.kwargs["pass_fds"], (int(entitlement.rsplit("/", 1)[1]),))
+        self.assertEqual(verify.call_args.args[1], "Developer ID Application")
+
+    def test_finalize_checks_signature_before_writing_manifests(self):
+        bundle = self.fixture()
+        runner = self.signing_runner()
+        with patch.object(p, "verify_bundle_signature", side_effect=p.BuildError("unsealed bundle")):
+            with self.assertRaisesRegex(p.BuildError, "unsealed"):
+                p.finalize(runner, bundle, self.root, self.meta, {})
+        self.assertFalse((self.root / "bundle-manifest.json").exists())
+        self.assertFalse(list(self.root.glob("*.zip")))
+
+    def test_finalize_records_signed_bytes_and_truthful_provenance(self):
+        bundle = self.fixture()
+        (bundle / "Contents/MacOS/Harbor").write_bytes(b"fixture signed bytes")
+        seal = bundle / "Contents/_CodeSignature/CodeResources"
+        seal.parent.mkdir();seal.write_text("fixture seal")
+        p.json_write(self.root / "simulation-qa.json", self.qa_report())
+        destination = self.root / "output";destination.mkdir()
+        runner = self.signing_runner()
+        with patch.object(p, "verify_bundle_signature"), patch.object(p, "notes", return_value="fixture"), patch.object(p, "distribution_roundtrip"):
+            p.finalize(runner, bundle, destination, self.meta, {})
+        provenance = json.loads((destination / "provenance.json").read_text())
+        self.assertEqual(provenance["signature"], "ad-hoc")
+        self.assertIs(provenance["notarized"], False)
+        self.assertEqual(json.loads((destination / "bundle-manifest.json").read_text()), p.inventory(bundle))
+        with zipfile.ZipFile(next(destination.glob("*.zip"))) as zipped:
+            self.assertEqual(zipped.read("Harbor.app/Contents/MacOS/Harbor"), b"fixture signed bytes")
+            self.assertEqual(zipped.read("Harbor.app/Contents/_CodeSignature/CodeResources"), b"fixture seal")
+
+    def test_artifact_manifest(self):
+        self.artifact()
+        with patch.object(p, "verify_bundle_signature") as verify:
+            p.verify_artifacts(self.root)
+            verify.assert_called_once_with(self.root / "Harbor.app", "ad-hoc")
+
+    def test_artifact_verification_allows_contained_runtime_symlink(self):
+        bundle = self.artifact()
+        alias = bundle / "Contents/Resources/backend/.venv/bin/python"
+        self.assertTrue(alias.is_symlink())
+        self.assertEqual(os.readlink(alias), "python3")
+        with patch.object(p, "verify_bundle_signature"):
+            p.verify_artifacts(self.root)
+
+    def test_verified_upload_descriptors_survive_path_swap(self):
+        self.artifact()
+        archive = self.root / "Harbor.zip"
+        expected = archive.read_bytes()
+        replacement = self.root.parent / "replacement.zip"
+        replacement.write_bytes(b"com.harbor.app.summary-qa")
+        with p.BoundReleaseAssets(self.root) as assets:
+            with patch.object(p, "verify_bundle_signature"):
+                p.verify_artifacts(self.root, bound_assets=assets)
+            archive.unlink()
+            archive.symlink_to(replacement)
+            descriptor = assets.descriptors["Harbor.zip"]
+            self.assertEqual(os.pread(descriptor, len(expected), 0), expected)
+            with self.assertRaisesRegex(p.BuildError, "identity changed|symlinks"):
+                assets.assert_paths_unchanged()
+
+    def test_bound_assets_reject_in_place_content_mutation(self):
+        self.artifact()
+        archive = self.root / "Harbor.zip"
+        original = archive.read_bytes()
+        with p.BoundReleaseAssets(self.root) as assets:
+            with patch.object(p, "verify_bundle_signature"):
+                p.verify_artifacts(self.root, bound_assets=assets)
+            archive.write_bytes(b"x" * len(original))
+            with self.assertRaisesRegex(p.BuildError, "content changed"):
+                assets.read_bytes("Harbor.zip")
+
+    def test_bound_archive_replacement_window_cannot_change_distribution_or_checksums(self):
+        bundle = self.artifact()
+        archive = self.root / "Harbor.zip"
+        expected = archive.read_bytes()
+        (self.root / "SHA256SUMS").unlink()
+        class DescriptorRunner:
+            logs = self.root
+            def run(inner, label, command, **kwargs):
+                if label == "extract-distribution":
+                    self.assertEqual(kwargs["pass_fds"], (descriptor,))
+                    self.assertEqual(Path(command[3]).read_bytes(), expected)
+                    p.shutil.copytree(bundle, Path(command[4]) / "Harbor.app", symlinks=True)
+                return 0, self.root / "unused.log"
+        with p.BoundReleaseAssets(self.root) as assets:
+            descriptor = assets.descriptors["Harbor.zip"]
+            archive.unlink()
+            archive.write_bytes(b"replacement-after-binding")
+            with patch.object(p, "verify_bundle_signature"), \
+                    patch.object(p, "relocation_smoke"):
+                p.distribution_roundtrip(DescriptorRunner(), archive, bundle, self.meta,
+                                         archive_descriptor=descriptor)
+            with self.assertRaisesRegex(p.BuildError, "identity changed"):
+                assets.write_checksums()
+
+    def test_descriptor_uploader_retries_with_exact_name_mime_and_body(self):
+        body = b"PK\x03\x04exact-bound-zip"
+        asset = self.root / "Harbor 1.2-arm64.zip"
+        asset.write_bytes(body)
+        calls = []
+        statuses = iter((503, 201))
+        class Response:
+            def __init__(inner, status): inner.status = status
+            def read(inner, _limit): return b"{}"
+        class Connection:
+            def __init__(inner, host, timeout):
+                self.assertEqual((host, timeout), ("uploads.github.com", 120))
+            def request(inner, method, endpoint, body=None, headers=None):
+                calls.append((method, endpoint, headers.copy(), body.read()))
+            def getresponse(inner): return Response(next(statuses))
+            def close(inner): pass
+        descriptor = os.open(asset, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            uploader = p.GitHubReleaseUploader("owner/repo", 42, "fixture-token",
+                connection_factory=Connection, sleeper=lambda _delay: None)
+            uploader.upload(asset.name, p.release_asset_content_type(asset.name), descriptor,
+                            hashlib.sha256(body).hexdigest(), len(body))
+        finally:
+            os.close(descriptor)
+        self.assertEqual(len(calls), 2)
+        for method, endpoint, headers, supplied in calls:
+            self.assertEqual(method, "POST")
+            self.assertEqual(supplied, body)
+            self.assertEqual(headers["Content-Type"], "application/zip")
+            self.assertEqual(headers["Content-Length"], str(len(body)))
+            from urllib.parse import parse_qs, urlsplit
+            self.assertEqual(parse_qs(urlsplit(endpoint).query), {"name": [asset.name]})
+
+    def test_uploader_rejects_in_place_mutation_before_retry(self):
+        asset = self.root / "Harbor.zip"
+        original, replacement = b"original-bound-archive", b"replacement-archive!!!"
+        self.assertEqual(len(original), len(replacement))
+        asset.write_bytes(original)
+        attempts = []
+        class Response:
+            status = 503
+            def read(inner, _limit): return b"retry"
+        class Connection:
+            def __init__(inner, _host, timeout): self.assertEqual(timeout, 120)
+            def request(inner, _method, _endpoint, body=None, headers=None):
+                attempts.append(body.read())
+                asset.write_bytes(replacement)
+            def getresponse(inner): return Response()
+            def close(inner): pass
+        descriptor = os.open(asset, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            uploader = p.GitHubReleaseUploader("owner/repo", 42, "fixture-token",
+                connection_factory=Connection, sleeper=lambda _delay: None)
+            with self.assertRaisesRegex(p.BuildError, "content changed"):
+                uploader.upload(asset.name, p.release_asset_content_type(asset.name), descriptor,
+                                hashlib.sha256(original).hexdigest(), len(original))
+        finally:
+            os.close(descriptor)
+        self.assertEqual(attempts, [original])
+
+    def test_notes_reader_is_independent_and_not_uploaded(self):
+        self.artifact()
+        notes = self.root / "release-notes.md"
+        notes.write_bytes(b"exact release notes\n")
+        p.checksums(self.root, exclude={notes.name})
+        with p.BoundReleaseAssets(self.root) as assets:
+            with self.assertRaisesRegex(p.BuildError, "Incomplete"):
+                assets.validate_checksums()
+            assets.validate_checksums(allow_unpublished_notes=True)
+            notes_fd = assets.descriptors[notes.name]
+            with open(f"/dev/fd/{notes_fd}", "rb") as reader:
+                self.assertEqual(reader.read(), b"exact release notes\n")
+            uploads = assets.upload_assets()
+            upload_names = {entry[0] for entry in uploads}
+            checksum_names = {line.split("  ", 1)[1]
+                              for line in assets.read_text("SHA256SUMS").splitlines()}
+            self.assertNotIn(notes.name, upload_names)
+            self.assertNotIn(notes.name, checksum_names)
+            self.assertEqual(checksum_names, upload_names - {"SHA256SUMS"})
+            self.assertIn("Harbor.zip", upload_names)
+
+    def test_bound_candidate_copy_rejects_metadata_path_replacement(self):
+        self.artifact()
+        notes = self.root / "release-notes.md"
+        notes.write_bytes(b"reviewed release notes\n")
+        (self.root / "dependencies.json").write_text("{}\n")
+        p.checksums(self.root)
+        destination = self.root.with_name(self.root.name + "-signed-copy")
+        with p.BoundReleaseAssets(self.root) as assets:
+            with patch.object(p, "verify_bundle_signature"):
+                p.verify_artifacts(self.root, bound_assets=assets)
+            notes.unlink()
+            notes.write_bytes(b"replacement notes\n")
+            with self.assertRaisesRegex(p.BuildError, "identity changed"):
+                release.copy_bound_candidate(self.root, destination, assets)
+        self.assertTrue(destination.exists())
+        self.assertFalse((destination / notes.name).exists())
+
+    def test_bound_candidate_copy_rejects_bundle_swap_before_signing(self):
+        bundle = self.artifact()
+        notes = self.root / "release-notes.md"
+        notes.write_text("reviewed release notes\n")
+        (self.root / "dependencies.json").write_text("{}\n")
+        p.checksums(self.root)
+        destination = self.root.with_name(self.root.name + "-rejected-copy")
+        original_copytree = release.shutil.copytree
+        executable = bundle / "Contents/MacOS/Harbor"
+        def swap_then_copy(source, target, *args, **kwargs):
+            executable.write_bytes(b"post-verification replacement")
+            return original_copytree(source, target, *args, **kwargs)
+        with p.BoundReleaseAssets(self.root) as assets:
+            with patch.object(p, "verify_bundle_signature"):
+                p.verify_artifacts(self.root, bound_assets=assets)
+            with patch.object(release.shutil, "copytree", side_effect=swap_then_copy), \
+                    self.assertRaisesRegex(p.BuildError, "bound candidate inventory"):
+                release.copy_bound_candidate(self.root, destination, assets)
+
+    def test_private_signing_preflight_rejects_post_copy_executable_swap(self):
+        bundle = self.artifact()
+        notes = self.root / "release-notes.md"
+        notes.write_text("reviewed release notes\n")
+        (self.root / "dependencies.json").write_text("{}\n")
+        p.checksums(self.root)
+        destination = self.root.with_name(self.root.name + "-private-copy")
+        original = release.copy_bound_candidate
+        def copy_then_swap(*args, **kwargs):
+            copied, expected = original(*args, **kwargs)
+            (copied / "Contents/MacOS/Harbor").write_bytes(b"post-copy substitution")
+            return copied, expected
+        with p.BoundReleaseAssets(self.root) as assets, \
+                patch.object(release, "copy_bound_candidate", side_effect=copy_then_swap), \
+                patch.object(release, "secret_run") as credentials, \
+                patch.object(release, "developer_sign") as signer, \
+                self.assertRaisesRegex(p.BuildError, "changed after candidate copy"):
+            release.prepare_private_candidate(self.root, destination, assets)
+        credentials.assert_not_called()
+        signer.assert_not_called()
+
+    def test_bound_entitlement_descriptor_survives_private_path_substitution(self):
+        app = plistlib.dumps({"com.apple.security.automation.apple-events": True})
+        empty = plistlib.dumps({})
+        def blob(_commit, source):
+            return app if source.endswith("app.entitlements") else empty
+        directory = self.root / "private-entitlements"
+        with patch.object(release, "_git_blob", side_effect=blob), \
+                release.BoundEntitlements("a" * 40, directory) as entitlements:
+            original = entitlements.source_bytes["app"]
+            entitlements.paths["app"].unlink()
+            entitlements.paths["app"].write_bytes(plistlib.dumps({
+                "com.apple.security.automation.apple-events": True,
+                "com.apple.security.cs.allow-jit": True,
+            }))
+            argument, descriptor = entitlements.argument("app")
+            self.assertEqual(argument, f"/dev/fd/{descriptor}")
+            self.assertEqual(os.pread(descriptor, len(original) + 1, 0), original)
+
+    def test_bound_entitlement_descriptor_rewinds_for_repeated_native_consumers(self):
+        app = plistlib.dumps({"com.apple.security.automation.apple-events": True})
+        empty = plistlib.dumps({})
+        def blob(_commit, source):
+            return app if source.endswith("app.entitlements") else empty
+        directory = self.root / "reused-entitlements"
+        with patch.object(release, "_git_blob", side_effect=blob), \
+                release.BoundEntitlements("a" * 40, directory) as entitlements:
+            for role, expected in (("app", app), ("python", empty)):
+                self.assertEqual(plistlib.loads(expected),
+                                 {"com.apple.security.automation.apple-events": True}
+                                 if role == "app" else {})
+                for attempt in range(2):
+                    argument, descriptor = entitlements.argument(role)
+                    result = subprocess.run(
+                        ["/bin/cat", argument], pass_fds=(descriptor,),
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, expected,
+                                     f"{role} entitlement attempt {attempt + 1}")
+
+    def test_real_nested_targets_then_app_root_preserve_exact_entitlement_roles(self):
+        bundle = self.root / "RealSequence.app"
+        main = bundle / "Contents/MacOS/Harbor"
+        helper = bundle / "Contents/Resources/backend/.venv/bin/python3"
+        main.parent.mkdir(parents=True)
+        helper.parent.mkdir(parents=True)
+        source = self.root / "sequence.swift"
+        source.write_text('@main enum Fixture { static func main() { print("fixture") } }\n')
+        cache = self.root / "sequence-cache"
+        environment = {**os.environ, "TMPDIR": str(self.root),
+            "CLANG_MODULE_CACHE_PATH": str(cache / "clang"),
+            "SWIFT_MODULECACHE_PATH": str(cache / "swift")}
+        for output in (main, helper):
+            compiled = subprocess.run(["/usr/bin/xcrun", "--sdk", "macosx", "swiftc",
+                "-parse-as-library", str(source), "-o", str(output)], env=environment,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+        (bundle / "Contents/Info.plist").write_bytes(plistlib.dumps({
+            "CFBundleExecutable": "Harbor", "CFBundleIdentifier": "com.harbor.fixture",
+            "CFBundlePackageType": "APPL", "CFBundleVersion": "1",
+        }))
+        app = plistlib.dumps({"com.apple.security.automation.apple-events": True})
+        empty = plistlib.dumps({})
+        def blob(_commit, source_name):
+            return app if source_name.endswith("app.entitlements") else empty
+        with patch.object(release, "_git_blob", side_effect=blob), \
+                release.BoundEntitlements("a" * 40, self.root / "sequence-entitlements") as entitlements:
+            targets = p.signing_targets(bundle)
+            self.assertEqual(targets[-1], bundle)
+            self.assertIn(main, targets[:-1])
+            self.assertIn(helper, targets[:-1])
+            for target in targets:
+                role = release.entitlement_role(bundle, target)
+                argument, descriptor = entitlements.argument(role)
+                try:
+                    signed = subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-",
+                        "--timestamp=none", "--entitlements", argument, str(target)],
+                        pass_fds=(descriptor,), stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, text=True, timeout=120)
+                except PermissionError as exc:
+                    if exc.filename != "/usr/bin/codesign":
+                        raise
+                    return
+                self.assertEqual(signed.returncode, 0, signed.stderr)
+            release.verify_signed_entitlements(bundle, entitlements)
+            self.assertEqual(release.signed_entitlements(main),
+                             release.canonical_entitlements(app))
+            self.assertEqual(release.signed_entitlements(helper),
+                             release.canonical_entitlements(empty))
+
+    def test_signed_entitlement_expansion_is_rejected(self):
+        bundle = self.signing_fixture()
+        empty = release.canonical_entitlements({})
+        app = release.canonical_entitlements(
+            {"com.apple.security.automation.apple-events": True})
+        expanded = release.canonical_entitlements({
+            "com.apple.security.automation.apple-events": True,
+            "com.apple.security.cs.allow-jit": True,
+        })
+        class Entitlements:
+            expected = {"app": app, "python": empty}
+        with patch.object(release, "signed_entitlements",
+                          side_effect=lambda target: expanded if target == bundle else empty), \
+                self.assertRaisesRegex(p.BuildError, "Signed entitlements differ"):
+            release.verify_signed_entitlements(bundle, Entitlements())
+
+    def test_inventories_bind_directory_modes_and_empty_topology(self):
+        bundle = self.fixture()
+        empty = bundle / "Contents/Resources/Empty"
+        empty.mkdir()
+        raw = p.inventory(bundle)
+        canonical = release.signature_insensitive_inventory(bundle)
+        empty.rmdir()
+        self.assertNotEqual(p.inventory(bundle), raw)
+        self.assertNotEqual(release.signature_insensitive_inventory(bundle), canonical)
+        empty.mkdir()
+        empty.chmod(0o777)
+        self.assertNotEqual(p.inventory(bundle), raw)
+        self.assertNotEqual(release.signature_insensitive_inventory(bundle), canonical)
+        empty.chmod(0o755)
+        added = empty / "Added"
+        added.mkdir()
+        self.assertNotEqual(p.inventory(bundle), raw)
+        self.assertNotEqual(release.signature_insensitive_inventory(bundle), canonical)
+
+    def test_signature_insensitive_inventory_ignores_only_code_signatures(self):
+        bundle = self.root / "Signed.app"
+        executable = bundle / "Contents/MacOS/Harbor"
+        executable.parent.mkdir(parents=True)
+        signature = b"first-signature"
+        header = struct.pack("<IIIIIIII", 0xFEEDFACF, 0x0100000C, 0, 2, 2, 88, 0, 0)
+        segment = struct.pack("<II16sQQQQiiII", 0x19, 72, b"__LINKEDIT",
+                              0, 0x1000, 120, len(signature), 1, 1, 0, 0)
+        command = struct.pack("<IIII", 0x1D, 16, 120, len(signature))
+        executable.write_bytes(header + segment + command + signature)
+        executable.chmod(0o755)
+        resources = bundle / "Contents/Resources"
+        resources.mkdir()
+        (resources / "payload.txt").write_text("payload")
+        code_resources = bundle / "Contents/_CodeSignature/CodeResources"
+        code_resources.parent.mkdir()
+        code_resources.write_text("first")
+        before = release.signature_insensitive_inventory(bundle)
+        replacement = b"different-longer-signature"
+        resigned_segment = struct.pack("<II16sQQQQiiII", 0x19, 72, b"__LINKEDIT",
+            0, 0x2000, 120, len(replacement), 1, 1, 0, 0)
+        executable.write_bytes(header + resigned_segment
+            + struct.pack("<IIII", 0x1D, 16, 120, len(replacement)) + replacement)
+        executable.chmod(0o755)
+        code_resources.write_text("second")
+        self.assertEqual(release.signature_insensitive_inventory(bundle), before)
+        (resources / "payload.txt").write_text("changed")
+        self.assertNotEqual(release.signature_insensitive_inventory(bundle), before)
+
+    def test_signature_insensitive_inventory_accepts_real_macos_resigning(self):
+        bundle = self.root / "RealSigned.app"
+        executable = bundle / "Contents/MacOS/Fixture"
+        executable.parent.mkdir(parents=True)
+        source = self.root / "fixture.swift"
+        source.write_text('@main enum Fixture { static func main() { print("fixture") } }\n')
+        cache = self.root / "native-cache"
+        environment = {**os.environ, "TMPDIR": str(self.root),
+            "CLANG_MODULE_CACHE_PATH": str(cache / "clang"),
+            "SWIFT_MODULECACHE_PATH": str(cache / "swift")}
+        compiled = subprocess.run(["/usr/bin/xcrun", "--sdk", "macosx", "swiftc",
+            "-parse-as-library", str(source), "-o", str(executable)], env=environment,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(compiled.returncode, 0, compiled.stderr)
+        try:
+            subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", executable],
+                           check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except PermissionError as exc:
+            if exc.filename != "/usr/bin/codesign":
+                raise
+            return
+        before = release.signature_insensitive_inventory(bundle)
+        entitlements = self.root / "fixture.entitlements"
+        entitlements.write_text("""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>com.apple.security.cs.allow-jit</key><true/></dict></plist>
+""")
+        resigned = subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-",
+            "--entitlements", entitlements, executable], stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True)
+        self.assertEqual(resigned.returncode, 0, resigned.stderr)
+        self.assertEqual(release.signature_insensitive_inventory(bundle), before)
+        self.assertEqual(release.signed_entitlements(executable),
+                         release.canonical_entitlements({
+                             "com.apple.security.cs.allow-jit": True}))
+
+    def test_universal_macho_alignment_is_validated_and_identity_bearing(self):
+        signature = b"fixture-signature"
+        thin_header = struct.pack("<IIIIIIII", 0xFEEDFACF, 0x0100000C, 0, 2, 2, 88, 0, 0)
+        segment = struct.pack("<II16sQQQQiiII", 0x19, 72, b"__LINKEDIT",
+                              0, 0x1000, 120, len(signature), 1, 1, 0, 0)
+        command = struct.pack("<IIII", 0x1D, 16, 120, len(signature))
+        thin = thin_header + segment + command + signature
+        offset = 32
+        def universal(align):
+            header = struct.pack(">II", 0xCAFEBABE, 1)
+            arch = struct.pack(">IIIII", 0x0100000C, 0, offset, len(thin), align)
+            return header + arch + b"\0" * (offset - len(header) - len(arch)) + thin
+        aligned = release._macho_identity(universal(2))
+        relaxed = release._macho_identity(universal(0))
+        self.assertEqual(aligned["universal"][0]["align"], 2)
+        self.assertNotEqual(aligned, relaxed)
+        with self.assertRaisesRegex(p.BuildError, "Malformed signed universal"):
+            release._macho_identity(universal(6))
+
+    def test_fat64_macho_is_detected_and_reserved_field_is_validated(self):
+        signature = b"fixture-signature"
+        thin_header = struct.pack("<IIIIIIII", 0xFEEDFACF, 0x0100000C, 0, 2, 2, 88, 0, 0)
+        segment = struct.pack("<II16sQQQQiiII", 0x19, 72, b"__LINKEDIT",
+                              0, 0x1000, 120, len(signature), 1, 1, 0, 0)
+        thin = thin_header + segment + struct.pack("<IIII", 0x1D, 16, 120, len(signature)) + signature
+        offset = 64
+        def universal(reserved=0):
+            header = struct.pack(">II", 0xCAFEBABF, 1)
+            arch = struct.pack(">IIQQII", 0x0100000C, 0, offset, len(thin), 2, reserved)
+            return header + arch + b"\0" * (offset - len(header) - len(arch)) + thin
+        path = self.root / "fat64"
+        path.write_bytes(universal())
+        self.assertTrue(p.is_macho(path))
+        self.assertTrue(release._macho_identity(universal())["fat64"])
+        with self.assertRaisesRegex(p.BuildError, "Malformed signed universal"):
+            release._macho_identity(universal(1))
+
+    def test_notarization_success_records_inside_prepared_output(self):
+        prepared = self.root / "prepared"
+        prepared.mkdir()
+        final = self.root / "final"
+        result = subprocess.CompletedProcess([], 0, json.dumps({
+            "id": "fixture-submission", "status": "Accepted", "message": "ok",
+            "ignored": "private",
+        }), "")
+        evidence = self.root / "notarization-evidence.json"
+        receipt = release.record_notarization(prepared, result, evidence)
+        self.assertEqual(receipt, {"id": "fixture-submission", "status": "Accepted",
+                                   "message": "ok"})
+        self.assertEqual(json.loads((prepared / "notarization.json").read_text()), receipt)
+        self.assertEqual(json.loads(evidence.read_text()), receipt)
+        self.assertFalse(final.exists())
+
+    def test_notarization_failure_preserves_sanitized_evidence(self):
+        prepared = self.root / "prepared-failure"
+        prepared.mkdir()
+        evidence = self.root / "notarization-failure.json"
+        result = subprocess.CompletedProcess([], 1, json.dumps({
+            "id": "fixture-submission", "status": "Invalid", "message": "rejected",
+            "private": "must-not-persist",
+        }), "")
+        with self.assertRaisesRegex(p.BuildError, "not accepted"):
+            release.record_notarization(prepared, result, evidence)
+        self.assertEqual(json.loads(evidence.read_text()), {
+            "id": "fixture-submission", "status": "Invalid", "message": "rejected"})
+
+    def test_local_release_output_precedes_publication_and_survives_failure(self):
+        events = []
+        class Runner:
+            def run(inner, label, command, **kwargs):
+                events.append(label)
+                self.assertTrue(destination.exists())
+                self.assertFalse(prepared.exists())
+                if fail_publish:
+                    raise p.BuildError("publish failed")
+                return 0, self.root / "unused.log"
+        for fail_publish in (False, True):
+            with self.subTest(fail_publish=fail_publish):
+                prepared = self.root / ("prepared-fail" if fail_publish else "prepared-ok")
+                destination = self.root / ("final-fail" if fail_publish else "final-ok")
+                prepared.mkdir()
+                (prepared / "artifact").write_text("verified")
+                events.clear()
+                if fail_publish:
+                    with self.assertRaisesRegex(p.BuildError, "publish failed"):
+                        release.install_then_publish(
+                            Runner(), prepared, destination, "v1.0.0", {})
+                else:
+                    release.install_then_publish(
+                        Runner(), prepared, destination, "v1.0.0", {})
+                self.assertEqual(events, ["publish-release"])
+                self.assertEqual((destination / "artifact").read_text(), "verified")
+
+    def test_failed_local_install_never_attempts_publication(self):
+        prepared = self.root / "prepared-install-failure"
+        prepared.mkdir()
+        destination = self.root / "final-install-failure"
+        class Runner:
+            def run(inner, *_args, **_kwargs):
+                self.fail("publication must not run")
+        with patch.object(release.os, "replace", side_effect=OSError("fixture")), \
+                self.assertRaisesRegex(p.BuildError, "draft remains unpublished"):
+            release.install_then_publish(Runner(), prepared, destination, "v1.0.0", {})
+
+    def test_archive_tampering(self):
+        self.artifact()
+        (self.root / "Harbor.zip").write_bytes(b"corrupt")
+        with self.assertRaisesRegex(p.BuildError, "checksum mismatch"):
+            p.verify_artifacts(self.root)
+
+    def test_bundle_tampering(self):
+        bundle = self.artifact()
+        (bundle / "Contents/Resources/backend/service/main.py").write_text("modified")
+        with self.assertRaisesRegex(p.BuildError, "Bundle contents differ"):
+            p.verify_artifacts(self.root)
+
+    def test_manifest_cannot_reference_parent(self):
+        self.artifact()
+        (self.root / "SHA256SUMS").write_text("a" * 64 + "  ../outside\n")
+        with self.assertRaisesRegex(p.BuildError, "Malformed"):
+            p.verify_artifacts(self.root)
+
+    def test_manifest_covers_every_artifact(self):
+        self.artifact()
+        (self.root / "extra.txt").write_text("unlisted")
+        with self.assertRaisesRegex(p.BuildError, "Incomplete"):
+            p.verify_artifacts(self.root)
+
+    def test_adapter_keeps_product_manifest_and_adds_build_checks(self):
+        import simulation
+        discovered = {str(f.relative_to(ROOT)) for f in (ROOT / "tests").rglob("test_*.py")}
+        self.assertEqual(set(simulation.qa._selected_tests(["full"])), discovered)
+        self.assertEqual(set(simulation.selected_tests(["full"])), discovered | simulation.BUILD_TESTS)
+        self.assertIn("tests/build_pipeline/pipeline_checks.py", simulation.BUILD_TESTS)
+
+    def native_runner(self, architecture="arm64", minimum="11.0", dependency="/usr/lib/libSystem.B.dylib"):
+        root = self.root
+        class FakeRunner:
+            logs = root
+            def run(self, label, command):
+                log = root / (label + ".log")
+                if label.startswith("macho-"):
+                    log.write_text(architecture)
+                elif label.startswith("load-commands-"):
+                    log.write_text("cmd LC_BUILD_VERSION\ncmdsize 32\nplatform 1\nminos " + minimum)
+                else:
+                    log.write_text("binary:\n\t" + dependency + " (compatibility version 1.0.0)\n")
+                return 0, log
+        return FakeRunner()
+
+    def test_native_inventory_rejects_newer_os_and_external_dylibs(self):
+        bundle = self.fixture()
+        for name in ("Contents/MacOS/Harbor", "Contents/Resources/backend/.venv/bin/python3"):
+            (bundle / name).write_bytes(b"\xcf\xfa\xed\xfe" + b"fixture")
+        p.validate_native(self.native_runner(), bundle, self.meta)
+        for runner, message in ((self.native_runner(architecture="x86_64"), "arm64"),
+                                (self.native_runner(minimum="26.0"), "advertised minimum"),
+                                (self.native_runner(dependency="/opt/homebrew/lib/libfixture.dylib"), "Nonportable")):
+            with self.subTest(message=message), self.assertRaisesRegex(p.BuildError, message):
+                p.validate_native(runner, bundle, self.meta)
+
+    def test_native_inventory_uses_engine_minimum_and_keeps_app_minimum(self):
+        bundle = self.fixture()
+        engine = self.engine_fixture(bundle)
+        app_paths = ("Contents/MacOS/Harbor", "Contents/Resources/backend/.venv/bin/python3")
+        for name in app_paths:
+            (bundle / name).write_bytes(b"\xcf\xfa\xed\xfe" + b"fixture")
+        engine_paths = tuple(str((engine / name).relative_to(bundle)) for name in
+                             ("py/bin/python3.11", "sp/mlx/core.cpython-311-darwin.so"))
+        app_main = app_paths[0]
+        minimums = {name: "14.0" for name in app_paths}
+        minimums.update({name: "26.2" for name in engine_paths})
+
+        def runner_for(target_minimums):
+            root = self.root
+
+            class FakeRunner:
+                logs = root
+
+                def run(inner, label, command):
+                    target = str(Path(command[-1]).relative_to(bundle))
+                    log = root / (label + ".log")
+                    if label.startswith("macho-"):
+                        log.write_text("arm64")
+                    elif label.startswith("load-commands-"):
+                        log.write_text("cmd LC_BUILD_VERSION\ncmdsize 32\nplatform 1\nminos "
+                                       + target_minimums[target])
+                    else:
+                        log.write_text("binary:\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0)\n")
+                    return 0, log
+
+            return FakeRunner()
+
+        p.validate_native(runner_for(minimums), bundle, self.meta)
+        too_new_app = dict(minimums, **{app_main: "14.1"})
+        with self.assertRaisesRegex(p.BuildError, "advertised minimum"):
+            p.validate_native(runner_for(too_new_app), bundle, self.meta)
+        too_new_engine = {**minimums, **{name: "26.3" for name in engine_paths}}
+        with self.assertRaisesRegex(p.BuildError, "the engine's own minimum"):
+            p.validate_native(runner_for(too_new_engine), bundle, self.meta)
+
+
+    def test_native_inventory_distinguishes_dylib_identity_from_loads(self):
+        bundle = self.fixture()
+        for name in ("Contents/MacOS/Harbor", "Contents/Resources/backend/.venv/bin/python3"):
+            (bundle / name).write_bytes(b"\xcf\xfa\xed\xfe" + b"fixture")
+        runner = self.native_runner(dependency="/wheel-build/library.dylib")
+        original = runner.run
+        def run(label, command):
+            code, log = original(label, command)
+            if label.startswith("load-commands-"):
+                log.write_text(log.read_text() + "\ncmd LC_ID_DYLIB\ncmdsize 88\nname /wheel-build/library.dylib (offset 24)\n")
+            return code, log
+        runner.run = run
+        p.validate_native(runner, bundle, self.meta)
+
+    def test_native_inventory_rejects_active_absolute_search_path(self):
+        bundle = self.fixture()
+        for name in ("Contents/MacOS/Harbor", "Contents/Resources/backend/.venv/bin/python3"):
+            (bundle / name).write_bytes(b"\xcf\xfa\xed\xfe" + b"fixture")
+        for dependency in ("/usr/lib/libSystem.B.dylib", "@rpath/library.dylib"):
+            runner = self.native_runner(dependency=dependency)
+            original = runner.run
+            def run(label, command):
+                code, log = original(label, command)
+                if label.startswith("load-commands-"):
+                    log.write_text(log.read_text() + "\ncmd LC_RPATH\ncmdsize 88\npath /wheel-build/lib (offset 12)\n")
+                return code, log
+            runner.run = run
+            if dependency.startswith("@rpath"):
+                with self.assertRaisesRegex(p.BuildError, "Absolute rpath"):
+                    p.validate_native(runner, bundle, self.meta)
+            else:
+                p.validate_native(runner, bundle, self.meta)
+
+    def test_preview_command_is_accepted_and_dry_run_has_no_side_effects(self):
+        with patch.object(sys, "argv", ["pipeline.py", "preview", "--dry-run"]), patch.object(p, "Runner") as runner:
+            self.assertEqual(p.main(), 0)
+            runner.assert_not_called()
+
+    def test_preview_metadata_allows_dirty_tree_and_marks_preview(self):
+        def git(*args):
+            if args[:1] == ("status",):
+                return " M service/x.py"
+            if args == ("rev-parse", "--is-shallow-repository"):
+                return "false"
+            return "1700000000" if args[0] == "show" else "7" if args[0] == "rev-list" else "b" * 40
+        with patch.object(p, "git", side_effect=git):
+            with self.assertRaisesRegex(p.BuildError, "Commit source changes"):
+                p.metadata(False, None)
+            meta = p.metadata(False, None, preview=True)
+        self.assertTrue(meta["preview"])
+        self.assertTrue(meta["dirty"])
+        self.assertTrue(p.plist(meta)["HarborPreviewBuild"])
+        self.assertTrue(p.plist(dict(meta, dirty=False))["HarborPreviewBuild"])
+        self.assertFalse(p.plist(dict(meta, dirty=False, preview=False))["HarborPreviewBuild"])
+
+    def test_tag_builds_accept_pre_release_tags_but_publishing_stays_final_only(self):
+        version = p.CONFIG["version"]
+        major, minor, fix = version.split(".")
+        other = f"{major}.{minor}.{int(fix) + 1}"
+        def git(*args):
+            if args[:1] == ("status",):
+                return ""
+            if args == ("rev-parse", "--is-shallow-repository"):
+                return "false"
+            return "1700000000" if args[0] == "show" else "7" if args[0] == "rev-list" else "b" * 40
+        def build(ref):
+            with patch.object(p, "git", side_effect=git), patch.dict(os.environ, {"GITHUB_REF": ref}):
+                return p.metadata(False, None)
+        for ref in ("refs/heads/main", "refs/pull/7/merge", f"refs/tags/v{version}", f"refs/tags/v{version}-rc3",
+                    f"refs/tags/v{version}-dev8", f"refs/tags/v{version}-rc2-beta2", f"refs/tags/v{version}-rc1-beta1"):
+            with self.subTest(ref=ref):
+                self.assertEqual(build(ref)["version"], version)
+        for ref in (f"refs/tags/v{other}", f"refs/tags/v{other}-rc1", f"refs/tags/v{version}-foo",
+                    f"refs/tags/v{version}-rc", f"refs/tags/v{version}-rc3-extra", f"refs/tags/v{version}-beta1",
+                    f"refs/tags/v{version}rc3", f"refs/tags/{version}-rc3", f"refs/tags/v{version}-rc3\n",
+                    "refs/tags/v" + version.replace(".", "x") + "-rc3", f"refs/tags/v{version}.1", "refs/tags/nightly"):
+            with self.subTest(ref=ref), self.assertRaisesRegex(p.BuildError, "Release tag must be"):
+                build(ref)
+        # Both publishing paths still take only the final tag.
+        args = Namespace(allow_dirty=False, test_python=None, offline=False, output=self.root)
+        dispatch = {"GITHUB_ACTIONS": "true", "GITHUB_EVENT_NAME": "workflow_dispatch",
+                    "GITHUB_REF": f"refs/tags/v{version}-rc3"}
+        with self.assertRaisesRegex(p.BuildError, "exact version tag"):
+            release.preflight(args, dict(dispatch, HARBOR_RELEASE_APPROVED="true"))
+        with self.assertRaisesRegex(p.BuildError, "exact version tag"):
+            release.ad_hoc_preflight(args, dict(dispatch, HARBOR_AD_HOC_RELEASE_APPROVED="true"))
+
+    def run_preview(self, *flags, uv=None):
+        """main() for a preview build with every stage faked; returns (exit code, stages, uv fetch mock)."""
+        meta = dict(self.meta, preview=True, tracked_source_sha256="0" * 64)
+        output = p.ROOT / "dist" / "unit-test-preview-output"
+        stages = []
+        class FakeRunner:
+            logs = self.root
+            records = []
+            env = {}
+            def __init__(inner):
+                pass
+            def run(inner, *a, **k):
+                return 0, self.root / "x.log"
+        with patch.object(sys, "argv", ["pipeline.py", "preview", *flags]), \
+                patch.object(p, "Runner", FakeRunner), \
+                patch.object(p, "check_locks"), patch.object(p, "doctor", return_value={}), \
+                patch.object(p, "metadata", return_value=meta) as metadata, \
+                patch.object(p, "source_fingerprint", return_value="0" * 64), \
+                patch.object(p, "bootstrap", return_value=Path(sys.executable)), \
+                patch.object(p, "git", return_value=meta["commit"]), \
+                patch.object(p, "simulation_tests", side_effect=lambda *a, **k: stages.append("simulation")), \
+                patch.object(p, "verify_artifacts", side_effect=lambda *a, **k: stages.append("verify")), \
+                patch.object(p, "build_swift", side_effect=lambda *a, **k: stages.append("swift") or Path("bin")), \
+                patch.object(p, "assemble", side_effect=lambda *a, **k: stages.append(("assemble", k.get("uv_archive")))
+                             or self.root / "Harbor.app"), \
+                patch.object(p.uv_tool, "verified_archive",
+                             **(uv or {"return_value": Path("pinned-uv.tar.gz")})) as uv_fetch, \
+                patch.object(p, "validate_structure", side_effect=lambda *a, **k: stages.append("structure")), \
+                patch.object(p, "prepare_native_for_signing"), \
+                patch.object(p, "validate_native", side_effect=lambda *a, **k: stages.append("native")), \
+                patch.object(p, "sign_adhoc", side_effect=lambda *a, **k: stages.append("sign")), \
+                patch.object(p, "relocation_smoke", side_effect=lambda *a, **k: stages.append("smoke")), \
+                patch.object(p, "finalize", side_effect=lambda *a, **k: stages.append("finalize")), \
+                patch.object(Path, "mkdir"):
+            code = p.main()
+        return code, stages, uv_fetch, metadata
+
+    def test_preview_skips_qa_stages_and_never_verifies_as_release(self):
+        code, stages, uv_fetch, metadata = self.run_preview()
+        self.assertEqual(code, 0)
+        uv_fetch.assert_called_once_with(p.STATE / "uv-tool-cache", offline=False)
+        metadata.assert_called_once_with(False, None, True)
+        self.assertEqual(stages, ["swift", ("assemble", Path("pinned-uv.tar.gz")), "structure", "native", "sign",
+                                  "smoke", "finalize"])
+
+    def test_uv_fetch_failure_stops_the_build_unless_no_uv(self):
+        import io
+        from contextlib import redirect_stderr
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code, stages, _, _ = self.run_preview(uv={"side_effect": p.uv_tool.UVToolError("uv release download failed")})
+        self.assertEqual(code, 1)
+        self.assertEqual(stages, [])                       # before Swift, tests or assembly
+        self.assertIn("Pass --no-uv", err.getvalue())
+        code, stages, uv_fetch, _ = self.run_preview("--no-uv")
+        self.assertEqual(code, 0)
+        uv_fetch.assert_not_called()
+        self.assertIn(("assemble", None), stages)
+
+    def test_packaging_without_a_google_client_warns_on_stderr(self):
+        import io
+        from contextlib import redirect_stderr
+        client = self.root / "client.json"
+        client.write_text(json.dumps(self.FAKE_GOOGLE_CLIENT))
+        for flags, warned in (((), True), (("--google-oauth-client", str(client)), False)):
+            err = io.StringIO()
+            with self.subTest(flags=flags), redirect_stderr(err), patch.dict(os.environ):
+                os.environ.pop(p.GOOGLE_OAUTH_CLIENT_ENV, None)
+                code, stages, _, _ = self.run_preview(*flags)
+                self.assertEqual(code, 0)
+                self.assertIn("finalize", stages)
+                self.assertEqual("no built-in Google sign-in" in err.getvalue(), warned)
+                self.assertNotIn(self.FAKE_GOOGLE_CLIENT["client_secret"], err.getvalue())
+
+    def run_build(self, command, *flags, fail=None, engine_version="7.7.7", identity_error=None, fetch_error=None):
+        """main() for `all` or `preview` below a temporary dist/, with every stage faked and recorded.
+
+        `fail` is (stage name, exception) for the stage that should fail. Returns (exit code, stages, stderr)."""
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        meta = dict(self.meta, preview=command == "preview", tracked_source_sha256="0" * 64)
+        stages = []
+        def stage(name, result=None):
+            def run(*args, **kwargs):
+                stages.append(name)
+                if fail and fail[0] == name:
+                    raise fail[1]
+                return result
+            return run
+        def assemble(runner, binary, destination, meta, offline, engine_app, **kwargs):
+            stages.append(("assemble", engine_app))
+            (destination / "Harbor.app" / "Contents").mkdir(parents=True)
+            (destination / "Harbor.app" / "Contents" / "partly-written").write_text("fixture")
+            if fail and fail[0] == "assemble":
+                raise fail[1]
+            return destination / "Harbor.app"
+        @contextmanager
+        def fetched_app(cache, offline=False):
+            if fetch_error:
+                raise fetch_error
+            stages.append("mount")
+            try:
+                yield self.root / "mounted" / "oMLX.app"
+            finally:
+                stages.append("unmount")
+        def identity(app, **kwargs):
+            stages.append(("engine-identity", app))
+            if identity_error:
+                raise identity_error
+            return {"version": engine_version, "build": "1"}
+        class FakeRunner:
+            logs = self.root
+            records = []
+            env = {}
+            def run(inner, *args, **kwargs):
+                return 0, self.root / "x.log"
+        err = io.StringIO()
+        with ExitStack() as stack:
+            for target, name, replacement in (
+                    (sys, "argv", ["pipeline.py", command, *flags]), (p, "ROOT", self.root), (p, "Runner", FakeRunner),
+                    (p, "check_locks", lambda: None), (p, "doctor", lambda *a, **k: {}),
+                    (p, "metadata", lambda *a, **k: meta), (p, "source_fingerprint", lambda: "0" * 64),
+                    (p, "git", lambda *a: meta["commit"]),
+                    (p.uv_tool, "verified_archive", lambda *a, **k: Path("pinned-uv.tar.gz")),
+                    (p.engine_build, "fetched_app", fetched_app), (p.engine_build, "verify_source_identity", identity),
+                    (p.engine_build, "load_lock", lambda: {"omlx_version": "7.7.7"}),
+                    (p, "bootstrap", stage("bootstrap", Path(sys.executable))), (p, "simulation_tests", stage("simulation")),
+                    (p, "build_swift", stage("swift", Path("bin"))), (p, "assemble", assemble),
+                    (p, "validate_structure", stage("structure")), (p, "prepare_native_for_signing", stage("prepare")),
+                    (p, "validate_native", stage("native")), (p, "sign_adhoc", stage("sign")),
+                    (p, "relocation_smoke", stage("smoke")), (p, "finalize", stage("finalize")),
+                    (p, "verify_artifacts", stage("verify"))):
+                stack.enter_context(patch.object(target, name, replacement))
+            stack.enter_context(redirect_stderr(err))
+            stack.enter_context(redirect_stdout(io.StringIO()))
+            code = p.main()
+        return code, stages, err.getvalue()
+
+    def test_taken_or_misplaced_output_stops_before_any_test_or_build_step(self):
+        dist = self.root / "dist"
+        taken = dist / "taken"
+        taken.mkdir(parents=True)
+        (taken / "keep.txt").write_text("an earlier build")
+        for command in ("all", "preview"):
+            with self.subTest(command=command):
+                code, stages, err = self.run_build(command, "--output", str(taken))
+                self.assertEqual((code, stages), (1, []))
+                self.assertIn("Output directory already exists", err)
+                self.assertNotIn("Removed", err)
+                self.assertEqual((taken / "keep.txt").read_text(), "an earlier build")
+        for misplaced in (self.root / "elsewhere", dist, dist / ".." / "sideways"):
+            with self.subTest(output=misplaced):
+                code, stages, err = self.run_build("all", "--output", str(misplaced))
+                self.assertEqual((code, stages), (1, []))
+                self.assertIn("below this checkout's dist/", err)
+                self.assertFalse((self.root / "elsewhere").exists() or (self.root / "sideways").exists())
+        # The default name of an earlier attempt at the same commit is caught the same way.
+        default = dist / f"{self.meta['version']}-12-{'a' * 12}"
+        default.mkdir()
+        code, stages, err = self.run_build("all")
+        self.assertEqual((code, stages), (1, []))
+        self.assertTrue(default.is_dir())
+        code, stages, _ = self.run_build("preview")          # its own -preview name is still free
+        self.assertEqual(code, 0)
+        self.assertTrue((dist / (default.name + "-preview")).is_dir())
+
+    def test_engine_source_is_checked_before_any_test_or_build_step(self):
+        app = self.root / "oMLX.app"
+        out = self.root / "dist" / "candidate"
+        code, stages, err = self.run_build("all", "--engine-app", str(app), "--output", str(out), engine_version="7.7.8")
+        self.assertEqual((code, stages), (1, [("engine-identity", app.resolve())]))
+        self.assertIn("oMLX source does not match engine.lock.json (version '7.7.8', the lock pins '7.7.7')", err)
+        code, stages, err = self.run_build("all", "--engine-app", str(app), "--output", str(out),
+                                           identity_error=p.engine_build.EngineBuildError("Source is not signed by the oMLX Team ID"))
+        self.assertEqual((code, len(stages)), (1, 1))
+        self.assertIn("BUILD FAILED: Source is not signed by the oMLX Team ID", err)
+        code, stages, err = self.run_build("all", "--fetch-engine", "--output", str(out),
+                                           fetch_error=p.engine_build.EngineBuildError("The downloaded oMLX release does not match engine-source.json"))
+        self.assertEqual((code, stages), (1, []))
+        self.assertIn("BUILD FAILED: The downloaded oMLX release does not match engine-source.json", err)
+        code, stages, err = self.run_build("all", "--fetch-engine", "--output", str(out), engine_version="7.7.8")
+        self.assertEqual((code, stages[0], stages[-1], len(stages)), (1, "mount", "unmount", 3))
+        self.assertFalse(out.exists())                        # none of these runs got as far as creating it
+        # A good source: opened and checked first, kept mounted through staging, released straight after.
+        mounted = self.root / "mounted" / "oMLX.app"
+        code, stages, _ = self.run_build("all", "--fetch-engine", "--output", str(out))
+        self.assertEqual(code, 0)
+        self.assertEqual(stages, ["mount", ("engine-identity", mounted), "bootstrap", "simulation", "swift",
+                                  ("assemble", mounted), "unmount", "structure", "prepare", "native", "sign", "smoke",
+                                  "finalize", "verify"])
+        code, stages, _ = self.run_build("preview", "--engine-app", str(app), "--output", str(out) + "-2")
+        self.assertEqual(code, 0)
+        self.assertEqual(stages[:4], [("engine-identity", app.resolve()), "bootstrap", "swift", ("assemble", app.resolve())])
+        code, stages, _ = self.run_build("preview", "--output", str(out) + "-3")
+        self.assertEqual(stages[:3], ["bootstrap", "swift", ("assemble", None)])
+        # Packaging only: `test` and `bootstrap` never open the engine source.
+        code, stages, _ = self.run_build("bootstrap", "--fetch-engine")
+        self.assertEqual((code, stages), (0, ["bootstrap"]))
+
+    def test_failed_build_removes_only_the_output_directory_it_created(self):
+        dist = self.root / "dist"
+        earlier = dist / "earlier"
+        earlier.mkdir(parents=True)
+        for name in ("assemble", "structure", "prepare", "native", "sign", "smoke", "finalize"):
+            for error in (p.BuildError(f"{name} failed"), OSError(f"{name} hit a full disk"),
+                          subprocess.CalledProcessError(1, [name])):
+                with self.subTest(stage=name, error=type(error).__name__):
+                    out = dist / "candidate"
+                    code, stages, err = self.run_build("preview", "--fetch-engine", "--output", str(out), fail=(name, error))
+                    self.assertEqual(code, 1)
+                    self.assertFalse(out.exists())
+                    self.assertTrue(earlier.is_dir())
+                    self.assertIn(f"Removed the incomplete output directory: {out.resolve()}", err)
+                    self.assertIn("BUILD FAILED", err)
+                    self.assertIn("unmount", stages)
+        # A step that fails before the directory exists has nothing to remove.
+        for name in ("bootstrap", "simulation", "swift"):
+            with self.subTest(stage=name):
+                out = dist / "candidate"
+                code, stages, err = self.run_build("all", "--output", str(out), fail=(name, p.BuildError(f"{name} failed")))
+                self.assertEqual(code, 1)
+                self.assertNotIn("Removed", err)
+                self.assertFalse(out.exists())
+                self.assertTrue(earlier.is_dir())
+        # The same output name works again straight after a failed attempt.
+        code, stages, _ = self.run_build("preview", "--output", str(dist / "candidate"))
+        self.assertEqual(code, 0)
+        self.assertTrue((dist / "candidate" / "Harbor.app" / "Contents" / "partly-written").is_file())
+
+
+
+    def test_preview_artifact_is_refused_by_release_verification(self):
+        self.artifact()
+        provenance = json.loads((self.root / "provenance.json").read_text())
+        provenance["source"] = dict(self.meta, preview=True)
+        p.json_write(self.root / "provenance.json", provenance)
+        p.checksums(self.root)
+        with self.assertRaisesRegex(p.BuildError, "never release eligible"):
+            p.verify_artifacts(self.root)
+
+    def test_allow_dirty_on_clean_tree_does_not_record_dirty_allowed(self):
+        import native_peer_gate, browser_bridge_gate, release_performance_gate
+        calls = []
+        class FakeRunner:
+            logs = self.root
+            env = {"PATH": "/usr/bin:/bin"}
+            def run(inner, label, command, **kwargs):
+                calls.append((label, command))
+                if "--report" in command:
+                    Path(command[command.index("--report") + 1]).write_text("{}")
+                return 0, self.root / "unused.log"
+        def git(*args):
+            if args[:1] == ("status",):
+                return ""
+            return ".git" if args == ("rev-parse", "--git-common-dir") else "a" * 40
+        for dirty, expected in (("", False), (" M x.py", True)):
+            calls.clear()
+            def git(*args, dirty=dirty):
+                if args[:1] == ("status",):
+                    return dirty
+                return ".git" if args == ("rev-parse", "--git-common-dir") else "a" * 40
+            with self.synthetic_profile_metadata(), patch.object(p, "git", side_effect=git), \
+                    patch.object(p, "_qa_node_runtime", return_value=Path("/usr/bin/true")), \
+                    patch.object(native_peer_gate, "validate"), patch.object(browser_bridge_gate, "validate"), \
+                    patch.object(release_performance_gate, "validate"), patch.object(p, "validate_simulation") as validate:
+                p.simulation_tests(FakeRunner(), Path(sys.executable), allow_dirty=True)
+            _, command = next(c for c in calls if c[0] == "simulation-qa")
+            self.assertEqual("--allow-dirty" in command, expected)
+            self.assertEqual(validate.call_args.kwargs["allow_dirty"], expected)
+
+    def test_release_preflights_still_reject_allow_dirty(self):
+        args = Namespace(allow_dirty=True, test_python=None, offline=False, output=self.root)
+        with self.assertRaisesRegex(p.BuildError, "preview"):
+            release.preflight(args, {})
+        with self.assertRaisesRegex(p.BuildError, "preview"):
+            release.ad_hoc_preflight(args, {})
+
+    def test_dry_run_does_not_write_or_run_stage(self):
+        with patch.object(sys, "argv", ["pipeline.py", "release", "--dry-run"]), patch.object(p, "Runner") as runner:
+            self.assertEqual(p.main(), 0)
+            runner.assert_not_called()
+
+    def test_environment_has_no_credentials_or_injection(self):
+        with patch.dict(os.environ, {"GH_TOKEN": "test", "UV_INDEX_URL": "https://untrusted.invalid", "PYTHONPATH": "/bad", "HARBOR_LIVE_REMINDER_TEST": "1"}):
+            env = p.clean_env()
+        for key in ("GH_TOKEN", "UV_INDEX_URL", "PYTHONPATH", "HARBOR_LIVE_REMINDER_TEST"):
+            self.assertNotIn(key, env)
+        self.assertEqual(env.get("HOME"), os.environ.get("HOME"))
+
+    def test_release_preflight_has_no_side_effects_when_credentials_absent(self):
+        args = Namespace(allow_dirty=False, test_python=None, offline=False, output=self.root)
+        env = {"GITHUB_ACTIONS": "true", "HARBOR_RELEASE_APPROVED": "true", "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/tags/v" + p.CONFIG["version"]}
+        with patch("release.subprocess.run") as run:
+            with self.assertRaisesRegex(p.BuildError, "Missing required CI secrets"):
+                release.preflight(args, env)
+            run.assert_not_called()
+
+    def test_release_cli_fails_cleanly_without_running_external_steps(self):
+        env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "TMPDIR")}
+        result = subprocess.run([sys.executable, "-B", str(p.SUPPORT / "pipeline.py"), "release", "--output", str(self.root)],
+                                capture_output=True, text=True, env=env)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("BUILD FAILED", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertNotIn("→", result.stdout)
+
+    def test_release_rejects_local_execution(self):
+        args = Namespace(allow_dirty=False, test_python=None, offline=False, output=self.root)
+        with self.assertRaisesRegex(p.BuildError, "protected"):
+            release.preflight(args, {})
+
+    def test_release_rejects_non_tag_dispatch_and_preview(self):
+        args = Namespace(allow_dirty=False, test_python=None, offline=False, output=self.root)
+        env = {"GITHUB_ACTIONS": "true", "HARBOR_RELEASE_APPROVED": "true", "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/heads/main"}
+        with self.assertRaisesRegex(p.BuildError, "exact version tag"):
+            release.preflight(args, env)
+        args.allow_dirty = True
+        with self.assertRaisesRegex(p.BuildError, "preview"):
+            release.preflight(args, env)
+
+    def workflow_jobs(self):
+        workflow = (ROOT / ".github/workflows/harbor-build.yml").read_text()
+        signed = workflow.index("\n  release:\n")
+        adhoc = workflow.index("\n  publish-ad-hoc-release:\n")
+        self.assertLess(signed, adhoc)
+        return workflow, workflow[signed:adhoc], workflow[adhoc:]
+
+    def workflow_step(self, section, name):
+        marker = f"      - name: {name}\n"
+        self.assertEqual(section.count(marker), 1, name)
+        start = section.index(marker)
+        following = section.find("\n      - ", start + 1)
+        comment = section.find("\n      # ", start + 1)
+        end = min(value for value in (following, comment, len(section)) if value > 0)
+        return section[start:end]
+
+    def test_workflow_keeps_pins_permissions_and_diagnostics(self):
+        workflow, signed, adhoc = self.workflow_jobs()
+        for line in workflow.splitlines():
+            if line.strip().startswith(("- uses:", "uses:")):
+                self.assertRegex(line, r"uses: [\w./-]+@[0-9a-f]{40}(\s+#.*)?$")
+        self.assertIn("    permissions:\n      contents: write\n      actions: read\n", adhoc)
+        self.assertIn("    permissions:\n      contents: write\n      actions: read\n", signed)
+        self.assertIn("permissions:\n  contents: read\n\nconcurrency:\n  group: harbor-build-${{ github.ref }}-${{ github.event_name }}\n", workflow)
+        self.assertIn("if: github.event_name == 'workflow_dispatch' && inputs.publish_ad_hoc && !inputs.publish && startsWith(github.ref, 'refs/tags/v')", adhoc)
+        diagnostics = self.workflow_step(adhoc, "Upload ad-hoc publication diagnostics")
+        self.assertIn("if: always()", diagnostics)
+        self.assertIn(".harbor-build/run-*/*.json", diagnostics)
+        for evidence in ("SHA256SUMS", "provenance.json", "bundle-manifest.json",
+                         "dependencies.json", "simulation-qa.json"):
+            self.assertIn(f"dist/candidate/{evidence}\n", diagnostics)
+        self.assertNotIn("*.zip", diagnostics)
+        self.assertEqual(workflow.count("environment: release"), 1)
+        self.assertNotIn("environment:", adhoc)
+
+    def adhoc_fixture(self, features=None):
+        checkout = self.root
+        self.root = checkout / "dist/candidate"
+        self.root.mkdir(parents=True)
+        self.meta = dict(self.meta, **(self.RELEASE_FEATURES if features is None else features))
+        self.artifact()
+        (self.root / "release-notes.md").write_text("Ad-hoc fixture notes")
+        provenance = json.loads((self.root / "provenance.json").read_text())
+        provenance.update(toolchain={"strict_toolchain": True},
+                          tests=[{"step": "fixture", "exit_code": 0}])
+        p.json_write(self.root / "provenance.json", provenance)
+        p.checksums(self.root)
+        return checkout
+
+    def run_adhoc_fixture(self, checkout, *, mutate=None, upload_error=False,
+                          existing=None, git_override=None):
+        events, uploaded = [], {}
+        root = self.root
+        class Runner:
+            logs = root
+            def run(inner, label, command, **kwargs):
+                events.append(label)
+                if label == "create-draft-release":
+                    self.assertIn("--draft", command)
+                    self.assertTrue(kwargs["pass_fds"])
+                    descriptor = kwargs["pass_fds"][0]
+                    self.adhoc_notes = os.pread(descriptor, os.fstat(descriptor).st_size, 0).decode()
+                    if mutate:
+                        mutate()
+                log = checkout / "release-id.log"
+                log.write_text("42")
+                return 0, log
+        class Uploader:
+            def __init__(inner, *args): pass
+            def upload(inner, name, mime, fd, digest, size):
+                events.append("upload")
+                if upload_error:
+                    raise p.BuildError("fixture upload failure")
+                body = os.pread(fd, size, 0)
+                self.assertEqual(hashlib.sha256(body).hexdigest(), digest)
+                uploaded[name] = body
+        def git(*args):
+            if git_override:
+                value = git_override(args)
+                if value is not None:
+                    return value
+            return "" if args[0] == "status" else self.meta["commit"]
+        environment = {"GITHUB_ACTIONS": "true", "HARBOR_AD_HOC_RELEASE_APPROVED": "true",
+            "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/tags/v" + p.CONFIG["version"],
+            "GH_TOKEN": "fixture-token", "GITHUB_REPOSITORY": "fixture/repo"}
+        args = Namespace(allow_dirty=False, test_python=None, offline=False, output=root)
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, environment, clear=True))
+            stack.enter_context(patch.object(release, "ROOT", checkout))
+            stack.enter_context(patch.object(release, "git", side_effect=git))
+            stack.enter_context(patch.object(p, "verify_bundle_signature"))
+            stack.enter_context(patch.object(release, "distribution_roundtrip"))
+            stack.enter_context(patch.object(release, "GitHubReleaseUploader", Uploader))
+            empty = subprocess.CompletedProcess([], 0, "[[]]", "")
+            draft = subprocess.CompletedProcess([], 0, json.dumps([[{
+                "id": 42, "tag_name": "v" + p.CONFIG["version"], "draft": True
+            }]]), "")
+            api = stack.enter_context(patch.object(release.subprocess, "run", side_effect=
+                [existing] if existing is not None else [empty, empty, draft]))
+            stack.enter_context(patch.object(release.time, "sleep"))
+            try:
+                release.release_ad_hoc(Runner(), args)
+            finally:
+                self.adhoc_events, self.adhoc_uploaded, self.adhoc_api_calls = events, uploaded, api.call_count
+        return events, uploaded
+
+    def test_ad_hoc_release_refuses_a_candidate_without_the_built_in_client_or_uv(self):
+        for features, message in (({"google_oauth_client": False, "uv": self.RELEASE_FEATURES["uv"]},
+                                   "no built-in Google OAuth client"),
+                                  ({"google_oauth_client": True, "uv": None}, "no bundled uv")):
+            with self.subTest(message=message):
+                saved_root, saved_meta = self.root, self.meta
+                scratch = Path(tempfile.mkdtemp(dir=self.temp.name))
+                self.root = scratch
+                try:
+                    checkout = self.adhoc_fixture(features)
+                    with self.assertRaisesRegex(p.BuildError, message):
+                        self.run_adhoc_fixture(checkout)
+                    self.assertNotIn("create-draft-release", self.adhoc_events)
+                    self.assertEqual(self.adhoc_uploaded, {})
+                finally:
+                    self.root, self.meta = saved_root, saved_meta
+
+    def test_release_features_gate_is_shared_by_both_publication_paths(self):
+        for meta, ok in (({"google_oauth_client": True, "uv": {"version": "x"}}, True),
+                         ({"google_oauth_client": False, "uv": {"version": "x"}}, False),
+                         ({"uv": {"version": "x"}}, False),                     # older build-info
+                         ({"google_oauth_client": "yes", "uv": {"version": "x"}}, False),
+                         ({"google_oauth_client": True, "uv": None}, False)):
+            with self.subTest(meta=meta):
+                if ok:
+                    release.require_release_features(meta)
+                else:
+                    with self.assertRaises(p.BuildError):
+                        release.require_release_features(meta)
+        source = (ROOT / "build-support/release.py").read_text()
+        for function in ("def release_ad_hoc(", "def release("):
+            body = source[source.index(function):]
+            end = body.find("\ndef ", 1)
+            body = body[:end if end > 0 else len(body)]
+            self.assertIn("require_release_features(meta)", body, function)
+        # PR previews and the full candidate build stay possible without the secret.
+        self.assertIsNone(p.google_oauth_client(environ={}))
+
+    def test_ad_hoc_app_only_publishes_after_upload_with_app_first_notes(self):
+        checkout = self.adhoc_fixture()
+        events, uploaded = self.run_adhoc_fixture(checkout)
+        app_name = f"01-Harbor-{p.CONFIG['version']}-{self.meta['build_number']}-arm64.zip"
+        self.assertEqual(set(uploaded), {app_name})
+        self.assertEqual(uploaded[app_name], (self.root / "Harbor.zip").read_bytes())
+        self.assertEqual(self.adhoc_notes.splitlines()[0],
+                         "**[Download Harbor for Mac (Apple silicon)]"
+                         f"(https://github.com/fixture/repo/releases/download/v{p.CONFIG['version']}/{app_name})**")
+        self.assertIn("Ad-hoc fixture notes", self.adhoc_notes)
+        self.assertTrue((self.root / "SHA256SUMS").is_file())
+        self.assertEqual(events[-1], "publish-release")
+        self.assertLess(events.index("create-draft-release"), events.index("upload"))
+        self.assertEqual(self.adhoc_api_calls, 3)
+
+    def test_ad_hoc_unpublished_evidence_is_still_required_and_verified(self):
+        checkout = self.adhoc_fixture()
+        (self.root / "dependencies.json").write_text("tampered evidence")
+        with self.assertRaisesRegex(p.BuildError, "checksum"):
+            self.run_adhoc_fixture(checkout)
+        self.assertEqual(self.adhoc_api_calls, 0)
+        self.assertNotIn("create-draft-release", self.adhoc_events)
+
+    def test_public_download_helper_handles_signed_archive_without_extra_assets(self):
+        self.artifact()
+        signed_name = f"Harbor-{p.CONFIG['version']}-{self.meta['build_number']}-arm64.zip"
+        (self.root / "Harbor.zip").rename(self.root / signed_name)
+        p.checksums(self.root)
+        with p.BoundReleaseAssets(self.root) as assets:
+            app = release.public_release_archive(assets, self.meta)
+            self.assertEqual(app[0], "01-" + signed_name)
+            self.assertEqual(os.pread(app[2], app[4], 0), (self.root / signed_name).read_bytes())
+            self.assertIn("provenance.json", assets.descriptors)
+            self.assertIn("SHA256SUMS", assets.descriptors)
+
+    def test_ad_hoc_failed_upload_leaves_draft(self):
+        checkout = self.adhoc_fixture()
+        with self.assertRaisesRegex(p.BuildError, "upload failure"):
+            self.run_adhoc_fixture(checkout, upload_error=True)
+        self.assertIn("create-draft-release", self.adhoc_events)
+        self.assertNotIn("publish-release", self.adhoc_events)
+
+    def test_ad_hoc_rejects_asset_mutation_before_upload(self):
+        checkout = self.adhoc_fixture()
+        with self.assertRaisesRegex(p.BuildError, "content changed"):
+            self.run_adhoc_fixture(checkout,
+                mutate=lambda: (self.root / "Harbor.zip").write_bytes(b"changed"))
+        self.assertNotIn("upload", self.adhoc_events)
+        self.assertNotIn("publish-release", self.adhoc_events)
+
+    def test_ad_hoc_rejects_extra_unchecked_zip(self):
+        checkout = self.adhoc_fixture()
+        (self.root / "extra.zip").write_bytes(b"unchecked")
+        with self.assertRaisesRegex(p.BuildError, "Incomplete"):
+            self.run_adhoc_fixture(checkout)
+        self.assertEqual(self.adhoc_api_calls, 0)
+
+    def test_ad_hoc_refuses_existing_release_and_api_failure(self):
+        checkout = self.adhoc_fixture()
+        existing = json.dumps([[[{"id": 7, "tag_name": "v" + p.CONFIG["version"],
+                                 "draft": True}]][0]])
+        for result in (subprocess.CompletedProcess([], 0, existing, ""),
+                       subprocess.CompletedProcess([], 1, "", "HTTP 403")):
+            with self.subTest(result=result), self.assertRaises(p.BuildError):
+                self.run_adhoc_fixture(checkout, existing=result)
+            self.assertNotIn("create-draft-release", self.adhoc_events)
+
+    def test_ad_hoc_rejects_missing_or_malformed_created_draft(self):
+        checkout = self.adhoc_fixture()
+        malformed = subprocess.CompletedProcess([], 0, "{}", "")
+        with self.assertRaisesRegex(p.BuildError, "invalid data"):
+            self.run_adhoc_fixture(checkout, existing=malformed)
+
+    def test_ad_hoc_rejects_source_and_tag_mismatch_before_api(self):
+        checkout = self.adhoc_fixture()
+        for target in ("HEAD", "refs/tags/v" + p.CONFIG["version"] + "^{commit}"):
+            with self.subTest(target=target), self.assertRaises(p.BuildError):
+                self.run_adhoc_fixture(checkout,
+                    git_override=lambda args: "b" * 40 if args[-1] == target else None)
+            self.assertEqual(self.adhoc_api_calls, 0)
+
+    def test_ad_hoc_rejects_ineligible_provenance_before_api(self):
+        checkout = self.adhoc_fixture()
+        path = self.root / "provenance.json"
+        original = path.read_text()
+        variants = [lambda v: v["source"].update(dirty=True),
+                    lambda v: v["toolchain"].update(strict_toolchain=False),
+                    lambda v: v["tests"][0].update(exit_code=1),
+                    lambda v: v.update(signature="Developer ID Application"),
+                    lambda v: v.update(notarized=True)]
+        for change in variants:
+            value = json.loads(original)
+            change(value)
+            p.json_write(path, value)
+            p.checksums(self.root)
+            with self.subTest(value=value), self.assertRaises(p.BuildError):
+                self.run_adhoc_fixture(checkout)
+            self.assertEqual(self.adhoc_api_calls, 0)
+
+    def test_ad_hoc_local_and_nonversion_dispatch_rejected(self):
+        args = Namespace(allow_dirty=False, test_python=None, offline=False, output=self.root)
+        with self.assertRaisesRegex(p.BuildError, "explicit CI"):
+            release.ad_hoc_preflight(args, {})
+        env = {"GITHUB_ACTIONS": "true", "HARBOR_AD_HOC_RELEASE_APPROVED": "true",
+               "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/tags/v999"}
+        with self.assertRaisesRegex(p.BuildError, "exact version tag"):
+            release.ad_hoc_preflight(args, env)
+
+    def test_ad_hoc_release_workflow_is_tag_only_and_preserves_signed_release(self):
+        workflow = (ROOT / ".github/workflows/harbor-build.yml").read_text()
+        self.assertIn("publish_ad_hoc:", workflow)
+        self.assertIn("inputs.publish_ad_hoc && !inputs.publish", workflow)
+        self.assertIn("startsWith(github.ref, 'refs/tags/v')", workflow)
+        job = workflow.split("  publish-ad-hoc-release:", 1)[1]
+        self.assertIn("all --strict-toolchain --fetch-engine --output dist/candidate", job)
+        self.assertIn("release-ad-hoc --output dist/candidate", job)
+        self.assertIn("HARBOR_AD_HOC_RELEASE_APPROVED: 'true'", job)
+        self.assertNotIn("gh release create", job)
+        self.assertNotIn("*.zip", job)
+
+
+    def workflow_job(self, workflow, job):
+        """Text of one top-level job; stdlib only (no YAML parser here)."""
+        marker = f"\n  {job}:\n"
+        self.assertEqual(workflow.count(marker), 1, job)
+        start = workflow.index(marker) + 1
+        following = [workflow.find(f"\n  {name}", start + 1) for name in
+                     ("preview:", "simulation-qa:", "full:", "verify:", "release:", "publish-ad-hoc-release:",
+                      "# ", "python-regressions:")]
+        ends = [value for value in following if value > start]
+        return workflow[start:min(ends) if ends else len(workflow)]
+
+    def test_pull_requests_split_preview_build_from_simulation_qa(self):
+        workflow = (ROOT / ".github/workflows/harbor-build.yml").read_text()
+        pr_only = "    if: github.event_name == 'pull_request'\n"
+        preview = self.workflow_job(workflow, "preview")
+        qa = self.workflow_job(workflow, "simulation-qa")
+        for job in (preview, qa):
+            self.assertIn(pr_only, job)
+            self.assertIn("runs-on: macos-15", job)
+            self.assertIn("persist-credentials: false", job)
+            self.assertIn('test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"', job)
+            self.assertIn('echo "sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"', job)
+            self.assertIn("sha: ${{ steps.candidate.outputs.sha }}", job)
+            self.assertIn("pipeline.check_locks()", job)
+            # The preview build step may read the built-in Google OAuth client;
+            # no other secret reaches either PR job.
+            self.assertNotIn("secrets.", job.replace(GOOGLE_CLIENT_SECRET_LINE, ""))
+            self.assertNotIn("download-artifact", job)
+            self.assertNotIn("harbor-build all", job)
+        self.assertIn("./scripts/harbor-build preview --strict-toolchain --fetch-engine --output dist/preview", preview)
+        self.assertNotIn("harbor-build test", preview)
+        self.assertIn("isolated_acl_fixture.py --ephemeral-macos", preview)
+        self.assertIn("mini_artifact.py --source-sha", preview)
+        self.assertIn("tests/test_primary_runtime_completion.py", preview)
+        self.assertIn("./scripts/harbor-build test --strict-toolchain\n", qa)
+        self.assertNotIn("harbor-build preview", qa)
+        self.assertNotIn("HARBOR_GOOGLE_OAUTH_CLIENT", qa)
+        build = self.workflow_step(preview, "Build, sign and smoke-test preview from source")
+        self.assertEqual(preview.count(GOOGLE_CLIENT_SECRET_LINE), 1)
+        self.assertIn(GOOGLE_CLIENT_SECRET_LINE, build)
+
+    def test_every_ci_build_receives_only_the_google_client_secret_on_its_build_step(self):
+        workflow = (ROOT / ".github/workflows/harbor-build.yml").read_text()
+        self.assertEqual(workflow.count(GOOGLE_CLIENT_SECRET_LINE), 4)
+        steps = {"preview": "Build, sign and smoke-test preview from source",
+                 "full": "Build and verify from source",
+                 "release": "Rebuild approved source with strict validation",
+                 "publish-ad-hoc-release": "Rebuild ad-hoc source with strict validation"}
+        for job, name in steps.items():
+            step = self.workflow_step(self.workflow_job(workflow, job), name)
+            self.assertIn(GOOGLE_CLIENT_SECRET_LINE, step)
+            self.assertEqual(step.count("secrets."), 1, job)
+
+    def test_every_ci_build_stages_the_pinned_engine(self):
+        """A release made by CI must carry the engine: every build command passes --fetch-engine."""
+        workflow = (ROOT / ".github/workflows/harbor-build.yml").read_text()
+        commands = [line.strip() for line in workflow.splitlines()
+                    if "./scripts/harbor-build preview" in line or "./scripts/harbor-build all" in line]
+        self.assertEqual(len(commands), 4)          # PR preview, full, release rebuild, ad-hoc rebuild
+        for command in commands:
+            self.assertIn("--fetch-engine", command)
+            self.assertNotIn("--engine-app", command)
+
+    def test_main_tags_and_dispatch_keep_the_unchanged_full_gate(self):
+        workflow = (ROOT / ".github/workflows/harbor-build.yml").read_text()
+        full = self.workflow_job(workflow, "full")
+        self.assertIn("    if: github.event_name != 'pull_request'\n", full)
+        self.assertIn("./scripts/harbor-build all --strict-toolchain --fetch-engine --output dist/candidate", full)
+        for step in ("Qualify isolated signed ACL replacement on disposable macOS", "Upload verified candidate",
+                     "Verify synthetic publisher signatures and provisioning transactions",
+                     "Build and verify exact-candidate offline mini artifact", "Upload diagnostics"):
+            self.workflow_step(full, step)
+        self.assertNotIn("harbor-build preview", full)
+        # Releases rebuild from source and depend on the full gate directly; a
+        # skipped pull-request job can never satisfy or skip them.
+        _, signed, adhoc = self.workflow_jobs()
+        self.assertIn("    needs: full\n", signed)
+        self.assertIn("    needs: full\n", adhoc)
+
+    def test_artifact_quota_cannot_fail_a_passing_gate(self):
+        """Copies kept for people are non-fatal; the evidence kept for main and tags stays strict."""
+        workflow = (ROOT / ".github/workflows/harbor-build.yml").read_text()
+        for job_name in ("preview", "simulation-qa", "full"):
+            job = self.workflow_job(workflow, job_name)
+            for line in job.splitlines():
+                if not line.strip().startswith("- name: Upload"):
+                    continue
+                name = line.strip()[len("- name: "):]
+                step = self.workflow_step(job, name)
+                strict = job_name == "full" and name in ("Upload verified candidate", "Upload verified mini artifact",
+                                                         "Upload isolated ACL qualification report")
+                self.assertEqual("continue-on-error: true" in step, not strict, f"{job_name}: {name}")
+
+    def test_required_check_aggregates_the_event_gates_on_the_exact_head(self):
+        workflow = (ROOT / ".github/workflows/harbor-build.yml").read_text()
+        verify = self.workflow_job(workflow, "verify")
+        self.assertEqual(workflow.count("name: Verified macOS artifact\n"), 1)
+        self.assertIn("    name: Verified macOS artifact\n", verify)
+        self.assertIn("    needs: [preview, simulation-qa, full]\n", verify)
+        self.assertIn("    if: ${{ !cancelled() }}\n", verify)
+        self.assertIn("    permissions: {}\n", verify)
+        self.assertNotIn("actions/checkout", verify)
+        self.assertNotIn("secrets.", verify)
+        for needle in ('for gate in "$PREVIEW_RESULT@$PREVIEW_SHA" "$QA_RESULT@$QA_SHA"; do',
+                       'if [ "$gate" != "success@$CANDIDATE_SHA" ]; then',
+                       '[ "$FULL_RESULT" != "success" ]', "PREVIEW_SHA: ${{ needs.preview.outputs.sha }}",
+                       "QA_SHA: ${{ needs.simulation-qa.outputs.sha }}", "PREVIEW_RESULT: ${{ needs.preview.result }}",
+                       "QA_RESULT: ${{ needs.simulation-qa.result }}", "FULL_RESULT: ${{ needs.full.result }}"):
+            self.assertIn(needle, verify)
+        self.assertEqual(verify.count("exit 1"), 2)
+
+    def test_pull_request_regressions_run_only_modules_outside_simulation_qa(self):
+        workflow = (ROOT / ".github/workflows/regression-gate.yml").read_text()
+        job = self.workflow_job(workflow, "python-regressions")
+        self.assertIn("        if: github.event_name == 'pull_request'\n"
+                      "        run: python scripts/test_replay_failure_fixes.py --only-outside-simulation-qa\n", job)
+        self.assertIn("        if: github.event_name != 'pull_request'\n"
+                      "        run: python scripts/test_replay_failure_fixes.py\n", job)
+
+    def test_jobs_reaches_simulation_qa_only_when_requested(self):
+        import native_peer_gate, browser_bridge_gate, release_performance_gate
+        calls = []
+        class FakeRunner:
+            logs = self.root
+            env = {"PATH": "/usr/bin:/bin"}
+            def run(inner, label, command, **kwargs):
+                calls.append((label, [str(part) for part in command]))
+                if "--report" in command:
+                    Path(command[command.index("--report") + 1]).write_text("{}")
+                return 0, self.root / "unused.log"
+        for jobs, expected in ((None, None), (1, ["--jobs", "1"]), (3, ["--jobs", "3"])):
+            calls.clear()
+            with self.synthetic_profile_metadata(), \
+                    patch.object(p, "_qa_node_runtime", return_value=Path("/usr/bin/true")), \
+                    patch.object(native_peer_gate, "validate"), patch.object(browser_bridge_gate, "validate"), \
+                    patch.object(release_performance_gate, "validate"), patch.object(p, "validate_simulation"):
+                p.simulation_tests(FakeRunner(), Path(sys.executable), jobs=jobs)
+            _, command = next(c for c in calls if c[0] == "simulation-qa")
+            if expected is None:
+                self.assertNotIn("--jobs", command)
+            else:
+                self.assertEqual(command[-2:], expected)
+            # The gate inputs and sandbox are unchanged by concurrency.
+            self.assertEqual(command[:2], ["sandbox-exec", "-p"])
+            self.assertIn("--profile", command)
+            self.assertEqual(command[command.index("--profile") + 1], "full")
+
+    def test_jobs_must_be_positive(self):
+        for value in ("0", "-2"):
+            with patch.object(sys, "argv", ["pipeline.py", "test", "--jobs", value, "--dry-run"]), \
+                    patch.object(p, "Runner") as runner, patch("sys.stderr"):
+                with self.assertRaises(SystemExit):
+                    p.main()
+                runner.assert_not_called()
+
+    def test_git_source_list_handles_terminating_nul(self):
+        with patch.object(p, "git", return_value="service/main.py\0"):
+            self.assertEqual(p.source_files(), [ROOT / "service/main.py"])
+
+    def test_private_command_timeout_cannot_expose_password(self):
+        import traceback
+        command = ["security", "import", "fixture.p12", "-P", "SENTINEL-PRIVATE-PASSWORD"]
+        with patch("release.subprocess.run", side_effect=subprocess.TimeoutExpired(command, 120)):
+            try:
+                release.secret_run(command)
+            except p.BuildError:
+                output = traceback.format_exc()
+            else:
+                self.fail("Timeout must fail")
+        self.assertNotIn("SENTINEL-PRIVATE-PASSWORD", output)
+        self.assertIn("suppressed", output)
+
+    def test_private_apple_tools_receive_no_unrelated_ci_secrets(self):
+        sentinels = {"GH_TOKEN": "github-secret", "HARBOR_SIGNING_P12_BASE64": "p12-secret",
+                     "HARBOR_SIGNING_P12_PASSWORD": "password-secret",
+                     "HARBOR_APPLE_API_KEY_BASE64": "api-secret"}
+        with patch.dict(os.environ, sentinels, clear=False), \
+                patch("release.subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as run:
+            release.secret_run(["security", "list-keychains"])
+        environment = run.call_args.kwargs["env"]
+        self.assertTrue(all(key not in environment for key in sentinels))
+
+    def test_guard_allows_scratch_sqlite_uri_and_cleanup(self):
+        snippet = f"""
+import sys, sqlite3, shutil
+sys.path.insert(0, {str(p.SUPPORT)!r})
+from pathlib import Path
+import test_worker
+scratch=Path({str(self.root)!r})
+violations=test_worker.install_guard(Path({str(ROOT)!r}), scratch, Path(sys.base_prefix))
+folder=scratch/'data'
+folder.mkdir()
+with sqlite3.connect(str(folder/'fixture.db')) as db:
+    db.execute('create table fixture (name text)')
+with sqlite3.connect(f'file:{{folder}}/fixture.db?mode=ro', uri=True) as db:
+    assert db.execute('select count(*) from fixture').fetchone()[0] == 0
+shutil.rmtree(folder)
+assert not violations, violations
+"""
+        proc = subprocess.run([sys.executable, "-B", "-c", snippet], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_bootstrap_never_executes_bad_binary(self):
+        import bootstrap_uv
+        wrong = self.root / "wrong-uv"
+        wrong.write_text("not the pinned binary")
+        with patch("bootstrap_uv.shutil.which", return_value=str(wrong)):
+            with self.assertRaisesRegex(RuntimeError, "Offline bootstrap"):
+                bootstrap_uv.ensure_uv(p.CONFIG, self.root, offline=True)
+
+
+    def test_guard_caught_denial_still_fails(self):
+        scratch = self.root / "scratch"
+        scratch.mkdir()
+        forbidden = self.root / "outside.txt"
+        proc = subprocess.run([sys.executable, "-B", str(p.SUPPORT / "test_worker.py"), "guard-probe", str(forbidden),
+            "--root", str(ROOT), "--scratch", str(scratch)], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 86, proc.stderr)
+        self.assertFalse(forbidden.exists())
+        self.assertIn("ISOLATION VIOLATIONS", proc.stderr)
+
+    def test_guard_denies_network_sqlite_and_subprocess(self):
+        # Run in a child because Python audit hooks cannot be removed.
+        snippet = f'''
+import sys
+sys.path.insert(0, {str(p.SUPPORT)!r})
+from pathlib import Path
+import test_worker, socket, sqlite3, subprocess
+violations=test_worker.install_guard(Path({str(ROOT)!r}), Path({str(self.root)!r}), Path(sys.base_prefix))
+for action in (lambda: socket.getaddrinfo("example.invalid", 80), lambda: sqlite3.connect("/tmp/harbor-forbidden.db"), lambda: subprocess.run(["/usr/bin/true"])):
+    try: action()
+    except PermissionError: pass
+assert len(violations)==3, violations
+'''
+        proc = subprocess.run([sys.executable, "-B", "-c", snippet], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

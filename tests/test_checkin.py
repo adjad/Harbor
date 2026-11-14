@@ -1,0 +1,656 @@
+"""Evening check-in, morning carry-forward and the weekly goal pulse
+(service/assistant/checkin.py, checkin_api.py). Disposable store and state files only."""
+from __future__ import annotations
+
+from datetime import datetime
+import json
+import time
+from zoneinfo import ZoneInfo
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from service import user_hours
+from service.assistant import checkin as C
+from service.assistant.store import AssistantStore
+from service.memory import profile as P
+
+ZONE = "America/Los_Angeles"
+
+
+def at(day: str, hour: int, minute: int = 0) -> float:
+    y, m, d = (int(x) for x in day.split("-"))
+    return datetime(y, m, d, hour, minute, tzinfo=ZoneInfo(ZONE)).timestamp()
+
+
+@pytest.fixture(autouse=True)
+def _paths(tmp_path, monkeypatch):
+    monkeypatch.setattr(C, "STATE_PATH", tmp_path / "checkins.json")
+    monkeypatch.setattr(P, "PROFILE_PATH", tmp_path / "profile.json")
+    # These cases are written around a 9-to-6 day.
+    user_hours.save(working={"start_minute": 540, "end_minute": 1080})
+
+
+@pytest.fixture
+def store(tmp_path):
+    return AssistantStore(tmp_path / "assistant.db")
+
+
+def task(store, title, day, **extra):
+    return store.today_save_task({"title": title, "day": day, "timezone": ZONE, "kind": "task",
+                                  "duration_minutes": 30, **extra})
+
+
+def event(store, sid, title, start, end, **values):
+    store.sync_source("calendar", [dict(id=sid, source_id=sid, source="calendar", title=title, kind="event",
+                                        when_ts=start, end_ts=end, all_day=False) | values])
+
+
+def events(store, *rows):
+    store.sync_source("calendar", [dict(id=sid, source_id=sid, source="calendar", title=title, kind="event",
+                                        when_ts=start, end_ts=end, all_day=False) for sid, title, start, end in rows])
+
+
+# --- due / build ------------------------------------------------------------------
+
+def test_due_only_in_the_evening_of_that_day(store):
+    day = "2026-10-17"
+    assert C.is_due(at(day, 16, 59), ZONE) is False
+    assert C.is_due(at(day, 17), ZONE) is True
+    card = C.build(store, day, ZONE, now=at(day, 18))
+    assert card["due"] is True and card["completed"] is False and card["tasks"] == []
+    assert C.build(store, day, ZONE, now=at("2026-10-18", 18))["due"] is False, "yesterday's card is not due"
+
+
+def test_build_lists_active_tasks_and_counts_done(store):
+    day = "2026-10-17"
+    a = task(store, "Write intro", day)
+    b = task(store, "Call bank", day)
+    store.today_save_task({"status": "done"}, task_id=b["id"], revision=b["revision"])
+    task(store, "Later thing", "2026-10-18")
+    card = C.build(store, day, ZONE, now=at(day, 19))
+    assert card["planned"] == 2 and card["done"] == 1
+    assert [t["title"] for t in card["tasks"]] == ["Write intro"]
+    assert card["tasks"][0]["revision"] == a["revision"]
+    assert card["tomorrow"]["day"] == "2026-10-18"
+
+
+# --- decisions -------------------------------------------------------------------------
+
+def test_done_tomorrow_and_drop(store):
+    day, tomorrow = "2026-10-17", "2026-10-18"
+    now = at(day, 19)
+    a = task(store, "Write intro", day)
+    b = task(store, "Call bank", day, due_ts=at(day, 14), pinned_start=at(day, 13))
+    c = task(store, "Gym", day)
+    assert C.decide_task(store, a["id"], "done", day=day, timezone=ZONE, now=now)["status"] == "done"
+    moved = C.decide_task(store, b["id"], "tomorrow", day=day, timezone=ZONE, now=now)
+    assert moved["day"] == tomorrow and moved["carried_from"] == day
+    assert moved["pinned_start"] is None and moved["due_ts"] is None, "a missed deadline and a pin do not follow"
+    dropped = C.decide_task(store, c["id"], "drop", day=day, timezone=ZONE, now=now)
+    assert dropped["status"] == "dismissed"
+    card = C.build(store, day, ZONE, now=now)
+    assert card["tasks"] == [] and card["done"] == 1
+    assert [t["title"] for t in store.today_snapshot(tomorrow, ZONE)["tasks"]] == ["Call bank"]
+    decisions = C.day_record(day)["decisions"]
+    assert [d["decision"] for d in decisions] == ["done", "tomorrow", "drop"]
+    with pytest.raises(ValueError):
+        C.decide_task(store, a["id"], "maybe", day=day, timezone=ZONE, now=now)
+    with pytest.raises(KeyError):
+        C.decide_task(store, "nope", "done", day=day, timezone=ZONE, now=now)
+
+
+def test_tomorrow_keeps_a_future_deadline_and_the_original_origin(store):
+    day = "2026-10-17"
+    t = task(store, "Essay", day, due_ts=at("2026-10-20", 23), carried_from="2026-10-15")
+    moved = C.decide_task(store, t["id"], "tomorrow", day=day, timezone=ZONE, now=at(day, 19))
+    assert moved["due_ts"] == at("2026-10-20", 23)
+    assert moved["carried_from"] == "2026-10-15", "the first planned day is what carries"
+
+
+def test_complete_and_times_moved(store):
+    C.complete("2026-10-17", now=1.0)
+    assert C.day_record("2026-10-17")["completed_at"] == 1.0
+    for day in ("2026-10-14", "2026-10-15", "2026-10-16"):
+        t = task(store, "Gym", day)
+        C.decide_task(store, t["id"], "tomorrow", day=day, timezone=ZONE, now=at(day, 19))
+    assert C.times_moved("gym", before_day="2026-10-17") == 3
+    assert C.times_moved("Gym", before_day="2026-10-15") == 1
+    assert C.times_moved("Essay", before_day="2026-10-17") == 0
+
+
+# --- carry-forward -------------------------------------------------------------------
+
+def test_carry_forward_moves_only_active_earlier_tasks_once(store):
+    today = "2026-10-17"
+    old = task(store, "Old thing", "2026-10-15", pinned_start=at("2026-10-15", 10), due_ts=at("2026-10-15", 12))
+    done = task(store, "Finished", "2026-10-16")
+    store.today_save_task({"status": "done"}, task_id=done["id"], revision=done["revision"])
+    task(store, "Today's own", today)
+    task(store, "Future", "2026-10-19")
+    now = at(today, 8)
+    moved = C.carry_forward(store, today, ZONE, now=now)
+    assert [t["title"] for t in moved] == ["Old thing"]
+    assert moved[0]["day"] == today and moved[0]["carried_from"] == "2026-10-15"
+    assert moved[0]["pinned_start"] is None and moved[0]["due_ts"] is None
+    assert C.carry_forward(store, today, ZONE, now=now) == [], "idempotent"
+    assert [c["title"] for c in C.carried_today(today)] == ["Old thing"]
+    titles = sorted(t["title"] for t in store.today_snapshot(today, ZONE)["tasks"])
+    assert titles == ["Old thing", "Today's own"]
+    assert old["id"] == moved[0]["id"]
+
+
+def _reminders(store, *items, undated=()):
+    """One native Reminders read: dated items as commitments, undated as a snapshot."""
+    from service.assistant.store import parse_undated_snapshot
+    snapshot = parse_undated_snapshot(list(undated), len(undated)) if undated else None
+    store.sync_source("reminders", [{"source_id": sid, "kind": "reminder", "title": title,
+                                     "context": "Reminders", "when_ts": when} for sid, title, when in items],
+                      diagnostics={"authorized": True, "count": len(items), "snapshot_started_at": 1000.0},
+                      undated=snapshot)
+
+
+def test_carry_forward_leaves_behind_a_task_from_a_two_week_old_reminder(store):
+    """The user's case (build 1998): "Get doordash order" is a Reminders item due
+    Oct 2. On Oct 18 the Day tab's Plan time made it a fresh undated Harbor task,
+    so the next morning the carry-forward used to move it onto Oct 19 as if it
+    were new. It is sixteen days old and must not ride along."""
+    due = 1790990100.0                                           # 2026-10-02, the reminder's due time
+    _reminders(store, ("E4EFB131-DF70-4000-9778-CC70E0C425B4", "Get doordash order", due))
+    stale = task(store, "Get doordash order", "2026-10-18", priority=1, duration_minutes=25)
+    fresh = task(store, "Call the bank", "2026-10-18")
+    now = at("2026-10-19", 8)
+    moved = C.carry_forward(store, "2026-10-19", ZONE, now=now)
+    assert [t["title"] for t in moved] == ["Call the bank"]
+    assert moved[0]["origin_ts"] == at("2026-10-18", 0) and moved[0]["carried_from"] == "2026-10-18"
+    left = store.today_task(stale["id"])
+    assert left["day"] == "2026-10-18" and left["status"] == "active", "left where it was, not deleted"
+    assert fresh["id"] == moved[0]["id"]
+    aged = C.aged_out_today("2026-10-19")
+    # The reminder is a week past due and unkept, so the stale policy hides it: the
+    # task is left behind for that reason, aged from the reminder's due time.
+    assert [(a["title"], a["reason"], a["age_days"]) for a in aged] == [("Get doordash order", "stale_reminder", 16)]
+    assert [t["title"] for t in store.today_snapshot("2026-10-19", ZONE)["tasks"]] == ["Call the bank"]
+    assert C.carry_forward(store, "2026-10-19", ZONE, now=now) == [], "idempotent"
+    assert len(C.aged_out_today("2026-10-19")) == 1
+
+
+def test_plan_time_task_keeps_the_reminder_due_time_as_its_origin(store, monkeypatch):
+    """The Day tab's Plan time on the overdue "Get doordash order" posts origin_ts =
+    the reminder's due time (NotchDayView.planTime, DayTimeline.planOrigin). Even
+    when no same-titled reminder is left to match (renamed, or planned as
+    "Review: …"), the task is sixteen days old on day one and is not carried."""
+    from service.assistant import today_api
+    monkeypatch.setattr(today_api, "assistant_store", store)
+    app = FastAPI()
+    app.include_router(today_api.router)
+    api = TestClient(app)
+    due = 1790990100.0                                           # 2026-10-02
+    body = {"title": "Get doordash order", "day": "2026-10-18", "timezone": ZONE, "kind": "task",
+            "duration_minutes": 25, "priority": 1}
+    made = api.post("/assistant/today/tasks", json=body | {"origin_ts": due})
+    assert made.status_code == 201 and made.json()["origin_ts"] == due
+    plain = api.post("/assistant/today/tasks", json=body | {"title": "Call the bank"})
+    assert plain.status_code == 201 and plain.json().get("origin_ts") is None
+    assert api.post("/assistant/today/tasks", json=body | {"origin_ts": -5.0}).status_code >= 400
+    assert api.post("/assistant/today/tasks", json=body | {"origin_ts": "yesterday"}).status_code == 422
+    # origin_ts is the one new field: anything else unknown is still refused.
+    for extra in ({"source_id": "E4EFB131"}, {"carried_from": "2026-10-02"}, {"revision": 7}, {"origin": due}):
+        assert api.post("/assistant/today/tasks", json=body | {"origin_ts": due} | extra).status_code == 422, extra
+    moved = C.carry_forward(store, "2026-10-19", ZONE, now=at("2026-10-19", 8))
+    assert [t["title"] for t in moved] == ["Call the bank"]
+    assert [(a["title"], a["age_days"]) for a in C.aged_out_today("2026-10-19")] == [("Get doordash order", 16)]
+
+
+def test_carry_forward_stops_after_a_week_even_when_the_task_kept_moving(store):
+    """"Work on Zybook" was planned on Sept 26 and carried every single morning
+    until the user dropped it on Oct 17. The age counts from the first day it
+    was planned, not from the last day it was moved to."""
+    zybook = task(store, "Work on Zybook", "2026-10-16", carried_from="2026-09-26")
+    recent = task(store, "Read the paper", "2026-10-12")
+    moved = C.carry_forward(store, "2026-10-17", ZONE, now=at("2026-10-17", 8))
+    assert [t["title"] for t in moved] == ["Read the paper"], "five days old still carries; three weeks does not"
+    assert moved[0]["origin_ts"] == at("2026-10-12", 0)
+    assert store.today_task(zybook["id"])["day"] == "2026-10-16"
+    assert [a["title"] for a in C.aged_out_today("2026-10-17")] == ["Work on Zybook"]
+    # Three days later the paper is eight days old by origin, although its `day` is Oct 17.
+    assert C.carry_forward(store, "2026-10-20", ZONE, now=at("2026-10-20", 8)) == []
+    # Zybook is still sitting on Oct 16, so it is noted again; nothing is ever deleted for the user.
+    assert sorted(a["title"] for a in C.aged_out_today("2026-10-20")) == ["Read the paper", "Work on Zybook"]
+    # The evening tap "Tomorrow" is explicit and still honoured, and keeps the origin.
+    saved = C.decide_task(store, moved[0]["id"], "tomorrow", day="2026-10-20", timezone=ZONE, now=at("2026-10-20", 18))
+    assert saved["day"] == "2026-10-21" and saved["origin_ts"] == at("2026-10-12", 0)
+
+
+def test_carry_forward_skips_titles_the_stale_reminder_policy_excludes(store):
+    now = at("2026-10-19", 8)
+    _reminders(store, undated=[
+        {"source_id": "u-ask", "title": "Clean the garage", "context": "Reminders", "created_ts": now - 8 * 86400},
+        {"source_id": "u-kept", "title": "Renew passport", "context": "Reminders", "created_ts": now - 20 * 86400},
+        {"source_id": "u-fresh", "title": "Buy stamps", "context": "Reminders", "created_ts": now - 2 * 86400},
+    ])
+    store.keep_stale_reminder("u-kept", "Renew passport")
+    task(store, "Clean the garage", "2026-10-18")
+    task(store, "Renew passport", "2026-10-18")
+    task(store, "buy  stamps", "2026-10-18")                    # title match ignores case and spacing
+    moved = C.carry_forward(store, "2026-10-19", ZONE, now=now)
+    assert sorted(t["title"] for t in moved) == ["Renew passport", "buy  stamps"]
+    assert moved[1]["origin_ts"] == now - 2 * 86400 or moved[0]["origin_ts"] == now - 2 * 86400, \
+        "a fresh reminder's creation time becomes the task's origin"
+    assert [(a["title"], a["reason"]) for a in C.aged_out_today("2026-10-19")] == [("Clean the garage", "stale_reminder")]
+
+
+def _count(monkeypatch, name: str) -> list:
+    """Count calls to one of the check-in module's functions without changing it."""
+    calls, real = [], getattr(C, name)
+
+    def counted(*args, **kwargs):
+        calls.append(args)
+        return real(*args, **kwargs)
+    monkeypatch.setattr(C, name, counted)
+    return calls
+
+
+def test_a_left_behind_task_is_recorded_once_not_on_every_call(store, monkeypatch):
+    """A task left behind stays active on its old day, so every later call (the
+    scheduler asks each 30 s, the Day tab on each open) meets it again. Only the
+    first one has anything to write, and an old task needs no reminder lookup."""
+    old = task(store, "Sort the bookshelf", "2026-10-09")
+    now = at("2026-10-19", 8)
+    writes, lookups = _count(monkeypatch, "_write_state"), _count(monkeypatch, "reminder_index")
+    assert C.carry_forward(store, "2026-10-19", ZONE, now=now) == []
+    assert len(writes) == 1 and len(lookups) == 1
+    first = C.day_record("2026-10-19")
+    assert [(a["id"], a["reason"], a["age_days"]) for a in first["aged_out"]] == [(old["id"], "aged_out", 10)]
+    for later in (30, 60, 3600):
+        assert C.carry_forward(store, "2026-10-19", ZONE, now=now + later) == []
+    assert len(writes) == 1, "nothing new to record, so the file is left alone"
+    assert len(lookups) == 1, "a week-old task is not looked up against Reminders again"
+    assert C.day_record("2026-10-19") == first
+    assert store.today_task(old["id"])["status"] == "active", "nothing is deleted"
+    # A second old task appearing later in the day is still recorded, once.
+    other = task(store, "Label the cables", "2026-10-08")
+    assert C.carry_forward(store, "2026-10-19", ZONE, now=now + 7200) == []
+    assert len(writes) == 2
+    assert [a["id"] for a in C.aged_out_today("2026-10-19")] == [old["id"], other["id"]]
+    assert C.carry_forward(store, "2026-10-19", ZONE, now=now + 7230) == []
+    assert len(writes) == 2
+    # The next day has its own record, so each task is noted there once more.
+    assert C.carry_forward(store, "2026-10-20", ZONE, now=at("2026-10-20", 8)) == []
+    assert len(writes) == 3
+    assert sorted(a["title"] for a in C.aged_out_today("2026-10-20")) == ["Label the cables", "Sort the bookshelf"]
+
+
+def test_a_task_held_back_by_a_stale_reminder_still_moves_once_the_reminder_is_kept(store, monkeypatch):
+    """A recent task left behind only because its reminder went stale is checked
+    again on every call (without rewriting the record), so Keep brings it back."""
+    now = at("2026-10-19", 8)
+    _reminders(store, undated=[
+        {"source_id": "u-ask", "title": "Clean the garage", "context": "Reminders", "created_ts": now - 8 * 86400},
+    ])
+    held = task(store, "Clean the garage", "2026-10-18")
+    writes = _count(monkeypatch, "_write_state")
+    assert C.carry_forward(store, "2026-10-19", ZONE, now=now) == []
+    assert [(a["title"], a["reason"]) for a in C.aged_out_today("2026-10-19")] == [("Clean the garage", "stale_reminder")]
+    assert C.carry_forward(store, "2026-10-19", ZONE, now=now + 30) == []
+    assert len(writes) == 1
+    store.keep_stale_reminder("u-ask", "Clean the garage")
+    moved = C.carry_forward(store, "2026-10-19", ZONE, now=now + 60)
+    assert [t["id"] for t in moved] == [held["id"]]
+    assert len(writes) == 2
+    assert [c["id"] for c in C.carried_today("2026-10-19")] == [held["id"]]
+    assert C.carry_forward(store, "2026-10-19", ZONE, now=now + 90) == []
+    assert len(writes) == 2
+
+
+def test_carry_forward_honours_the_store_hidden_reminder_set(store):
+    """Once the store knows which reminders are hidden (undated or overdue
+    dated, #286), carry-forward asks it rather than re-deriving the rule."""
+    class Store(type(store)):
+        def hidden_reminder_titles(self, now=None):
+            return {"pay the parking ticket"}
+    store.__class__ = Store
+    task(store, "Pay the  Parking ticket", "2026-10-18")
+    task(store, "Water the plants", "2026-10-18")
+    moved = C.carry_forward(store, "2026-10-19", ZONE, now=at("2026-10-19", 8))
+    assert [t["title"] for t in moved] == ["Water the plants"]
+    assert [(a["title"], a["reason"]) for a in C.aged_out_today("2026-10-19")] == [("Pay the  Parking ticket", "stale_reminder")]
+
+
+def test_origin_ts_is_validated():
+    from service.assistant.today import validate_task
+    base = {"title": "x", "day": "2026-10-18", "timezone": ZONE, "kind": "task", "duration_minutes": 30,
+            "priority": 2, "status": "active", "id": "a", "revision": 1}
+    assert validate_task({**base, "origin_ts": None})["origin_ts"] is None
+    assert validate_task({**base, "origin_ts": 1790990100.0})["origin_ts"] == 1790990100.0
+    for bad in ("soon", True, -1, 0):
+        with pytest.raises(ValueError):
+            validate_task({**base, "origin_ts": bad})
+
+
+def test_workspace_explains_a_carried_task(store):
+    from service.assistant import daily_workspace as D
+    today = "2026-10-17"
+    task(store, "Old thing", "2026-10-16")
+    now = at(today, 8)
+    C.carry_forward(store, today, ZONE, now=now)
+    state = store.today_snapshot(today, ZONE)
+    out = D.assess(today, ZONE, state, {}, now=now)
+    item = next(i for i in out["attention"] if i["title"] == "Old thing")
+    assert item["reason"].startswith("Carried over from 2026-10-16.")
+
+
+# --- goal pulse ---------------------------------------------------------------------
+
+def test_goal_pulse_is_weekly_and_prefers_behind():
+    now = 10_000_000.0
+    assert C.goal_pulse(None, now=now) is None
+    assert C.goal_pulse(P.empty(), now=now) is None
+    P.update({"goals": ["Ship it", "Run far"]}, now=now)
+    assert C.goal_pulse(P.load(), now=now + 86400) is None, "not a week yet"
+    pulse = C.goal_pulse(P.load(), now=now + 8 * 86400)
+    assert pulse and pulse["goal"] in ("Ship it", "Run far") and pulse["options"] == ["on_track", "behind", "done"]
+    P.set_goal_status("Run far", "behind", now=now + 8 * 86400)
+    assert C.goal_pulse(P.load(), now=now + 9 * 86400) is None, "answered this week"
+    later = C.goal_pulse(P.load(), now=now + 16 * 86400)
+    assert later["goal"] == "Run far" and later["status"] == "behind"
+    P.set_goal_status("Run far", "done", now=now + 16 * 86400)
+    P.set_goal_status("Ship it", "done", now=now + 16 * 86400)
+    assert C.goal_pulse(P.load(), now=now + 40 * 86400) is None, "every goal done"
+    with pytest.raises(ValueError):
+        P.set_goal_status("Ship it", "meh")
+    with pytest.raises(ValueError):
+        P.set_goal_status("Not a goal", "done")
+
+
+def test_goal_status_shapes_the_brief_focus():
+    now = time.mktime((2026, 10, 17, 8, 0, 0, 0, 0, -1))
+    P.update({"goals": ["A", "B", "C"]}, now=now)
+    P.set_goal_status("C", "behind", now=now)
+    profile = P.load()
+    assert P.goal_in_focus(profile, now) == "C"
+    assert "you said you're behind" in P.keeping_in_mind(profile, now)
+    P.set_goal_status("C", "done", now=now)
+    assert P.goal_in_focus(P.load(), now) in ("A", "B")
+    # Editing goals drops statuses for goals that are gone.
+    P.update({"goals": ["A"]}, now=now)
+    assert P.load()["goal_status"] == {}
+
+
+def test_keeping_in_mind_names_carried_tasks_even_without_a_profile():
+    text = P.keeping_in_mind(P.empty(), 0.0, carried_over=[{"title": "Old thing"}, {"title": "Essay"}])
+    assert "2 tasks carried over from before: Old thing; Essay. Already on today's plan." in text
+    assert P.keeping_in_mind(P.empty(), 0.0, carried_over=[]) == ""
+
+
+@pytest.mark.parametrize("patch", [
+    {"name": "A different name"},
+    {"tone": "direct"},
+    {"detail": "thorough"},
+    {"goals": ["  Finish the project  "], "tone": "gentle"},
+])
+def test_due_goal_pulse_survives_unrelated_and_unchanged_goal_saves(patch):
+    start = 1_800_000_000.0
+    due = start + 8 * 86400
+    P.update({"goals": ["Finish the project"]}, now=start)
+    expected = C.goal_pulse(P.load(), now=due)
+    assert expected is not None
+    P.update(patch, now=due - 60)
+    assert C.goal_pulse(P.load(), now=due) == expected
+
+
+def test_changed_goals_start_a_new_week_after_an_older_answer():
+    start = 1_800_000_000.0
+    P.update({"goals": ["Finish the project"]}, now=start)
+    P.set_goal_status("Finish the project", "behind", now=start + 8 * 86400)
+    changed = start + 20 * 86400
+    P.update({"goals": ["Finish the project", "Run farther"]}, now=changed)
+    assert P.load()["goal_status"]["Finish the project"]["status"] == "behind"
+    assert C.goal_pulse(P.load(), now=changed + 7 * 86400 - 1) is None
+    assert C.goal_pulse(P.load(), now=changed + 7 * 86400)["goal"] == "Finish the project"
+
+
+@pytest.mark.parametrize("previous_update", [None, 0.0, 1_800_000_000.0])
+def test_legacy_goal_clock_is_preserved_before_profile_edit(previous_update):
+    P.PROFILE_PATH.write_text(json.dumps({"goals": ["Finish the project"],
+                                         "updated_at": previous_update}))
+    due = 1_800_000_000.0 + 8 * 86400
+    expected = C.goal_pulse(P.load(), now=due)
+    assert expected is not None
+    P.update({"tone": "direct", "goals": ["Finish the project"]}, now=due - 60)
+    assert P.load()["updated_at"] == due - 60, "the profile's edit date remains accurate"
+    assert C.goal_pulse(P.load(), now=due) == expected
+
+
+def test_epoch_zero_goal_answer_is_not_replaced_by_a_later_profile_edit():
+    P.update({"goals": ["Finish the project"]}, now=0.0)
+    P.set_goal_status("Finish the project", "on_track", now=0.0)
+    P.update({"name": "A different name"}, now=86400.0)
+    assert C.goal_pulse(P.load(), now=7 * 86400 - 1) is None
+    assert C.goal_pulse(P.load(), now=7 * 86400) is not None
+
+
+# --- moving an event ---------------------------------------------------------------
+
+
+def test_move_suggestions_find_free_time_around_the_day(store):
+    """Tomorrow (Monday Oct 19) has office hours 9:30-10:30, a lecture 11-12 and a
+    planned task pinned at 2 PM. Working hours are 9-6. Moving the office hours
+    offers: later Monday after the lecture, the same time Tuesday, and Tuesday's
+    first free slot."""
+    monday, tuesday = "2026-10-19", "2026-10-20"
+    events(store, ("oh", "STAT 7-02 Office Hours", at(monday, 9, 30), at(monday, 10, 30)),
+                  ("lec", "Lecture", at(monday, 11), at(monday, 12)),
+                  ("tue", "Team sync", at(tuesday, 9, 30), at(tuesday, 10, 30)))
+    task(store, "Write up", monday, pinned_start=at(monday, 14), duration_minutes=120)
+    now = at("2026-10-18", 18)
+    oh = C.find_event(store, "oh", monday, ZONE)
+    assert oh["title"] == "STAT 7-02 Office Hours"
+    result = C.move_suggestions(store, oh, ZONE, now=now)
+    assert result["duration_minutes"] == 60 and result["event"]["label"] == "Monday 9:30 AM"
+    got = [(s["label"], s["reason"]) for s in result["suggestions"]]
+    assert got[0] == ("Monday 12:00 PM", "Later that day, after Lecture")
+    assert ("Tuesday 10:30 AM", "First free slot Tuesday") in got, "9:00 would run into the 9:30 Team sync"
+    assert all(s["end_ts"] - s["start_ts"] == 3600 for s in result["suggestions"])
+    # Tuesday 9:30 is taken by Team sync, so "same time Tuesday" is not offered;
+    # the third slot comes from the day after.
+    assert not any(label == "Tuesday 9:30 AM" for label, _ in got)
+    assert len(got) == 3 and got[2][0].startswith("Wednesday")
+
+
+def test_move_suggestions_respect_working_hours_and_learned_windows(store):
+    monday = "2026-10-19"
+    events(store, ("oh", "Office Hours", at(monday, 16), at(monday, 17)))
+    now = at("2026-10-18", 18)
+    # A learned "likely busy" window 9-12 Tuesday (the Day tab's behavior contract).
+    tuesday = "2026-10-20"
+    behavior = {
+        "version": 1, "ready": True, "timezone": ZONE,
+        "generated_at": now - 120, "evidence_checked_at": now - 60,
+        "source_coverage": {}, "associations": [], "demands": [], "detail": "Usual routine",
+        "windows": [{"id": "w1", "kind": "busy", "start": at(tuesday, 9), "end": at(tuesday, 12), "confidence": 0.9,
+                     "observed_at": now - 3600, "current": True, "because": "You are usually in class then.",
+                     "timezone": ZONE, "evidence": ["calendar:class"], "coverage": "adequate",
+                     "title": "Class"}]}
+    def provider(day):
+        return behavior if day == tuesday else None
+    result = C.move_suggestions(store, C.find_event(store, "oh", monday, ZONE), ZONE, now=now, behavior=provider)
+    labels = [s["label"] for s in result["suggestions"]]
+    # Nothing later on Monday fits inside 9-6 after a 4-5 PM event (5-6 is only an hour: it fits).
+    assert labels[0] == "Monday 5:00 PM"
+    # Tuesday: same time 4 PM is free; the first free slot skips the learned busy morning.
+    assert "Tuesday 4:00 PM" in labels
+    assert "Tuesday 12:00 PM" in labels, labels
+    assert not any(l.startswith("Tuesday 9") or l.startswith("Tuesday 10") or l.startswith("Tuesday 11") for l in labels)
+
+
+def test_move_suggestions_use_wall_clock_across_the_dst_change(store):
+    """Nov 1 2026 is the fall-back day in Los Angeles (25 hours long). Working
+    hours and "same time" must be wall-clock minutes, not seconds from midnight."""
+    saturday, sunday, monday = "2026-10-31", "2026-11-01", "2026-11-02"
+    events(store, ("oh", "Office Hours", at(saturday, 15), at(saturday, 16)))
+    result = C.move_suggestions(store, C.find_event(store, "oh", saturday, ZONE), ZONE, now=at("2026-10-30", 18))
+    labels = [s["label"] for s in result["suggestions"]]
+    assert "Sunday 3:00 PM" in labels, labels            # same wall time, despite the extra hour
+    sunday_slots = [s for s in result["suggestions"] if s["day"] == sunday]
+    assert all(at(sunday, 9) <= s["start_ts"] < at(sunday, 18) for s in sunday_slots), "inside 9-6 wall clock"
+    assert all(s["day"] in (saturday, sunday, monday) for s in result["suggestions"])
+
+
+def test_move_suggestions_fall_back_to_the_saved_plan_when_the_workspace_fails(store, monkeypatch):
+    from service.assistant import daily_workspace as D
+    monday = "2026-10-19"
+    events(store, ("oh", "Office Hours", at(monday, 9, 30), at(monday, 10, 30)),
+                  ("lec", "Lecture", at(monday, 11), at(monday, 12)))
+    def boom(*args, **kwargs):
+        raise RuntimeError("evidence source offline")
+    monkeypatch.setattr(D, "workspace", boom)
+    result = C.move_suggestions(store, C.find_event(store, "oh", monday, ZONE), ZONE, now=at("2026-10-18", 18))
+    labels = [s["label"] for s in result["suggestions"]]
+    assert labels and labels[0] == "Monday 12:00 PM", "the saved plan still sees the lecture"
+
+
+def test_move_suggestions_api_rejects_a_bad_day(client, store):
+    assert client.get("/assistant/checkin/move_suggestions",
+                      params={"event_id": "x", "day": "not-a-day", "timezone": ZONE}).status_code == 422
+
+
+def test_move_suggestions_for_an_event_without_a_start(store):
+    result = C.move_suggestions(store, {"id": "x", "title": "Someday", "when_ts": None}, ZONE, now=at("2026-10-18", 18))
+    assert result["suggestions"] == [] and "no start time" in result["reason"]
+
+
+def test_move_suggestions_api(client, store, monkeypatch):
+    monday = "2026-10-19"
+    events(store, ("oh", "Office Hours", at(monday, 9, 30), at(monday, 10, 30)))
+    monkeypatch.setattr(time, "time", lambda: at("2026-10-18", 18))
+    ok = client.get("/assistant/checkin/move_suggestions", params={"event_id": "oh", "day": monday, "timezone": ZONE})
+    assert ok.status_code == 200
+    body = ok.json()
+    assert body["event"]["source_id"] == "oh" and len(body["suggestions"]) == 3
+    assert {"start_ts", "end_ts", "day", "reason", "label"} <= set(body["suggestions"][0])
+    gone = client.get("/assistant/checkin/move_suggestions", params={"event_id": "nope", "day": monday, "timezone": ZONE})
+    assert gone.status_code == 404
+
+
+# --- API -----------------------------------------------------------------------------
+
+@pytest.fixture
+def client(store, monkeypatch):
+    from service.assistant import checkin_api
+    monkeypatch.setattr(checkin_api, "assistant_store", store)
+    app = FastAPI()
+    app.include_router(checkin_api.router)
+    return TestClient(app)
+
+
+def test_api_round_trip(client, store, monkeypatch):
+    day = "2026-10-17"
+    monkeypatch.setattr(time, "time", lambda: at(day, 19))
+    t = task(store, "Write intro", day)
+    task(store, "Old thing", "2026-10-16")
+    card = client.get("/assistant/checkin", params={"day": day, "timezone": ZONE}).json()
+    assert card["due"] is True and sorted(x["title"] for x in card["tasks"]) == ["Old thing", "Write intro"]
+    assert [c["title"] for c in card["carried"]] == ["Old thing"], "opening the card carried forward"
+    after = client.post(f"/assistant/checkin/tasks/{t['id']}",
+                        json={"decision": "done", "day": day, "timezone": ZONE}).json()
+    assert after["done"] == 1 and [x["title"] for x in after["tasks"]] == ["Old thing"]
+    assert client.post(f"/assistant/checkin/tasks/{t['id']}",
+                       json={"decision": "nope", "day": day, "timezone": ZONE}).status_code == 422
+    assert client.post("/assistant/checkin/tasks/missing",
+                       json={"decision": "done", "day": day, "timezone": ZONE}).status_code == 404
+    done = client.post("/assistant/checkin/complete", json={"day": day, "timezone": ZONE}).json()
+    assert done["completed"] is True
+    P.update({"goals": ["Ship it"]}, now=at(day, 19) - 10 * 86400)
+    pulse = client.get("/assistant/checkin", params={"day": day, "timezone": ZONE}).json()["goal_pulse"]
+    assert pulse["goal"] == "Ship it"
+    out = client.post("/assistant/checkin/goal", json={"goal": "Ship it", "status": "behind"}).json()
+    assert out["goal_status"]["Ship it"]["status"] == "behind" and out["goal_pulse"] is None
+    assert client.post("/assistant/checkin/goal", json={"goal": "Ship it", "status": "meh"}).status_code == 422
+
+
+# --- evening notification text ----------------------------------------------------------
+
+@pytest.fixture
+def tick(store, monkeypatch):
+    """Run the scheduler's evening check-in tick against `store` and return what
+    it published. The app is connected and no chat turn is in flight."""
+    import asyncio
+    from types import SimpleNamespace
+    from service.assistant import scheduler
+
+    published: list[dict] = []
+
+    async def publish(event, **_kwargs):
+        published.append(event)
+        return event
+    monkeypatch.setattr(scheduler, "assistant_store", store)
+    monkeypatch.setattr(scheduler, "hub", SimpleNamespace(has_subscribers=True, publish=publish))
+    monkeypatch.setattr(scheduler.idle, "foreground_busy", lambda: False)
+    monkeypatch.setattr("service.attention.detectors.local_timezone", lambda: ZONE)
+
+    def run(now: float) -> list[dict]:
+        asyncio.run(scheduler._checkin_tick(now))
+        return published
+    return run
+
+
+def _finish(store, saved, status="done"):
+    return store.today_save_task({"status": status}, task_id=saved["id"], revision=saved["revision"])
+
+
+def test_evening_text_does_not_ask_about_the_rest_when_every_task_is_done(store, tick):
+    day = "2026-10-17"
+    for title in ("Write intro", "Call bank", "Book train"):
+        _finish(store, task(store, title, day))
+    event(store, "e1", "Design review", at("2026-10-18", 10), at("2026-10-18", 11))
+    [sent] = tick(at(day, 17, 30))
+    assert sent["text"] == "You planned 3 things today and finished 3. Tomorrow has 1 event. Anything to move?"
+    assert "How did the rest go?" not in sent["text"]
+    # The fields the app reads are unchanged.
+    assert (sent["type"], sent["day"]) == ("checkin", day)
+    assert (sent["planned"], sent["done"], sent["open_tasks"], sent["events_tomorrow"]) == (3, 3, 0, 1)
+    assert C.day_record(day)["notified_at"] == at(day, 17, 30)
+
+
+def test_evening_text_still_asks_about_the_rest_while_a_task_is_open(store, tick):
+    day = "2026-10-17"
+    task(store, "Write intro", day)
+    _finish(store, task(store, "Call bank", day))
+    event(store, "e1", "Design review", at("2026-10-18", 10), at("2026-10-18", 11))
+    [sent] = tick(at(day, 17, 30))
+    assert sent["text"] == "You planned 2 things today and finished 1. How did the rest go?"
+    assert (sent["open_tasks"], sent["events_tomorrow"]) == (1, 1)
+
+
+def test_evening_text_with_one_open_task_and_nothing_finished(store, tick):
+    day = "2026-10-17"
+    task(store, "Write intro", day)
+    assert tick(at(day, 16, 59)) == [], "never before the evening"
+    [sent] = tick(at(day, 17, 30))
+    assert sent["text"] == "You planned 1 thing today. How did the rest go?"
+    assert len(tick(at(day, 17, 31))) == 1, "and only once a day"
+
+
+def test_evening_text_when_the_only_task_was_dropped(store, tick):
+    day = "2026-10-17"
+    _finish(store, task(store, "Write intro", day), status="dismissed")
+    events(store, ("e1", "Design review", at("2026-10-18", 10), at("2026-10-18", 11)),
+           ("e2", "Lunch with Priya", at("2026-10-18", 12), at("2026-10-18", 13)))
+    [sent] = tick(at(day, 17, 30))
+    assert sent["text"] == "You planned 1 thing today. Tomorrow has 2 events. Anything to move?"
+
+
+def test_evening_text_with_no_tasks_asks_only_about_tomorrow(store, tick):
+    day = "2026-10-17"
+    event(store, "e1", "Design review", at("2026-10-18", 10), at("2026-10-18", 11))
+    [sent] = tick(at(day, 17, 30))
+    assert sent["text"] == "Tomorrow has 1 event. Anything to move?"
+
+
+def test_evening_with_nothing_open_and_no_events_tomorrow_stays_silent(store, tick):
+    day = "2026-10-17"
+    _finish(store, task(store, "Write intro", day))
+    assert tick(at(day, 17, 30)) == []
+    assert C.day_record(day)["notified_at"] == at(day, 17, 30), "marked so it is not rebuilt every tick"

@@ -1,0 +1,575 @@
+import Foundation
+
+final class DeliveryMock: URLProtocol {
+    enum Reply { case json(Int, [String: Any]), corrupt, disconnected }
+    static var handler: (URLRequest) -> Reply = { _ in .json(500, [:]) }
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    static func body(_ request: URLRequest) -> [String: Any] {
+        var data = request.httpBody ?? Data()
+        if data.isEmpty, let stream = request.httpBodyStream {
+            stream.open(); defer { stream.close() }
+            var bytes = [UInt8](repeating: 0, count: 4096)
+            while stream.hasBytesAvailable {
+                let n = stream.read(&bytes, maxLength: bytes.count)
+                if n <= 0 { break }
+                data.append(contentsOf: bytes.prefix(n))
+            }
+        }
+        return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+    override func startLoading() {
+        precondition(request.url!.host == "offline.fixture")
+        let status: Int, data: Data
+        switch Self.handler(request) {
+        case .json(let code, let body): status = code; data = try! JSONSerialization.data(withJSONObject: body)
+        case .corrupt: status = 200; data = Data("{broken transport".utf8)
+        case .disconnected:
+            client?.urlProtocol(self, didFailWithError: URLError(.networkConnectionLost)); return
+        }
+        client?.urlProtocol(self, didReceive: HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: data)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() {}
+}
+
+final class ReceiptServer {
+    let event: HarborClient.Event
+    var payload: [String: Any] { event.payload.filter { $0.key != "event_id" } }
+    var claimed = false
+    var result: [String: Any]?
+    var claimPosts = 0, resultPosts = 0, ackPosts = 0
+    var badResult: DeliveryMock.Reply?
+    var badClaim: DeliveryMock.Reply?
+    var badAck: DeliveryMock.Reply?
+    init(_ event: HarborClient.Event) { self.event = event }
+    var identity: [String: Any] { ["event_id": event.str("event_id"), "action_id": event.str("action_id"), "kind": event.type] }
+    func respond(_ request: URLRequest) -> DeliveryMock.Reply {
+        let body = DeliveryMock.body(request)
+        if request.url!.path.hasSuffix("/claim") {
+            claimPosts += 1
+            guard body["action_id"] as? String == event.str("action_id"),
+                  body["kind"] as? String == event.type,
+                  let proposed = body["payload"] as? NSDictionary, proposed.isEqual(to: payload) else { return .json(409, [:]) }
+            if let badClaim { return badClaim }
+            var response = identity
+            response["payload"] = payload
+            response["execute"] = !claimed && result == nil
+            response["recorded"] = result != nil
+            if let result { response["result"] = result }
+            else if claimed { response["error"] = "native outcome unknown" }
+            else { response["claim_token"] = "exclusive-token"; claimed = true }
+            return .json(200, response)
+        }
+        if request.url!.path.hasSuffix("action_result") {
+            resultPosts += 1
+            precondition(body["event_id"] as? String == event.str("event_id"))
+            precondition(body["action_id"] as? String == event.str("action_id"))
+            precondition(body["kind"] as? String == event.type)
+            precondition(body["claim_token"] as? String == "exclusive-token")
+            if let badResult { return badResult }
+            result = body["result"] as? [String: Any]
+            precondition(result != nil)
+            return .json(200, identity.merging(["ok": true, "recorded": true]) { _, new in new })
+        }
+        precondition(request.url!.path.hasSuffix("/ack"))
+        ackPosts += 1
+        if let badAck { return badAck }
+        precondition(!event.type.contains("calendar_event") || result != nil)
+        return .json(200, ["ok": true, "event_id": event.str("event_id"), "kind": event.type])
+    }
+}
+
+@main
+struct AssistantDeliveryChecks {
+    /// Receipts name the user's reminders and events: the file is 0600 from the first
+    /// byte under a 022 umask, a 0644 one an older build left is replaced by a 0600 one,
+    /// and no temp file is left behind.
+    static func receiptFileIsOwnerOnly() {
+        let dir = URL(fileURLWithPath: ProcessInfo.processInfo.environment["TMPDIR"] ?? NSTemporaryDirectory())
+            .appendingPathComponent("harbor-delivery-receipts-\(getpid())")
+        try? FileManager.default.removeItem(at: dir)
+        try! FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let previous = umask(0o022)
+        defer { umask(previous) }
+        func mode(_ path: String) -> Int {
+            var info = stat()
+            return lstat(path, &info) == 0 ? Int(info.st_mode & 0o777) : -1
+        }
+        let receipts = dir.appendingPathComponent("assistant-delivery-receipts.json")
+        precondition(AssistantDelivery.writeOwnerOnly(Data("{}".utf8), to: receipts))
+        precondition(mode(receipts.path) == 0o600, "a new receipts file is owner-only")
+        chmod(receipts.path, 0o644)
+        precondition(AssistantDelivery.writeOwnerOnly(Data("{\"a\":1}".utf8), to: receipts))
+        precondition(mode(receipts.path) == 0o600, "an older 0644 receipts file is replaced by a 0600 one")
+        precondition((try? String(contentsOf: receipts, encoding: .utf8)) == "{\"a\":1}")
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
+        precondition(names == ["assistant-delivery-receipts.json"], "no temp file left: \(names)")
+        chmod(receipts.path, 0o644)
+        AssistantDelivery.tightenOwnerOnly(receipts)
+        precondition(mode(receipts.path) == 0o600, "a loose receipts file is tightened when loaded")
+        let outside = dir.appendingPathComponent("outside.json")
+        try! Data("{}".utf8).write(to: outside)
+        chmod(outside.path, 0o644)
+        let link = dir.appendingPathComponent("linked.json")
+        try! FileManager.default.createSymbolicLink(at: link, withDestinationURL: outside)
+        AssistantDelivery.tightenOwnerOnly(link)
+        precondition(mode(outside.path) == 0o644, "tightening never follows a symlink")
+    }
+
+    @MainActor static func main() async throws {
+        receiptFileIsOwnerOnly()
+        let facts = CalendarCreationFacts(title: "Exam", start: 2e9, end: 2e9 + 3600, allDay: false)
+        var saves = 0
+        let saveThenThrow = CalendarCreationReceipt.perform(expected: facts, save: {
+            saves += 1
+            throw URLError(.networkConnectionLost)
+        }, readback: { _ in facts })
+        precondition(saves == 1 && saveThenThrow["status"] as? String == "unknown")
+        for observed: CalendarCreationFacts? in [nil,
+            .init(title: "Other", start: facts.start, end: facts.end, allDay: false),
+            .init(title: facts.title, start: facts.start + 3600, end: facts.end, allDay: false),
+            .init(title: facts.title, start: facts.start, end: facts.end, allDay: true)] {
+            let result = CalendarCreationReceipt.perform(expected: facts, save: { "fixture" }, readback: { _ in observed })
+            precondition(result["status"] as? String == "unknown")
+        }
+        precondition(CalendarCreationReceipt.perform(expected: facts, save: { nil }, readback: { _ in facts })["status"] as? String == "unknown")
+        precondition(CalendarCreationReceipt.perform(expected: facts, save: { "fixture" }, readback: { _ in facts })["ok"] as? Bool == true)
+        // Native and backend must agree on civil-date bounds across DST.
+        for (day, minutes) in [("2036-03-09", 1380), ("2036-11-02", 1500), ("2036-10-29", 1440)] {
+            let bounds = AssistantDelivery.allDayCalendarBounds(day: day, timezone: "America/Los_Angeles")!
+            precondition(bounds.minutes == minutes)
+            let payload: [String: Any] = ["type": "create_calendar_event", "action_id": "all-day-calendar",
+                "title": "Exam", "when_ts": bounds.start, "duration_min": bounds.minutes, "location": "",
+                "all_day": true, "due_date": day, "timezone": "America/Los_Angeles"]
+            precondition(AssistantDelivery.calendarPayload(payload, kind: "create_calendar_event") != nil)
+            for invalid: [String: Any] in [["all_day": 1], ["due_date": "2036-02-30"],
+                ["when_ts": bounds.start + 3600], ["timezone": "invalid"], ["invitees": ["Other"]]] {
+                precondition(AssistantDelivery.calendarPayload(payload.merging(invalid) { _, b in b }, kind: "create_calendar_event") == nil)
+            }
+        }
+        let datePayload: [String: Any] = ["type": "create_reminder", "action_id": "all-day-fixture",
+            "title": "Review report", "commitment_kind": "reminder", "all_day": true, "due_date": "2026-10-20"]
+        precondition(AssistantDelivery.calendarPayload(datePayload, kind: "create_reminder") != nil)
+        for bad in ["2026-02-30", "2026-10-20T00:00"] {
+            precondition(AssistantDelivery.calendarPayload(datePayload.merging(["due_date": bad]) { _, b in b }, kind: "create_reminder") == nil)
+        }
+        precondition(AssistantDelivery.calendarPayload(datePayload.merging(["all_day": 1]) { _, b in b }, kind: "create_reminder") == nil)
+        precondition(AssistantDelivery.calendarPayload(datePayload.merging(["due_ts": 123.0]) { _, b in b }, kind: "create_reminder") == nil)
+        let dateReceipt: [String: Any] = ["ok": true, "status": "succeeded", "error": "", "source_id": "fixture:date",
+            "title": "Review report", "all_day": true, "due_date": "2026-10-20"]
+        precondition(AssistantDelivery.terminalResult(dateReceipt, kind: "create_reminder") != nil)
+        precondition(AssistantDelivery.terminalResult(dateReceipt.merging(["all_day": 1]) { _, b in b }, kind: "create_reminder") == nil)
+        let dateTarget: [String: Any] = ["type": "delete_reminder", "action_id": "date-target",
+            "source_id": "fixture:date", "expected_title": "Review report", "expected_due_ts": 2e9,
+            "expected_due_date": "2026-10-20"]
+        precondition(AssistantDelivery.calendarPayload(dateTarget, kind: "delete_reminder") != nil)
+        precondition(AssistantDelivery.calendarPayload(dateTarget.merging(["expected_due_date": "2026-02-30"]) { _, b in b }, kind: "delete_reminder") == nil)
+        precondition(AssistantDelivery.calendarPayload(dateTarget.merging(["expected_due_ts": NSNull()]) { _, b in b }, kind: "delete_reminder") == nil)
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [DeliveryMock.self]
+        let session = URLSession(configuration: config)
+        defer { session.invalidateAndCancel() }
+        let client = HarborClient(deliverySession: session, deliveryURL: URL(string: "http://offline.fixture")!)
+        var scenarios = 0
+        func path() -> URL { root.appendingPathComponent(UUID().uuidString + ".json") }
+        func read(_ path: URL) -> [String: [String: Any]] {
+            (try! JSONSerialization.jsonObject(with: Data(contentsOf: path))) as! [String: [String: Any]]
+        }
+        func write(_ path: URL, _ receipts: [String: [String: Any]]) throws {
+            try JSONSerialization.data(withJSONObject: receipts).write(to: path)
+        }
+        func calendarEvent(_ id: String = "cal-1") -> HarborClient.Event {
+            .init(type: "create_calendar_event", payload: ["type": "create_calendar_event", "event_id": id,
+                "action_id": "action-" + id, "title": "Fixture lunch", "when_ts": 1900000000.0,
+                "duration_min": 60, "location": ""])
+        }
+        let note = HarborClient.Event(type: "reminder", payload: ["type": "reminder", "event_id": "r1"])
+        for malformed in ["data: {", "data: {}", "data: {\"type\":\"\"}", "data: {\"type\":\"reminder\",\"event_id\":1}"] {
+            precondition(HarborClient.Event.decodeAssistantLine(malformed) == nil)
+        }
+        precondition(HarborClient.Event.decodeAssistantLine("data: {\"type\":\"changed\",\"event_id\":\"fixture\"}")?.type == "changed")
+        scenarios += 1
+        // Refresh invalidations can repeat after a lost ACK or restart. They
+        // never create a receipt or rewrite existing native-action receipts.
+        do {
+            let event = HarborClient.Event(type: "changed", payload: ["type": "changed", "event_id": "refresh-1"])
+            let server = ReceiptServer(event), file = path()
+            DeliveryMock.handler = server.respond
+            var performed = 0
+            var delivery = AssistantDelivery(path: file)
+            let fresh = await delivery.handle(event, client: client,
+                perform: { _ in performed += 1; return true }, calendar: { _ in fatalError() })
+            precondition(fresh && performed == 1 && server.ackPosts == 1)
+            precondition(!FileManager.default.fileExists(atPath: file.path))
+            try write(file, ["native-existing": ["kind": "create_reminder", "action_id": "native-action",
+                "claim_token": "native-claim", "started": true]])
+            let before = try Data(contentsOf: file)
+            delivery = AssistantDelivery(path: file)
+            server.badAck = .disconnected
+            let lost = await delivery.handle(event, client: client,
+                perform: { _ in performed += 1; return true }, calendar: { _ in fatalError() })
+            precondition(!lost && performed == 2 && server.ackPosts == 2)
+            let afterLost = try Data(contentsOf: file)
+            precondition(afterLost == before)
+            delivery = AssistantDelivery(path: file)
+            server.badAck = nil
+            let replayed = await delivery.handle(event, client: client,
+                perform: { _ in performed += 1; return true }, calendar: { _ in fatalError() })
+            precondition(replayed && performed == 3 && server.ackPosts == 3)
+            let afterReplay = try Data(contentsOf: file)
+            precondition(afterReplay == before)
+            scenarios += 1
+        }
+        // Failed refresh handling must not ACK. A completed legacy receipt
+        // can still skip handling, and an event-kind collision still refuses.
+        do {
+            let event = HarborClient.Event(type: "changed", payload: ["type": "changed", "event_id": "refresh-2"])
+            let server = ReceiptServer(event), file = path()
+            DeliveryMock.handler = server.respond
+            let failed = await AssistantDelivery(path: file).handle(event, client: client,
+                perform: { _ in false }, calendar: { _ in fatalError() })
+            precondition(!failed && server.ackPosts == 0 && !FileManager.default.fileExists(atPath: file.path))
+            try write(file, ["refresh-2": ["kind": "changed", "done": true]])
+            let before = try Data(contentsOf: file)
+            let legacy = await AssistantDelivery(path: file).handle(event, client: client,
+                perform: { _ in fatalError() }, calendar: { _ in fatalError() })
+            precondition(legacy && server.ackPosts == 1)
+            let afterLegacy = try Data(contentsOf: file)
+            precondition(afterLegacy == before)
+            try write(file, ["refresh-2": ["kind": "reminder", "done": true]])
+            let collision = await AssistantDelivery(path: file).handle(event, client: client,
+                perform: { _ in fatalError() }, calendar: { _ in fatalError() })
+            precondition(!collision && server.ackPosts == 1)
+            try Data("corrupt receipts".utf8).write(to: file)
+            let corrupt = await AssistantDelivery(path: file).handle(event, client: client,
+                perform: { _ in fatalError() }, calendar: { _ in fatalError() })
+            precondition(!corrupt && server.ackPosts == 1)
+            scenarios += 1
+        }
+        // Failed handling and failed ACK must leave retryable state; restart
+        // after successful handling never repeats the notification effect.
+        do {
+            let server = ReceiptServer(note), file = path()
+            DeliveryMock.handler = server.respond
+            var performed = 0
+            var delivery = AssistantDelivery(path: file)
+            let failed = await delivery.handle(note, client: client, perform: { _ in performed += 1; return false }, calendar: { _ in fatalError() })
+            precondition(!failed && server.ackPosts == 0)
+            server.badAck = .disconnected
+            let lost = await delivery.handle(note, client: client, perform: { _ in performed += 1; return true }, calendar: { _ in fatalError() })
+            precondition(!lost && performed == 2 && server.ackPosts == 1)
+            delivery = AssistantDelivery(path: file); server.badAck = nil
+            let retried = await delivery.handle(note, client: client, perform: { _ in fatalError() }, calendar: { _ in fatalError() })
+            precondition(retried && server.ackPosts == 2)
+            scenarios += 1
+        }
+        // F5 exact audit case and structural corruption variants. No malformed
+        // done value authorizes skipping handling or ACKing failed handling.
+        let corruptDone: [Any] = [1, 0, "true", "false", NSNull(), [], ["value": true]]
+        for value in corruptDone {
+            let server = ReceiptServer(note), file = path()
+            DeliveryMock.handler = server.respond
+            try write(file, ["r1": ["kind": "reminder", "done": value]])
+            let before = try Data(contentsOf: file)
+            var performed = 0
+            let failed = await AssistantDelivery(path: file).handle(note, client: client,
+                perform: { _ in performed += 1; return false }, calendar: { _ in fatalError() })
+            precondition(!failed && performed == 1 && server.ackPosts == 0)
+            let after = try Data(contentsOf: file)
+            precondition(before == after)
+            let fixed = await AssistantDelivery(path: file).handle(note, client: client,
+                perform: { _ in performed += 1; return true }, calendar: { _ in fatalError() })
+            precondition(fixed && performed == 2 && server.ackPosts == 1)
+            precondition(AssistantDelivery.jsonBoolean(read(file)["r1"]?["done"]) == true)
+            scenarios += 1
+        }
+        for done in [true, false] {
+            let server = ReceiptServer(note), file = path()
+            DeliveryMock.handler = server.respond
+            try write(file, ["r1": ["kind": "reminder", "done": done]])
+            var performed = 0
+            let accepted = await AssistantDelivery(path: file).handle(note, client: client,
+                perform: { _ in performed += 1; return false }, calendar: { _ in fatalError() })
+            precondition(accepted == done && performed == (done ? 0 : 1) && server.ackPosts == (done ? 1 : 0))
+            scenarios += 1
+        }
+        for receipt: [String: Any] in [["kind": "reminder"], ["kind": "reminder", "done": true, "started": true]] {
+            let server = ReceiptServer(note), file = path()
+            DeliveryMock.handler = server.respond
+            try write(file, ["r1": receipt])
+            var performed = 0
+            let rejected = await AssistantDelivery(path: file).handle(note, client: client,
+                perform: { _ in performed += 1; return false }, calendar: { _ in fatalError() })
+            precondition(!rejected && performed == 1 && server.ackPosts == 0)
+            scenarios += 1
+        }
+        // The claimed native callback receives the exact local 6–7 PM
+        // interval, and a recorded success cannot execute it a second time.
+        do {
+            let start = ISO8601DateFormatter().date(from: "2026-09-28T18:00:00-07:00")!.timeIntervalSince1970
+            let interval = HarborClient.Event(type: "create_calendar_event", payload: [
+                "type": "create_calendar_event", "event_id": "cal-interval",
+                "action_id": "action-cal-interval", "title": "Fixture event",
+                "when_ts": start, "duration_min": 60, "location": ""])
+            let server = ReceiptServer(interval), file = path()
+            DeliveryMock.handler = server.respond
+            var calls = 0
+            let delivered = await AssistantDelivery(path: file).handle(interval, client: client,
+                perform: { _ in fatalError() }, calendar: { proposed in
+                    calls += 1
+                    precondition(proposed.payload["when_ts"] as? Double == start)
+                    precondition(proposed.payload["duration_min"] as? Int == 60)
+                    precondition(start + Double((proposed.payload["duration_min"] as! Int) * 60)
+                                 == ISO8601DateFormatter().date(from: "2026-09-28T19:00:00-07:00")!.timeIntervalSince1970)
+                    return ["ok": true, "source_id": "fixture-native"]
+                })
+            precondition(delivered && calls == 1 && server.resultPosts == 1 && server.ackPosts == 1)
+            let replay = await AssistantDelivery(path: file).handle(interval, client: client,
+                perform: { _ in fatalError() }, calendar: { _ in fatalError() })
+            precondition(replay && server.resultPosts == 1 && server.ackPosts == 2)
+            scenarios += 1
+        }
+        let uncertainSave: [String: Any] = ["ok": false, "status": "unknown",
+            "error": "Calendar may have saved this event but returned no identity; check Calendar before retrying"]
+        precondition(AssistantDelivery.terminalResult(uncertainSave,
+            kind: "create_calendar_event", native: true)?["status"] as? String == "unknown")
+        scenarios += 1
+        // F6 retained native result survives unrecorded/mismatched/corrupt
+        // replies. Corrected replay re-posts it, without another native effect.
+        let event = calendarEvent()
+        let matching: [String: Any] = ["ok": true, "recorded": true, "event_id": "cal-1", "action_id": "action-cal-1", "kind": event.type]
+        let badResults: [DeliveryMock.Reply] = [
+            .json(200, ["ok": true, "recorded": false, "delivered": false]),
+            .json(200, matching.merging(["event_id": "wrong"]) { _, n in n }),
+            .json(200, matching.merging(["action_id": "wrong"]) { _, n in n }),
+            .json(200, matching.merging(["kind": "wrong"]) { _, n in n }),
+            .json(200, matching.merging(["recorded": 1]) { _, n in n }),
+            .json(200, matching.merging(["ok": 1]) { _, n in n }),
+            .json(200, matching.merging(["ok": "true"]) { _, n in n }),
+            .json(200, matching.merging(["recorded": "true"]) { _, n in n }),
+            .json(200, ["ok": true]), .json(503, matching), .corrupt, .disconnected]
+        for reply in badResults {
+            let server = ReceiptServer(event), file = path()
+            server.badResult = reply; DeliveryMock.handler = server.respond
+            var executions = 0
+            let first = await AssistantDelivery(path: file).handle(event, client: client, perform: { _ in fatalError() }, calendar: { _ in
+                executions += 1
+                precondition(AssistantDelivery.jsonBoolean(read(file)["cal-1"]?["started"]) == true)
+                return ["ok": true, "source_id": "native-fixture"]
+            })
+            precondition(!first && executions == 1 && server.resultPosts == 1 && server.ackPosts == 0)
+            let receipt = read(file)["cal-1"]!
+            precondition(receipt["payload"] == nil && (receipt["payload_digest"] as? String)?.count == 64)
+            let savedText = try String(contentsOf: file, encoding: .utf8)
+            precondition(!savedText.contains("Fixture lunch"))
+            precondition(receipt["claim_token"] as? String == "exclusive-token" && receipt["result"] is [String: Any] && receipt["done"] == nil)
+            // A wrong replay identity cannot submit/ACK the cached callback.
+            var wrong = event.payload; wrong["action_id"] = "wrong"
+            let mismatch = await AssistantDelivery(path: file).handle(.init(type: event.type, payload: wrong), client: client,
+                perform: { _ in fatalError() }, calendar: { _ in fatalError() })
+            precondition(!mismatch && server.resultPosts == 1 && server.ackPosts == 0)
+            var changedPayload = event.payload; changedPayload["title"] = "Another meeting"
+            let changed = await AssistantDelivery(path: file).handle(.init(type: event.type, payload: changedPayload), client: client,
+                perform: { _ in fatalError() }, calendar: { _ in fatalError() })
+            precondition(!changed && server.resultPosts == 1 && server.ackPosts == 0)
+            server.badResult = nil
+            let fixed = await AssistantDelivery(path: file).handle(event, client: client, perform: { _ in fatalError() }, calendar: { _ in fatalError() })
+            precondition(fixed && executions == 1 && server.resultPosts == 2 && server.ackPosts == 1)
+            let duplicate = await AssistantDelivery(path: file).handle(event, client: client, perform: { _ in fatalError() }, calendar: { _ in fatalError() })
+            precondition(duplicate && server.resultPosts == 2 && server.ackPosts == 2)
+            scenarios += 1
+        }
+        // Payload and identity are checked before invoking the native callback.
+        let serverIdentity = ReceiptServer(event)
+        var grant = serverIdentity.identity
+        grant["payload"] = serverIdentity.payload; grant["execute"] = true; grant["recorded"] = false; grant["claim_token"] = "exclusive-token"
+        let badClaims: [[String: Any]] = [
+            grant.merging(["action_id": "wrong"]) { _, n in n },
+            grant.merging(["event_id": "wrong"]) { _, n in n },
+            grant.merging(["execute": 1]) { _, n in n },
+            grant.merging(["recorded": 0]) { _, n in n },
+            grant.merging(["payload": serverIdentity.payload.merging(["title": "Wrong target"]) { _, n in n }]) { _, n in n },
+            grant.merging(["claim_token": ""]) { _, n in n }]
+        for bad in badClaims {
+            let server = ReceiptServer(event), file = path()
+            server.badClaim = .json(200, bad); DeliveryMock.handler = server.respond
+            let rejected = await AssistantDelivery(path: file).handle(event, client: client, perform: { _ in fatalError() }, calendar: { _ in fatalError() })
+            precondition(!rejected && server.resultPosts == 0 && server.ackPosts == 0)
+            server.badClaim = nil
+            let corrected = await AssistantDelivery(path: file).handle(event, client: client, perform: { _ in fatalError() }, calendar: { _ in ["ok": true, "source_id": "fixture"] })
+            precondition(corrected && server.resultPosts == 1 && server.ackPosts == 1)
+            scenarios += 1
+        }
+        for badTerminal: [String: Any] in [["ok": 1, "status": "succeeded", "error": "", "source_id": "fixture"],
+            ["ok": true, "error": "", "source_id": "fixture"],
+            ["ok": true, "status": "failed", "error": "native failed", "source_id": "fixture"]] {
+            let server = ReceiptServer(event), file = path()
+            var bad = grant
+            bad["execute"] = false; bad["recorded"] = true; bad["result"] = badTerminal
+            server.badClaim = .json(200, bad); DeliveryMock.handler = server.respond
+            let rejected = await AssistantDelivery(path: file).handle(event, client: client,
+                perform: { _ in fatalError() }, calendar: { _ in fatalError() })
+            precondition(!rejected && server.resultPosts == 0 && server.ackPosts == 0)
+            server.badClaim = nil; server.result = ["ok": true, "status": "succeeded", "error": "", "source_id": "fixture"]
+            let corrected = await AssistantDelivery(path: file).handle(event, client: client,
+                perform: { _ in fatalError() }, calendar: { _ in fatalError() })
+            precondition(corrected && server.resultPosts == 0 && server.ackPosts == 1)
+            scenarios += 1
+        }
+        for badAck in [DeliveryMock.Reply.json(200, ["ok": 1, "event_id": "r1", "kind": "reminder"]),
+                       .json(200, ["ok": true, "event_id": "wrong", "kind": "reminder"]), .corrupt] {
+            let server = ReceiptServer(note), file = path()
+            server.badAck = badAck; DeliveryMock.handler = server.respond
+            let rejected = await AssistantDelivery(path: file).handle(note, client: client, perform: { _ in true }, calendar: { _ in fatalError() })
+            precondition(!rejected)
+            server.badAck = nil
+            let replay = await AssistantDelivery(path: file).handle(note, client: client, perform: { _ in fatalError() }, calendar: { _ in fatalError() })
+            precondition(replay && server.ackPosts == 2)
+            scenarios += 1
+        }
+        // Interrupted native receipt and lost claim both show durable unknown
+        // notices; neither recovery repeats native execution.
+        for started in [true, false] {
+            let server = ReceiptServer(event), file = path()
+            server.claimed = true; DeliveryMock.handler = server.respond
+            if started { try write(file, ["cal-1": ["kind": event.type, "claim_token": "exclusive-token", "started": true]]) }
+            var notices = 0
+            for _ in 0..<2 {
+                let recovered = await AssistantDelivery(path: file).handle(event, client: client,
+                    perform: { ev in precondition(ev.type == "calendar_action_unknown"); notices += 1; return true }, calendar: { _ in fatalError() })
+                precondition(recovered == started)
+            }
+            precondition(notices == 1 && server.resultPosts == (started ? 1 : 0))
+            if started { precondition(server.result?["status"] as? String == "unknown") }
+            scenarios += 1
+        }
+        // Legacy crash results remain unknown, both before and after the
+        // backend has migrated its terminal receipt.
+        for recorded in [false, true] {
+            let server = ReceiptServer(event), file = path()
+            let legacy: [String: Any] = ["ok": false, "error": "Harbor was interrupted; native Calendar outcome is unknown"]
+            precondition(AssistantDelivery.terminalResult(legacy, kind: event.type, native: true)?["status"] as? String == "unknown")
+            server.claimed = true
+            if recorded { server.result = legacy.merging(["status": "unknown"]) { _, new in new } }
+            DeliveryMock.handler = server.respond
+            try write(file, ["cal-1": ["kind": event.type, "claim_token": "exclusive-token", "result": legacy]])
+            let recovered = await AssistantDelivery(path: file).handle(event, client: client,
+                perform: { _ in fatalError() }, calendar: { _ in fatalError() })
+            precondition(recovered && server.result?["status"] as? String == "unknown")
+            precondition(server.resultPosts == (recorded ? 0 : 1) && server.ackPosts == 1)
+            scenarios += 1
+        }
+        do {
+            let file = path(), data = Data("not JSON".utf8)
+            try data.write(to: file)
+            let corrupt = await AssistantDelivery(path: file).handle(note, client: client, perform: { _ in fatalError() }, calendar: { _ in fatalError() })
+            let preserved = try Data(contentsOf: file)
+            precondition(!corrupt && preserved == data)
+            scenarios += 1
+        }
+        // A delete of an undated reminder carries expected_due_ts: null. Only delete may;
+        // complete/update still require a real due time, and 0 is never a stand-in for null.
+        do {
+            let undated: [String: Any] = ["type": "delete_reminder", "action_id": "reminder:u1",
+                "source_id": "ek-u", "expected_title": "Old idea", "expected_due_ts": NSNull()]
+            precondition(AssistantDelivery.calendarPayload(undated, kind: "delete_reminder")?["expected_due_ts"] is NSNull)
+            var complete = undated; complete["type"] = "complete_reminder"
+            precondition(AssistantDelivery.calendarPayload(complete, kind: "complete_reminder") == nil)
+            var zero = undated; zero["expected_due_ts"] = 0.0
+            precondition(AssistantDelivery.calendarPayload(zero, kind: "delete_reminder") == nil)
+            scenarios += 1
+        }
+        // A Calendar move names the exact occurrence and the new start; a null length keeps
+        // the event's own. A verified result carries exactly its read-back start and end.
+        do {
+            let move: [String: Any] = ["type": "move_calendar_event", "action_id": "move1",
+                "source_id": "ek-1", "expected_title": "Dentist", "expected_start_ts": 1_900_000_000.0,
+                "when_ts": 1_900_003_600.0, "duration_min": NSNull(), "invitee_count": 0]
+            precondition(AssistantDelivery.calendarPayload(move, kind: "move_calendar_event")?["duration_min"] is NSNull)
+            var invited = move; invited["invitee_count"] = 3
+            precondition(AssistantDelivery.calendarPayload(invited, kind: "move_calendar_event")?["invitee_count"] as? Int == 3)
+            var negative = move; negative["invitee_count"] = -1
+            precondition(AssistantDelivery.calendarPayload(negative, kind: "move_calendar_event") == nil)
+            var uncounted = move; uncounted.removeValue(forKey: "invitee_count")
+            precondition(AssistantDelivery.calendarPayload(uncounted, kind: "move_calendar_event") == nil)
+            var timed = move; timed["duration_min"] = 30
+            precondition(AssistantDelivery.calendarPayload(timed, kind: "move_calendar_event")?["duration_min"] as? Int == 30)
+            var partial = move; partial["duration_min"] = 30.5
+            precondition(AssistantDelivery.calendarPayload(partial, kind: "move_calendar_event") == nil)
+            var untitled = move; untitled["expected_title"] = " "
+            precondition(AssistantDelivery.calendarPayload(untitled, kind: "move_calendar_event") == nil)
+            var extra = move; extra["location"] = "Elsewhere"
+            precondition(AssistantDelivery.calendarPayload(extra, kind: "move_calendar_event") == nil)
+            var noStart = move; noStart.removeValue(forKey: "expected_start_ts")
+            precondition(AssistantDelivery.calendarPayload(noStart, kind: "move_calendar_event") == nil)
+            let verified = AssistantDelivery.terminalResult(["ok": true, "when_ts": 1_900_003_600.0,
+                "end_ts": 1_900_007_200.0], kind: "move_calendar_event", native: true)
+            precondition(verified?["status"] as? String == "succeeded" && verified?["end_ts"] as? Double == 1_900_007_200.0)
+            precondition(AssistantDelivery.terminalResult(["ok": true], kind: "move_calendar_event", native: true) == nil)
+            precondition(AssistantDelivery.terminalResult(["ok": true, "when_ts": 2.0, "end_ts": 1.0],
+                kind: "move_calendar_event", native: true) == nil)
+            let unknown = AssistantDelivery.terminalResult(["ok": false, "status": "unknown",
+                "error": "Calendar saved the move but its read-back differs (notes); the outcome is unknown."],
+                kind: "move_calendar_event", native: true)
+            precondition(unknown?["status"] as? String == "unknown")
+            precondition(AssistantDelivery.terminalResult(["ok": false, "error": "denied", "when_ts": 1.0],
+                kind: "move_calendar_event", native: true) == nil)
+            scenarios += 1
+        }
+        // A one-tap cancel names one exact occurrence; a verified result says it is gone.
+        do {
+            let cancel: [String: Any] = ["type": "cancel_calendar_event", "action_id": "cancel1",
+                "source_id": "ek-1", "expected_title": "Dentist", "expected_start_ts": 1_900_000_000.0,
+                "invitee_count": 2]
+            precondition(AssistantDelivery.calendarPayload(cancel, kind: "cancel_calendar_event")?["invitee_count"] as? Int == 2)
+            var timed = cancel; timed["when_ts"] = 1.0
+            precondition(AssistantDelivery.calendarPayload(timed, kind: "cancel_calendar_event") == nil)
+            var untitled = cancel; untitled["expected_title"] = ""
+            precondition(AssistantDelivery.calendarPayload(untitled, kind: "cancel_calendar_event") == nil)
+            let gone = AssistantDelivery.terminalResult(["ok": true, "is_absent": true],
+                kind: "cancel_calendar_event", native: true)
+            precondition(gone?["status"] as? String == "succeeded")
+            precondition(AssistantDelivery.terminalResult(["ok": true], kind: "cancel_calendar_event", native: true) == nil)
+            precondition(AssistantDelivery.terminalResult(["ok": true, "is_absent": false],
+                kind: "cancel_calendar_event", native: true) == nil)
+            scenarios += 1
+        }
+        // A reminder past its expiry is acknowledged without a banner or a
+        // receipt; a current one, or one without an expiry, still notifies.
+        do {
+            let now = Date().timeIntervalSince1970
+            let stale = HarborClient.Event(type: "reminder", payload: ["type": "reminder", "event_id": "r-stale",
+                "title": "Fixture standup", "when_label": "in 9 min", "expires_at": now - 1])
+            precondition(AssistantDelivery.expiredReminder(stale))
+            precondition(!AssistantDelivery.expiredReminder(stale, now: now - 2))
+            precondition(!AssistantDelivery.expiredReminder(HarborClient.Event(type: "reminder",
+                payload: ["type": "reminder", "event_id": "r-legacy"])))
+            precondition(!AssistantDelivery.expiredReminder(HarborClient.Event(type: "reminder",
+                payload: ["type": "reminder", "event_id": "r-bool", "expires_at": true])))
+            precondition(!AssistantDelivery.expiredReminder(HarborClient.Event(type: "nudge",
+                payload: ["type": "nudge", "event_id": "n-1", "expires_at": now - 1])))
+            let server = ReceiptServer(stale), file = path()
+            DeliveryMock.handler = server.respond
+            let skipped = await AssistantDelivery(path: file).handle(stale, client: client,
+                perform: { _ in fatalError("an expired reminder must not notify") }, calendar: { _ in fatalError() })
+            precondition(skipped && server.ackPosts == 1)
+            precondition(!FileManager.default.fileExists(atPath: file.path))
+            let current = HarborClient.Event(type: "reminder", payload: ["type": "reminder", "event_id": "r-current",
+                "title": "Fixture standup", "when_label": "in 9 min", "expires_at": now + 600])
+            let currentServer = ReceiptServer(current)
+            DeliveryMock.handler = currentServer.respond
+            var shown = 0
+            let delivered = await AssistantDelivery(path: path()).handle(current, client: client,
+                perform: { _ in shown += 1; return true }, calendar: { _ in fatalError() })
+            precondition(delivered && shown == 1 && currentServer.ackPosts == 1)
+            scenarios += 1
+        }
+        print("AssistantDelivery: \(scenarios) offline audit/receipt/transport scenarios passed")
+    }
+}

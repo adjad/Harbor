@@ -1,0 +1,299 @@
+"""Miners recover the routines planted in the fictional test persona.
+
+Synthetic data only: ``generate_persona`` (tests/fixtures, fictional) and small
+hand-built timelines. The engine runs on a temp SQLite file.
+"""
+import time
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+import pytest
+
+from service.behavior import miners
+from service.behavior.engine import BehaviorEngine
+from tests.fixtures.behavior_persona import generate_persona
+from service.behavior.types import Observation
+
+TZ = ZoneInfo("America/Los_Angeles")
+NOW = datetime(2026, 10, 13, 8, 0, tzinfo=TZ).timestamp()      # a Tuesday morning
+
+
+@pytest.fixture(scope="module")
+def mined(tmp_path_factory):
+    persona = generate_persona(NOW)
+    eng = BehaviorEngine(tmp_path_factory.mktemp("beh") / "b.db", tz="America/Los_Angeles")
+    eng.observe(persona.observations + persona.upcoming)
+    patterns = eng.mine(NOW)
+    yield persona, patterns
+    eng.close()
+
+
+def one(patterns, kind, subject):
+    found = [p for p in patterns if p.kind == kind and p.subject == subject]
+    assert found, f"no {kind} pattern for {subject!r}: {[(p.kind, p.subject) for p in patterns]}"
+    return max(found, key=lambda p: p.confidence)
+
+
+def test_gym_habit_window_and_weekdays(mined):
+    persona, patterns = mined
+    gym = one(patterns, "habit", "fitness")
+    assert gym.window.weekdays == (0, 2, 4)                      # Mon/Wed/Fri; the odd Tuesday is ignored
+    assert 6 * 60 + 30 <= gym.window.start_minute <= 7 * 60
+    assert 7 * 60 + 30 <= gym.window.end_minute <= 8 * 60
+    assert gym.confidence > 0.5 and gym.support >= 15
+    assert "work out" in gym.statement and "Mon, Wed and Fri mornings" in gym.statement
+    assert gym.stats["label"] == "Morning lift"
+    assert gym.next_expected is not None and gym.next_expected > NOW
+
+
+def test_focus_habit_weekday_mornings(mined):
+    _, patterns = mined
+    focus = one(patterns, "habit", "focus")
+    assert focus.window.weekdays == (0, 1, 2, 3, 4)
+    assert (focus.window.start_minute, focus.window.end_minute) == (9 * 60, 11 * 60)
+
+
+def test_dev_afternoon_contact_rhythm(mined):
+    _, patterns = mined
+    dev = one(patterns, "contact_rhythm", "Dev Malik")
+    assert dev.stats["daypart"] == "afternoon"
+    assert dev.window.weekdays == (0, 1, 2, 3, 4)
+    assert 13 * 60 <= dev.window.start_minute <= 15 * 60 and dev.window.end_minute <= 18 * 60
+    assert "Dev Malik recur most weekday afternoons" in dev.statement
+    assert dev.stats["reply_latency_s"] is not None and dev.stats["reply_latency_s"] < 3600
+    assert dev.stats["calls"] >= 4                              # the Thursday "Dev / Robin 1:1"
+
+
+def test_mom_sunday_evenings(mined):
+    _, patterns = mined
+    mom = one(patterns, "contact_rhythm", "Mom")
+    assert mom.window.weekdays == (6,)
+    assert mom.stats["daypart"] == "evening"
+    assert mom.statement.startswith("Messages and scheduled calls with Mom recur on Sunday evenings")
+
+
+def test_back_to_back_last_cancel_rate(mined):
+    persona, patterns = mined
+    b2b = one(patterns, "cancel_propensity", "back_to_back_last")
+    assert 0.4 <= b2b.stats["rate"] <= 0.8
+    assert b2b.support == persona.expected["b2b_last"]["cancelled"]
+    assert b2b.opportunities == persona.expected["b2b_last"]["opportunities"]
+    assert b2b.stats["last_share"] >= 0.6 and b2b.stats["lift"] >= 1.5
+    assert "meetings that ended a 3+ back-to-back run" in b2b.statement
+    assert set(b2b.window.weekdays) <= {1, 3}
+    # Precision: nothing else is claimed as a cancel habit from this history.
+    cancel_subjects = {p.subject for p in patterns if p.kind == "cancel_propensity"
+                       and p.stats["action"] == "cancel"}
+    assert cancel_subjects == {"back_to_back_last"}
+
+
+def test_meetings_over_gym_get_moved(mined):
+    persona, patterns = mined
+    prot = one(patterns, "habit_protection", "fitness")
+    assert prot.stats["moved"] == persona.expected["gym_collisions"]["moved"] == 4
+    assert prot.stats["kept"] == persona.expected["gym_collisions"]["kept"] == 1
+    assert "4 moved, 0 removed, 1 remained scheduled out of 5" in prot.statement
+
+
+def test_harbor_brief_around_8_15(mined):
+    _, patterns = mined
+    brief = one(patterns, "harbor_usage", "brief")
+    assert abs(brief.stats["around_minute"] - 8 * 60 - 15) <= 10
+    assert brief.window.weekdays == (0, 1, 2, 3, 4)
+    assert "8:15am" in brief.statement or "8:10am" in brief.statement or "8:20am" in brief.statement
+
+
+def test_day_shape_and_evidence_contract(mined):
+    persona, patterns = mined
+    assert any(p.kind == "day_shape" and p.subject == "weekdays" for p in patterns)
+    ids = {o.id for o in persona.observations}
+    for p in patterns:
+        assert len(p.id) == 16 and 0 < len(p.evidence) <= 5
+        assert set(p.evidence) <= ids, p
+        assert 0.0 <= p.confidence <= 1.0 and p.support <= p.opportunities
+
+
+def test_mining_is_deterministic_and_fast(tmp_path):
+    persona = generate_persona(NOW)
+    eng = BehaviorEngine(tmp_path / "b.db", tz="America/Los_Angeles")
+    eng.observe(persona.observations + persona.upcoming)
+    t0 = time.perf_counter()
+    first = eng.mine(NOW)
+    assert time.perf_counter() - t0 < 2.0
+    again = eng.mine(NOW)
+    assert [(p.id, p.statement, p.confidence) for p in first] == [(p.id, p.statement, p.confidence) for p in again]
+    eng.close()
+
+
+def test_habit_window_survives_dst_change(tmp_path):
+    """History crossing the Nov 1 2026 DST change keeps the 6:45 wall-clock window."""
+    now = datetime(2026, 11, 17, 8, 0, tzinfo=TZ).timestamp()
+    persona = generate_persona(now)
+    eng = BehaviorEngine(tmp_path / "b.db", tz="America/Los_Angeles")
+    eng.observe(persona.observations)
+    gym = one(eng.mine(now), "habit", "fitness")
+    assert gym.window.weekdays == (0, 2, 4) and gym.window.start_minute == 6 * 60 + 45
+    eng.close()
+
+
+# ------------------------------------------------------------- unit level
+
+def _yoga(day, minute=7 * 60, n=0):
+    start = datetime.combine(day, datetime.min.time(), TZ) + timedelta(minutes=minute)
+    return Observation(id=f"y{n}", kind="event", ts=start.timestamp(), end_ts=start.timestamp() + 3600,
+                       subject="Yoga", category="fitness")
+
+
+def test_habit_needs_three_occurrences_over_three_weeks():
+    now = datetime(2026, 10, 30, 12, 0, tzinfo=TZ).timestamp()
+    saturdays = [datetime(2026, 10, d, tzinfo=TZ).date() for d in (3, 10, 17, 24)]
+    first = Observation(id="anchor", kind="event", ts=datetime(2026, 10, 1, 9, tzinfo=TZ).timestamp(),
+                        end_ts=datetime(2026, 10, 1, 10, tzinfo=TZ).timestamp(), subject="Errand", category="errand")
+    two = [_yoga(d, n=i) for i, d in enumerate(saturdays[:2])]
+    assert not [p for p in miners.mine_all([first] + two, now, TZ) if p.subject == "fitness"]
+    # a third session on a different weekday adds no recurring weekday: still not a habit
+    sunday = datetime(2026, 10, 4, tzinfo=TZ).date()
+    two_weeks = two + [_yoga(sunday, n=9)]
+    assert not [p for p in miners.mine_all([first] + two_weeks, now, TZ) if p.subject == "fitness"]
+    three = [_yoga(d, n=i) for i, d in enumerate(saturdays[:3])]
+    (p,) = [p for p in miners.mine_all([first] + three, now, TZ) if p.subject == "fitness"]
+    assert p.window.weekdays == (5,) and p.support == 3 and p.opportunities == 4
+    four = [_yoga(d, n=i) for i, d in enumerate(saturdays)]
+    (p,) = [p for p in miners.mine_all([first] + four, now, TZ) if p.subject == "fitness"]
+    assert p.window.weekdays == (5,) and p.support == 4 and p.opportunities == 4
+    assert p.statement == "Your calendar usually has time to work out on Saturday mornings (7–8am); completion is unknown"
+
+
+def _titled(day, title, minute, n):
+    start = datetime.combine(day, datetime.min.time(), TZ) + timedelta(minutes=minute)
+    return Observation(id=f"{title}{n}", kind="event", ts=start.timestamp(), end_ts=start.timestamp() + 3600,
+                       subject=title, category="meeting")
+
+
+def test_titled_habit_counts_misses_only_since_it_first_appeared():
+    """Office hours that began in week 5 of 7 are three for three, not three of seven."""
+    now = datetime(2026, 10, 13, 12, 0, tzinfo=TZ).timestamp()
+    old = [_titled(datetime(2026, 8, 25, tzinfo=TZ).date() + timedelta(days=i), "Lab", 14 * 60, i)
+           for i in range(0, 14, 3)]
+    mondays = [datetime(2026, 9, d, tzinfo=TZ).date() for d in (21, 28)] + [datetime(2026, 10, 5, tzinfo=TZ).date()]
+    hours = [_titled(d, "Community office hours", 18 * 60, i) for i, d in enumerate(mondays)]
+    (p,) = [p for p in miners.mine_all(old + hours, now, TZ)
+            if p.kind == "habit" and p.stats.get("key_type") == "subject" and "office" in p.subject.lower()]
+    assert (p.support, p.opportunities, p.window.weekdays) == (3, 4, (0,))   # incl. Mon Oct 12
+    assert p.confidence >= 0.3
+
+
+def test_category_habit_still_counts_the_whole_history():
+    now = datetime(2026, 10, 13, 12, 0, tzinfo=TZ).timestamp()
+    anchor = _titled(datetime(2026, 8, 25, tzinfo=TZ).date(), "Kickoff", 9 * 60, 0)
+    sats = [datetime(2026, 9, 26, tzinfo=TZ).date() + timedelta(weeks=i) for i in range(3)]
+    (p,) = [p for p in miners.mine_all([anchor] + [_yoga(d, n=i) for i, d in enumerate(sats)], now, TZ)
+            if p.subject == "fitness"]
+    assert p.support == 3 and p.opportunities == 7       # every Saturday since Aug 25
+
+
+def test_harbor_usage_keeps_four_asks():
+    now = datetime(2026, 10, 13, 12, 0, tzinfo=TZ).timestamp()
+    tuesdays = [datetime(2026, 10, 13, 9, tzinfo=TZ) - timedelta(weeks=w) for w in (1, 2, 3)]
+    asks = [Observation(id=f"ask:{i}", kind="harbor_ask", ts=d.timestamp(), subject="email", source="harbor")
+            for i, d in enumerate(tuesdays)]
+    assert not [p for p in miners.mine_all(asks, now, TZ) if p.kind == "harbor_usage"]
+    more = asks + [Observation(id="ask:9", kind="harbor_ask",
+                               ts=(datetime(2026, 10, 13, 9, tzinfo=TZ) - timedelta(weeks=4)).timestamp(),
+                               subject="email", source="harbor")]
+    assert [p for p in miners.mine_all(more, now, TZ) if p.kind == "harbor_usage"]
+
+
+def test_wilson_lower_bound_prefers_more_evidence():
+    assert miners.wilson_lower(0, 0) == 0.0
+    assert miners.wilson_lower(4, 4) < miners.wilson_lower(40, 40) < 1.0
+    assert miners.wilson_lower(20, 24) < 20 / 24
+
+
+def test_pattern_ids_are_stable_hashes():
+    gym = miners.pattern_id("habit", "fitness", "0,2,4|morning")
+    assert gym == miners.pattern_id("habit", "fitness", "0,2,4|morning") and len(gym) == 16
+    assert gym != miners.pattern_id("habit", "fitness", "5|morning")
+
+
+def test_back_to_back_runs_ignore_double_bookings():
+    day = datetime(2026, 10, 6, tzinfo=TZ).date()
+
+    def ev(i, minute, dur):
+        start = datetime.combine(day, datetime.min.time(), TZ) + timedelta(minutes=minute)
+        return Observation(id=f"e{i}", kind="event", ts=start.timestamp(),
+                           end_ts=start.timestamp() + dur * 60, subject=f"M{i}", category="meeting")
+
+    slots = miners.assign_features(miners.build_slots(
+        [ev(1, 840, 30), ev(2, 875, 30), ev(3, 905, 30), ev(4, 950, 30), ev(5, 960, 60)], [], [], TZ))
+    by_id = {s.loc.obs.id: s for s in slots}
+    assert [by_id[i].position for i in ("e1", "e2", "e3")] == ["first", "middle", "last"]   # 5-min gaps join
+    assert by_id["e4"].run_len == 1 and by_id["e5"].run_len == 1   # e4 after a 15 min gap; e5 overlaps e4
+
+
+def test_categories_from_titles():
+    from service.behavior.categorize import categorize
+    assert categorize("Morning lift") == "fitness"
+    assert categorize("Cash runway review") == "meeting"          # "run" is a whole word only
+    assert categorize("Dev / Robin 1:1") == "one_on_one"
+    assert categorize("Sync with Dev") == "one_on_one"
+    assert categorize("Hiring sync") == "meeting"
+    assert categorize("Call Mom") == "call"
+    assert categorize("Customer call", {"attendees": ["a", "b", "c"]}) == "meeting"
+    assert categorize("Focus block") == "focus" and categorize("Team lunch") == "meal"
+    assert categorize("Dentist") == "health" and categorize("Flight to SFO") == "travel"
+    assert categorize("Zzz") == "other"
+
+
+def test_course_sessions_are_class_and_coursework_is_not():
+    """University calendars tag entries with a course code and rarely say "class";
+    work handed in on a due time must not become a class habit at 11:59pm."""
+    from service.behavior.categorize import categorize
+    for title in ("Attendance October 12 (Contains one question) [CMP-22-04]",
+                  "Office Hours with TA Imai [STAT-7-02]", "San Jose Community Office Hours",
+                  "Chem lab", "Physics recitation", "Study group"):
+        assert categorize(title) == "class", title
+    for title in ("HW1 [STAT-7-02]", "Week 3 Reading: Branching [CMP-22-04]",
+                  "Quiz 1- Requires Respondus LockDown Browser [CMP-22-04]",
+                  "NYT Discussion Post # 3 [CLNI-1-09]", "Plenary #1 Assignment [CLNI-1-09]",
+                  "PA 1 [CMP-22-04]", "Worksheet 1 [STAT-7-02]",
+                  "[OPS-123] Fix login", "Community Meetings with your RA [MANDATORY for On-Campus Frosh]"):
+        assert categorize(title) != "class", title
+    assert categorize("Q3 planning [OPS-12]") == "meeting"        # a ticket id is not a course
+
+
+def test_contact_spread_over_the_week_is_not_a_rhythm():
+    """Finding 4: when no weekday qualifies the miner used to emit weekdays=()
+    (= every day) with a bogus 0-60 minute window: "most afternoons (12–1am)"."""
+    base = datetime(2026, 9, 7, 15, 0, tzinfo=TZ)                 # a Monday afternoon
+    obs = []
+    for i, dd in enumerate((0, 1, 2, 3, 4, 12)):                   # one per weekday + a Saturday
+        t = (base + timedelta(days=dd)).timestamp()
+        obs.append(Observation(id=f"m{i}a", kind="message_in", ts=t, subject="Sam"))
+        if i < 3:
+            obs.append(Observation(id=f"m{i}b", kind="message_out", ts=t + 600, subject="Sam"))
+    pats = miners.mine_all(obs, (base + timedelta(days=20)).timestamp(), TZ)
+    sam = [p for p in pats if p.kind == "contact_rhythm" and p.subject == "Sam"]
+    assert sam == [] or all(p.window.weekdays and p.window.end_minute - p.window.start_minute > 0
+                            and "12–1am" not in p.statement for p in sam)
+    assert all(p.window.weekdays for p in pats if p.kind == "contact_rhythm")
+
+
+def test_fmt_range_midnight_end():
+    from service.behavior.timeutil import fmt_range
+    assert fmt_range(1380, 1440) == "11pm–12am"
+    assert fmt_range(14 * 60, 17 * 60) == "2–5pm" and fmt_range(405, 465) == "6:45–7:45am"
+    assert fmt_range(690, 780) == "11:30am–1pm" and fmt_range(0, 60) == "12–1am"
+
+
+def test_harbor_usage_statements_read_naturally():
+    now = datetime(2026, 10, 13, 12, 0, tzinfo=TZ).timestamp()
+    asks = []
+    for topic, hour in (("general", 9), ("web", 15), ("email", 18)):
+        for w in range(1, 6):
+            ts = (datetime(2026, 10, 13, hour, tzinfo=TZ) - timedelta(weeks=w)).timestamp()
+            asks.append(Observation(id=f"ask:{topic}{w}", kind="harbor_ask", ts=ts, subject=topic, source="harbor"))
+    stmts = {p.subject: p.statement for p in miners.mine_all(asks, now, TZ) if p.kind == "harbor_usage"}
+    assert stmts["general"].startswith("You usually use Harbor around 9")
+    assert stmts["web"].startswith("You look things up with Harbor around 3")
+    assert stmts["email"].startswith("You ask Harbor about email around 6")
