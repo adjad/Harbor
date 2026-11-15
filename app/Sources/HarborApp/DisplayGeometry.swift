@@ -9,17 +9,19 @@ import SwiftUI
 // Three styles, chosen per display:
 //   .notch    — a built-in display with a camera housing. Fused to the top
 //               edge and centred on the notch.
-//   .menuBar  — a built-in display without one (M1 Air, 13" Pro, iMac). Nothing
-//               is drawn at rest: a drawn notch there would cover app menus and
-//               window titles. The menu-bar icon is the visible anchor and
-//               carries the bar's status; pushing the pointer to the top-centre
-//               edge opens the same panel as a card just under the menu bar.
+//   .menuBar  — a built-in display without one (M1 Air, 13" Pro, iMac). A small
+//               black pill hangs from the top edge at the screen's centre,
+//               exactly as tall as the menu bar and no wider than a notch, so
+//               it sits inside the menu bar and covers only its empty middle.
+//               The panel grows out of it. While a full-screen app is in front
+//               it is an undrawn hitbox, with its status on the menu-bar icon.
 //   .floating — external monitors. Same hover-to-open behaviour and the same
 //               panel, but no notch is drawn: a detached capsule sits just
 //               under the menu bar and opens into a fully rounded card.
 //
-// The hybrid notch: on a notched display, while a full-screen app, video or
-// presentation is in front, the collapsed notch bar becomes an undrawn hitbox
+// The hybrid notch: on a notched display (and the notchless pill), while a
+// full-screen app, video or presentation is in front, the collapsed bar becomes
+// an undrawn hitbox
 // (see `CollapsedPresentation`) and its status moves to the menu-bar icon.
 
 /// The facts about one display that layout needs.
@@ -101,17 +103,13 @@ struct SurfaceLayout: Equatable {
     static let floatingGap: CGFloat = 8
     static let floatingBar = CGSize(width: 148, height: 28)
     static let screenMargin: CGFloat = 12
-    /// Menu bar only: the invisible top-centre target. As wide as a notch's zone,
-    /// but only the top few points of the menu bar, because on these displays app
-    /// menus and status items DO run under the centre: people hover them at the
-    /// menu bar's middle, while the open gesture is a push against the top edge
-    /// (macOS pins the pointer there, so a thin strip is easy to hit).
-    static let edgeZoneWidth: CGFloat = 240
-    static let edgeZoneDepth: CGFloat = 4
-    /// Menu bar only: the never-drawn shape the card grows out of and gathers
-    /// back into, at the top-centre of the card. Small, so the close ends on
-    /// almost nothing rather than on a shape that then vanishes.
-    static let edgeSeed = CGSize(width: 64, height: 12)
+    /// Menu bar only: the resting pill. On a 13" MacBook Pro the first size (176 pt
+    /// wide, the menu bar's full height) was too big: this is a barely visible sliver
+    /// hanging from the top edge. Moving the pointer to the top edge above it (or
+    /// clicking it, or Option-Space) still opens the panel; the hover zone is wider
+    /// than the sliver. Never taller than the menu bar.
+    static let restingPillWidth: CGFloat = 96
+    static let restingPillHeight: CGFloat = 6
     /// Menu bar heights: macOS's standard, used when the menu bar is hidden
     /// (auto-hide) and the display reports no height of its own.
     static let standardMenuBarHeight: CGFloat = 24
@@ -121,15 +119,16 @@ struct SurfaceLayout: Equatable {
     let usableFrame: CGRect
     let notchSize: CGSize
     var expandedWidth: CGFloat
-    /// The collapsed window. On .menuBar it is never drawn and lets clicks
-    /// through to the menu bar under it (see `barIsVisible`).
+    /// The collapsed window, and exactly the shape drawn in it: its hit area
+    /// is this frame and no more, so clicks beside it reach the menu bar. It
+    /// is undrawn and click-through only as a hitbox (see `barIsVisible`).
     let barFrame: CGRect
     /// Screen coordinates in which the pointer counts as "at the bar".
     let hoverZone: CGRect
     /// Whether the display has a camera housing (see `CollapsedPresentation`).
     var displayHasNotch = false
     /// Whether a full-screen app, video or presentation is in front on this
-    /// display. Only ever set on a notched display (DisplayGeometry's watch).
+    /// display. Only ever set on a built-in display (DisplayGeometry's watch).
     var frontmostFullScreen = false
 
     /// How the collapsed bar presents right now: drawn, or an undrawn hitbox.
@@ -137,25 +136,25 @@ struct SurfaceLayout: Equatable {
         CollapsedPresentation.decide(style: style, displayHasNotch: displayHasNotch,
                                      frontmostFullScreen: frontmostFullScreen)
     }
-    /// Whether anything is drawn while collapsed. False on .menuBar, and on a
-    /// notch behind a full-screen app; the collapsed window then also ignores
-    /// the mouse, so the menu bar or the app under it keeps every click.
+    /// Whether anything is drawn while collapsed. False on a notch or a
+    /// notchless pill behind a full-screen app; the collapsed window then also
+    /// ignores the mouse, so the menu bar or the app under it keeps every click.
     var barIsVisible: Bool { presentation.mode == .bar }
     /// Whether the menu-bar icon carries the bar's status (working, ready, due
     /// today, not set up), because there is no visible bar to carry it.
     var statusInMenuBar: Bool { presentation.statusInMenuBar }
     /// How long the pointer must rest in the zone. Longer wherever nothing is
-    /// drawn: on .menuBar the zone shares the top edge with whatever menu sits
-    /// under the centre, and over a full-screen video a brush on the way to the
-    /// hidden menu bar should not open Harbor on top of it.
-    var hoverDwell: TimeInterval { barIsVisible ? HoverIntent.dwell : 0.2 }
+    /// drawn (over a full-screen video a brush on the way to the hidden menu
+    /// bar should not open Harbor on top of it), and on .menuBar, whose pill
+    /// shares the strip with the menus and status items beside it.
+    var hoverDwell: TimeInterval { barIsVisible && style != .menuBar ? HoverIntent.dwell : 0.2 }
     /// The first-run tip, naming where Harbor lives on this display.
     var firstRunTip: String {
         let place: String
         switch style {
         case .notch: place = "Harbor lives in the notch now. Press ⌥Space or hover here to ask."
-        case .menuBar: place = "Harbor lives at the top of your screen. Press ⌥Space, push the pointer "
-            + "to the top centre, or click the Harbor icon in the menu bar to ask."
+        case .menuBar: place = "Harbor lives at the top of your screen. Press ⌥Space, hover the black "
+            + "pill at the top centre, or click the Harbor icon in the menu bar to ask."
         case .floating: place = "Harbor lives at the top of your screen. Press ⌥Space or hover here to ask."
         }
         return place + " Click Harbor in the Dock for the full window."
@@ -163,17 +162,32 @@ struct SurfaceLayout: Equatable {
     var barCornerRadius: CGFloat {
         switch style {
         case .notch: return 10
-        case .menuBar: return Self.edgeSeed.height / 2
+        case .menuBar: return 3          // the sliver is 6 pt tall
         case .floating: return 14
         }
     }
     var panelCornerRadius: CGFloat { style == .notch ? 28 : 24 }
-    /// SwiftUI content sits below the camera housing on a notch; a card just
-    /// needs ordinary padding.
-    var contentTopInset: CGFloat { style == .notch ? notchSize.height + 8 : 16 }
-    var windowLevel: NSWindow.Level { style == .notch ? .statusBar : .floating }
+    /// Whether the open panel hangs from the screen's top edge (flat top): on a
+    /// notch, and on a built-in display without one, where it covers the menu
+    /// bar's empty centre. A monitor's card floats under the menu bar instead.
+    private var hangsFromTopEdge: Bool { style == .notch || style == .menuBar }
+    /// SwiftUI content sits below the camera housing on a notch, and below the
+    /// menu bar's strip on a notchless built-in display; a card just needs
+    /// ordinary padding.
+    var contentTopInset: CGFloat {
+        switch style {
+        case .notch: return notchSize.height + 8
+        case .menuBar: return max(screenFrame.maxY - usableFrame.maxY, 0) + 8
+        case .floating: return 16
+        }
+    }
+    /// Level of the strip the panel and the resting pill hang over; it must sit
+    /// above the menu bar's own window to be seen there, as on a notch. The
+    /// collapsed window is only the pill's own frame, so the bar's clicks
+    /// beside it are never blocked.
+    var windowLevel: NSWindow.Level { hangsFromTopEdge ? .statusBar : .floating }
     var maskedCorners: CACornerMask {
-        style == .notch ? [.layerMinXMinYCorner, .layerMaxXMinYCorner]
+        hangsFromTopEdge ? [.layerMinXMinYCorner, .layerMaxXMinYCorner]
                         : [.layerMinXMinYCorner, .layerMaxXMinYCorner,
                            .layerMinXMaxYCorner, .layerMaxXMaxYCorner]
     }
@@ -206,17 +220,17 @@ struct SurfaceLayout: Equatable {
     }
 
     func shape(radius: CGFloat) -> UnevenRoundedRectangle {
-        let top: CGFloat = style == .notch ? 0 : radius
+        let top: CGFloat = hangsFromTopEdge ? 0 : radius
         return UnevenRoundedRectangle(topLeadingRadius: top, bottomLeadingRadius: radius,
                                       bottomTrailingRadius: radius, topTrailingRadius: top)
     }
     var panelShape: UnevenRoundedRectangle { shape(radius: panelCornerRadius) }
     var barShape: UnevenRoundedRectangle { shape(radius: barCornerRadius) }
 
-    /// Top of the expanded panel: the screen edge on a notch, just under the menu
-    /// bar otherwise.
+    /// Top of the expanded panel: the screen edge on a notch or a notchless
+    /// built-in display, just under the menu bar on a monitor.
     private var panelTop: CGFloat {
-        style == .notch ? screenFrame.maxY : usableFrame.maxY - Self.floatingGap
+        hangsFromTopEdge ? screenFrame.maxY : usableFrame.maxY - Self.floatingGap
     }
 
     /// The tallest the expanded panel gets: from its top to a margin above the
@@ -256,6 +270,11 @@ struct SurfaceLayout: Equatable {
         return max(room.rounded(.down), Self.minTabScroll)
     }
 
+    /// The horizontal centre the panel and the bar share: the display's own on
+    /// a notch and on the pill (a side Dock shifts `usableFrame`, not the pill),
+    /// the usable area's under a monitor's menu bar.
+    private var anchorMidX: CGFloat { style == .floating ? usableFrame.midX : screenFrame.midX }
+
     /// The Study tab is lists and reading (a guide can run a thousand points), so
     /// it stops at half the screen and scrolls: 491 pt on a 982 pt screen.
     static let studyScreenShare: CGFloat = 0.5
@@ -278,7 +297,7 @@ struct SurfaceLayout: Equatable {
     func expandedFrame(contentHeight: CGFloat) -> CGRect {
         let top = panelTop
         let height = min(contentHeight, maxPanelHeight)
-        return CGRect(x: (usableFrame.midX - expandedWidth / 2).rounded(),
+        return CGRect(x: (anchorMidX - expandedWidth / 2).rounded(),
                       y: (top - height).rounded(), width: expandedWidth, height: height)
     }
 
@@ -317,18 +336,21 @@ struct SurfaceLayout: Equatable {
                                  expandedWidth: centrable(width, in: frame.width, .down), barFrame: bar,
                                  hoverZone: notchZone(around: bar, top: frame.maxY))
         case .menuBar:
-            // Under the menu bar, even while it is auto-hidden (visibleFrame then
-            // reaches the top edge, and a card there would sit on the menu bar when
-            // it slides back in).
+            // `usable` is the area under the menu bar, even while it is auto-hidden
+            // (visibleFrame then reaches the top edge); its top is how deep the
+            // panel's menu-bar strip reaches. The pill and the panel it grows
+            // into hang from the screen's top edge, like a notch's, centred on
+            // the display (not on `usable`, which a side Dock shifts) and as tall
+            // as the menu bar at most, so the pill never reaches below it.
             var usable = metrics.visibleFrame
             usable.size.height = min(usable.height, frame.maxY - metrics.menuBarHeight - usable.minY)
-            let seed = edgeSeed
-            let bar = CGRect(x: (usable.midX - seed.width / 2).rounded(),
-                             y: (usable.maxY - floatingGap - seed.height).rounded(),
-                             width: seed.width, height: seed.height)
+            let barW = centrable(restingPillWidth, in: frame.width, .up)
+            let barH = min(restingPillHeight, metrics.menuBarHeight.rounded())
+            let bar = CGRect(x: (frame.midX - barW / 2).rounded(), y: frame.maxY - barH,
+                             width: barW, height: barH)
             return SurfaceLayout(style: .menuBar, screenFrame: frame, usableFrame: usable, notchSize: .zero,
                                  expandedWidth: width, barFrame: bar,
-                                 hoverZone: edgeZone(centredOn: frame.midX, top: frame.maxY))
+                                 hoverZone: notchZone(around: bar, top: frame.maxY))
         case .floating:
             let usable = metrics.visibleFrame
             let size = floatingBar
@@ -341,7 +363,7 @@ struct SurfaceLayout: Equatable {
         }
     }
 
-    /// The notch's hover zone: wide, covering the upper part of the notch and the
+    /// The notch's hover zone (also the notchless pill's): wide, covering the upper part of the notch and the
     /// screen's top edge, and stopping above the notch's bottom strip.
     ///
     /// The top reaches ONE POINT past the screen edge on purpose. macOS clamps a
@@ -352,13 +374,6 @@ struct SurfaceLayout: Equatable {
         let lower = bar.minY + bar.height * notchHoverBottomExclusion
         return CGRect(x: bar.minX - notchHoverMarginX, y: lower,
                       width: bar.width + 2 * notchHoverMarginX, height: top + 1 - lower)
-    }
-
-    /// The menu bar's invisible zone: a thin strip along the top-centre edge,
-    /// reaching one point past it for the same reason as the notch's.
-    private static func edgeZone(centredOn midX: CGFloat, top: CGFloat) -> CGRect {
-        CGRect(x: (midX - edgeZoneWidth / 2).rounded(), y: top - edgeZoneDepth,
-               width: edgeZoneWidth, height: edgeZoneDepth + 1)
     }
 
     private static func zone(around bar: CGRect, top: CGFloat) -> CGRect {
@@ -428,10 +443,10 @@ struct MenuBarStatus: Equatable {
 ///   ⌥Space and the menu-bar icon still open Harbor. The bar's status marks move
 ///   to the menu-bar icon so they aren't lost.
 ///
-/// A notch turns into a hitbox while a full-screen app, video or presentation
-/// is in front on its display: the drawn bar there covered the app and took its
-/// clicks. Built-in displays without a notch are always a hitbox (.menuBar);
-/// monitors always keep their capsule.
+/// A notch, and the notchless built-in display's pill (.menuBar), turn into a
+/// hitbox while a full-screen app, video or presentation is in front on their
+/// display: the drawn bar there covered the app and took its clicks. Monitors
+/// always keep their capsule.
 struct CollapsedPresentation: Equatable {
     enum Mode: Equatable { case bar, hitbox }
     let mode: Mode
@@ -440,10 +455,13 @@ struct CollapsedPresentation: Equatable {
     static func decide(style: SurfaceLayout.Style, displayHasNotch: Bool,
                        frontmostFullScreen: Bool) -> CollapsedPresentation {
         switch style {
+        case .menuBar where frontmostFullScreen,
+             .notch where displayHasNotch && frontmostFullScreen:
+            return CollapsedPresentation(mode: .hitbox, statusInMenuBar: true)
         case .menuBar:
-            return CollapsedPresentation(mode: .hitbox, statusInMenuBar: true)
-        case .notch where displayHasNotch && frontmostFullScreen:
-            return CollapsedPresentation(mode: .hitbox, statusInMenuBar: true)
+            // The notchless sliver is too thin for the count or the "!", so the
+            // menu-bar icon carries them, as it does in full screen.
+            return CollapsedPresentation(mode: .bar, statusInMenuBar: true)
         case .notch, .floating:
             return CollapsedPresentation(mode: .bar, statusInMenuBar: false)
         }
@@ -697,11 +715,12 @@ final class DisplayGeometry: ObservableObject {
     /// The safety net's period, for what no notification announces: a player's
     /// or game's own borderless full-screen window, or a missed event. One
     /// window-list read (about a millisecond), coalesced by a wide tolerance,
-    /// and only while a notched display hosts Harbor.
+    /// and only while a built-in display hosts Harbor.
     static let pollInterval: TimeInterval = 3
 
     /// Whether the target display's bar can change with full screen at all.
-    /// Only a notched display's can; nothing is watched otherwise.
+    /// A notched display's and a notchless built-in display's pill can; a
+    /// monitor's capsule cannot, so nothing is watched there.
     private var watchesFullScreen: Bool {
         guard let target = SurfaceLayout.target(from: displays) else { return false }
         return CollapsedPresentation.watchesFullScreen(
@@ -735,7 +754,7 @@ final class DisplayGeometry: ObservableObject {
         fullScreenPoll = timer
     }
 
-    /// Look again whether a full-screen app is in front on the notched display,
+    /// Look again whether a full-screen app is in front on the built-in display,
     /// and switch the bar between drawn and hitbox if that changed. Reads the
     /// display fresh, since its visible frame follows the menu bar.
     func checkFullScreen() {
