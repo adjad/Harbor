@@ -2756,15 +2756,16 @@ print('external venv readable; private home and writes denied')
         workflow = (ROOT / ".github/workflows/harbor-build.yml").read_text()
         commands = [line.strip() for line in workflow.splitlines()
                     if "./scripts/harbor-build preview" in line or "./scripts/harbor-build all" in line]
-        self.assertEqual(len(commands), 4)          # PR preview, full, release rebuild, ad-hoc rebuild
+        self.assertEqual(len(commands), 5)          # PR preview, push preview, full, release rebuild, ad-hoc rebuild
         for command in commands:
             self.assertIn("--fetch-engine", command)
             self.assertNotIn("--engine-app", command)
 
-    def test_main_tags_and_dispatch_keep_the_unchanged_full_gate(self):
+    def test_tags_and_dispatch_keep_the_unchanged_full_gate(self):
         workflow = (ROOT / ".github/workflows/harbor-build.yml").read_text()
         full = self.workflow_job(workflow, "full")
-        self.assertIn("    if: github.event_name != 'pull_request'\n", full)
+        self.assertIn("    if: github.event_name == 'workflow_dispatch' || "
+                      "(github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))\n", full)
         self.assertIn("./scripts/harbor-build all --strict-toolchain --fetch-engine --output dist/candidate", full)
         for step in ("Qualify isolated signed ACL replacement on disposable macOS", "Upload verified candidate",
                      "Verify synthetic publisher signatures and provisioning transactions",
@@ -2796,7 +2797,7 @@ print('external venv readable; private home and writes denied')
         verify = self.workflow_job(workflow, "verify")
         self.assertEqual(workflow.count("name: Verified macOS artifact\n"), 1)
         self.assertIn("    name: Verified macOS artifact\n", verify)
-        self.assertIn("    needs: [preview, simulation-qa, full]\n", verify)
+        self.assertIn("    needs: [preview, simulation-qa, push-build, full]\n", verify)
         self.assertIn("    if: ${{ !cancelled() }}\n", verify)
         self.assertIn("    permissions: {}\n", verify)
         self.assertNotIn("actions/checkout", verify)
@@ -2807,7 +2808,8 @@ print('external venv readable; private home and writes denied')
                        "QA_SHA: ${{ needs.simulation-qa.outputs.sha }}", "PREVIEW_RESULT: ${{ needs.preview.result }}",
                        "QA_RESULT: ${{ needs.simulation-qa.result }}", "FULL_RESULT: ${{ needs.full.result }}"):
             self.assertIn(needle, verify)
-        self.assertEqual(verify.count("exit 1"), 2)
+        self.assertIn('"$PUSH_RESULT@$PUSH_SHA" != "success@$CANDIDATE_SHA"', verify)
+        self.assertEqual(verify.count("exit 1"), 3)   # pull request, push to a branch, tag or dispatch
 
     def test_pull_request_regressions_run_only_modules_outside_simulation_qa(self):
         workflow = (ROOT / ".github/workflows/regression-gate.yml").read_text()
