@@ -301,6 +301,11 @@ final class BackendManager {
                 do {
                     try Self.publishRuntimeReceipt(generation: snapshot.generation, pid: proc.processIdentifier,
                                                    configDigest: configDigest)
+                } catch BackendCredentials.Failure.unavailable {
+                    // The receipt couldn't be written (lsof slower than its 3 s bound on a
+                    // slow Mac, or no room for the file). Nothing about the child is in
+                    // doubt, so the healthy service keeps running without a receipt.
+                    NSLog("Harbor: runtime receipt not written (unavailable); the service keeps running")
                 } catch {
                     credentialState.quarantine()
                     proc.terminate()
@@ -323,6 +328,12 @@ final class BackendManager {
                 credentialState.quarantine()
             }
             _ = enforceCredentialState()
+            // Any other error here is `proc.run()` failing: the service's own program
+            // could not be launched. Say so instead of leaving a long "Starting Harbor…".
+            if !(error is BackendCredentials.Failure) {
+                let ns = error as NSError
+                startBlocked(Self.launchFailedReason(domain: ns.domain, code: ns.code))
+            }
         }
     }
 
@@ -383,6 +394,14 @@ final class BackendManager {
         + "Retry; if it keeps failing, quit and reopen Harbor."
     nonisolated static let missingFilesReason = "Some of Harbor's own files are missing, so it can't start. "
         + "Download Harbor again and replace this copy."
+    /// The service's own program could not be launched (missing, not executable, the
+    /// wrong architecture, or blocked by macOS). Only the error's domain and code are
+    /// named: never its description, which can carry a path from this Mac.
+    nonisolated static func launchFailedReason(domain: String, code: Int) -> String {
+        "Harbor couldn't launch its own service (macOS error \(domain) \(code)). "
+            + "If you just downloaded Harbor, move it to Applications and open it again; "
+            + "otherwise download Harbor again and replace this copy."
+    }
 
     /// The child to keep: nil for one that has exited.
     nonisolated static func liveChild(_ process: Process?) -> Process? {

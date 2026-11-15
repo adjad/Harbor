@@ -193,14 +193,21 @@ struct NotchBriefView: View {
 
     /// What Harbor read to make the Brief, beside Ask about this: the whole line
     /// when it fits, else without what was found (the cards and rows show that).
+    /// With a cloud model, the line also names it ("· Gemini 3.8 Flash").
     @ViewBuilder private func workLine(_ proactive: ProactiveState) -> some View {
-        if let full = proactive.workLine {
-            let short = proactive.workLine(short: true) ?? full
+        let cloud = model.cloudModel
+        if let read = proactive.workLine {
+            let full = cloud.map { read + " · " + $0 } ?? read
+            let short = (proactive.workLine(short: true) ?? read) + (cloud.map { " · " + $0 } ?? "")
             ViewThatFits(in: .horizontal) {
                 Text(full)
                 Text(short).help(full)
+                // The model's name stays even when the read counts don't fit.
+                Text(cloud ?? (proactive.workLine(short: true) ?? read)).help(full)
             }
             .font(.harbor(size: 11.5)).foregroundStyle(Theme.textMuted).lineLimit(1)
+        } else if let cloud {
+            Text(cloud).font(.harbor(size: 11.5)).foregroundStyle(Theme.textMuted).lineLimit(1)
         }
     }
 

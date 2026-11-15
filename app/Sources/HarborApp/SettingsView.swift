@@ -9,7 +9,7 @@ extension Notification.Name {
     static let harborExportDebugLog = Notification.Name("HarborExportDebugLog")
 }
 
-private enum CloudCredentialError: LocalizedError {
+enum CloudCredentialError: LocalizedError {
     case invalidKey
     case storage
 
@@ -21,10 +21,30 @@ private enum CloudCredentialError: LocalizedError {
     }
 }
 
+/// What the Cloud form and the Intel first run share: the Keychain account name
+/// for a new key and the POST /inference/cloud body.
+enum CloudConnection {
+    static func newCredentialName() -> String {
+        "cloud-" + UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+    }
+
+    static func requestBody(provider: String, baseURL: String, apiPrefix: String, modelID: String,
+                            contextWindow: Int, roles: [String], superModelEnabled: Bool,
+                            credentialName: String) -> [String: Any] {
+        [
+            "provider": provider, "base_url": baseURL,
+            "api_prefix": apiPrefix, "model_id": modelID,
+            "context_window": contextWindow, "roles": roles,
+            "super_model_enabled": superModelEnabled,
+            "credential_name": credentialName,
+        ]
+    }
+}
+
 /// Provider keys never enter YAML, URL requests to Harbor, logs, or debug exports.
 /// The account name binds each key to its normalized HTTPS origin, matching the
 /// backend's provider_credentials.keychain_account contract.
-private enum CloudCredentialStore {
+enum CloudCredentialStore {
     #if HARBOR_SETTINGS_QA
     static let service = "com.harbor.settings-qa.inference"
     #else
@@ -253,15 +273,6 @@ final class SettingsLoader: ObservableObject {
     private var confirmedIdleMinutes: Double = 5
     private var idleSaveGeneration = 0
     @Published var humanizerEnabled = false
-    /// "Gemini handles everything" (Advanced): a Gemini API connection exists to run
-    /// it on, whether it is saved on, and a switch in flight or its last problem.
-    @Published var geminiEverythingAvailable = false
-    @Published var geminiEverythingEnabled = false
-    @Published var geminiEverythingBusy = false
-    @Published var geminiEverythingProblem: String?
-    /// A cloud role or Super Model is on: those requests use the cloud provider even
-    /// while the switch is off, so the Off caption must not say everything stays here.
-    @Published var geminiCloudRolesOn = false
     @Published var behaviorEnabled: Bool? = nil
     @Published var behaviorChanging = false
     @Published var behaviorStatus: String?
@@ -313,6 +324,7 @@ final class SettingsLoader: ObservableObject {
         }
         return localProviderStatus
     }
+    private var intelPresetApplied = false
     private var savedCloudBaseURL = ""
     private var savedCloudCredentialName = "cloud"
 
@@ -321,10 +333,8 @@ final class SettingsLoader: ObservableObject {
                             baseURL: "https://openrouter.ai", apiPrefix: "/api/v1"),
         CloudProviderPreset(id: "openai", label: "OpenAI", provider: "openai-compatible",
                             baseURL: "https://api.openai.com", apiPrefix: "/v1"),
-        // The Gemini API's own provider: pinned by the service to Google's origin and
-        // prefix, and its tool steps carry their thought signatures back.
-        CloudProviderPreset(id: "gemini", label: "Gemini API", provider: "gemini",
-                            baseURL: "https://generativelanguage.googleapis.com", apiPrefix: "/v1beta/openai"),
+        CloudProviderPreset(id: "gemini", label: CloudProvider.gemini.label, provider: CloudProvider.gemini.provider,
+                            baseURL: CloudProvider.gemini.baseURL, apiPrefix: CloudProvider.gemini.apiPrefix),
         CloudProviderPreset(id: "custom", label: "OpenAI-compatible", provider: "openai-compatible",
                             baseURL: "", apiPrefix: "/v1"),
     ]
@@ -333,6 +343,7 @@ final class SettingsLoader: ObservableObject {
     // The backend still honours `everything` set in config by hand; the
     // caption below then says so, and Disconnect returns to local models.
     let cloudRoleOptions = [
+        (id: "everything", label: "Everything"),
         (id: "reasoning", label: "Reasoning"),
         (id: "coding", label: "Coding"),
         (id: "research", label: "Research"),
@@ -377,6 +388,19 @@ final class SettingsLoader: ObservableObject {
         return OverlayModel.abbrev(model)
     }
 
+    /// A cloud row's model: the cloud model's name when "everything" is saved (the
+    /// local roles still hold their on-device defaults then), else the role's own.
+    func cloudRowLabel(for role: String) -> String {
+        guard savedCloudRoles.contains("everything") else { return savedModelLabel(for: role) }
+        return Self.cloudModelName(cloudModelID)
+    }
+
+    /// The cloud model's name ("Gemini 3.8 Flash"); a plain fallback before it is known.
+    nonisolated static func cloudModelName(_ id: String) -> String {
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "Cloud model" : CloudModelName.model(trimmed)
+    }
+
     func refresh() {
         Task {
             let m = await client.models()
@@ -393,7 +417,6 @@ final class SettingsLoader: ObservableObject {
             await self.refreshAttachmentBackground()
             await self.refreshCloud()
             await self.refreshLocalProvider()
-            await self.refreshGeminiEverything()
         }
     }
 
@@ -768,15 +791,12 @@ final class SettingsLoader: ObservableObject {
         let provider = object["provider"] as? String ?? "openrouter"
         if provider == "openrouter" {
             cloudPreset = "openrouter"
-        } else if provider == "gemini" {
+        } else if CloudProvider.saved(provider: provider, baseURL: cloudBaseURL) == .gemini {
             cloudPreset = "gemini"
         } else if cloudBaseURL == "https://api.openai.com" {
             cloudPreset = "openai"
         } else if cloudBaseURL == "https://generativelanguage.googleapis.com" {
-            // Saved by an earlier build as OpenAI-compatible: the next save uses the
-            // Gemini API provider, which the service pins to this exact prefix.
             cloudPreset = "gemini"
-            cloudAPIPrefix = "/v1beta/openai"
         } else {
             cloudPreset = "custom"
         }
@@ -801,6 +821,29 @@ final class SettingsLoader: ObservableObject {
             cloudStateUnknown = true
             cloudStatus += ". Keychain cleanup is pending; cloud changes are paused until Refresh models succeeds"
         }
+        if !cloudConnected { await preselectIntelPreset() }
+    }
+
+    /// On the Intel build (no local engine) with nothing configured, the form opens
+    /// on the same values the first run uses, so only the key needs typing.
+    private func preselectIntelPreset() async {
+        guard IntelCloudPreset.compiledForIntel, !intelPresetApplied, !cloudConnected,
+              cloudRoles.isEmpty, cloudAPIKey.isEmpty else { return }
+        var request = URLRequest(url: HarborClient.baseURL.appendingPathComponent("setup/status"))
+        request.timeoutInterval = 10
+        guard let (data, _) = try? await URLSession.shared.data(for: request),
+              let status = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              IntelCloudPreset.offersKeyOnlySetup(
+                compiledForIntel: IntelCloudPreset.compiledForIntel,
+                engineAvailable: (status["bundled_engine"] as? [String: Any])?["available"] as? Bool),
+              !cloudConnected, !intelPresetApplied else { return }
+        intelPresetApplied = true
+        cloudPreset = "openrouter"
+        cloudBaseURL = IntelCloudPreset.baseURL
+        cloudAPIPrefix = IntelCloudPreset.apiPrefix
+        cloudModelID = IntelCloudPreset.modelID
+        cloudContextWindow = IntelCloudPreset.contextWindow
+        cloudRoles = Set(IntelCloudPreset.roles)
     }
 
     func connectCloud() {
@@ -820,7 +863,7 @@ final class SettingsLoader: ObservableObject {
         let previousCredentialName = savedCloudCredentialName
         let requestedCredentialName = requestedKey.isEmpty
             ? previousCredentialName
-            : "cloud-" + UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+            : CloudConnection.newCredentialName()
         let pendingConnect = PendingCloudCredential(
             mode: "connect", staged: !requestedKey.isEmpty,
             name: requestedCredentialName, baseURL: requestedBase,
@@ -851,13 +894,12 @@ final class SettingsLoader: ObservableObject {
                                                   baseURL: requestedBase)
                     stagedCredential = true
                 }
-                let body: [String: Any] = [
-                    "provider": requestedPreset.provider, "base_url": requestedBase,
-                    "api_prefix": requestedPrefix, "model_id": requestedModel,
-                    "context_window": requestedContext, "roles": requestedRoles,
-                    "super_model_enabled": requestedSuperModel,
-                    "credential_name": requestedCredentialName,
-                ]
+                let body = CloudConnection.requestBody(
+                    provider: requestedPreset.provider, baseURL: requestedBase,
+                    apiPrefix: requestedPrefix, modelID: requestedModel,
+                    contextWindow: requestedContext, roles: requestedRoles,
+                    superModelEnabled: requestedSuperModel,
+                    credentialName: requestedCredentialName)
                 var object: [String: Any]?
                 var requestError: Error?
                 var recoveredStatus: String?
@@ -1039,41 +1081,6 @@ final class SettingsLoader: ObservableObject {
             }
             cloudSaving = false
             await PendingConfigWrites.shared.end()
-        }
-    }
-
-    func refreshGeminiEverything() async {
-        guard !geminiEverythingBusy,
-              let object = try? await request("GET", path: "inference/cloud/everything") else { return }
-        geminiEverythingAvailable = object["available"] as? Bool == true
-        geminiEverythingEnabled = object["enabled"] as? Bool == true
-        geminiCloudRolesOn = object["cloud_roles_on"] as? Bool == true
-    }
-
-    /// Saves the switch, then restarts Harbor's service so every part of Harbor moves to
-    /// (or back from) the cloud model together. Turning it on reads and tests the
-    /// Gemini key first, so it can wait on macOS's Keychain question.
-    func setGeminiEverything(_ on: Bool) async {
-        guard !geminiEverythingBusy else { return }
-        geminiEverythingBusy = true
-        geminiEverythingProblem = nil
-        defer { geminiEverythingBusy = false }
-        do {
-            let object = try await request("POST", path: "inference/cloud/everything",
-                                           body: ["enabled": on], timeout: 200)
-            geminiEverythingAvailable = object["available"] as? Bool == true
-            geminiEverythingEnabled = object["enabled"] as? Bool == true
-            geminiCloudRolesOn = object["cloud_roles_on"] as? Bool == true
-            if object["restart_required"] as? Bool == true {
-                NotificationCenter.default.post(name: .harborRestartBackend, object: nil)
-            }
-        } catch {
-            geminiEverythingProblem = (error as? CloudSettingsError)?.localizedDescription
-                ?? "Harbor couldn't change this setting. Try again."
-            if let object = try? await request("GET", path: "inference/cloud/everything") {
-                geminiEverythingAvailable = object["available"] as? Bool == true
-                geminiEverythingEnabled = object["enabled"] as? Bool == true
-            }
         }
     }
 
@@ -1620,6 +1627,16 @@ struct SettingsView: View {
     static let paneKey = "HarborSettingsPane"
     static let modelsPaneKey = "HarborModelsPane"
     private var palette: ThemePalette { embedded ? .harborWindow : .notch }
+    /// An Intel build with no engine: Harbor runs on OpenRouter, so engine, local-model
+    /// and setup-guide controls lead nowhere.
+    private var intelNoEngine: Bool {
+        QuickSettingsText.noLocalEngine(remoteOnly: false, compiledForIntel: IntelCloudPreset.compiledForIntel,
+                                        engineAvailable: setup?.status?.bundledEngine?.available)
+    }
+    /// No model runs on this Mac: remote-only, or the Intel build with no engine.
+    private var noLocalEngine: Bool {
+        intelNoEngine || setup?.status?.remoteOnly == true
+    }
     @ObservedObject private var sync = SyncProgress.shared
     // Keep the last-used settings pane so reopening Settings returns to the
     // user's context when the window opens again.
@@ -1633,85 +1650,6 @@ struct SettingsView: View {
     @ObservedObject private var browserPrivacySync = BrowserHistoryReader.delivery
     @ObservedObject private var contactsPrivacySync = ContactsReader.delivery
     @State private var confirmForgetBehavior = false
-    @State private var confirmGeminiEverything = false
-    /// Set once the person has read and accepted what leaves the Mac; later turns
-    /// on skip the question. Turning it off never asks.
-    @AppStorage("HarborGeminiEverythingConsented") private var geminiEverythingConsented = false
-
-    /// What leaves the Mac while Gemini handles everything, said before it is turned on.
-    static let geminiEverythingDisclosure =
-        "While this is on, everything Harbor reads to answer you goes to Google's Gemini API: "
-        + "your questions, your voice recordings and meeting audio, and the mail, messages, "
-        + "calendar, reminders, notes, files, pictures and screen captures it uses for them, "
-        + "plus what it reads in the background for the Brief and Day. Google's terms for your "
-        + "API key apply. Turn it off to go back to the on-device model, which stays installed "
-        + "(cloud roles or Super Model you set in Models › Cloud keep using the cloud). "
-        + "Read-aloud stays on this Mac."
-
-    @ViewBuilder private var geminiEverythingRow: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Toggle(isOn: Binding(
-                get: { loader.geminiEverythingEnabled },
-                set: { on in
-                    if on && !geminiEverythingConsented {
-                        confirmGeminiEverything = true
-                    } else {
-                        Task { await loader.setGeminiEverything(on) }
-                    }
-                })) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Gemini handles everything")
-                        .font(.system(size: 14, weight: .medium))
-                    Text(loader.geminiEverythingEnabled
-                         ? "On. Ask, Brief, Day, pictures, voice recordings, meetings and "
-                           + "background work run on Gemini through your API key, and your data "
-                           + "goes to Google to do it. "
-                           + "Turn off to go back to the private on-device model."
-                         : loader.geminiCloudRolesOn
-                         ? "Off. Ask, Brief and Day run on the on-device model; the cloud roles "
-                           + "or Super Model you chose in Models › Cloud still use your cloud provider."
-                         : loader.geminiEverythingAvailable
-                         ? "Off. Everything runs on the on-device model and stays on this Mac."
-                         : "Off. Connect a Gemini API key in Models › Cloud first.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    if loader.geminiEverythingBusy {
-                        Text(loader.geminiEverythingEnabled ? "Switching back to this Mac…"
-                                                            : "Checking your Gemini key…")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    if let problem = loader.geminiEverythingProblem {
-                        Text(problem)
-                            .font(.caption)
-                            .foregroundStyle(.orange)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-            }
-            .toggleStyle(.switch)
-            .tint(palette.accent)
-            .disabled(loader.geminiEverythingBusy
-                      || (!loader.geminiEverythingAvailable && !loader.geminiEverythingEnabled))
-            if !loader.geminiEverythingAvailable && !loader.geminiEverythingEnabled {
-                Button("Set up Gemini in Cloud…") {
-                    selectedPane = "models"
-                    modelsPane = "cloud"
-                }
-                .controlSize(.small)
-            }
-        }
-        .alert("Let Gemini handle everything?", isPresented: $confirmGeminiEverything) {
-            Button("Cancel", role: .cancel) {}
-            Button("Turn On") {
-                geminiEverythingConsented = true
-                Task { await loader.setGeminiEverything(true) }
-            }
-        } message: {
-            Text(Self.geminiEverythingDisclosure)
-        }
-    }
 
     var body: some View {
         if embedded {
@@ -1834,7 +1772,10 @@ struct SettingsView: View {
                     Text("Models").font(.title2.weight(.medium))
                     VStack(alignment: .leading, spacing: 14) {
                         if modelsPane == "assignments" {
-                        EngineSettingsView()
+                        EngineSettingsView(
+                            cloudOnly: intelNoEngine,
+                            cloudModelName: loader.cloudModelID.isEmpty
+                                ? nil : SettingsLoader.cloudModelName(loader.cloudModelID))
                         Text("Pick the expert for each kind of task")
                             .font(.callout)
                             .foregroundStyle(.secondary)
@@ -1867,9 +1808,15 @@ struct SettingsView: View {
                                         .font(.system(size: 12, weight: .medium))
                                         .foregroundStyle(.secondary)
                                         .frame(width: 190, alignment: .trailing)
-                                } else if loader.savedCloudRoles.contains(role) {
-                                    Label("Cloud · \(loader.savedModelLabel(for: role))",
+                                } else if RoleModelChoices.onCloud(role, savedCloudRoles: loader.savedCloudRoles) {
+                                    Label("Cloud · \(loader.cloudRowLabel(for: role))",
                                           systemImage: "cloud.fill")
+                                        .font(.system(size: 12, weight: .medium))
+                                        .foregroundStyle(.secondary)
+                                        .frame(width: 190, alignment: .trailing)
+                                } else if intelNoEngine {
+                                    // No model on this Mac to pick: the key isn't connected yet.
+                                    Label("Not connected", systemImage: "cloud")
                                         .font(.system(size: 12, weight: .medium))
                                         .foregroundStyle(.secondary)
                                         .frame(width: 190, alignment: .trailing)
@@ -1902,17 +1849,24 @@ struct SettingsView: View {
                         }
                         Divider()
                         HStack {
-                            Text("Manage downloaded models and cloud keys")
+                            // An Intel build with no engine has nothing to download or set
+                            // up here: only the cloud key, which Cloud… holds.
+                            Text(intelNoEngine ? "Manage your cloud key and model"
+                                               : "Manage downloaded models and cloud keys")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                             Spacer()
-                            Button("Local models…") { modelsPane = "local" }
+                            if !intelNoEngine {
+                                Button("Local models…") { modelsPane = "local" }
+                            }
                             Button("Cloud…") { modelsPane = "cloud" }
-                            Button("Setup guide…") {
-                                if setup != nil {
-                                    modelsPane = "setup"
-                                } else {
-                                    NotificationCenter.default.post(name: .harborOpenSetupGuide, object: nil)
+                            if !intelNoEngine {
+                                Button("Setup guide…") {
+                                    if setup != nil {
+                                        modelsPane = "setup"
+                                    } else {
+                                        NotificationCenter.default.post(name: .harborOpenSetupGuide, object: nil)
+                                    }
                                 }
                             }
                         }
@@ -2177,7 +2131,7 @@ struct SettingsView: View {
                                     Text(loader.superModelEnabled
                                          ? "Super Model overrides these workload choices while it is on. Public web tools run locally; the cloud model explains their results."
                                          : loader.cloudRoles.contains("everything")
-                                         ? "All of Harbor runs on this model (set in config.yaml): Ask, Brief, summaries, drafts and tools. Your mail, texts and calendar go to the provider. Disconnect to return to local models."
+                                         ? "All of Harbor runs on this model: Ask, Brief, summaries, drafts and tools. Your mail, texts and calendar go to the provider. Disconnect to return to local models."
                                          : "Fast routing, message/email summaries, embeddings, and tool execution stay local.")
                                         .font(.caption2).foregroundStyle(.secondary)
                                 }
@@ -2310,7 +2264,7 @@ struct SettingsView: View {
 
                         Divider()
 
-                        MailMemorySettingsRow()
+                        MailMemorySettingsRow(cloud: noLocalEngine)
 
                         Divider()
 
@@ -2447,6 +2401,9 @@ struct SettingsView: View {
                 VStack(alignment: .leading, spacing: 14) {
                     Text("Advanced").font(.title3.weight(.medium))
                     VStack(alignment: .leading, spacing: 14) {
+                        // Nothing runs on this Mac to unload when every answer comes from
+                        // the cloud.
+                        if !noLocalEngine {
                         HStack(alignment: .center) {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("Auto-unload idle models")
@@ -2474,10 +2431,7 @@ struct SettingsView: View {
                         }
 
                         Divider()
-
-                        geminiEverythingRow
-
-                        Divider()
+                        }
 
                         Toggle(isOn: Binding(
                             get: { loader.humanizerEnabled },
