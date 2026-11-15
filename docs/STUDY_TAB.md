@@ -452,6 +452,52 @@ account needs `drive.readonly`, which the Workspace consent already requests.
   `google_error` has its own message (timed out, unreachable, refused, rate limited, Google down, odd reply), and
   each failure logs one line with only the status and Google's reason code.
 
+## Find materials
+
+For one Canvas course, "Find materials" (a pill under the course's "Whole course" row) gathers the
+materials the course links to, so the student can add them as sources in one go.
+
+- **Walking the course** (`StudyFindMaterials.swift`). After a consent card, Harbor opens the
+  course's Modules page and its section lists (Home, Announcements, Syllabus, Assignments, Pages,
+  Discussions, Files, Grades) in the student's own signed-in browser, reads their links through
+  Accessibility, and visits up to 100 of the course's own Pages and Discussions, one level deep,
+  with a pause between opens and an overall time limit. Each page opens as a background tab that
+  the student closes; Harbor never closes, clicks or types in a tab. It opens only https URLs on
+  that course's Canvas site, through `NSWorkspace.open`: no AppleScript, JavaScript, key or mouse
+  events, and no Accessibility actions. The walked tab has its own read budget, and the card shows
+  counts of what was read. Only tabs that are new since Harbor's snapshot are read.
+- **Never opened.** Quizzes, tests, surveys and evaluations, assignments, graded or proctored
+  work, submissions, start or attempt links, payments and enrolment, live meetings, account pages,
+  outside tools (External Tool / LTI items) and one-time or signed links, judged by the module
+  item's type and by the words of its title and address (`find.important`, and the same checks in
+  the app). Opening one could start a quiz, submit work or send the student's identity to a tool's
+  site. Each refused item is listed under "Can't open" with its reason. A course page Harbor does
+  open may still load a tool embedded in it (a video player, say); the consent card says so.
+- **Classifying** (`POST /study/find/resolve`, app-only, no network). `find.classify` gives each
+  link a kind (`slides`, `doc`, `pdf`, `notebook`, `article`, `page`, `discussion`, `file`,
+  `video`, `other`) and a way to read it (`drive`, `web`, `browser`, `none`), strips tracking
+  parameters, and marks links that are already sources. At most `MAX_FOUND` links per request;
+  `MAX_IMPORTABLE` Drive and web items, `MAX_BROWSER` course pages and `MAX_REFUSED` refused items
+  come back.
+- **Adding** (`POST /study/find/add`, app-only). Every url is classified again on the server and
+  only the ticked items are added. Google Slides, Docs, PDFs and Colab notebooks are read by Drive
+  file id through the existing read-only Google sign-in (`drive.py`); Canvas pages and discussions
+  are read by the app in the browser, which sends their text. The whole add has `ADD_BUDGET_S`,
+  each Drive item `ITEM_S`, `CONCURRENCY` at a time; what is not done in time comes back as
+  `timeout`.
+- **Outside links** (`find.judge`, then `fetch.py`). One Study-model call sees each outside link's
+  title, host and path (never its query) and answers, per link, whether it is plainly a public
+  reading resource that is safe to download. A link judged unsafe, or one the model did not
+  answer, is not fetched. Safe links are fetched over https on port 443 only, from a host name
+  that resolves only to public addresses (the connection goes to the address that was checked),
+  with at most `MAX_REDIRECTS` redirects each checked again, and no cookies, sign-in, Referer or
+  proxy. HTML and plain text are capped at `MAX_BYTES`; a public PDF at `PDF_MAX_BYTES`, its text
+  read in a sandboxed child process.
+- **Afterwards.** One background worker reads new decks as pages and labels the new sources with
+  topics. Fetched or sent text is untrusted data: stored as-is and given to the Study model only
+  inside the delimited data block. Nothing about a page is logged beyond a status, a host or a
+  count.
+
 ## App (`app/Sources/HarborApp/`)
 
 | file | owns |

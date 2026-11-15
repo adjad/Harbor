@@ -29,7 +29,11 @@ Harbor is a Swift app plus a bundled Python (FastAPI) service. It is Apache-2.0 
   flash cards. Study material is written by a cloud model you connect with your own key. Drive
   slides and PDFs are read one page at a time with Gemini. Brief then shows "Ready for tomorrow"
   with a prepared quiz, Day shows the slides that match a deadline and a "Review (15 min)" item,
-  and Ask answers cite the deck and page.
+  and Ask answers cite the deck and page. "Find materials" on a Canvas course opens the course's
+  Modules page, its section lists and up to 100 of its own Pages and Discussions as tabs in your
+  browser (you close them yourself), and lists the slides, documents, notebooks, PDFs and articles
+  they link to. It never opens quizzes, tests, surveys, assignments, submissions or outside tools;
+  those are listed as "Can't open" with the reason. Nothing is added until you tick it.
 
 Also in the app: meeting notes, reading files attached to email, and an optional mode where Harbor
 adds events and reminders by itself from trusted sources (off until you say yes, with an Undo on
@@ -77,7 +81,10 @@ What can leave the Mac, only after you turn it on:
   build), the prompts, conversation context and tool schemas for the roles you moved go to that
   provider, and it may charge you.
 - **Study.** Page text from your courses and the text of Drive files you add are sent to the Study
-  model when you ask for material. Without a Study key nothing is sent.
+  model when you ask for material. Without a Study key nothing is sent. Find materials sends the
+  title and address (without the query) of each outside link to the Study model, which decides
+  whether it is a public reading that is safe to download; Harbor then downloads only those, with
+  no cookies or sign-in.
 - **Google.** Harbor talks to Google only for accounts you sign in. It reads; it does not write.
 - **Web search and research,** when you ask a question that needs them.
 
