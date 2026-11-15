@@ -24,7 +24,7 @@ Harbor is a Swift app plus a bundled Python (FastAPI) service. It is Apache-2.0 
   suggested study blocks. A study block stays in Harbor until you tap "Add to calendar" on it; that
   tap books exactly that block in your calendar, and Undo removes it again.
 - **Study.** Reads coursework from Canvas pages you have open in your browser (through the
-  Accessibility API; Harbor never clicks, submits or types on a school site) and from Google Docs
+  Accessibility API; Harbor never submits, posts or types on a school site) and from Google Docs
   and Slides you pick in Google Drive. It makes study guides, practice quizzes, short lessons and
   flash cards. Study material is written by a cloud model you connect with your own key. Drive
   slides and PDFs are read one page at a time with Gemini. Brief then shows "Ready for tomorrow"
@@ -112,8 +112,9 @@ To turn cloud use off:
 
 ## Install and first run
 
-There are no published releases yet, so build from source (next section). Builds are ad-hoc signed,
-not notarized, so macOS blocks the first open:
+Download the ZIP from the latest release on the [Releases](https://github.com/adjad/Harbor/releases)
+page, or build from source (next section). Harbor is ad-hoc signed, not notarized, so macOS blocks the
+first open:
 
 1. Unzip the build and move `Harbor.app` to Applications.
 2. Open it. When macOS says it cannot verify the app, choose Done.
