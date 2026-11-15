@@ -21,8 +21,9 @@ Harbor is a Swift app plus a bundled Python (FastAPI) service. It is Apache-2.0 
   Harbor got ready before you asked: a drafted reply (sent only when you tap Send), deadlines and
   bills found in mail, and anything it added for you, with Undo. "Your lists" holds the rest of
   today's calendar, to-dos from every source, school work and the mail and texts that need you.
-- **Day.** A row for the week, the next event as a card (Open in Calendar, Move…), then the rest
-  of the day as a time-ordered agenda of meetings, reminders and open time, school deadlines and
+- **Day.** A row for the week, the next event as a card (Open in Calendar, and Move… where it can
+  be moved), then the rest of the day as a time-ordered agenda of meetings, reminders and open
+  time, school deadlines and
   suggested study blocks. A study block stays in Harbor until you tap "Add to calendar" on it; that
   tap books exactly that block in your calendar, and Undo removes it again.
 - **Study.** Reads coursework from Canvas pages you have open in your browser (through the

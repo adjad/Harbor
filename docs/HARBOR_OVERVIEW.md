@@ -18,7 +18,7 @@ device through **oMLX**, a local MLX-based model server.
 
 | | |
 |---|---|
-| **Repo** | `~/Desktop/Harbor_Project` — the folder name predates the 2026-07-06 rename from "MOE" to "Harbor" |
+| **Repo** | `~/Desktop/Harbor_Project` |
 | **Hardware** | MacBook Pro, M5 Pro, 24 GB unified memory. Optional MacBook Air (M4 / 16 GB) side node. |
 | **Processes** | `Harbor.app` (Swift, menu bar) → Python FastAPI backend on `:8765` → oMLX on `:8000` |
 | **Installed app** | `/Applications/Harbor.app` — bundles its own copy of `service/` and a slim `.venv`, and launches the backend itself |
