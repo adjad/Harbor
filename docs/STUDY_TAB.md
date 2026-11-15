@@ -461,9 +461,12 @@ materials the course links to, so the student can add them as sources in one go.
   course's Modules page and its section lists (Home, Announcements, Syllabus, Assignments, Pages,
   Discussions, Files, Grades) in the student's own signed-in browser, reads their links through
   Accessibility, and visits up to 100 of the course's own Pages and Discussions, one level deep,
-  with a pause between opens and an overall time limit. Each page opens as a background tab that
-  the student closes; Harbor never closes, clicks or types in a tab. It opens only https URLs on
-  that course's Canvas site, through `NSWorkspace.open`: no AppleScript, JavaScript, key or mouse
+  with a pause between opens and an overall time limit. Each page opens as a background tab, and
+  once it has been read Harbor closes that tab (`StudyFindTabCloser`): it lists the browser's tabs
+  through AppleScript around each open to claim the one new tab, checks the tab's address again
+  right before closing it, and closes only tabs it opened. Any failure leaves the tab open. macOS
+  asks once to let Harbor control the browser. Harbor never clicks or types in a tab. It opens only
+  https URLs on that course's Canvas site, through `NSWorkspace.open`: no JavaScript, key or mouse
   events, and no Accessibility actions. The walked tab has its own read budget, and the card shows
   counts of what was read. Only tabs that are new since Harbor's snapshot are read.
 - **Never opened.** Quizzes, tests, surveys and evaluations, assignments, graded or proctored

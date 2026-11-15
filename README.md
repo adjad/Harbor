@@ -31,7 +31,8 @@ Harbor is a Swift app plus a bundled Python (FastAPI) service. It is Apache-2.0 
   with a prepared quiz, Day shows the slides that match a deadline and a "Review (15 min)" item,
   and Ask answers cite the deck and page. "Find materials" on a Canvas course opens the course's
   Modules page, its section lists and up to 100 of its own Pages and Discussions as tabs in your
-  browser (you close them yourself), and lists the slides, documents, notebooks, PDFs and articles
+  browser, closes each tab it opened once it has read it (macOS asks once to let Harbor control
+  your browser), and lists the slides, documents, notebooks, PDFs and articles
   they link to. It never opens quizzes, tests, surveys, assignments, submissions or outside tools;
   those are listed as "Can't open" with the reason. A lecture recording is listed by its title and
   link and can be added as a video source, but it is never opened. Nothing is added until you tick

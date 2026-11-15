@@ -4,6 +4,23 @@ All notable changes to Harbor are documented here.
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-11-14
+
+See [docs/releases/0.1.5.md](docs/releases/0.1.5.md) for the release notes.
+
+### Added
+- **Two-zone Brief.** What Harbor has ready and what is on your plate, with "Found in your mail" in the right half of the two-column Brief.
+- **Two-column Day.** One two-column setting for Brief and Day; Old reminders closes the left half, Still to fit and School this week fill the right.
+- **Find closes the tabs it opened,** behind macOS's own permission to control the browser; a refusal, failure or timeout leaves them open and says so.
+- **Class notes in Ask** also search the slides added in Study.
+
+### Changed
+- **Tab switches to and from the wide Brief and wide Day** are one motion.
+- **Find** checks every redirect against the never-open rules, keeps course and assignment addresses on the page's own site, refuses form, poll, payment and meeting sites, and stops at once when asked.
+
+### Fixed
+- Unnamed group rows ("in a group of 3"), the Brief's calendar line, repeated to-do quotes, course codes in to-do titles, the Day summary count, a cut-off Still-to-fit reason, and study-block Undo and deletion seen from Calendar.
+
 ## [0.1.0] - 2026-11-14
 
 First public release. See [docs/releases/0.1.0.md](docs/releases/0.1.0.md) for the release notes.

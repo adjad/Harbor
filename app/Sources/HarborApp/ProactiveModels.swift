@@ -100,9 +100,9 @@ struct ProactiveState: Decodable, Equatable {
         return todoLine
     }
 
-    /// The calendar row's line when nothing else is on today.
-    static func emptyDayLine(calendarUnread: Bool) -> String {
-        calendarUnread ? "Harbor can't see your calendar yet" : "Nothing else on your calendar today"
+    /// The calendar row's line when nothing is left on today (BriefPlate.calendarLine).
+    static func emptyDayLine(calendarUnread: Bool, earlierToday: Int = 0) -> String {
+        BriefPlate.calendarLine(upcoming: [], allDay: [], earlierToday: earlierToday, calendarUnread: calendarUnread)
     }
 
     init(state: String = "ready", asOf: Double? = nil, progress: Progress? = nil, accounts: [String] = [],
@@ -502,9 +502,13 @@ struct ProactiveTodo: Decodable, Equatable, Identifiable {
                     canComplete: canComplete && !done && source == "reminders", route: NeedsYouRow.todoRoute)
     }
 
+    /// Who it is from as a row shows it ("Sam in a group of 3 (…)", not
+    /// "Sam in of 3 (…)"); `who` stays as the service sent it (BriefPlate.who).
+    var shownWho: String { BriefPlate.who(who) }
+
     /// As the Day tab's timeline takes it.
     var dayInput: DayTodoInput {
-        DayTodoInput(id: id, title: title, source: source, who: who, due: dueTs, dueLabel: dueLabel, kind: kind, done: done)
+        DayTodoInput(id: id, title: title, source: source, who: shownWho, due: dueTs, dueLabel: dueLabel, kind: kind, done: done)
     }
 
     /// A calendar event is already on the Day; anything else can be added to it.
@@ -551,6 +555,9 @@ struct ProactiveThread: Decodable, Equatable, Identifiable {
         replyRef = c.lenientRef(.reply_ref)
         fingerprint = c.lenientString(.fingerprint) ?? ""
     }
+
+    /// Who it is from as a row shows it (BriefPlate.who); `who` stays as sent.
+    var shownWho: String { BriefPlate.who(who) }
 
     /// Its trailing ×: Clear only. Nothing is marked read or answered.
     var actionRow: NeedsYouRow {
@@ -695,4 +702,77 @@ struct AnyKey: CodingKey {
     var intValue: Int? { nil }
     init?(stringValue: String) { self.stringValue = stringValue }
     init?(intValue: Int) { return nil }
+}
+
+/// One row of the Brief's "On your plate" list: a to-do or school work (R6).
+enum PlateItem: Identifiable, Equatable {
+    case todo(ProactiveTodo)
+    case school(StudyDaySummary.Due)
+
+    var id: String {
+        switch self {
+        case .todo(let todo): return "todo:" + todo.id
+        case .school(let due): return "school:" + (due.id.isEmpty ? due.title : due.id)
+        }
+    }
+
+    var isSchool: Bool {
+        if case .school = self { return true }
+        return false
+    }
+}
+
+extension ProactiveState {
+    /// School work and to-dos as one list, most urgent first (BriefPlate.order).
+    /// `named`: the events the calendar line above the list names; a to-do
+    /// that only restates one of them is left out (BriefPlate.restatesCalendar).
+    static func plate(todos: [ProactiveTodo], school: [StudyDaySummary.Due], isDone: (ProactiveTodo) -> Bool,
+                      now: Double, dayStart: Double, todayEnd: Double, tomorrowEnd: Double,
+                      named: [String] = []) -> [PlateItem] {
+        var items: [String: PlateItem] = [:]
+        var entries: [BriefPlate.Entry] = []
+        for todo in todos where !restatesCalendar(todo, named: named) {
+            let item = PlateItem.todo(todo)
+            items[item.id] = item
+            entries.append(BriefPlate.Entry(key: item.id, title: todo.title, due: todo.dueTs,
+                                            overdue: todo.dueLabel.lowercased().contains("overdue"), done: isDone(todo)))
+        }
+        for due in school where items[PlateItem.school(due).id] == nil {
+            let item = PlateItem.school(due)
+            items[item.id] = item
+            entries.append(BriefPlate.Entry(key: item.id, title: due.title, due: due.dueTS, allDay: due.allDay))
+        }
+        let ordered = BriefPlate.order(entries, now: now, dayStart: dayStart, todayEnd: todayEnd, tomorrowEnd: tomorrowEnd)
+        return ordered.compactMap { items[$0.key] }
+    }
+
+    /// Whether a to-do only restates an event the calendar line already names:
+    /// a calendar event, by its title (case and punctuation aside). It is left
+    /// out of the list, so nothing shows twice in ON YOUR PLATE; an event the
+    /// line doesn't name (tomorrow's, a fourth one today) stays.
+    static func restatesCalendar(_ todo: ProactiveTodo, named: [String]) -> Bool {
+        guard todo.kind == "event" || todo.source == "calendar" else { return false }
+        let key = BriefPlate.words(todo.title)
+        return !key.isEmpty && named.contains { BriefPlate.words($0) == key }
+    }
+
+    /// Mail and texts without the ones a reply card already holds: a thread
+    /// is the card's when the card sends a drafted reply and names that thread
+    /// (its source ref is the thread's item, or its reply reference is the
+    /// thread's message). Everything else stays.
+    static func threads(_ threads: [ProactiveThread], coveredBy cards: [ProactiveCard]) -> [ProactiveThread] {
+        var refs = Set<String>()
+        var messages = Set<String>()
+        for card in cards where card.action?.sendsDraft == true {
+            for source in card.sources where !source.ref.isEmpty { refs.insert(source.ref) }
+            if let message = card.replyRef["message_id"], !message.isEmpty { messages.insert(message) }
+        }
+        guard !refs.isEmpty || !messages.isEmpty else { return threads }
+        return threads.filter { thread in
+            let item = thread.id.hasPrefix("thread:") ? String(thread.id.dropFirst("thread:".count)) : thread.id
+            if refs.contains(item) || refs.contains(thread.id) { return false }
+            let message = thread.replyRef["message_id"] ?? ""
+            return message.isEmpty || !messages.contains(message)
+        }
+    }
 }

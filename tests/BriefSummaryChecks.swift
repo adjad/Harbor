@@ -345,6 +345,7 @@ func briefTileChecks(_ check: (Bool, String) -> Void, dayStart: Double, now: Dou
     check(BriefDetail.calendar(allDay: ["🎂"], events: [(title: "1:1", start: now, end: nil)], unsynced: false, clock: { _ in "9" })
             .lines.map(\.text) == ["🎂", "1:1"], "calendar details keep letterless titles")
     firstDayChecks(check)
+    briefPlateChecks(check)
 }
 
 /// The first launch day: what Harbor does and when, the summary times when none
@@ -408,4 +409,92 @@ func firstDayChecks(_ check: (Bool, String) -> Void) {
     check(contacts?.headline == "Harbor can't see your contacts yet" && contacts?.fixLink == BriefDetail.contactsAccess
           && contacts?.detail.contains("names, not numbers") == true && contacts?.symbol == "person.crop.circle",
           "Contacts denied: why, and the Contacts setting")
+}
+
+/// R6: the Brief's two zones, and its "On your plate" list in one urgency order.
+func briefPlateChecks(_ check: (Bool, String) -> Void) {
+    let day0: Double = 1_700_000_000, now = day0 + 10 * 3600
+    let end = day0 + 86400, tomorrowEnd = day0 + 2 * 86400
+    func urgency(_ entry: BriefPlate.Entry) -> BriefPlate.Urgency {
+        BriefPlate.urgency(entry, now: now, dayStart: day0, todayEnd: end, tomorrowEnd: tomorrowEnd)
+    }
+    check(urgency(.init(key: "a", title: "A", due: now - 60)) == .overdue, "past its time: overdue")
+    check(urgency(.init(key: "a", title: "A", due: day0, allDay: true)) == .today, "all-day today is today, not overdue")
+    check(urgency(.init(key: "a", title: "A", due: day0 - 86400, allDay: true)) == .overdue, "all-day yesterday is overdue")
+    check(urgency(.init(key: "a", title: "A", due: now + 3600, overdue: true)) == .overdue, "the service's overdue wins")
+    check(urgency(.init(key: "a", title: "A", due: end + 60)) == .tomorrow, "tomorrow")
+    check(urgency(.init(key: "a", title: "A", due: tomorrowEnd + 60)) == .later, "later")
+    check(urgency(.init(key: "a", title: "A", due: nil)) == .undated, "undated")
+    check(urgency(.init(key: "a", title: "A", due: now - 60, done: true)) == .done, "done goes last")
+    let ordered = BriefPlate.order([
+        .init(key: "undated", title: "Zed", due: nil),
+        .init(key: "b-today", title: "Beta", due: now + 7200),
+        .init(key: "a-today", title: "Alpha", due: now + 7200),
+        .init(key: "early", title: "Early", due: now + 600),
+        .init(key: "late", title: "Late", due: now - 3600),
+        .init(key: "done", title: "Done", due: now - 7200, done: true),
+        .init(key: "tom", title: "Tom", due: end + 60),
+    ], now: now, dayStart: day0, todayEnd: end, tomorrowEnd: tomorrowEnd)
+    check(ordered.map(\.key) == ["late", "early", "a-today", "b-today", "tom", "undated", "done"],
+          "overdue, today by time then title, tomorrow, undated, done: \(ordered.map(\.key))")
+    check(BriefPlate.moreParts(hiddenTodos: 3, hiddenSchool: 5) == ["+3 to-dos", "+5 in Study"], "both parts")
+    check(BriefPlate.moreParts(hiddenTodos: 1, hiddenSchool: 0) == ["+1 to-do"], "one to-do, no Study part")
+    check(BriefPlate.moreParts(hiddenTodos: 0, hiddenSchool: 0).isEmpty, "nothing hidden, no line")
+    check(!BriefPlate.sideBySide(width: 596, textScale: 1), "the 640 pt panel (596 pt of content) stacks the zones")
+    check(BriefPlate.sideBySide(width: 796, textScale: 1), "the 840 pt wide panel puts them side by side")
+    check(BriefPlate.sideBySide(width: 796, textScale: 1.3) && !BriefPlate.sideBySide(width: 700, textScale: 1.3),
+          "larger text needs more room before the zones sit side by side")
+    check(BriefPlate.shown(sideBySide: true) == 5 && BriefPlate.shown(sideBySide: false) == 2,
+          "five rows side by side, two stacked, before Show all")
+    check(BriefPlate.heading("NEEDS YOU", count: 4) == "NEEDS YOU · 4" && BriefPlate.heading("NEEDS YOU", count: 0) == "NEEDS YOU",
+          "a zone heading counts only when there is something")
+    briefWordingChecks(check)
+}
+
+/// B1 to B4: who a row is from, a quote that repeats its title, the calendar
+/// line, and a course code in brackets.
+func briefWordingChecks(_ check: (Bool, String) -> Void) {
+    // B1: an unnamed group lost its "Group" word on the way; a group with no name left "in" bare.
+    check(BriefPlate.who("Sam Rivera in of 3 (Dana, Lee, Sam Rivera)") == "Sam Rivera in a group of 3 (Dana, Lee, Sam Rivera)",
+          "an unnamed group reads as a group of 3: \(BriefPlate.who("Sam Rivera in of 3 (Dana, Lee, Sam Rivera)"))")
+    check(BriefPlate.who("of 4 (Dana, Lee, Sam, Jo)") == "A group of 4 (Dana, Lee, Sam, Jo)", "the group alone")
+    check(BriefPlate.who("Dana Okafor in ") == "Dana Okafor" && BriefPlate.who("Dana Okafor in") == "Dana Okafor",
+          "no group name: the in clause goes, not a hole")
+    check(BriefPlate.who("Dana Okafor in Study Buddies") == "Dana Okafor in Study Buddies", "a named group stays")
+    check(BriefPlate.who("Dana Okafor in Group \"Study Buddies\"") == "Dana Okafor in Study Buddies", "a leftover Group word goes")
+    check(BriefPlate.who("Sam Rivera") == "Sam Rivera" && BriefPlate.who("") == "", "a person stays as sent")
+    check(BriefPlate.who("Office of 3 (Main)") == "Office of 3 (Main)", "a name with \"of\" in it is left alone")
+    // B3: the quote under a to-do only when it says more than the title.
+    check(BriefPlate.quoteRepeats("finish the CS 101 lab writeup!", title: "Finish the CS 101 lab writeup"),
+          "the same words, case and punctuation aside")
+    check(BriefPlate.quoteRepeats("\"Midterm review\"", title: "Midterm review"), "quote marks aside")
+    check(BriefPlate.quoteRepeats("midterm review", title: "Midterm review, QNT 210"), "the title holds the quote")
+    check(BriefPlate.quoteRepeats("do the midterm review", title: "Midterm review"), "two words more")
+    check(!BriefPlate.quoteRepeats("can you send the midterm review slides by Friday?", title: "Midterm review"),
+          "a quote that says more stays")
+    check(!BriefPlate.quoteRepeats("let's talk tmrw", title: "Call Jo"), "a different quote stays")
+    check(BriefPlate.quoteRepeats("", title: "Call Jo"), "no quote, nothing to show")
+    // B2: the calendar line reads the same day the cards do.
+    check(BriefPlate.calendarLine(upcoming: [], allDay: [], earlierToday: 0, calendarUnread: false) == "Nothing on your calendar today",
+          "nothing on today at all")
+    check(BriefPlate.calendarLine(upcoming: [], allDay: [], earlierToday: 2, calendarUnread: false) == "Nothing left on your calendar today",
+          "everything today has ended")
+    check(BriefPlate.calendarLine(upcoming: [], allDay: ["Career fair"], earlierToday: 0, calendarUnread: false) == "All day: Career fair",
+          "an all-day event is named, not \"nothing\"")
+    check(BriefPlate.calendarLine(upcoming: ["9 AM Lab", "1 PM Lecture", "3 PM Club"], allDay: ["Career fair"],
+                                  earlierToday: 0, calendarUnread: false) == "All day: Career fair · 9 AM Lab · 1 PM Lecture",
+          "all-day first, three at most")
+    check(BriefPlate.calendarLine(upcoming: [], allDay: [], earlierToday: 0, calendarUnread: true) == "Harbor can't see your calendar yet",
+          "an unread calendar is never an all-clear")
+    for line in [BriefPlate.calendarLine(upcoming: [], allDay: [], earlierToday: 0, calendarUnread: false),
+                 BriefPlate.calendarLine(upcoming: [], allDay: [], earlierToday: 3, calendarUnread: false)] {
+        check(!line.contains("else"), "never \"else\" with nothing above it: \(line)")
+    }
+    // B4: a course code in brackets after a to-do's title goes where the course shows.
+    check(BriefPlate.splitCourse("Chapter 4 reading [CS 101]") == ("Chapter 4 reading", "CS 101"), "square brackets")
+    check(BriefPlate.splitCourse("Readings (QNT 210)") == ("Readings", "QNT 210"), "round brackets")
+    check(BriefPlate.splitCourse("Lab writeup [CS101]") == ("Lab writeup", "CS101"), "a code in one word")
+    check(BriefPlate.splitCourse("Dinner (with Sam)") == ("Dinner (with Sam)", ""), "an ordinary aside stays")
+    check(BriefPlate.splitCourse("Call back (2 PM)") == ("Call back (2 PM)", ""), "a time stays")
+    check(BriefPlate.splitCourse("[CS 101]") == ("[CS 101]", ""), "a code alone stays the title")
 }

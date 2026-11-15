@@ -40,8 +40,9 @@ struct OverlayView: View {
     // The header's laid-out height (it grows with Text size), for the Brief and
     // Day scroll cap.
     @State private var headerHeight: CGFloat = 30
-    // The Brief in two columns in a wider panel (the header's toggle); persists.
-    @AppStorage(NotchBriefView.wideKey) private var briefWide = false
+    // Brief and Day in two columns in a wider panel (the header's toggle,
+    // NotchWide); persists.
+    @AppStorage(NotchBriefView.wideKey) private var wideChosen = false
     // Which way the page change in flight slides (NotchPageSlide).
     @State private var pageSlide = NotchPageSlide()
     // The panel's drawn height (followHeight): nil until the open panel's
@@ -106,13 +107,13 @@ struct OverlayView: View {
 
     private var renderKey: String { "\(textSize)-\(contrastTick)" }
     private var layout: SurfaceLayout { display.layout }
-    /// Whether the Brief can show two columns (NotchBriefView.canShowWide);
-    /// the header's toggle shows only then.
-    private var briefCanWiden: Bool {
-        NotchBriefView.canShowWide(model: model, today: todayModel, canWiden: layout.canWiden)
+    /// Whether the panel can be wide (NotchWide.canShow: Brief or Day); the
+    /// header's toggle shows only then.
+    private var panelCanWiden: Bool {
+        NotchWide.canShow(model: model, today: todayModel, canWiden: layout.canWiden)
     }
-    /// The Brief in two columns, in the wider panel.
-    private var briefIsWide: Bool { briefWide && briefCanWiden }
+    /// Brief or Day in two columns, in the wider panel.
+    private var panelIsWide: Bool { wideChosen && panelCanWiden }
     private var isNotch: Bool { layout.style == .notch }
 
     /// Brief and Day under the fixed header: as tall as their content until the
@@ -135,9 +136,14 @@ struct OverlayView: View {
         #endif
     }
 
+    /// The panel's side insets: the page lays out at the panel's width less these.
+    static let sideInset: CGFloat = 22
+
     private var expandedPanel: some View {
         let page = model.page
         pageSlide.follow(page)
+        let surfaceWidth: CGFloat = layout.widened(panelIsWide).expandedWidth
+        let pageWidth: CGFloat = max(0, surfaceWidth - 2 * Self.sideInset)
         return VStack(alignment: .leading, spacing: 0) {
             header
                 .background(GeometryReader { geo in
@@ -148,10 +154,17 @@ struct OverlayView: View {
             // (a tab, quick settings, a permission page, a card) crossfades with
             // a short slide while the panel's height follows. The ZStack lets
             // the leaving page and the arriving one overlap rather than stack.
+            // Each page is laid out at the width it arrived at (PinnedWidth): a
+            // page leaving the wide Brief fades at its own width while the panel
+            // narrows over it, never re-laid out at the narrower one, and the
+            // arriving page is at its final width from its first frame. Both
+            // are clipped to the surface.
             ZStack(alignment: .topLeading) {
-                VStack(alignment: .leading, spacing: 0) { pageBody }
-                    .id(page)
-                    .transition(.notchPage(pageSlide))
+                PinnedWidth(width: pageWidth) {
+                    VStack(alignment: .leading, spacing: 0) { pageBody }
+                }
+                .id(page)
+                .transition(.notchPage(pageSlide))
             }
         }
         .background(shortcuts)
@@ -159,14 +172,18 @@ struct OverlayView: View {
         // so its center is behind the camera housing — push the content
         // below it. A floating card just uses ordinary padding.
         .padding(EdgeInsets(top: layout.contentTopInset,
-                            leading: 22, bottom: SurfaceLayout.panelBottomPadding, trailing: 22))
+                            leading: Self.sideInset, bottom: SurfaceLayout.panelBottomPadding,
+                            trailing: Self.sideInset))
         // The panel's surface follows its content's height on the panel's
         // spring, whatever changed it: a page, a card or notice arriving, an
         // answer streaming in, the Brief's columns. The content lays out at
         // once (measured at its own height) and the surface glides to it,
         // clipping what is still below its edge, so nothing inside a page
-        // has to animate for the panel to. Width is never animated: the
-        // Brief re-laid out at every width in between took most of a second.
+        // has to animate for the panel to. The width moves on the same spring
+        // (below), but only the header and the surface follow it: every page
+        // keeps the width it was laid out at (PinnedWidth), so nothing is
+        // re-laid out at the widths in between (the Brief once was, and one
+        // frame took most of a second).
         .fixedSize(horizontal: false, vertical: true)
         .background(GeometryReader { geo in
             Color.clear
@@ -193,7 +210,11 @@ struct OverlayView: View {
         // Must match the width OverlayPanel sizes its window to — both widen
         // SurfaceLayout.expandedWidth from the same state (AppDelegate's layout
         // provider asks NotchBriefView.showsWide), so they cannot disagree.
-        .frame(width: layout.widened(briefIsWide).expandedWidth)
+        .frame(width: surfaceWidth)
+        // A change of width (into or out of the wide Brief, or its toggle)
+        // glides on the panel's spring; Reduce Motion: at once. The window
+        // already covers both widths (OverlayPanel.resizeToFit).
+        .animation(Theme.Motion.panel(reduceMotion: reduceMotion), value: surfaceWidth)
         .background(Theme.surface)
         .clipShape(layout.panelShape)
         .shadow(color: .black.opacity(0.55), radius: 20, y: 10)
@@ -202,12 +223,18 @@ struct OverlayView: View {
         .onExitCommand { model.requestCollapse() }
         // Two columns on or off: refit the window, which reads the same state,
         // once SwiftUI has laid the change out.
-        .onChange(of: briefIsWide) { model.onResize() }
+        .onChange(of: panelIsWide) { model.onResize() }
         // Every change of page moves together, on the panel's one spring: the
         // pages, the panel's height and width, the selected tab's capsule, the
         // header's buttons. The window grows ahead of it and shrinks after it
         // (OverlayPanel.resizeToFit). Reduce Motion: an instant swap.
         .animation(Theme.Motion.panel(reduceMotion: reduceMotion), value: page)
+        // The stage: as wide as the panel can get on this display, with the
+        // panel centred in it. The window centres the host and clips it, so a
+        // panel narrowing inside the still-wide window (it shrinks after the
+        // settle) stays centred while its width glides, instead of the host
+        // snapping to the new width on the first frame.
+        .frame(width: max(surfaceWidth, layout.widened(layout.canWiden).expandedWidth))
     }
 
     /// Moves the panel's surface to the content's measured height: on the
@@ -275,9 +302,9 @@ struct OverlayView: View {
                 }
             }
         case .brief:
-            tabScroll { NotchBriefView(model: model, today: todayModel, wide: briefIsWide) }
+            tabScroll { NotchBriefView(model: model, today: todayModel, wide: panelIsWide) }
         case .day:
-            tabScroll { NotchDayView(model: model, today: todayModel) }
+            tabScroll { NotchDayView(model: model, today: todayModel, wide: panelIsWide) }
         case .meet:
             tabScroll { NotchMeetingView(model: MeetingModel.shared) }
         case .study:
@@ -520,14 +547,15 @@ struct OverlayView: View {
             if model.tab == .ask && (!model.turns.isEmpty || model.showingCorpus) {
                 ctrl("square.and.pencil", "New chat (⌘N)", { model.newChat() })
             }
-            // Brief: one column or two. The icon shows the layout the click switches to.
-            if briefCanWiden {
+            // Brief and Day: one column or two, one choice for both. The icon
+            // shows the layout the click switches to.
+            if panelCanWiden {
                 // VoiceOver hears one switch, "Two columns", with its state,
                 // rather than a label that flips with each press.
-                ctrl(briefWide ? "rectangle.split.1x2" : "rectangle.split.2x1",
-                     briefWide ? "Show the Brief in one column" : "Show the Brief in two columns",
-                     toggle: (label: "Two columns", isOn: briefWide),
-                     { setBriefWide(!briefWide) })
+                ctrl(wideChosen ? "rectangle.split.1x2" : "rectangle.split.2x1",
+                     NotchWide.toggleHelp(wide: wideChosen),
+                     toggle: (label: "Two columns", isOn: wideChosen),
+                     { setWide(!wideChosen) })
             }
             // Brief and Day: ask about your day out loud; it opens Ask and listens.
             if model.tab != .ask && model.tab != .research {
@@ -577,13 +605,13 @@ struct OverlayView: View {
         .accessibilityHidden(true)
     }
 
-    /// The Brief's columns, switched so the window and the content change width
+    /// Brief and Day's columns, switched so the window and the content change width
     /// in the same pass: the window is refit now, from the saved choice the
     /// layout provider reads, instead of a runloop after SwiftUI has redrawn the
-    /// content at the new width (a visible one-frame snap). onChange(briefIsWide)
+    /// content at the new width (a visible one-frame snap). onChange(panelIsWide)
     /// still refits once the new height is laid out.
-    private func setBriefWide(_ on: Bool) {
-        briefWide = on
+    private func setWide(_ on: Bool) {
+        wideChosen = on
         model.onResizeNow()
     }
 
@@ -1568,6 +1596,26 @@ private struct NotchPageShift: ViewModifier {
         content
             .offset(x: CGFloat(steps) * Theme.Motion.slideStep)
             .opacity(away ? 0 : 1)
+    }
+}
+
+/// Lays its content out at a fixed width whatever width it is offered, from
+/// the leading edge, and takes the offered width itself. The panel's page sits
+/// in one: a page keeps the width it was laid out at while the panel's width
+/// changes around it (a leaving page keeps its last one), so the panel can
+/// narrow or widen on its spring without re-laying out a page at every width
+/// in between. What is wider than the panel is clipped by the surface.
+struct PinnedWidth: Layout {
+    let width: CGFloat
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let child: CGSize = subviews.first?.sizeThatFits(ProposedViewSize(width: width, height: proposal.height)) ?? .zero
+        return CGSize(width: proposal.width ?? width, height: child.height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        subviews.first?.place(at: bounds.origin, anchor: .topLeading,
+                              proposal: ProposedViewSize(width: width, height: bounds.height))
     }
 }
 
