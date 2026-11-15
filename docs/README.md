@@ -43,7 +43,7 @@ Start with the root [README](../README.md) for what Harbor is and how to run it.
 - [../TESTING.md](../TESTING.md) — manual test plan.
 - [DEMO_TEST_PROMPTS.md](DEMO_TEST_PROMPTS.md) — manual prompt checklist, including notch and display checks.
 - [google-cloud-setup.md](google-cloud-setup.md) — Google Cloud project, tester list and OAuth client for Connect Google.
-- [releases/](releases/) — curated release notes; start with [0.5.0-dev4](releases/0.5.0-dev4.md).
+- [releases/](releases/) — curated release notes, one page per version.
 
 ## Audits and backlog
 

@@ -164,9 +164,9 @@ Google sign-in in a source build needs your own OAuth client; see
 Harbor is pre-1.0 and changes quickly. Be aware of the following.
 
 - Not notarized. Harbor does not update itself.
-- The cloud-key fixes in 0.5.2 are covered by tests that stand in for the Keychain. They have not
-  been tried by hand with a real key and real macOS prompts.
-- Study is new and unreleased. Treat it as untested against real school sites and real Drive files
+- Recent fixes to cloud-key handling are covered by tests that stand in for the Keychain. They have
+  not been tried by hand with a real key and real macOS prompts.
+- Study is new. Treat it as untested against real school sites and real Drive files
   until you have tried it yourself.
 - Several recent features (reading email and Messages attachments, meeting notes, writing-style
   drafts) are noted in the changelog as not yet tried in the running app.

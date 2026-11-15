@@ -119,9 +119,8 @@ refused a start rather than admitted unchecked.
 Metal caps the threads of one threadgroup per compiled pipeline, and the cap
 depends on the GPU: a kernel that may use 1024 threads on an M5 may use 448 on
 an M1 Pro. MLX does not expose the cap and checks it only when the lazy graph
-is evaluated, so no caller can fall back. With oMLX 0.7.3rc1 (Harbor 0.5.0-dev5
-to 0.5.0-rc2-beta2) the M1 verify kernel `omlx_m1_verify_mma5` asked for 512
-threads where its 5-bit bf16 pipeline allows 448 on M1 and M2, and every reply
+is evaluated, so no caller can fall back. With oMLX 0.7.3rc1 the M1 verify
+kernel `omlx_m1_verify_mma5` asked for 512 threads where its 5-bit bf16 pipeline allows 448 on M1 and M2, and every reply
 ended ("Thread group size (512) is greater than the maximum allowed threads per
 threadgroup (448)", upstream issue jundot/omlx#4913, fixed in oMLX 0.7.3).
 
@@ -555,7 +554,7 @@ published. Existing releases (including failed drafts) are never overwritten;
 review a failed draft before any manual recovery.
 
 The release benchmark (`scripts/release_performance.py`) is an optional measurement tool and is no
-longer a publication gate (removed for 1.2.5 by owner decision). Neither publisher takes performance inputs.
+longer a publication gate (removed by owner decision). Neither publisher takes performance inputs.
 
 Download the app ZIP from the first link on the release page and extract it
 with Finder or `ditto`. Maintainers can download the complete CI candidate and

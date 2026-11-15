@@ -1512,7 +1512,7 @@ async def email_triage(message_id: str, action: str) -> str:
 # whole chat ("An earlier action in this chat may not have finished") for a
 # send that never began. Until a real forward has been checked in Mail, the
 # tool says plainly that nothing was sent. Set True together with the app-side
-# change, after the hand check in docs/releases/0.5.0-hand-checks.md.
+# change, after a real forward has been checked by hand in Mail.
 APPLE_MAIL_FORWARD_READY = False
 
 

@@ -788,7 +788,7 @@ def whats_new() -> str:
     state = _acting_state()
     switch = ("on" if state["enabled"] else "off until you say yes") if state else "off until you say yes"
     return "\n".join([
-        "**New in Harbor 0.5.0:**", "",
+        "**New in Harbor:**", "",
         f"- **Acting for you**: a new switch, \"Let Harbor act for me\" ({switch}). With it on I add a dated "
         "text from a saved contact, or a dated email from someone you know, to Calendar, hold an hour for a "
         "deadline and remind you to reply to email, each with an Undo. Harbor never sends anything by itself.",
@@ -796,7 +796,12 @@ def whats_new() -> str:
         "- **Demo mode**: a switch in the menu-bar icon's menu that keeps the model loaded and warm for the "
         "fastest answers.",
         "- **Web privacy**: a web lookup sends only its search words, and a question about someone in your "
-        "life stays off the web."])
+        "life stays off the web.",
+        "- **Study**: study guides, practice quizzes, lessons and flash cards from your Canvas pages and "
+        "Google Drive files, written by a cloud model you connect with a key used for Study only.",
+        "- **Find materials**: Harbor opens a course's own Canvas pages in your browser, read-only, and lists "
+        "the notebooks, files and articles they link to. Tests, quizzes and graded work are never opened, and "
+        "nothing is added until you tick it."])
 
 
 OWN_ANSWERS = {"acting": acting, "replies": replies, "leaves": leaves, "whats_new": whats_new}

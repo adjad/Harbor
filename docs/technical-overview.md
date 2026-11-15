@@ -1,8 +1,8 @@
 # Harbor: technical overview
 
 How Harbor is built: the agent loop and its tools, the assistant layer, memory, safety, models and
-engines, running from source, and where state lives. This was the second half of the README until
-0.5.0-dev3; the README now covers the product. For the long-form system reference see
+engines, running from source, and where state lives. This used to be the second half of the README;
+the README now covers the product. For the long-form system reference see
 [HARBOR_OVERVIEW.md](HARBOR_OVERVIEW.md), and for the index of every document see [README.md](README.md).
 
 ## What it does
