@@ -10,6 +10,7 @@ See [docs/releases/0.1.6.md](docs/releases/0.1.6.md) for the release notes.
 
 ### Changed
 - **Brief.** The first zone (the left half when wide) is "Ready for you": the drafted reply, a row for each thing Harbor prepared or found, and what it added for you, with Undo. The second zone is your lists.
+- **Assignments due today or tomorrow** lead the Brief, each with its study guide and a link to its page.
 - **Day.** A seven-day row, a "Next up" card and "Later today", from a new read-only week summary.
 
 ### Fixed
