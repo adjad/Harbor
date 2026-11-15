@@ -65,7 +65,7 @@ required:
 # docs/cordis-tutorial/ in the harness repo for the authoritative patch
 # syntax; I did not verify the exact insert/replace YAML keys against a
 # running instance)
-- name: /Users/you/Desktop/MOE_Project/integrations/dsh-llm-omlx/src/index.ts
+- name: /Users/you/Desktop/Harbor_Project/integrations/dsh-llm-omlx/src/index.ts
   config:
     baseURL: http://127.0.0.1:PORT/v1   # oMLX's actual OpenAI-compatible base — no default on purpose
     # apiKeyEnv: OMLX_API_KEY           # only if you've put auth in front of oMLX

@@ -2562,7 +2562,7 @@ def _nr_root_like(path: str | None) -> bool:
 def _nr_rel_problem(rel: str) -> str | None:
     """Why a recursive change to a path below home is too broad, or None.
     A main folder (Documents, Desktop, Library ...) and what sits directly in
-    it are refused; a folder deeper down (Desktop/MOE_Project/build) is not."""
+    it are refused; a folder deeper down (Desktop/Harbor_Project/build) is not."""
     if rel == ".":
         return "the whole working folder, which is your home folder"
     if rel == ".." or rel.startswith("../"):

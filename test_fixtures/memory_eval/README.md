@@ -162,9 +162,9 @@ checks rubric consistency, not model quality or label correctness.
 From the repository root:
 
 ```sh
-/Users/you/Desktop/MOE_Project/.venv/bin/python test_fixtures/memory_eval/score.py --self-test
+/Users/you/Desktop/Harbor_Project/.venv/bin/python test_fixtures/memory_eval/score.py --self-test
 mkdir -p .test-home
-HOME=$PWD/.test-home HARBOR_HOME=$PWD/.test-home/.moe /Users/you/Desktop/MOE_Project/.venv/bin/python -m pytest -q -p no:cacheprovider tests/test_memory_eval_scorer.py
+HOME=$PWD/.test-home HARBOR_HOME=$PWD/.test-home/.moe /Users/you/Desktop/Harbor_Project/.venv/bin/python -m pytest -q -p no:cacheprovider tests/test_memory_eval_scorer.py
 ```
 
 The self-test writes/reads a temporary gold JSONL, requires perfect overall and

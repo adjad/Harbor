@@ -18,7 +18,7 @@ device through **oMLX**, a local MLX-based model server.
 
 | | |
 |---|---|
-| **Repo** | `~/Desktop/MOE_Project` — the folder name predates the 2026-07-06 rename from "MOE" to "Harbor" |
+| **Repo** | `~/Desktop/Harbor_Project` — the folder name predates the 2026-07-06 rename from "MOE" to "Harbor" |
 | **Hardware** | MacBook Pro, M5 Pro, 24 GB unified memory. Optional MacBook Air (M4 / 16 GB) side node. |
 | **Processes** | `Harbor.app` (Swift, menu bar) → Python FastAPI backend on `:8765` → oMLX on `:8000` |
 | **Installed app** | `/Applications/Harbor.app` — bundles its own copy of `service/` and a slim `.venv`, and launches the backend itself |
@@ -217,7 +217,7 @@ not data — see §3.5.
 
 > **`/Applications/Harbor.app/Contents/Resources/backend/service` is a plain
 > `cp -R` copy, not a symlink.** The running app reads only from that copy.
-> Edits to `~/Desktop/MOE_Project/service/` do not exist for the user until
+> Edits to `~/Desktop/Harbor_Project/service/` do not exist for the user until
 > `bash scripts/package_app.sh` runs and the app is relaunched. This has burned
 > the project repeatedly — a fix verified from source while the app runs stale
 > code reads as "still broken". The standing rule is: **repackage and relaunch

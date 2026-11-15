@@ -262,7 +262,7 @@ def test_child_process_uses_fake_home_and_strips_host_harbor_overrides(
     assert payload["home"] != str(hostile_home)
     assert Path(payload["harbor_home"]).parent == Path(payload["home"]).parent
     assert Path(payload["harborair_home"]).parent == Path(payload["home"]).parent
-    assert payload["present"] == ["HARBOR_HOME", "HARBOR_TEST_PYTHON"]
+    assert payload["present"] == ["HARBOR_HOME", "HARBOR_KEYCHAIN_LEGACY", "HARBOR_TEST_PYTHON"]
     assert payload["optimize"] == 0
     assert payload["optimize_env"] == "0"
     assert payload["startup_env"] == []

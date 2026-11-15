@@ -496,6 +496,9 @@ func dayChecks(_ check: (Bool, String) -> Void) {
     briefSummaryChecks(check, dayStart: dayStart, now: now)
 
     dayTodoChecks(check, dayStart: dayStart, now: now, clock: clock, dayClock: dayClock)
+    dayWeekChecks(check, dayStart: dayStart, now: now)
+    weekRouteChecks(check)
+    dayNextChecks(check, dayStart: dayStart, clock: clock)
 
     // How busy the calendar is: one verdict for the CAL line and the lede.
     func event(_ title: String, _ start: Double, _ end: Double?) -> DayLoad.Event {
@@ -1056,10 +1059,12 @@ func firstDayChecks(_ check: (Bool, String) -> Void, dayStart: Double, dayEnd: D
 
     // An unread calendar: never "Nothing is planned".
     let empty = build([])
-    check(DayTimeline.blurb(empty, needs: [], isToday: true, endOfDay: dayEnd, clock: clock, dayStart: dayStart, calendarRead: false)
-            == "Harbor can't see your calendar yet, so this may not be your whole day.", "an unread calendar is named")
+    let cantRead = "Harbor can't read your calendar. Allow it in System Settings › Privacy & Security › Calendars."
+    check(DayTimeline.blurb(empty, needs: [], isToday: true, endOfDay: dayEnd, clock: clock, dayStart: dayStart, calendar: .unread)
+            == cantRead, "an unread calendar is named")
     check(DayTimeline.blurb(empty, needs: [], isToday: true, endOfDay: dayEnd, clock: clock, dayStart: dayStart)
             == "Nothing is planned for the rest of today.", "a read, empty calendar is an honest all-clear")
+    noCalendarChecks(check, build: { build($0, needs: $1, allDay: $2) }, at: at, now: now, dayStart: dayStart, dayEnd: dayEnd, clock: clock, cantRead: cantRead)
 
     // The lede gives an all-clear only for what was read.
     check(DayTimeline.lede(weekday: "Monday", isToday: true, load: nil, dueToday: [], overdue: [], next: nil,
@@ -1104,3 +1109,351 @@ func firstDayChecks(_ check: (Bool, String) -> Void, dayStart: Double, dayEnd: D
     check(DayTimeline.afterHoursLine(start: 540, end: 1080) == "It's after your working hours (9 AM–6 PM), so nothing new is placed today.",
           "after-hours line names the hours")
 }
+
+/// The Day's week row (C3): the week's dates in the person's week order, the
+/// shown day's load and count, and nothing invented for any other day.
+func dayWeekChecks(_ check: (Bool, String) -> Void, dayStart: Double, now: Double) {
+    let hour = 3600.0
+    func at(_ h: Double) -> Double { dayStart + h * hour }
+    var utc = Calendar(identifier: .gregorian)
+    utc.timeZone = TimeZone(identifier: "UTC")!
+    // 2026-11-14 is a Saturday.
+    let saturday = utc.date(from: DateComponents(year: 2026, month: 11, day: 14, hour: 13))!
+    var monday = utc
+    monday.firstWeekday = 2
+    let mondayWeek = DayWeek.cards(shown: saturday, today: saturday, calendar: monday, shownLoad: nil)
+    check(mondayWeek.map(\.weekday) == ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
+          && mondayWeek.map(\.number) == [9, 10, 11, 12, 13, 14, 15],
+          "a Monday-first week runs Mon 9 to Sun 15: \(mondayWeek.map(\.weekday)) \(mondayWeek.map(\.number))")
+    check(mondayWeek.map(\.day).first == "2026-11-09" && mondayWeek.map(\.day).last == "2026-11-15",
+          "each card keys its day as the snapshot route takes it")
+    check(mondayWeek.filter(\.isToday).map(\.weekday) == ["SAT"] && mondayWeek.filter(\.isShown).map(\.weekday) == ["SAT"],
+          "today is the one shown")
+    var sunday = utc
+    sunday.firstWeekday = 1
+    let sundayWeek = DayWeek.cards(shown: saturday, today: saturday, calendar: sunday, shownLoad: nil)
+    check(sundayWeek.map(\.weekday) == ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"]
+          && sundayWeek.first?.number == 8 && sundayWeek.last?.number == 14,
+          "a Sunday-first week ends on Saturday 14: \(sundayWeek.map(\.number))")
+    let sundayShown = utc.date(from: DateComponents(year: 2026, month: 11, day: 15, hour: 9))!
+    check(DayWeek.dates(containing: sundayShown, calendar: monday).count == 7
+          && DayWeek.cards(shown: sundayShown, today: saturday, calendar: monday, shownLoad: nil).last?.isShown == true,
+          "a Sunday in a Monday-first week is its last day")
+    let monthEnd = utc.date(from: DateComponents(year: 2026, month: 12, day: 31, hour: 12))!
+    check(DayWeek.cards(shown: monthEnd, today: saturday, calendar: monday, shownLoad: nil).map(\.number) == [28, 29, 30, 31, 1, 2, 3]
+          && DayWeek.cards(shown: monthEnd, today: saturday, calendar: monday, shownLoad: nil).allSatisfy { !$0.isToday },
+          "a week across the year's end; today is in another week")
+
+    // Load: commitments only, clipped to the day, overlaps once.
+    let blocks = [
+        DayBlockInput(id: "a", title: "Lecture", start: at(9), end: at(10.5), kind: "calendar"),
+        DayBlockInput(id: "b", title: "Lab", start: at(10), end: at(11), kind: "calendar"),
+        DayBlockInput(id: "s", title: "Study: Lab 5", start: at(16), end: at(16.75), kind: "study"),
+        DayBlockInput(id: "x", title: "Work on PA 2", start: at(20), end: at(21.5), kind: "suggestion"),
+        DayBlockInput(id: "u", title: "Usually busy", start: at(12), end: at(13), kind: "behavior"),
+        DayBlockInput(id: "n", title: "n/a", start: at(14), end: at(15), kind: "calendar"),
+        DayBlockInput(id: "late", title: "Late show", start: at(23), end: at(25), kind: "calendar"),
+        DayBlockInput(id: "open", title: "Open end", start: at(18), end: nil, kind: "calendar"),
+    ]
+    let spans = DayWeek.spans(blocks, dayStart: dayStart, dayEnd: at(24))
+    check(spans.count == 5 && !spans.contains { $0.start == at(20) || $0.start == at(12) || $0.start == at(14) },
+          "suggestions, usual windows and placeholder events add no load: \(spans.count)")
+    check(spans.contains { $0.start == at(23) && $0.end == at(24) } && spans.contains { $0.start == at(18) && $0.end == at(18.5) },
+          "a late event is clipped at midnight; one without an end holds half an hour")
+    let span = DayWeek.span(workStart: at(9), workEnd: at(17), spans: spans, dayStart: dayStart, dayEnd: at(24))
+    check(span.start == at(9) && span.end == at(24), "the bar spans working hours, widened to what is held: \(span)")
+    let narrowSpan = DayWeek.span(workStart: at(9.5), workEnd: at(17.25), spans: [], dayStart: dayStart, dayEnd: at(24))
+    check(narrowSpan.start == at(9) && narrowSpan.end == at(18), "to whole hours")
+    let load = DayWeek.load(onClock: 3, due: 2, spans: spans, span: span, now: at(12))
+    check(load.minutes == 120 + 45 + 30 + 60, "overlapping events count once: \(load.minutes) min")
+    check(load.segments.count == 4 && load.segments[0].from == 0 && abs(load.segments[0].to - 2.0 / 15) < 1e-9
+          && load.segments[0].past && !load.segments[1].past,
+          "segments merge and sit on the span; what ended before now is past: \(load.segments)")
+    check(load.now.map { abs($0 - 3.0 / 15) < 1e-9 } == true, "now on the bar")
+    check(DayWeek.load(onClock: 1, due: 0, spans: spans, span: span, now: at(7)).now == nil
+          && DayWeek.load(onClock: 1, due: 0, spans: spans, span: span, now: nil).segments.allSatisfy { !$0.past },
+          "no now tick outside the span, nor on another day; nothing past there")
+
+    // Counts and words.
+    func bar(_ n: Int, _ d: Int) -> DayLoadBar { DayLoadBar(onClock: n, due: d, minutes: 0, segments: [], now: nil) }
+    check(DayWeek.countText(bar(3, 2)) == "3 · 2 due" && DayWeek.countText(bar(3, 0)) == "3"
+          && DayWeek.countText(bar(0, 2)) == "2 due" && DayWeek.countText(bar(0, 0)) == "free",
+          "card counts: 3 · 2 due, 3, 2 due, free")
+    check(DayWeek.shortCountText(bar(3, 2)) == "3" && DayWeek.shortCountText(bar(0, 2)) == "2 due",
+          "with less room, the things on the clock alone")
+    var cards = DayWeek.cards(shown: saturday, today: saturday, calendar: monday, shownLoad: bar(3, 2))
+    check(cards.filter { $0.load != nil }.map(\.weekday) == ["SAT"], "only the shown day carries a load")
+    check(DayWeek.spoken(cards[5]) == "Saturday 14, today, 3 things and 2 due", DayWeek.spoken(cards[5]))
+    check(DayWeek.spoken(cards[2]) == "Wednesday 11", "a day Harbor hasn't read is its date alone: \(DayWeek.spoken(cards[2]))")
+    cards = DayWeek.cards(shown: utc.date(byAdding: .day, value: -3, to: saturday)!, today: saturday, calendar: monday,
+                          shownLoad: bar(4, 0))
+    check(DayWeek.spoken(cards[2]) == "Wednesday 11, shown, 4 things" && DayWeek.spoken(cards[5]) == "Saturday 14, today",
+          "another day shown: its load; today's date alone: \(DayWeek.spoken(cards[2])) / \(DayWeek.spoken(cards[5]))")
+    check(DayWeek.spoken(DayWeek.cards(shown: saturday, today: saturday, calendar: monday, shownLoad: bar(0, 0))[5])
+          == "Saturday 14, today, free", "free")
+    // Compact until other days carry a load; the shown day twice as wide there.
+    let compactWeek = DayWeek.cards(shown: saturday, today: saturday, calendar: monday, shownLoad: bar(3, 2))
+    check(!DayWeek.fullRow(compactWeek) && !DayWeek.fullRow(DayWeek.cards(shown: saturday, today: saturday, calendar: monday,
+                                                                          shownLoad: nil)),
+          "one day's load (or none): the compact row")
+    var weekLoad = compactWeek
+    weekLoad[2].load = bar(4, 0)
+    check(DayWeek.fullRow(weekLoad), "a load for another day too: the full row")
+    check(DayWeek.weights(compactWeek, full: false) == [1, 1, 1, 1, 1, 2, 1]
+          && DayWeek.weights(DayWeek.cards(shown: saturday, today: saturday, calendar: monday, shownLoad: nil), full: false)
+              == [1, 1, 1, 1, 1, 2, 1]
+          && DayWeek.weights(weekLoad, full: true) == Array(repeating: 1, count: 7),
+          "compact: the shown day twice as wide, before and after its load; full: equal")
+    _ = now
+}
+
+/// The Next card and Later today (C3): which thing is next (ties, all-day and
+/// due rows), its words, the rows after it, the Show more line, the bars and
+/// the card's buttons.
+func dayNextChecks(_ check: (Bool, String) -> Void, dayStart: Double, clock: (Double) -> String) {
+    let hour = 3600.0
+    func at(_ h: Double) -> Double { dayStart + h * hour }
+    let now = at(13 + 20.0 / 60)
+    let blocks = [
+        DayBlockInput(id: "lunch", title: "Lunch with Sam Rivera", start: at(12), end: at(13), kind: "calendar"),
+        DayBlockInput(id: "review", title: "STAT 110 review session", start: at(14), end: at(15.5), kind: "calendar"),
+        DayBlockInput(id: "plan", title: "Plan block at two", start: at(14), end: at(14.5), kind: "task", taskID: "t1"),
+        DayBlockInput(id: "pset", title: "Study: Problem set 6", start: at(15.75), end: at(16.5), kind: "study"),
+        DayBlockInput(id: "notes", title: "Review lecture 9 notes", start: at(13.5), end: at(14.25), kind: "suggestion",
+                      evidenceID: "n9"),
+        DayBlockInput(id: "practice", title: "Ultimate practice", start: at(18.5), end: at(20), kind: "calendar"),
+    ]
+    let needs = [
+        DayNeedInput(id: "lab", title: "CS 101 Lab 4", source: "reminders", due: at(23.98)),
+        DayNeedInput(id: "ps", title: "Problem set 6 · MATH 110", source: "study", due: at(23.98)),
+        DayNeedInput(id: "n9", title: "Review lecture 9 notes", source: "reminders", due: nil),
+    ]
+    let timeline = DayTimeline.build(blocks: blocks, allDay: ["Campus Fall Fest"], needs: needs, caught: [], now: now,
+                                     dayStart: dayStart, dayEnd: at(24), workStart: at(9), workEnd: at(22),
+                                     isToday: true, clock: clock, dayClock: clock)
+    let next = DayTimeline.nextUp(timeline.items, now: now)
+    check(next?.id == "block:review", "a Calendar event beats a plan block at the same time; a suggestion is never next: \(next?.id ?? "nil")")
+    check(next.map { DayTimeline.nextLabel($0, now: now) } == "NEXT · IN 40 MIN", next.map { DayTimeline.nextLabel($0, now: now) } ?? "")
+    check(next.map { DayTimeline.spokenNextLabel($0, now: now) } == "Next, in 40 min", "said as words")
+    check(next.map { DayTimeline.nextTimeLine($0, clock: clock) } == "14:00 – 15:30 · 1 h 30 min",
+          next.map { DayTimeline.nextTimeLine($0, clock: clock) } ?? "")
+    // The suggestion at 1:30 holds the time, so free runs only until it.
+    check(DayTimeline.nowFreeLine(timeline.items, now: now, clock: clock) == "Now 13:20 · free until 13:30",
+          DayTimeline.nowFreeLine(timeline.items, now: now, clock: clock) ?? "nil")
+    check(DayTimeline.nowFreeLine(timeline.items, now: at(13.6), clock: clock) == nil, "not free while something holds now")
+    check(DayTimeline.nowFreeLine(timeline.items, now: now, clock: clock, calendarRead: false) == nil
+          && DayTimeline.nothingNextLine(.unread) == "Harbor can't read your calendar."
+          && DayTimeline.nothingNextLine(.read) == "Nothing else on the clock today.",
+          "no free time or all-clear claimed while Calendar can't be read")
+    let onNow = DayTimeline.nextUp(timeline.items, now: at(14.5))
+    check(onNow?.id == "block:review" && onNow.map { DayTimeline.nextLabel($0, now: at(14.5)) } == "NOW · 1 H LEFT",
+          "one already on stays next, with the time left: \(onNow.map { DayTimeline.nextLabel($0, now: at(14.5)) } ?? "nil")")
+    check(DayTimeline.nextUp(timeline.items, now: at(13.995)).map { DayTimeline.nextLabel($0, now: at(13.995)) } == "NEXT · IN 1 MIN"
+          && DayTimeline.nextUp(timeline.items, now: at(14)).map { DayTimeline.nextLabel($0, now: at(14)) } == "NOW · 1 H 30 MIN LEFT",
+          "a minute away, then on")
+    let far = DayTimeline.build(blocks: [DayBlockInput(id: "e", title: "Evening", start: at(18), end: nil, kind: "calendar")],
+                                allDay: [], needs: [], caught: [], now: at(16.9), dayStart: dayStart, dayEnd: at(24),
+                                workStart: at(9), workEnd: at(17), isToday: true, clock: clock, dayClock: clock)
+    let farNext = DayTimeline.nextUp(far.items, now: at(16.9))
+    check(farNext.map { DayTimeline.nextLabel($0, now: at(16.9)) } == "NEXT · IN 1 H 6 MIN"
+          && farNext.map { DayTimeline.nextTimeLine($0, clock: clock) } == "From 18:00",
+          "hours and minutes; an event with no end reads From")
+    // Only due rows and an all-day item left: nothing is next.
+    let late = DayTimeline.build(blocks: blocks, allDay: ["Campus Fall Fest"], needs: needs, caught: [], now: at(21),
+                                 dayStart: dayStart, dayEnd: at(24), workStart: at(9), workEnd: at(22),
+                                 isToday: true, clock: clock, dayClock: clock)
+    check(DayTimeline.nextUp(late.items, now: at(21)) == nil, "due rows and all-day items are never next")
+    let studyNext = DayTimeline.nextUp(timeline.items, now: at(15.6))
+    check(studyNext.map { DayTimeline.nextTimeLine($0, clock: clock) } == "15:45 – 16:30 · 45 min · Study block",
+          "a study block says what it is: \(studyNext.map { DayTimeline.nextTimeLine($0, clock: clock) } ?? "nil")")
+
+    // Later today: the rest after the card's item, timed rows and due rows apart.
+    let agenda = timeline.agenda(now: now, isToday: true)
+    let later = DayTimeline.laterRows(agenda, excluding: next)
+    check(later.timed.map(\.id) == ["block:notes", "block:plan", "block:pset", "block:practice"],
+          "timed rows after the card, in agenda order: \(later.timed.map(\.id))")
+    check(later.due.map(\.id) == ["need:lab", "need:ps"], "due rows apart: \(later.due.map(\.id))")
+    let narrow = DayTimeline.agenda(agenda, without: next)
+    check(!narrow.ahead.contains { $0.id == "block:review" } && narrow.thingsAhead == agenda.thingsAhead - 1
+          && !narrow.ahead.contains { if case .free(_, let end) = $0 { return end == at(14) } else { return false } },
+          "the one-column agenda drops the card's row and the free stretch up to it")
+    check(DayTimeline.agenda(agenda, without: nil) == agenda, "no card, the agenda as it was")
+    check(DayTimeline.moreLine(later.due, clock: clock) == "Show 2 more · due 23:59: CS 101 Lab 4 and Problem set 6 · MATH 110",
+          DayTimeline.moreLine(later.due, clock: clock))
+    check(DayTimeline.moreLine(Array(later.timed.suffix(2)) + later.due, clock: clock)
+          == "Show 4 more: Study: Problem set 6, Ultimate practice and 2 more",
+          DayTimeline.moreLine(Array(later.timed.suffix(2)) + later.due, clock: clock))
+    check(DayTimeline.moreLine([], clock: clock).isEmpty, "nothing hidden, no line")
+    check(later.timed.map { DayTimeline.laterTime($0, clock: clock) } == ["13:30", "14:00", "15:45", "18:30"]
+          && later.due.map { DayTimeline.laterTime($0, clock: clock) } == ["23:59", "23:59"], "times in a column")
+    check(later.timed.map { DayTimeline.laterDetail($0, now: now, isToday: true, clock: clock) }
+          == ["Suggested · about 45 min", "Your plan · 30 min", "45 min", "1 h 30 min"],
+          "details: \(later.timed.map { DayTimeline.laterDetail($0, now: now, isToday: true, clock: clock) })")
+    // Bars: two hours fills it, a short one keeps a sliver, due rows hold none.
+    let fractions = later.timed.map { DayTimeline.durationFraction($0) }
+    check(fractions == [0.375, 0.25, 0.375, 0.75], "duration bars against two hours: \(fractions)")
+    check(later.due.allSatisfy { DayTimeline.durationFraction($0) == nil }, "due rows draw a dot, not a bar")
+    let long = DayItem(id: "x", title: "Long", detail: "", start: at(9), end: at(13), style: .calendar, begins: at(9), ends: at(13))
+    let short = DayItem(id: "y", title: "Short", detail: "", start: at(9), end: at(9.05), style: .calendar, begins: at(9), ends: at(9.05))
+    check(DayTimeline.durationFraction(long) == 1 && DayTimeline.durationFraction(short) == 0.12, "capped, and never invisible")
+
+    // Rows before Show more, and the halves' balance.
+    check(DayTimeline.rowsBeforeMore(hasNext: false, oneFewer: false) == 8 && DayTimeline.rowsBeforeMore(hasNext: true, oneFewer: false) == 7
+          && DayTimeline.rowsBeforeMore(hasNext: true, oneFewer: true) == 6 && DayTimeline.rowsBeforeMore(1, hasNext: true, oneFewer: true) == 1,
+          "eight, less the Next card, less one when asked, never none")
+    check(DayTimeline.trimLater(trimmed: false, left: 1400, right: 1000, rowAllowance: 44)
+          && !DayTimeline.trimLater(trimmed: false, left: 1300, right: 1000, rowAllowance: 44),
+          "trim when the left is more than a third taller")
+    check(DayTimeline.trimLater(trimmed: true, left: 1310, right: 1000, rowAllowance: 44)
+          && !DayTimeline.trimLater(trimmed: true, left: 1280, right: 1000, rowAllowance: 44),
+          "trimmed stays trimmed unless a row back would still be within the third")
+    check(!DayTimeline.trimLater(trimmed: false, left: 1400, right: 0, rowAllowance: 44), "no right half, no trim")
+
+    // The card's buttons: only for a described Calendar event; Move only where the menu has it.
+    check(DayTimeline.nextButtons(isDescribedEvent: true, menuOffersMove: true, cancelActive: false) == [.open, .move]
+          && DayTimeline.nextButtons(isDescribedEvent: true, menuOffersMove: false, cancelActive: false) == [.open]
+          && DayTimeline.nextButtons(isDescribedEvent: false, menuOffersMove: true, cancelActive: false).isEmpty
+          && DayTimeline.nextButtons(isDescribedEvent: true, menuOffersMove: true, cancelActive: true).isEmpty,
+          "Open and Move only where they work today; none during a cancel")
+}
+
+/// Calendar not granted, unknown or still syncing: the summary, the Next
+/// line, the agenda and the week card say only what Harbor read, never that
+/// the day or the calendar is empty, free or clear.
+func noCalendarChecks(_ check: (Bool, String) -> Void, build: ([DayBlockInput], [DayNeedInput], [String]) -> DayTimeline, at: (Double) -> Double,
+                      now: Double, dayStart: Double, dayEnd: Double, clock: (Double) -> String, cantRead: String) {
+    let denied = SourceAccess(source: "calendar", ready: false, state: "unavailable", blocked: "calendar_access")
+    let syncing = SourceAccess(source: "calendar", ready: false, state: "syncing")
+    // Granted (the service says ready), shown events, not granted, unknown, syncing.
+    check(DayCalendarState.of(ready: true, eventsShown: false, access: SourceAccess(source: "calendar", ready: true)) == .read
+          && DayCalendarState.of(ready: false, eventsShown: true, access: denied) == .read
+          && DayCalendarState.of(ready: false, eventsShown: false, access: denied) == .unread
+          && DayCalendarState.of(ready: nil, eventsShown: false, access: nil) == .unread
+          && DayCalendarState.of(ready: false, eventsShown: false, access: syncing) == .reading,
+          "the Brief's rule: read when ready or its events show; unknown counts as unread")
+    let allClear = ["Nothing is planned", "nothing else", "Nothing else", "Clear after", "free", "nothing on the clock"]
+    func claims(_ text: String) -> [String] { allClear.filter { text.contains($0) } }
+    // Without other items, and with a reminder, school work and a plan caught in texts.
+    let bare = build([], [], [])
+    let needs = [DayNeedInput(id: "r", title: "Readings", source: "reminders", due: at(17)),
+                 DayNeedInput(id: "s", title: "Lab 5 · CS 101", source: "study", due: at(23.9))]
+    let busy = build([DayBlockInput(id: "task:call", title: "Call Sam Rivera", start: at(19), end: at(20), kind: "task", taskID: "call"),
+                      DayBlockInput(id: "pa2-a", title: "Work on PA 2", start: at(20), end: at(21.5), kind: "suggestion")],
+                     needs, [])
+    for (state, line) in [(DayCalendarState.unread, cantRead),
+                          (.reading, "Harbor is still reading your calendar, so this may not be your whole day.")] {
+        let alone = DayTimeline.blurb(bare, needs: [], isToday: true, endOfDay: dayEnd, clock: clock, dayStart: dayStart,
+                                      calendar: state)
+        let others = DayTimeline.blurb(busy, needs: needs, isToday: true, endOfDay: dayEnd, clock: clock, dayStart: dayStart,
+                                       calendar: state)
+        check(alone == line, "\(state) alone: only the calendar line: \(alone)")
+        check(others.hasPrefix(line) && claims(others).isEmpty && !others.contains("on the clock"),
+              "\(state) with other items: the line, then only what was read: \(others)")
+        check(DayTimeline.nothingNextLine(state) == state.nextLine && claims(DayTimeline.nothingNextLine(state)).isEmpty,
+              "\(state): the Next line is the calendar line alone")
+        // The agenda lists every row it read, and no free stretch between them.
+        let rows = DayTimeline.agenda(busy.agenda(now: now, isToday: true), without: nil, calendarRead: false).ahead
+        check(!rows.contains { if case .free = $0 { return true }; return false }
+              && rows.count == busy.agenda(now: now, isToday: true).ahead.filter { if case .item = $0 { return true }; return false }.count,
+              "\(state): no free stretch in the agenda, every item kept")
+    }
+    let read = DayTimeline.blurb(busy, needs: needs, isToday: true, endOfDay: dayEnd, clock: clock, dayStart: dayStart)
+    check(!read.contains("calendar"), "granted: the summary as before: \(read)")
+    let readRows = DayTimeline.agenda(busy.agenda(now: now, isToday: true), without: nil).ahead
+    check(readRows.contains { if case .free = $0 { return true }; return false }, "granted: free stretches stay")
+    // The week card: no load (no count, no bar, never "free") without a read calendar.
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = TimeZone(identifier: "UTC")!
+    let cards = DayWeek.cards(shown: Date(timeIntervalSince1970: now), today: Date(timeIntervalSince1970: now),
+                              calendar: calendar, shownLoad: nil)
+    check(cards.allSatisfy { $0.load == nil } && !DayWeek.fullRow(cards)
+          && cards.allSatisfy { !DayWeek.spoken($0).contains("free") },
+          "no calendar: every card is its date alone, today too")
+}
+
+/// The week route's reply (GET /assistant/today/week), decoded defensively and
+/// reduced to card loads, with invented data only.
+func weekRouteChecks(_ check: (Bool, String) -> Void) {
+    var utc = Calendar(identifier: .gregorian)
+    utc.timeZone = TimeZone(identifier: "UTC")!
+    utc.firstWeekday = 1
+    let wednesday = utc.date(from: DateComponents(year: 2030, month: 3, day: 13, hour: 12))!
+    let dates = DayWeek.dates(containing: wednesday, calendar: utc)
+    let keys = DayWeek.keys(dates, calendar: utc)
+    let start = DayWeek.start(of: wednesday, calendar: utc)
+    check(start == "2030-03-10" && keys.first == start && keys.last == "2030-03-16" && keys.count == 7,
+          "the week starts on the calendar's first weekday: \(start) \(keys)")
+    utc.firstWeekday = 2
+    check(DayWeek.start(of: wednesday, calendar: utc) == "2030-03-11", "a Monday-first calendar starts on Monday")
+    utc.firstWeekday = 1
+    check(DayWeekReply.query(start: start, timezone: "Area/City") == "/assistant/today/week?start=2030-03-10&timezone=Area/City",
+          DayWeekReply.query(start: start, timezone: "Area/City"))
+
+    func ready(_ key: String, _ spans: [[Any]], due: Int) -> [String: Any] {
+        ["day": key, "calendar_ready": true, "on_clock": spans.count, "on_clock_minutes": 60, "due": due,
+         "all_day": 0, "spans": spans]
+    }
+    var days: [[String: Any]] = keys.map { ready($0, [[540, 600, "calendar"]], due: 0) }
+    days[1] = ready(keys[1], [[540, 600, "calendar"], [600, 660, "task"], [780, 900, "study"], [900, 960, "suggestion"]], due: 2)
+    days[2] = ready(keys[2], [], due: 0)
+    days[3] = ["day": keys[3], "calendar_ready": false]
+    days[4] = ready(keys[4], [], due: 3)
+    func data(_ object: [String: Any]) -> Data { try! JSONSerialization.data(withJSONObject: object) }
+    let good: [String: Any] = ["start": start, "timezone": "Area/City", "days": days, "extra": "ignored"]
+    let reply = DayWeekReply.decode(data(good), start: start, timezone: "Area/City", days: keys)
+    check(reply?.days.count == 7 && reply?.days[3].ready == false && reply?.days[1].spans.count == 4,
+          "a whole week decodes; extra keys are ignored")
+    let loads = reply?.loads(workStart: 540, workEnd: 1080) ?? [:]
+    // Suggestions hold nothing: three things, not four; the bar spans working hours.
+    check(loads[keys[1]].map(DayWeek.countText) == "3 · 2 due", "busy: \(loads[keys[1]].map(DayWeek.countText) ?? "nil")")
+    check(loads[keys[1]]?.segments.count == 2 && loads[keys[1]]?.now == nil,
+          "overlapping or touching spans merge; no now line on another day")
+    check(loads[keys[2]].map(DayWeek.countText) == "free", "free only when ready with nothing on the clock or due")
+    check(loads[keys[3]] == nil, "a day whose calendar isn't current: its date alone")
+    check(loads[keys[4]].map(DayWeek.countText) == "3 due", "nothing on the clock but due: not free")
+
+    // Wrong shapes are no data, never a guess.
+    var short = good; short["days"] = Array(days.prefix(6))
+    var shifted = good; shifted["days"] = Array(days.dropFirst()) + [days[0]]
+    var otherWeek = good; otherWeek["start"] = "2030-03-17"
+    var otherZone = good; otherZone["timezone"] = "Elsewhere/Town"
+    for (name, object) in [("six days", short), ("days out of order", shifted), ("another week", otherWeek),
+                           ("another zone", otherZone)] {
+        check(DayWeekReply.decode(data(object), start: start, timezone: "Area/City", days: keys) == nil, "\(name): no data")
+    }
+    check(DayWeekReply.decode(Data("[]".utf8), start: start, timezone: "Area/City", days: keys) == nil
+          && DayWeekReply.decode(Data("not json".utf8), start: start, timezone: "Area/City", days: keys) == nil,
+          "not an object: no data")
+    // A ready day missing a number, with a bool for a count, or a bad span: its date alone.
+    var missing = days; missing[0].removeValue(forKey: "due")
+    var boolean = days; boolean[0]["on_clock"] = true
+    var badSpan = days; badSpan[0]["spans"] = [[600, 540, "calendar"]]
+    var miscount = days; miscount[0]["on_clock"] = 5
+    var stringReady = days; stringReady[0]["calendar_ready"] = "true"
+    for (name, list) in [("missing due", missing), ("a bool count", boolean), ("a backwards span", badSpan),
+                         ("a count the spans don't match", miscount), ("ready as a string", stringReady)] {
+        var object = good; object["days"] = list
+        let day = DayWeekReply.decode(data(object), start: start, timezone: "Area/City", days: keys)?.days[0]
+        check(day?.ready == false, "\(name): that day has its date alone")
+    }
+
+    // Today agrees: the route's today counts as the shown day's own card does
+    // (six on the clock and four due in the Day fixture; the suggestion holds nothing).
+    let todaySpans: [[Any]] = [[705, 840, "calendar"], [720, 780, "calendar"], [930, 975, "study"], [990, 1035, "study"],
+                               [1080, 1140, "calendar"], [1140, 1200, "caught"], [1200, 1290, "suggestion"]]
+    var withToday = days; withToday[0] = ready(keys[0], todaySpans, due: 4)
+    var todayObject = good; todayObject["days"] = withToday
+    let todayLoad = DayWeekReply.decode(data(todayObject), start: start, timezone: "Area/City", days: keys)
+        .flatMap { DayWeekReply.load($0.days[0], workStart: 540, workEnd: 1320) }
+    check(todayLoad?.onClock == 6 && todayLoad?.due == 4, "the fixture's today agrees with the shown day: \(String(describing: todayLoad))")
+
+    // The row's form: from what was read before its first frame, then kept.
+    // Wednesday is the not-ready day and is shown with no load of its own.
+    let cards = DayWeek.cards(shown: wednesday, today: wednesday, calendar: utc, shownLoad: nil, weekLoads: loads)
+    check(cards.filter { $0.load != nil }.count == 6 && cards[3].load == nil, "every ready day's card has its load")
+    check(DayWeek.full(latched: nil, cards: cards) && !DayWeek.full(latched: false, cards: cards)
+          && DayWeek.full(latched: true, cards: []), "a latched form wins over the data that arrived since")
+    let noWeek = DayWeek.cards(shown: wednesday, today: wednesday, calendar: utc, shownLoad: loads[keys[0]])
+    check(!DayWeek.fullRow(noWeek), "without the week (pending, failed, 404): compact")
+}
+

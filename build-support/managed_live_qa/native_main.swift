@@ -204,6 +204,8 @@ do {
         "PYTHONNOUSERSITE": "1",
         "PYTHONPATH": stage.path,
         "HARBOR_QA_CANDIDATE_SHA": candidate,
+        // Live QA uses synthetic state: never a Keychain key through the pre-rename lookup.
+        "HARBOR_KEYCHAIN_LEGACY": "off",
     ]
     environment["HARBOR_CREDENTIAL_PIPE"] = try BackendCredentials.pipeMetadata(pipe)
     process.environment = environment

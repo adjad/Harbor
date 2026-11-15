@@ -187,7 +187,7 @@ ORDINARY = [
     ("cd ~/Projects/app && rm -rf node_modules", "CONFIRM", "CONFIRM"),
     ("cd /tmp && tar xzf x.tgz && rm -rf x", "CONFIRM", "CONFIRM"),
     ("pushd ~/Projects && rm -rf tmp", "CONFIRM", "CONFIRM"),
-    ("cd ~/Desktop/MOE_Project && rm -rf build", "CONFIRM", "CONFIRM"),
+    ("cd ~/Desktop/Harbor_Project && rm -rf build", "CONFIRM", "CONFIRM"),
     ("cd \"$(git rev-parse --show-toplevel)\" && rm -rf build", "CONFIRM", "CONFIRM"),
     ("cd \"$PROJECT\" && rm -rf dist", "CONFIRM", "CONFIRM"),
     ("tmp=$(mktemp -d); cd \"$tmp\" && rm -rf x", "CONFIRM", "CONFIRM"),

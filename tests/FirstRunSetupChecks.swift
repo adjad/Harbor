@@ -1294,7 +1294,7 @@ struct FirstRunSetupChecks {
         // Release Auditor, 6c3d68d4: a build in a repo on the Desktop (no quarantine
         // mark) or any preview build is never asked, so a move can't Trash build output
         // or replace the re-signed local install.
-        check(!offers(.downloaded, quarantined: false), "Built on this Mac, say in ~/Desktop/MOE_Project: never asked")
+        check(!offers(.downloaded, quarantined: false), "Built on this Mac, say in ~/Desktop/Harbor_Project: never asked")
         check(!offers(.downloaded, preview: true) && !offers(.translocated, preview: true)
               && !offers(.diskImage, preview: true), "A preview build: never asked")
         check(offers(.diskImage, quarantined: false), "A disk image with no mark of its own is still asked")

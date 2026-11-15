@@ -727,7 +727,7 @@ final class BackendManager {
             return bundled
         }
 
-        let devRoot = URL(fileURLWithPath: "/Users/you/Desktop/MOE_Project")
+        let devRoot = URL(fileURLWithPath: "/Users/you/Desktop/Harbor_Project")
         if FileManager.default.fileExists(atPath: devRoot.appendingPathComponent("service/main.py").path) {
             return devRoot
         }

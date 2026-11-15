@@ -33,8 +33,10 @@ enum NotchQADriver {
         let midnight = calendar.startOfDay(for: Date())
         let now = midnight.addingTimeInterval(10 * 3600 + 32 * 60)
         let dayStart = midnight.timeIntervalSince1970
-        func dayModel(_ proactive: ProactiveFixture, study: Bool = false) -> TodayModel {
-            TodayModel(now: { now }, timeZoneProvider: { zone }, transport: { request in
+        func dayModel(_ proactive: ProactiveFixture, study: Bool = false, at clock: Date? = nil,
+                      calendarFacts: Bool = false, noCalendar: Bool = false, week: Bool = false) -> TodayModel {
+            let moment = clock ?? now
+            return TodayModel(now: { moment }, timeZoneProvider: { zone }, transport: { request in
                 let components = request.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: true) }
                 let ok = { (body: String) in
                     (Data(body.utf8), HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
@@ -43,6 +45,16 @@ enum NotchQADriver {
                 if request.httpMethod == "POST", components?.path.hasPrefix("/assistant/proactive/") == true {
                     return ok(#"{"ok":true,"detail":"Done"}"#)
                 }
+                if components?.path == DayWeekReply.path {
+                    // The week row's route: a stub week for the "-week" scenes; a
+                    // service without the route (404) for every other scene.
+                    let start = components?.queryItems?.first { $0.name == "start" }?.value ?? ""
+                    guard week, let body = try? fixtureWeek(start: start, today: moment) else {
+                        return (Data(#"{"detail":"Not Found"}"#.utf8),
+                                HTTPURLResponse(url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!)
+                    }
+                    return ok(String(decoding: body, as: UTF8.self))
+                }
                 if components?.path == "/assistant/daily_summary/latest" {
                     // No kept summary: the "brief" scenes use the live one, "brief-nosummary" shows the note.
                     return (Data(#"{"detail":"no composed summary for that day"}"#.utf8),
@@ -50,7 +62,8 @@ enum NotchQADriver {
                 }
                 let body = components?.path == "/assistant/upcoming" ? try fixtureUpcoming(dayStart: dayStart)
                     : try fixturePlan(day: components?.queryItems?.first { $0.name == "day" }?.value ?? "", dayStart: dayStart,
-                                      proactive: proactive, study: study)
+                                      proactive: proactive, study: study, calendarFacts: calendarFacts,
+                                      noCalendar: noCalendar)
                 return (body, HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
             })
         }
@@ -62,6 +75,17 @@ enum NotchQADriver {
         let schoolDay = dayModel(.ready, study: true)
         // The Brief from before the proactive engine, with the same school work.
         let schoolLegacy = dayModel(.none, study: true)
+        // The Day's week row and Next card (C3): the school day with its Calendar
+        // events described (Open in Calendar, Move…), and the same day at 9:45 PM
+        // with nothing left on the clock.
+        let c3Day = dayModel(.ready, study: true, calendarFacts: true)
+        let c3Late = dayModel(.ready, study: true, at: midnight.addingTimeInterval(21 * 3600 + 45 * 60), calendarFacts: true)
+        // The school day with Calendar access off: reminders, school work and
+        // plans caught in texts, and no word that the calendar is clear.
+        let c3NoCalendar = dayModel(.ready, study: true, noCalendar: true)
+        // The school day with the week read: a busy day, a free day, a day whose
+        // calendar wasn't current, and the rest; the full-height week row.
+        let c3Week = dayModel(.ready, study: true, calendarFacts: true, week: true)
         // First-day states: a new user's empty day, the same day with Calendar,
         // Reminders, Mail and Messages unreadable, and the service still starting.
         func variantModel(_ variant: DayVariant) -> TodayModel {
@@ -103,6 +127,11 @@ enum NotchQADriver {
         today.startBackgroundRefresh(afterRefresh: { await DayCards.refresh() })
         let model = OverlayModel()
         model.qaShow(brief: fixtureBrief)
+        // READY FOR YOU: two things found in mail, and Harbor acting for you with
+        // one thing added today. Neither reads the live service.
+        MailMemoryCards.model = fixtureMailMemory(found: true)
+        let noMail = fixtureMailMemory(found: false)
+        ProactiveBriefSection.qaActing = fixtureActing(now: now)
         let width = SurfaceLayout.maxExpandedWidth
         // Each Brief scene keeps its own card and to-do state.
         func state(_ configure: (ProactiveActions) -> Void = { _ in }) -> ProactiveActions {
@@ -110,6 +139,8 @@ enum NotchQADriver {
             configure(actions)
             return actions
         }
+        // The Brief opens on the drafted reply, as it would after a cycle that wrote one.
+        func briefState() -> ProactiveActions { state { $0.qaReset(hero: "card-ed") } }
         // The reply composer answers from its own canned fixture, never the service.
         BriefReplyHook.composer = { thread, close in
             AnyView(BriefReplyComposer(replyRef: thread.replyRef, account: thread.replyAccount, transport: { request in
@@ -124,11 +155,15 @@ enum NotchQADriver {
             }, onDismiss: close))
         }
         let scenes: [(name: String, tab: NotchTab, view: () -> AnyView)] = [
-            ("brief", .brief, { AnyView(NotchBriefView(model: model, today: today, actions: state())) }),
-            ("brief-wide", .brief, { AnyView(NotchBriefView(model: model, today: today, actions: state(), wide: true)) }),
+            ("brief", .brief, { AnyView(NotchBriefView(model: model, today: today, actions: briefState())) }),
+            ("brief-wide", .brief, { AnyView(NotchBriefView(model: model, today: today, actions: briefState(), wide: true)) }),
             // R6 side by side with school work, and with nothing in either zone.
-            ("brief-wide-study", .brief, { AnyView(NotchBriefView(model: model, today: schoolDay, actions: state(), wide: true)) }),
-            ("brief-wide-empty", .brief, { AnyView(NotchBriefView(model: model, today: blockedProactive, actions: state(), wide: true)) }),
+            ("brief-wide-study", .brief, { AnyView(NotchBriefView(model: model, today: schoolDay, actions: briefState(), wide: true)) }),
+            // Nothing ready: READY FOR YOU is one line, side by side and stacked.
+            ("brief-wide-empty", .brief, { AnyView(NotchBriefView(model: model, today: blockedProactive, actions: state(), wide: true,
+                                                                  mailMemory: noMail)) }),
+            ("brief-empty", .brief, { AnyView(NotchBriefView(model: model, today: blockedProactive, actions: state(),
+                                                             mailMemory: noMail)) }),
             ("brief-todos", .brief, { AnyView(NotchBriefView(model: model, today: today, uncapped: true,
                                                              actions: state { $0.qaReset(openRow: "todos", showAll: true) })) }),
             ("brief-threads", .brief, { AnyView(NotchBriefView(model: model, today: today, uncapped: true,
@@ -146,19 +181,30 @@ enum NotchQADriver {
             ("brief-blocked-proactive", .brief, { AnyView(NotchBriefView(model: model, today: blockedProactive, actions: state())) }),
             ("day-blocked", .day, { AnyView(NotchDayView(model: model, today: blocked)) }),
             ("day-starting", .day, { AnyView(NotchDayView(model: startingModel, today: starting)) }),
-            ("brief-study", .brief, { AnyView(NotchBriefView(model: model, today: schoolDay, actions: state())) }),
+            ("brief-study", .brief, { AnyView(NotchBriefView(model: model, today: schoolDay, actions: briefState())) }),
             ("day-study", .day, { AnyView(NotchDayView(model: model, today: schoolDay)) }),
             // The Day in the wide panel: two halves, the left up to Old reminders.
             ("day-wide", .day, { AnyView(NotchDayView(model: model, today: today, wide: true)) }),
             ("day-wide-study", .day, { AnyView(NotchDayView(model: model, today: schoolDay, wide: true)) }),
             ("day-wide-empty", .day, { AnyView(NotchDayView(model: model, today: blockedProactive, wide: true)) }),
+            ("day-c3-wide", .day, { AnyView(NotchDayView(model: model, today: c3Day, wide: true)) }),
+            ("day-c3", .day, { AnyView(NotchDayView(model: model, today: c3Day)) }),
+            ("day-c3-empty", .day, { AnyView(NotchDayView(model: model, today: c3Late)) }),
+            ("day-c3-empty-wide", .day, { AnyView(NotchDayView(model: model, today: c3Late, wide: true)) }),
+            // Calendar unreadable: no load is known for any day, so all seven show their date alone.
+            ("day-c3-noweek", .day, { AnyView(NotchDayView(model: model, today: blocked)) }),
+            ("day-c3-nocalendar", .day, { AnyView(NotchDayView(model: model, today: c3NoCalendar)) }),
+            ("day-c3-nocalendar-wide", .day, { AnyView(NotchDayView(model: model, today: c3NoCalendar, wide: true)) }),
+            ("day-c3-week", .day, { AnyView(NotchDayView(model: model, today: c3Week)) }),
+            ("day-c3-week-wide", .day, { AnyView(NotchDayView(model: model, today: c3Week, wide: true)) }),
             ("brief-legacy-study", .brief, { AnyView(NotchBriefView(model: model, today: schoolLegacy, open: nil)) }),
         ] + NotchQASetup.scenes() + panelScenes(model: model, today: today, state: state)
             + studyScenes(model: model)
         for scene in scenes {
             let name = scene.name
             // The Brief's and the Day's two columns render at the wide panel's width.
-            let sceneWidth = name.hasPrefix("brief-wide") || name.hasPrefix("day-wide") ? SurfaceLayout.wideExpandedWidth : width
+            let sceneWidth = name.hasPrefix("brief-wide") || name.hasPrefix("day-wide") || name.hasSuffix("-wide")
+                ? SurfaceLayout.wideExpandedWidth : width
             let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: sceneWidth, height: 760),
                                   styleMask: [.borderless], backing: .buffered, defer: false)
             let content = VStack(alignment: .leading, spacing: 0) {
@@ -188,14 +234,26 @@ enum NotchQADriver {
             }
             await starting.refresh()
             // The "-study" scenes' days load like the rest (they rendered "Starting Harbor…" before).
-            for school in [schoolDay, schoolLegacy] {
+            for school in [schoolDay, schoolLegacy, c3Day, c3Late, c3NoCalendar, c3Week] {
                 await school.refresh()
                 await school.refreshUpcoming()
                 await school.refreshStoredBrief()
             }
+            // The week read before the first frame, so its row opens full height.
+            if let plan = c3Week.currentPlan {
+                var weekCalendar = Calendar(identifier: .gregorian)
+                weekCalendar.timeZone = zone
+                weekCalendar.firstWeekday = Calendar.autoupdatingCurrent.firstWeekday
+                let dates = DayWeek.dates(containing: now, calendar: weekCalendar)
+                await c3Week.refreshWeek(start: DayWeek.start(of: now, calendar: weekCalendar),
+                                         days: DayWeek.keys(dates, calendar: weekCalendar), revision: plan.revision)
+                // The scene windows exist before the read: their rows opened
+                // compact. Shown as the next opening would be, full height.
+                c3Week.weekRowClosed()
+            }
             let deadline = Date().addingTimeInterval(5)
             @MainActor func populated() -> Bool {
-                today.currentPlan?.workspace?.proactive?.cards.count == 3 && today.upcomingReply != nil && today.storedBriefChecked &&
+                today.currentPlan?.workspace?.proactive?.cards.count == 4 && today.upcomingReply != nil && today.storedBriefChecked &&
                 working.currentPlan?.workspace?.proactive?.isWorking == true &&
                 legacy.currentPlan?.workspace != nil && legacy.currentPlan?.workspace?.proactive == nil &&
                 dayOne.currentPlan != nil && blocked.currentPlan?.unreadSources.count == 4 &&
@@ -203,7 +261,11 @@ enum NotchQADriver {
                 starting.currentPlan == nil && starting.error.isEmpty &&
                 attention.items.count == 1 && stale.asks.count == 2 &&
                 schoolDay.currentPlan?.study?.upcoming.isEmpty == false &&
-                schoolLegacy.currentPlan?.study?.upcoming.isEmpty == false
+                schoolLegacy.currentPlan?.study?.upcoming.isEmpty == false &&
+                c3Day.currentPlan?.displayBlocks.contains { $0.calendarEvent != nil } == true &&
+                c3Late.currentPlan != nil &&
+                c3NoCalendar.currentPlan?.calendarState == .unread &&
+                c3Week.weekReply?.days.count == 7
             }
             while !populated() && Date() < deadline {
                 try? await Task.sleep(for: .milliseconds(20))
@@ -452,6 +514,36 @@ enum NotchQADriver {
 
     static let judgeAccount = "judge.demo@gmail.com"
 
+    /// "Found in your mail" in its live mode: two invented reminders, or none.
+    /// Due dates are counted from today, as the rows label them.
+    static func fixtureMailMemory(found: Bool) -> MailMemoryModel {
+        let format = DateFormatter()
+        format.locale = Locale(identifier: "en_US_POSIX")
+        format.dateFormat = "yyyy-MM-dd"
+        func day(_ offset: Int) -> String { format.string(from: Date().addingTimeInterval(Double(offset) * 86_400)) }
+        let rows: [[String: Any]] = [
+            ["id": 1, "what": "Housing rent due", "due": day(6), "precision": "day", "quote": "",
+             "from": "Campus Housing", "subject": "Rent reminder", "message_id": "<rent-11@example.edu>",
+             "actions": ["accept", "dismiss"]],
+            ["id": 2, "what": "StreamBox subscription expires", "due": day(9), "precision": "day", "quote": "",
+             "from": "StreamBox", "subject": "Your plan renews soon", "message_id": "<plan-2@example.com>",
+             "actions": ["accept", "dismiss"]],
+        ]
+        return MailMemoryModel(baseURL: URL(string: "http://fixture.invalid")!, transport: { request in
+            let body: [String: Any] = ["mode": "live", "suggestions": found ? rows : []]
+            return (try JSONSerialization.data(withJSONObject: body),
+                    HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+        })
+    }
+
+    /// "Let Harbor act for me", on, with one thing added today.
+    static func fixtureActing(now: Date) -> ActForMe? {
+        ActForMe(["enabled": true, "asked": true, "today": 1,
+                  "does": ["Adds an event or deadline you missed in a text from a saved contact to Calendar or Reminders."],
+                  "recent": [["title": "CS 101 lab moved to Tue 2 PM", "who": "Prof. Alvarez",
+                              "at": now.timeIntervalSince1970 - 3 * 3600]]])
+    }
+
     /// A demo day: Hack Day and Hacktoberfest at midday, a QNT 210 worksheet to
     /// block time for, Dana's exam email, "Jo: let's talk tmrw", a recruiter's
     /// coffee chat and a Trader Joe's reminder; three cards, seven to-dos and
@@ -486,12 +578,22 @@ enum NotchQADriver {
              "sources": [["kind": "mail", "ref": "mail:ed-1", "who": "Dana Okafor", "quote": "Exam 1 is Wednesday at 10 in Room 321"]],
              "action": ["method": "reminder", "button": "Set the reminder?", "draft": "", "recipient": "",
                         "event": NSNull(), "envelope": "opaque"]],
+            // What Harbor added by itself today (acting for you), with its Undo.
+            ["id": "card-added", "meta": "Today · Messages", "account": me,
+             "title": "CS 101 lab moved to Tue 2 PM", "when": "from Prof. Alvarez",
+             "body": "Prof. Alvarez texted that the lab moved, so Harbor put it on your calendar.",
+             "why": "A saved contact's text moved an event; you said Harbor may add those.",
+             "sources": [["kind": "messages", "ref": "msg:alvarez-1", "who": "Prof. Alvarez", "quote": "Lab moves to Tuesday at 2"]],
+             "action": ["method": "undo_add", "button": "", "draft": "", "recipient": "",
+                        "event": NSNull(), "envelope": "opaque"]],
         ]
         func todo(_ id: String, _ title: String, _ source: String, who: String = "", quote: String = "",
                   due: Double?, label: String, kind: String = "task", card: String? = nil, account: String = "me") -> [String: Any] {
             ["id": id, "title": title, "source": source, "account": account, "who": who, "quote": quote,
              "due_ts": due.map { at($0) } ?? NSNull(), "due_label": label, "kind": kind, "done": false,
-             "card_id": card ?? NSNull()]
+             "card_id": card ?? NSNull(),
+             // Clear (and Mark done for a dated reminder) behind the Brief's row icons.
+             "fingerprint": "fp-" + id, "can_complete": source == "reminders" && due != nil]
         }
         let todos: [[String: Any]] = [
             todo("todo-read-cse", "Readings", "reminders", who: "CMP 140", due: 17, label: "5 PM"),
@@ -511,7 +613,7 @@ enum NotchQADriver {
                  due: 24 * 3 + 20, label: "Tue"),
             todo("todo-cs-reading", "Chapter 4 reading [CS 101]", "reminders", due: 24 * 3 + 21, label: "Tue"),
         ]
-        let threads: [[String: Any]] = [
+        let threadRows: [[String: Any]] = [
             ["id": "t-ed", "source": "mail", "account": me, "who": "Dana", "title": "Exam 1 timing",
              "summary": "Asks if you can take Exam 1 early on Tuesday morning; the exam itself is Wednesday at 10.",
              "needs_reply": true, "received_ts": at(-14),
@@ -535,6 +637,12 @@ enum NotchQADriver {
              "needs_reply": false, "received_ts": at(8),
              "reply_ref": ["message_id": "<hack-1@gmail.com>", "account": judgeAccount]],
         ]
+        // Each thread's Clear needs its fingerprint, as the service sends it.
+        let threads: [[String: Any]] = threadRows.map { row in
+            var row = row
+            row["fingerprint"] = "fp-" + (row["id"] as? String ?? "")
+            return row
+        }
         return [
             "state": working ? "working" : "ready", "as_of": at(10.4), "progress": ["done": 12, "total": 40],
             "accounts": [me, judgeAccount], "owner": ["id": "me", "label": "Alex"],
@@ -551,7 +659,8 @@ enum NotchQADriver {
     /// deadlines and SCHOOL summary (the "-study" scenes); without it the plan
     /// is exactly what it was before Study.
     static func fixturePlan(day: String, dayStart: Double, proactive: ProactiveFixture = .none,
-                            study withStudy: Bool = false) throws -> Data {
+                            study withStudy: Bool = false, calendarFacts: Bool = false,
+                            noCalendar: Bool = false) throws -> Data {
         func at(_ h: Double) -> Double { dayStart + h * 3600 }
         func block(_ id: String, _ title: String, _ start: Double, _ end: Double, _ kind: String,
                    task: String? = nil, pattern: String? = nil, evidence: String? = nil) -> [String: Any] {
@@ -566,7 +675,7 @@ enum NotchQADriver {
              "priority": 1, "reference": source + ":" + id, "suggested_minutes": 25, "needs_review": source != "reminders"]
                 .merging(extra) { $1 }
         }
-        let blocks = proactive == .none ? [
+        var blocks = proactive == .none ? [
             block("lunch", "Lunch with Sam", 11.5, 12.5, "calendar"),
             block("lecture", "CMP 140 lecture", 14, 15.25, "calendar"),
             block("club", "Startup club meeting", 18, 19, "calendar"),
@@ -577,6 +686,18 @@ enum NotchQADriver {
             block("club", "Startup club meeting", 18, 19, "calendar"),
             block("pa2-a", "Work on PA 2", 20, 21.5, "suggestion", evidence: "pa2"),
         ]
+        if calendarFacts {
+            // What the service adds to a synced Calendar event (checkin.annotate_calendar_blocks):
+            // the user's own events on a writable calendar, so the ⋯ menu offers Move.
+            blocks = blocks.map { block in
+                guard block["kind"] as? String == "calendar" else { return block }
+                return block.merging(["source_id": "qa-cal-\(block["id"] ?? "")", "all_day": false, "invitee_count": 0,
+                                      "organizer_is_user": true, "calendar_writable": true,
+                                      "cancel_blocked": "", "move_blocked": ""]) { $1 }
+            }
+        }
+        // Calendar access off: no Calendar events or all-day items reach the plan.
+        if noCalendar { blocks = blocks.filter { $0["kind"] as? String != "calendar" } }
         var workspace: [String: Any] = [
             "attention": [
                 need("pa2", "reminders", "PA 2", due: 23.98),
@@ -708,12 +829,63 @@ enum NotchQADriver {
             "preferences": ["start_minute": 540, "end_minute": 1320, "not_before": NSNull()],
             "workspace": workspace,
         ]
+        if noCalendar {
+            payload["all_day"] = [[String: Any]]()
+            payload["sources"] = ["calendar": ["ready": false, "last_sync": NSNull(), "state": "unavailable",
+                                               "blocked": "calendar_access",
+                                               "reason": "Calendar access is off for Harbor."]]
+            workspace["attention"] = (workspace["attention"] as? [[String: Any]] ?? []).filter { $0["source"] as? String != "calendar" }
+            payload["workspace"] = workspace
+        }
         if withStudy {
             payload["blocks"] = studyBlocks
             payload["deadlines"] = studyDeadlines
             payload["study"] = study
         }
         return try JSONSerialization.data(withJSONObject: payload)
+    }
+
+    /// The week route's stub (`GET /assistant/today/week`), in its exact
+    /// shape. Today's entry is what the shown day's own plan counts at 10:32
+    /// (six on the clock, four due), so the two agree; then a busy day, a free
+    /// day, a day whose calendar wasn't current, and three ordinary days.
+    static func fixtureWeek(start: String, today: Date) throws -> Data {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = zone
+        let parts = start.split(separator: "-").compactMap { Int($0) }
+        guard parts.count == 3,
+              let first = calendar.date(from: DateComponents(year: parts[0], month: parts[1], day: parts[2], hour: 12)) else {
+            throw URLError(.badURL)
+        }
+        let dates = (0..<7).compactMap { calendar.date(byAdding: .day, value: $0, to: first) }
+        let keys = DayWeek.keys(dates, calendar: calendar)
+        let todayKey = DayWeek.keys([today], calendar: calendar)[0]
+        func ready(_ key: String, _ spans: [[Any]], due: Int) -> [String: Any] {
+            let minutes = spans.reduce(0) { $0 + (($1[1] as? Int ?? 0) - ($1[0] as? Int ?? 0)) }
+            return ["day": key, "calendar_ready": true, "on_clock": spans.count, "on_clock_minutes": minutes,
+                    "due": due, "all_day": 0, "spans": spans]
+        }
+        // Today: Hack Day, Hacktoberfest, two study blocks, the club meeting and
+        // the dinner caught in texts (as the shown day counts it), and the plan's suggestion.
+        let todaySpans: [[Any]] = [[705, 840, "calendar"], [720, 780, "calendar"], [930, 975, "study"],
+                                   [990, 1035, "study"], [1080, 1140, "calendar"], [1140, 1200, "caught"],
+                                   [1200, 1290, "suggestion"]]
+        let busy: [[Any]] = [[540, 600, "calendar"], [600, 690, "calendar"], [780, 870, "calendar"],
+                             [900, 1020, "study"], [1080, 1170, "calendar"]]
+        let ordinary: [[Any]] = [[600, 675, "calendar"], [840, 900, "calendar"]]
+        var others = keys.filter { $0 != todayKey }.makeIterator()
+        let busyKey = others.next(), freeKey = others.next(), notReadyKey = others.next()
+        let days: [[String: Any]] = keys.map { key in
+            switch key {
+            case todayKey:
+                return ready(key, todaySpans, due: 4)
+            case busyKey: return ready(key, busy, due: 2)
+            case freeKey: return ready(key, [], due: 0)
+            case notReadyKey: return ["day": key, "calendar_ready": false]
+            default: return ready(key, ordinary, due: 1)
+            }
+        }
+        return try JSONSerialization.data(withJSONObject: ["start": start, "timezone": zone.identifier, "days": days])
     }
 
     static func fixtureUpcoming(dayStart: Double) throws -> Data {

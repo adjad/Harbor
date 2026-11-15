@@ -4,6 +4,18 @@ All notable changes to Harbor are documented here.
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-11-15
+
+See [docs/releases/0.1.6.md](docs/releases/0.1.6.md) for the release notes.
+
+### Changed
+- **Brief.** The first zone (the left half when wide) is "Ready for you": the drafted reply, a row for each thing Harbor prepared or found, and what it added for you, with Undo. The second zone is your lists.
+- **Day.** A seven-day row, a "Next up" card and "Later today", from a new read-only week summary.
+
+### Fixed
+- Keys saved before the app was renamed are copied on first use, behind macOS's own prompt, and Ask says "Reconnect your cloud AI key" when one is missing.
+- The Day says when it cannot read your calendar instead of saying nothing is planned.
+
 ## [0.1.5] - 2026-11-14
 
 See [docs/releases/0.1.5.md](docs/releases/0.1.5.md) for the release notes.

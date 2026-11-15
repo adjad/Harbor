@@ -1221,7 +1221,7 @@ print('external venv readable; private home and writes denied')
     def test_host_checkout_scan_covers_nested_dependencies(self):
         bundle = self.signing_fixture()
         native = bundle / "Contents/Resources/dependency.so"
-        for marker in (str(ROOT), "/Users/you/private-checkout", "/Users/you/Desktop/MOE_Project"):
+        for marker in (str(ROOT), "/Users/you/private-checkout", "/Users/you/Desktop/Harbor_Project"):
             native.write_bytes(b"\xcf\xfa\xed\xfe" + marker.encode())
             with self.assertRaisesRegex(p.BuildError, "Host build path"):
                 p.scan_host_paths(bundle)
