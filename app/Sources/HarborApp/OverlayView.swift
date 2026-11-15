@@ -1278,7 +1278,8 @@ struct OverlayView: View {
             if !draft.status.isEmpty {
                 Text(draft.status)
                     .font(.harbor(.footnote))
-                    .foregroundStyle((draft.sent || draft.isSending)
+                    .foregroundStyle((draft.sent || draft.isSending
+                                      || draft.status == HarborClient.quietNotDelivered)
                                      ? Theme.textSecondary : Theme.bad)
             }
             if !draft.sent {
