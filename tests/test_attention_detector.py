@@ -493,7 +493,7 @@ def test_the_remaining_lure_forms_from_the_review_are_refused(text):
 
 @pytest.mark.parametrize("text", [
     "nsu.example portal due 11:59pm",
-    "see https://canvas.nsu.example/courses/95486 at 5",
+    "see https://canvas.nsu.example/courses/40486 at 5",
     "meet at 6 https://maps.apple.com/?q=Quad",
     "meet at 6 https://www.google.com/maps/place/Quad",
     "Dr. Smith at 3", "St. Mary at 6", "7 p.m. at the gym", "e.g. at 6", "U.S. history at 4",
@@ -507,7 +507,7 @@ def test_the_university_and_ordinary_abbreviations_are_not_refused(text, monkeyp
 
 @pytest.mark.parametrize("text", [
     "nsu.example portal due 11:59pm",
-    "see https://canvas.nsu.example/courses/95486 at 5",
+    "see https://canvas.nsu.example/courses/40486 at 5",
 ])
 def test_a_school_portal_is_a_contact_vector_until_it_is_the_users_own(text, monkeypatch):
     monkeypatch.setattr(exclusions, "_own_account_suffixes", lambda: ())

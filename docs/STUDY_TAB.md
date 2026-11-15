@@ -493,6 +493,17 @@ materials the course links to, so the student can add them as sources in one go.
   with at most `MAX_REDIRECTS` redirects each checked again, and no cookies, sign-in, Referer or
   proxy. HTML and plain text are capped at `MAX_BYTES`; a public PDF at `PDF_MAX_BYTES`, its text
   read in a sandboxed child process.
+- **Lecture recordings.** A course item that is a lecture recording (by its title: a recording,
+  a recorded lecture, a lecture capture or class video) usually launches an outside tool, so it is
+  never opened. Unless its title also has a never-open word (a meeting or a quiz, say), it is
+  listed as "Recording · link only" and can be added as a video source by its title and link.
+- **Titles and hosts.** Found-item titles drop Canvas's screen-reader notes such as "Links to an
+  external site."; each row shows the link's host, on its own line when the title is long.
+- **Staying open.** While a Find materials walk or add runs (as while a Study read or a new
+  material is being made, or an Ask answer is coming), the notch's automatic close waits for it,
+  up to the job's own limit (`OverlayModel.jobHoldsOpen`). Closing it yourself never stops the job.
+- **Drive failures.** A Drive file that cannot be read says why, for example when its owner turned
+  off downloading.
 - **Afterwards.** One background worker reads new decks as pages and labels the new sources with
   topics. Fetched or sent text is untrusted data: stored as-is and given to the Study model only
   inside the delimited data block. Nothing about a page is logged beyond a status, a host or a

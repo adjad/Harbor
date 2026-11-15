@@ -26,6 +26,8 @@ from datetime import date, datetime, timedelta
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
+from service.study.course_names import merge_key
+
 SOURCE = "canvas"
 
 
@@ -94,8 +96,8 @@ def _lines(text: str) -> list[str]:
     return out
 
 
-def _norm(name: str) -> str:
-    return _WS.sub(" ", re.sub(r"[^0-9a-z]+", " ", (name or "").lower())).strip()
+# The store's merge_key: one normalisation for the name hash and the store's merging.
+_norm = merge_key
 
 
 def _sha(value: str) -> str:
@@ -536,7 +538,7 @@ def _course_from_title(title: str, *, plain: bool = False) -> str | None:
 
 
 def _code_only(line: str) -> bool:
-    """A bare course code ("CMP-22-01", "STAT 101-02"): a breadcrumb's short name, not a course name."""
+    """A bare course code ("CS-101-01", "STAT 101-02"): a breadcrumb's short name, not a course name."""
     m = _CODE.match(line or "")
     return bool(m) and not re.sub(r"[\s\-:.,()]+", "", line[m.end():])
 

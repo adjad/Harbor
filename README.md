@@ -33,7 +33,9 @@ Harbor is a Swift app plus a bundled Python (FastAPI) service. It is Apache-2.0 
   Modules page, its section lists and up to 100 of its own Pages and Discussions as tabs in your
   browser (you close them yourself), and lists the slides, documents, notebooks, PDFs and articles
   they link to. It never opens quizzes, tests, surveys, assignments, submissions or outside tools;
-  those are listed as "Can't open" with the reason. Nothing is added until you tick it.
+  those are listed as "Can't open" with the reason. A lecture recording is listed by its title and
+  link and can be added as a video source, but it is never opened. Nothing is added until you tick
+  it.
 
 Also in the app: meeting notes, reading files attached to email, and an optional mode where Harbor
 adds events and reminders by itself from trusted sources (off until you say yes, with an Undo on

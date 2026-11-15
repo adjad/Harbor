@@ -604,8 +604,8 @@ enum StudyFindReader {
                let url = absolute(raw, base: w.base), !w.seenLinks.contains(url) {
                 let description = stringValue(element, kAXDescriptionAttribute as String)
                 let help = stringValue(element, kAXHelpAttribute as String)
-                let title = clean(stringValue(element, kAXTitleAttribute as String))
-                    ?? clean(description) ?? clean(inner) ?? ""
+                let title = StudyFindText.cleanTitle(clean(stringValue(element, kAXTitleAttribute as String))
+                    ?? clean(description) ?? clean(inner) ?? "")
                 // The row's label, then the link's own description or tooltip.
                 // A tool or quiz label wins, so the server drops the item.
                 let pending = w.visited - w.pendingAt < 60 ? w.pendingType : nil
@@ -885,17 +885,22 @@ struct StudyFoundItem: Decodable, Equatable, Identifiable, Sendable {
     /// Why the server refused a course item it still lists: "tool", "quiz",
     /// "assignment" or "unknown". Such an item is never opened or added.
     let reason: String?
+    /// A lecture recording the server lists by title and link only: it can be
+    /// added as a video source but is never opened (it launches an outside tool).
+    let recording: Bool
 
-    enum CodingKeys: String, CodingKey { case id, kind, title, url, via, known, reason }
+    enum CodingKeys: String, CodingKey { case id, kind, title, url, via, known, reason, recording }
 
-    init(id: String, kind: String, title: String, url: String, via: String, known: Bool, reason: String? = nil) {
+    init(id: String, kind: String, title: String, url: String, via: String, known: Bool, reason: String? = nil,
+         recording: Bool = false) {
         self.id = id
         self.kind = kind
-        self.title = title
+        self.title = StudyFindText.cleanTitle(title)
         self.url = url
         self.via = via
         self.known = known
         self.reason = reason
+        self.recording = recording
     }
 
     init(from decoder: Decoder) throws {
@@ -903,10 +908,11 @@ struct StudyFoundItem: Decodable, Equatable, Identifiable, Sendable {
         id = try c.decode(String.self, forKey: .id)
         url = try c.decode(String.self, forKey: .url)
         kind = ((try? c.decodeIfPresent(String.self, forKey: .kind)) ?? nil)?.lowercased() ?? "other"
-        title = ((try? c.decodeIfPresent(String.self, forKey: .title)) ?? nil) ?? ""
+        title = StudyFindText.cleanTitle(((try? c.decodeIfPresent(String.self, forKey: .title)) ?? nil) ?? "")
         via = ((try? c.decodeIfPresent(String.self, forKey: .via)) ?? nil)?.lowercased() ?? "none"
         known = ((try? c.decodeIfPresent(Bool.self, forKey: .known)) ?? nil) ?? false
         reason = ((try? c.decodeIfPresent(String.self, forKey: .reason)) ?? nil)?.lowercased()
+        recording = ((try? c.decodeIfPresent(Bool.self, forKey: .recording)) ?? nil) ?? false
     }
 
     var host: String { URL(string: url)?.host?.lowercased() ?? "" }
@@ -1128,6 +1134,30 @@ enum StudyFindText {
         }
     }
 
+    /// Canvas's screen-reader notes on links ("Links to an external site.",
+    /// "(opens in a new tab)") taken off a title, so sources get clean names.
+    static func cleanTitle(_ title: String) -> String {
+        var t = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let notes = [
+            #"\(?\s*links?\s+to\s+an\s+external\s+site\.?\s*\)?$"#,
+            #"\(?\s*opens\s+in\s+(a\s+)?new\s+(tab|window)\.?\s*\)?$"#,
+            #"\(?\s*external\s+link\.?\s*\)?$"#,
+        ]
+        var changed = true
+        while changed {
+            changed = false
+            for note in notes {
+                if let range = t.range(of: note, options: [.regularExpression, .caseInsensitive]) {
+                    t = String(t[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    changed = true
+                }
+            }
+        }
+        return t
+    }
+
+    static let recordingLabel = "Recording · link only"
+
     /// The row note for an item Harbor never opens because it sounds important.
     static func notOpened(_ reason: String) -> String { "Not opened: \(reason)" }
     static func kindName(_ kind: String) -> String {
@@ -1190,7 +1220,10 @@ final class StudyFindRun: ObservableObject {
     }
 
     @Published var visible = false
-    @Published private(set) var phase: Phase = .idle
+    @Published private(set) var phase: Phase = .idle {
+        // [notch hold] Tells the notch a walk started or ended (AppDelegate.watchForStudyJobEnding).
+        didSet { if phase != oldValue { NotificationCenter.default.post(name: Self.phaseChanged, object: self) } }
+    }
     @Published private(set) var step = ""
     @Published private(set) var tabsOpened = 0
     @Published private(set) var items: [StudyFoundItem] = []
@@ -1227,6 +1260,13 @@ final class StudyFindRun: ObservableObject {
     static let addTimeout: TimeInterval = 120
 
     private static var runs: [String: StudyFindRun] = [:]
+
+    // [notch hold] Read by the notch's automatic close (OverlayModel.studyJobRunningNow, studyHoldsOpen).
+    static let phaseChanged = Notification.Name("HarborStudyFindRunPhaseChanged")
+    /// A walk or an add is under way for some course.
+    static var anyRunning: Bool { runs.values.contains { $0.running } }
+    /// Some course's found card is waiting for Add or Done.
+    static var anyAwaitingChoice: Bool { runs.values.contains { $0.visible && $0.phase == .found } }
 
     /// The run for this course (one per course and Canvas site).
     static func shared(for target: StudyFindTarget) -> StudyFindRun {
@@ -1712,6 +1752,8 @@ final class StudyFindRun: ObservableObject {
         if let reason = item.reason { return StudyFindText.refused(reason) }
         if item.known { return StudyFindText.added }
         if let why = important[item.id] { return StudyFindText.notOpened(why) }
+        // A lecture recording: added by title and link, never opened.
+        if item.recording, item.via == "none", item.reason == nil { return nil }
         switch item.via {
         case "drive", "web":
             return item.kind == "video" || item.kind == "other" ? StudyFindText.cantAdd : nil
@@ -1726,6 +1768,7 @@ final class StudyFindRun: ObservableObject {
     /// The list group an item shows under: refused items all go under "Can't open".
     func group(_ item: StudyFoundItem) -> String {
         if item.reason != nil || important[item.id] != nil { return "other" }
+        if item.recording { return "video" }
         return StudyFindText.order.contains(item.kind) ? item.kind : "other"
     }
 
@@ -1994,7 +2037,6 @@ private struct StudyFindCard: View {
             .studyReportsHeight(onResize)
             .onAppear { run.setFinished(onFinished) }
             .onChange(of: run.phase) { _, _ in onResize() }
-            .onExitCommand { if !run.running { set { run.close() } } }
         }
     }
 
@@ -2265,6 +2307,16 @@ private struct StudyFoundRow: View {
         return trimmed.isEmpty ? (item.host.isEmpty ? item.url : item.host) : trimmed
     }
 
+    private var titleText: some View {
+        Text(title).font(.harbor(.body, weight: .medium))
+            .foregroundStyle(blocker == nil ? Theme.textPrimary : Theme.textSecondary)
+            .lineLimit(1)
+    }
+
+    private var hostText: some View {
+        Text(item.host).font(.harbor(.caption)).foregroundStyle(Theme.textMuted).lineLimit(1)
+    }
+
     private var glyph: String {
         if item.known { return "checkmark" }
         if blocker != nil { return "minus.square" }
@@ -2281,18 +2333,25 @@ private struct StudyFoundRow: View {
                 Image(systemName: StudyFindText.symbol(item.kind)).font(.harbor(size: 10))
                     .foregroundStyle(Theme.textMuted)
                     .accessibilityHidden(true)
-                Text(title).font(.harbor(.body, weight: .medium))
-                    .foregroundStyle(blocker == nil ? Theme.textPrimary : Theme.textSecondary)
-                    .lineLimit(1).truncationMode(.middle)
-                    .layoutPriority(1)
-                Spacer(minLength: 8)
-                if let blocker {
-                    Text(blocker).font(.harbor(.caption, weight: .medium)).foregroundStyle(Theme.textMuted)
+                // Title and host on one line when they fit; else the host on
+                // a second muted line, never squeezed to a letter.
+                ViewThatFits(in: .horizontal) {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        titleText.fixedSize()
+                        Spacer(minLength: 8)
+                        hostText.fixedSize()
+                    }
+                    VStack(alignment: .leading, spacing: 0) {
+                        titleText.truncationMode(.middle)
+                        hostText.truncationMode(.middle)
+                    }
+                }
+                .layoutPriority(1)
+                if let note = blocker ?? (item.recording && !item.known ? StudyFindText.recordingLabel : nil) {
+                    Spacer(minLength: 4)
+                    Text(note).font(.harbor(.caption, weight: .medium)).foregroundStyle(Theme.textMuted)
                         .lineLimit(1).fixedSize()
                 }
-                Text(item.host).font(.harbor(.caption)).foregroundStyle(Theme.textMuted)
-                    .lineLimit(1).truncationMode(.head)
-                    .frame(maxWidth: 120, alignment: .trailing)
             }
             .frame(minHeight: 24)
             .contentShape(Rectangle())
