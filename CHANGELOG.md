@@ -14,6 +14,7 @@ See [docs/releases/0.1.6.md](docs/releases/0.1.6.md) for the release notes.
 - **Day.** A seven-day row, a "Next up" card and "Later today", from a new read-only week summary.
 
 ### Fixed
+- Texts go out on the line the conversation already uses; a failed text no longer blocks the chat; an email to an address you typed reaches the approval card; reminders with a time and a title are created as asked.
 - Keys saved before the app was renamed are copied on first use, behind macOS's own prompt, and Ask says "Reconnect your cloud AI key" when one is missing.
 - The Day says when it cannot read your calendar instead of saying nothing is planned.
 
