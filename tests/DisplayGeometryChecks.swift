@@ -36,19 +36,19 @@ struct DisplayGeometryChecks {
         check(l.style == style, "\(name): style")
         // The bar is centred on its display and touches the top of its anchor area.
         check(abs(l.barFrame.midX - l.usableFrame.midX) <= 1, "\(name): bar centred")
-        check(l.barFrame.maxY <= l.usableFrame.maxY + 0.5, "\(name): bar inside the display")
+        check(l.barFrame.maxY <= (style == .floating ? l.usableFrame.maxY : d.frame.maxY) + 0.5, "\(name): bar inside the display")
         check(d.frame.contains(l.barFrame), "\(name): bar on screen")
         // The hover zone is easier to hit than the bar. On a notch it is wider than the
         // bar, covers the top of the notch and the screen's top edge, and leaves out the
         // notch's bottom strip; on a monitor it is the bar plus a margin.
         check(l.hoverZone.width > l.barFrame.width, "\(name): zone is wider than the bar")
         check(l.hoverZone.minX < l.barFrame.minX && l.hoverZone.maxX > l.barFrame.maxX, "\(name): zone reaches past both sides")
-        check(l.barIsVisible == (style != .menuBar) && l.statusInMenuBar == (style == .menuBar),
-              "\(name): only the menu-bar style hides the bar and moves its status to the icon")
-        if style == .notch {
+        // The notchless pill is too thin for the count or the "!", so its status
+        // goes to the menu-bar icon (CollapsedPresentation.decide); the others keep it.
+        check(l.barIsVisible && l.statusInMenuBar == (style == .menuBar),
+              "\(name): every style draws its bar on the desktop; only the notchless pill hands its status to the menu-bar icon")
+        if style == .notch || style == .menuBar {
             hoverZoneChecks(name, l, d)
-        } else if style == .menuBar {
-            edgeZoneChecks(name, l, d)
         } else {
             check(l.hoverZone.contains(l.barFrame), "\(name): zone contains the capsule")
             check(l.hoverZone.height > l.barFrame.height, "\(name): zone is forgiving")
@@ -59,7 +59,7 @@ struct DisplayGeometryChecks {
             check(d.frame.contains(f), "\(name): expanded \(h) on screen")
             check(abs(f.midX - l.usableFrame.midX) <= 1, "\(name): expanded centred")
             check(f.width == l.expandedWidth && l.expandedWidth <= 640, "\(name): width")
-            if style == .notch {
+            if style != .floating {
                 check(abs(f.maxY - d.frame.maxY) < 0.5, "\(name): panel hangs from the top edge")
             } else {
                 check(f.maxY < d.visibleFrame.maxY, "\(name): floating card sits below the menu bar")
@@ -106,8 +106,8 @@ struct DisplayGeometryChecks {
         studyCapChecks()
         pageCapChecks()
 
-        // Built-in displays without a notch (M1 Air, 13"/M2 13" Pro, iMac 24"): nothing
-        // drawn; the menu-bar icon and an invisible top-edge zone stand in. Default
+        // Built-in displays without a notch (M1 Air, 13"/M2 13" Pro, iMac 24"): a small
+        // black sliver hangs from the top-centre edge, inside the menu bar. Default
         // and scaled point sizes, plus a hidden (auto-hide) menu bar.
         for (n, d) in [("M1 Air", notchless(1440, 900)), ("M1 Air more space", notchless(1680, 1050)),
                        ("M1 Air larger text", notchless(1280, 800)), ("13in Pro", notchless(1440, 900)),
@@ -115,13 +115,18 @@ struct DisplayGeometryChecks {
                        ("M1 Air menu bar hidden", notchless(1440, 900, menuBar: 0))] {
             checkLayout(n, d, style: .menuBar)
             let l = SurfaceLayout.make(for: d)
-            check(l.notchSize == .zero && l.contentTopInset == 16, "\(n): no notch inset")
-            check(l.barFrame.maxY <= d.frame.maxY - 24, "\(n): the undrawn seed sits under the menu bar")
-            check(l.maskedCorners.contains(.layerMaxXMaxYCorner), "\(n): card rounds all four corners")
+            let strip = d.frame.maxY - l.usableFrame.maxY
+            check(l.notchSize == .zero && l.contentTopInset == strip + 8 && strip >= 24, "\(n): content clears the menu-bar strip")
+            check(l.barFrame.maxY == d.frame.maxY, "\(n): the pill hangs from the top edge")
+            let open = l.expandedFrame(contentHeight: 300)
+            check(open.maxY == d.frame.maxY && abs(open.midX - d.frame.midX) <= 1, "\(n): panel flush at the top edge, centred")
+            check(!l.maskedCorners.contains(.layerMaxXMaxYCorner) && !l.maskedCorners.isEmpty, "\(n): flat top like a notch")
             check(l.hoverDwell > HoverIntent.dwell, "\(n): a longer dwell, since menus share the edge")
-            check(l.windowLevel == .floating, "\(n): not above the menu bar")
+            check(l.windowLevel == .statusBar && l.barIsVisible, "\(n): above the menu bar, the pill drawn at rest")
         }
         check(SurfaceLayout.make(for: notched(1512, 982)).hoverDwell == HoverIntent.dwell, "Notch keeps its dwell")
+
+        MainActor.assumeIsolated { menuBarPillChecks() }
 
         check(real.notchSize == CGSize(width: 185, height: 32), "Reads the physical notch")
         check(real.barFrame.width == 198 && real.barFrame.minX == 657,
@@ -142,6 +147,17 @@ struct DisplayGeometryChecks {
         let oddLayout = SurfaceLayout.make(for: odd)
         check(oddLayout.style == .notch, "Odd notch stays a notch")
         check(oddLayout.notchSize == CGSize(width: SurfaceLayout.referenceNotch.width, height: 34), "Odd notch width falls back")
+
+        // 2020 13-inch MacBook Pro (Intel, no notch): 1440x900 frame, 24 pt menu bar.
+        let pro13 = SurfaceLayout.make(for: notchless(1440, 900))
+        check(pro13.style == .menuBar && pro13.usableFrame.maxY == 876, "13in Pro 2020: menu-bar style")
+        let pro13Open = pro13.expandedFrame(contentHeight: 300)
+        check(pro13Open.maxY == 900 && pro13Open.midX == 720, "13in Pro 2020: open panel flush at the top, centred")
+        check(pro13.contentTopInset == 32, "13in Pro 2020: content starts below the 24 pt strip")
+        // A notch keeps its geometry: bar and panel flush, content under the housing.
+        let keep = SurfaceLayout.make(for: notched(1512, 982))
+        check(keep.windowLevel == .statusBar && keep.contentTopInset == 40 && keep.expandedFrame(contentHeight: 300).maxY == 982,
+              "Notch geometry unchanged")
 
         // The debug override puts any style on any display (how the menu-bar style is
         // tried on a notched MacBook).
@@ -186,7 +202,7 @@ struct DisplayGeometryChecks {
         hybridNotchChecks()
         fullScreenProbeChecks()
         widePanelChecks()
-        print("PASS: display geometry — 8 notched MacBooks, 7 notchless built-in displays, 7 monitor placements, overrides, target selection, hover intent, menu-bar status, Brief/Day scroll cap, hybrid notch, full-screen probe, wide Brief panel")
+        print("PASS: display geometry — 8 notched MacBooks, 7 notchless built-in displays with a resting pill, 7 monitor placements, overrides, target selection, hover intent, menu-bar status, Brief/Day scroll cap, hybrid notch, full-screen probe, wide Brief panel")
     }
 
     /// The hybrid notch: a notch behind a full-screen app becomes an undrawn
@@ -196,19 +212,22 @@ struct DisplayGeometryChecks {
         let bar = P(mode: .bar, statusInMenuBar: false), hitbox = P(mode: .hitbox, statusInMenuBar: true)
         check(P.decide(style: .notch, displayHasNotch: true, frontmostFullScreen: false) == bar, "Desktop notch: the drawn bar")
         check(P.decide(style: .notch, displayHasNotch: true, frontmostFullScreen: true) == hitbox, "Full-screen notch: hitbox")
-        check(P.decide(style: .menuBar, displayHasNotch: false, frontmostFullScreen: false) == hitbox, "Notchless: hitbox as before")
-        check(P.decide(style: .menuBar, displayHasNotch: false, frontmostFullScreen: true) == hitbox, "Notchless in full screen: unchanged")
+        check(P.decide(style: .menuBar, displayHasNotch: false, frontmostFullScreen: false)
+              == P(mode: .bar, statusInMenuBar: true), "Notchless: the drawn pill, its status on the icon")
+        check(P.decide(style: .menuBar, displayHasNotch: false, frontmostFullScreen: true) == hitbox, "Notchless in full screen: hitbox")
         check(P.decide(style: .floating, displayHasNotch: false, frontmostFullScreen: false) == bar, "Monitor: capsule")
         check(P.decide(style: .floating, displayHasNotch: false, frontmostFullScreen: true) == bar, "Monitor in full screen: unchanged")
         // The debug override's forced notch on a notchless display keeps its bar.
         check(P.decide(style: .notch, displayHasNotch: false, frontmostFullScreen: true) == bar, "Forced notch without a notch: unchanged")
         // A notched MacBook forced to another style follows that style.
+        check(P.decide(style: .menuBar, displayHasNotch: true, frontmostFullScreen: false)
+              == P(mode: .bar, statusInMenuBar: true), "Forced menu bar on a notch: the pill, its status on the icon")
         check(P.decide(style: .menuBar, displayHasNotch: true, frontmostFullScreen: true) == hitbox, "Forced menu bar on a notch")
         check(P.decide(style: .floating, displayHasNotch: true, frontmostFullScreen: true) == bar, "Forced floating on a notch")
         // Only a real notch is watched at all.
         check(P.watchesFullScreen(style: .notch, displayHasNotch: true), "A notch is watched")
         check(!P.watchesFullScreen(style: .notch, displayHasNotch: false), "A forced notch is not")
-        check(!P.watchesFullScreen(style: .menuBar, displayHasNotch: false), "Notchless is not watched")
+        check(P.watchesFullScreen(style: .menuBar, displayHasNotch: false), "Notchless is watched, for its pill")
         check(!P.watchesFullScreen(style: .floating, displayHasNotch: false), "A monitor is not watched")
 
         // Through the layout: same frame and hover zone, only presentation changes.
@@ -224,10 +243,16 @@ struct DisplayGeometryChecks {
             check(full != desk, "The change is visible to observers of the layout")
             check(full.firstRunTip == desk.firstRunTip, "Tip unchanged")
         }
-        for d in [notchless(1440, 900), monitor(1920, 1080)] {
-            check(SurfaceLayout.make(for: d, frontmostFullScreen: true).presentation
-                  == SurfaceLayout.make(for: d).presentation, "Full screen changes nothing off the notch")
+        // The notchless pill hides in full screen like a notch: same frame and zone, nothing drawn.
+        for d in [notchless(1440, 900), notchless(1024, 640)] {
+            let desk = SurfaceLayout.make(for: d)
+            let full = SurfaceLayout.make(for: d, frontmostFullScreen: true)
+            check(desk.barIsVisible && desk.statusInMenuBar, "Desktop sliver is drawn; its status is on the icon")
+            check(!full.barIsVisible && full.statusInMenuBar, "Full-screen pill draws nothing, status on the icon")
+            check(full.barFrame == desk.barFrame && full.hoverZone == desk.hoverZone, "Hitbox keeps the pill's frame and zone")
         }
+        check(SurfaceLayout.make(for: monitor(1920, 1080), frontmostFullScreen: true).presentation
+              == SurfaceLayout.make(for: monitor(1920, 1080)).presentation, "Full screen changes nothing on a monitor")
     }
 
     /// Full-screen detection from the window list: bounds in, a yes or no out.
@@ -449,9 +474,11 @@ struct DisplayGeometryChecks {
         }
         check(SurfaceLayout.make(for: notched(1512, 982)).tabScrollCap(headerHeight: 30) == 872, "14in cap is 872 pt")
         check(SurfaceLayout.make(for: notched(1352, 878)).tabScrollCap(headerHeight: 30) == 768, "14in larger-text cap is 768 pt")
-        // Cards hang under the menu bar and a gap.
+        // A notchless built-in display's panel hangs from the top edge (its content
+        // starts under the menu bar's strip); a monitor's card hangs under the bar and a gap.
         let air = SurfaceLayout.make(for: notchless(1440, 900))
-        check(air.maxPanelHeight == 900 - 24 - SurfaceLayout.floatingGap - SurfaceLayout.screenMargin, "Menu-bar card room")
+        check(air.maxPanelHeight == 900 - SurfaceLayout.screenMargin, "Menu-bar card room")
+        check(air.contentTopInset == 24 + 8, "Menu-bar content clears the bar")
         let screen = SurfaceLayout.make(for: monitor(1920, 1080))
         check(screen.maxPanelHeight == 1080 - 24 - SurfaceLayout.floatingGap - SurfaceLayout.screenMargin, "Monitor card room")
         // A tiny display still gets a usable scroll rather than none.
@@ -682,20 +709,65 @@ struct DisplayGeometryChecks {
         check(zone.width > oldTop.width, "\(name): wider than the old zone")
     }
 
-    /// The invisible top-edge zone: hit by a push against the top-centre, never by
-    /// hovering a menu at the menu bar's middle or anything under it.
-    static func edgeZoneChecks(_ name: String, _ l: SurfaceLayout, _ d: DisplayMetrics) {
-        let zone = l.hoverZone, top = d.frame.maxY, midX = d.frame.midX
-        check(zone.contains(CGPoint(x: midX, y: top)), "\(name): pointer pinned to the top edge opens")
-        check(zone.contains(CGPoint(x: midX - 100, y: top)) && zone.contains(CGPoint(x: midX + 100, y: top)),
-              "\(name): the whole top-centre edge opens")
-        check(zone.contains(CGPoint(x: midX, y: top - 3)), "\(name): just under the edge opens")
-        check(!zone.contains(CGPoint(x: midX, y: top - 12)), "\(name): a menu hovered at the menu bar's middle does not")
-        check(!zone.contains(CGPoint(x: midX, y: top - 30)), "\(name): nothing under the menu bar opens")
-        check(!zone.contains(CGPoint(x: midX - 160, y: top)) && !zone.contains(CGPoint(x: midX + 160, y: top)),
-              "\(name): the edge away from the centre does not")
-        check(zone.maxY > top, "\(name): the zone reaches past the screen's top edge")
-        check(abs(zone.midX - midX) <= 1, "\(name): zone centred on the display")
+    /// The notchless built-in display's resting pill (MacBook Pro 13" 2020 and its
+    /// scaled modes): flush with the top edge, centred, a barely visible sliver,
+    /// and exactly as large as what is drawn, so menus beside it stay clickable.
+    @MainActor
+    static func menuBarPillChecks() {
+        for (n, w, h) in [("1440x900", 1440, 900), ("1680x1050", 1680, 1050),
+                          ("1280x800", 1280, 800), ("1024x640", 1024, 640)] as [(String, CGFloat, CGFloat)] {
+            let d = notchless(w, h)
+            check(d.visibleFrame.maxY == d.frame.maxY - 24, "\(n): fixture has a 24 pt menu bar")
+            let l = SurfaceLayout.make(for: d)
+            let bar = l.barFrame
+            check(l.style == .menuBar, "\(n): menu-bar style")
+            check(bar.maxY == d.frame.maxY, "\(n): pill flush with the top edge")
+            check(bar.midX == d.frame.midX, "\(n): pill dead centre: \(bar)")
+            check(bar.height == 6 && bar.minY > d.visibleFrame.maxY, "\(n): a barely visible sliver inside the menu bar, never below it")
+            check(bar.width == 96, "\(n): small width: \(bar.width)")
+            check(l.hoverZone.width > bar.width && l.hoverZone.maxY >= d.frame.maxY && l.hoverZone.contains(CGPoint(x: bar.midX, y: d.frame.maxY - 1)),
+                  "\(n): the top edge above the sliver still opens it")
+            check(l.barCornerRadius * 2 <= bar.height, "\(n): corners fit the sliver")
+            check(bar.minX == bar.minX.rounded() && bar.maxX == bar.maxX.rounded(), "\(n): whole points")
+            // Drawn and hit-tested as one shape: the window is the bar's frame, the
+            // view fills it, and the corners are square on top, rounded below.
+            check(l.barSize == bar.size, "\(n): drawn size is the hit size")
+            check(l.presentation == CollapsedPresentation(mode: .bar, statusInMenuBar: true) && l.barIsVisible,
+                  "\(n): drawn at rest, not a hitbox; the count and \"!\" go to the menu-bar icon")
+            check(!OverlayPanel.ignoresMouse(collapsed: true, layout: l), "\(n): the drawn pill takes its own clicks")
+            check(!OverlayPanel.ignoresMouse(collapsed: false, layout: l), "\(n): the open panel takes the mouse")
+            for x in [bar.minX - 1, bar.maxX + 1] {
+                check(!bar.contains(CGPoint(x: x, y: d.frame.maxY - 12)),
+                      "\(n): menu items beside the pill are outside its hit area")
+            }
+            check(!bar.contains(CGPoint(x: d.frame.midX, y: d.visibleFrame.maxY - 1)), "\(n): nothing below the menu bar is covered")
+            check(l.barCornerRadius > 0 && l.barShape.cornerRadii.topLeading == 0 && l.barShape.cornerRadii.topTrailing == 0
+                  && l.barShape.cornerRadii.bottomLeading > 0 && l.barShape.cornerRadii.bottomTrailing > 0,
+                  "\(n): square top, rounded bottom")
+            check(l.windowLevel == NSWindow.Level.statusBar && l.windowLevel == SurfaceLayout.make(for: notched(1512, 982)).windowLevel,
+                  "\(n): same level as a notch, so it draws over the menu bar")
+            // The panel grows out of it: top at the edge, same centre, wide and wider.
+            for wide in [false, true] {
+                let open = l.widened(wide).expandedFrame(contentHeight: 300)
+                check(open.maxY == d.frame.maxY && abs(open.midX - bar.midX) <= 0.5, "\(n): \(wide ? "wide " : "")panel grows out of the pill")
+                check(open.contains(CGPoint(x: bar.midX, y: bar.midY)), "\(n): the pill lies inside the open panel")
+            }
+            // Full screen: undrawn and click-through, same frame.
+            let full = SurfaceLayout.make(for: d, frontmostFullScreen: true)
+            check(!full.barIsVisible && full.barFrame == bar && OverlayPanel.ignoresMouse(collapsed: true, layout: full),
+                  "\(n): hidden in full screen")
+        }
+        // A side Dock shifts the usable area, not the pill or the panel.
+        var docked = notchless(1440, 900)
+        docked.visibleFrame = CGRect(x: 70, y: 0, width: 1370, height: 876)
+        let dl = SurfaceLayout.make(for: docked)
+        check(dl.barFrame.midX == 720 && dl.expandedFrame(contentHeight: 300).midX == 720, "A side Dock does not move the pill or the panel")
+        // Notches and monitors are untouched by the pill.
+        let notch = SurfaceLayout.make(for: notched(1512, 982))
+        check(notch.barFrame == CGRect(x: 657, y: 950, width: 198, height: 32) && notch.barIsVisible, "Notch bar unchanged")
+        let mon = SurfaceLayout.make(for: monitor(1920, 1080))
+        check(mon.barFrame.size == SurfaceLayout.floatingBar && mon.barIsVisible && mon.windowLevel == NSWindow.Level.floating,
+              "Monitor capsule unchanged")
     }
 
     static func statusChecks() {
