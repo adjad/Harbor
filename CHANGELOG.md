@@ -4,6 +4,24 @@ All notable changes to Harbor are documented here.
 
 ## [Unreleased]
 
+## [0.1.7] - TODO-COORDINATOR (release date)
+
+See [docs/releases/0.1.7.md](docs/releases/0.1.7.md) for the release notes.
+
+### Changed
+- **Tab switches** from a short tab to a tall or wide one are one glide: the window grows before the panel. The two-column button slides the panel, and with Reduce Motion on it cuts straight to the final size.
+- **Setup** shows a permission as granted right away; a slower, older check can no longer overwrite a newer answer. Screen Recording and Full Disk Access can still need Harbor to reopen.
+- **Alarms** accept "7 a.m.", "at 6pm", "noon" and "midnight".
+
+### Fixed
+- Cancelling in Ask removes the exact event or reminder from Calendar or Reminders (one occurrence of a repeating event), says "Cancelled" only after reading back that it is gone, and the approval card names the item, its date and time, and its calendar or list. Marking a reminder done completes it. Harbor says plainly when it cannot: someone else's invitation, read-only or subscribed calendars, a whole repeating series.
+- A text Messages gives no delivery evidence for is reported as handed to Messages, not "Sent"; no second copy after Messages reports an error having already queued it; a blocked or declined send gives a short reason.
+- A setting, clipboard or screenshot action that was refused is no longer reported as done.
+
+### Security
+- Only the Harbor app can talk to Harbor's background service (a new key each launch). No compiled-code cache is kept in a user-writable folder (start is about a second slower). "Run in Terminal" shows the full script and asks first. The tool-server settings file is refused if it is a link or writable by others.
+- For developers: the phone gateway and scripts that call the running app's service are refused by the new key.
+
 ## [0.1.6] - 2026-11-15
 
 See [docs/releases/0.1.6.md](docs/releases/0.1.6.md) for the release notes.

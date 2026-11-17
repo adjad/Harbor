@@ -175,6 +175,7 @@ PROFILE_TESTS = {
     "outbound": {
         "tests/test_action_tools_sanitize.py",
         "tests/test_event_move.py",
+        "tests/test_cancel_reaches_mac_apps.py",
         "tests/test_outbound_content_provenance.py",
         "tests/test_outbound_language_clarification.py",
         "tests/test_outbound_payload_presentation.py",
@@ -383,6 +384,7 @@ ADDITIONAL_FULL_TESTS = {
     "tests/test_final_send_to_myself.py",
     "tests/test_final_ask_card_and_referents.py",
     "tests/test_ask_typed_reminder.py",
+    "tests/test_send_truthfulness.py",
     "tests/test_final_ask_web_wordings.py",
     "tests/test_final_web_ownership.py",
     "tests/test_rc2_ask_web_possessive_egress.py",
@@ -591,6 +593,9 @@ ADDITIONAL_FULL_TESTS = {
     # these suites never use the user's oMLX port, Keychain, or Tailnet.
     "tests/test_additive_policy.py",
     "tests/test_credential_pipe.py",
+    # The per-launch app key on every route (in-process TestClient, refused before any
+    # handler runs) and the mcp.json ownership check on a temporary folder.
+    "tests/test_app_key_guard.py",
     "tests/test_remote_recovery.py",
     "tests/test_runtime_peer.py",
     # Characterization of the desktop oMLX attestation walker and _listener call shape

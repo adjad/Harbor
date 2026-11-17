@@ -617,8 +617,9 @@ app.add_middleware(RecoveryMiddleware)
 from service.harbor_reset import ResetGate, router as harbor_reset_router
 app.add_middleware(ResetGate)           # /resetharbor: refuse everything else once deleting starts
 app.include_router(harbor_reset_router)
-from service.local_http import BodyLimit, LocalOriginGuard
+from service.local_http import AppKeyGuard, BodyLimit, LocalOriginGuard
 app.add_middleware(BodyLimit)           # /agent: refuse an over-large media body before parsing it
+app.add_middleware(AppKeyGuard)         # other programs: this launch's app key on every route
 app.add_middleware(LocalOriginGuard)    # web pages: loopback Host, same-origin changes only
 from service.memory.api import router as memory_router
 app.include_router(memory_router)
@@ -4257,6 +4258,22 @@ async def assistant_update(cid: str, body: dict[str, Any]) -> dict[str, Any]:
     status = str(body.get("status") or "").strip()
     if status not in {"active", "done", "dismissed"}:
         return {"ok": False, "error": "status must be active|done|dismissed"}
+    c = assistant_store.get(cid)
+    if c and c.get("source") == "reminders" and status == "done":
+        # Completed in Apple Reminders first, read back, then here (the Brief's Mark done path).
+        from service.tools.schedule_extras import complete_commitment
+        twins = [i for i in assistant_store.duplicate_ids(cid)
+                 if (assistant_store.get(i) or {}).get("status") == "active"]
+        done, message = await complete_commitment({**c, "duplicate_ids": twins}, assistant_store)
+        if not done:
+            return {"ok": False, "error": message.strip("()").removeprefix("error: ")}
+        await assistant_hub.publish({"type": "changed"})
+        return {"ok": True}
+    if c and c.get("source") in {"calendar", "reminders"} and status == "dismissed":
+        # Hiding a native item here would leave it in Calendar or Reminders while Harbor
+        # looked as if it were gone. Removing it is DELETE, the verified path.
+        return {"ok": False, "error": "This item is in Calendar or Reminders; cancel it so it is "
+                                      "removed there too. Nothing changed."}
     ok = assistant_store.set_status(cid, status)
     if ok:
         await assistant_hub.publish({"type": "changed"})
@@ -4592,31 +4609,23 @@ async def assistant_sync_messages(body: dict[str, Any]) -> dict[str, Any]:
 
 @app.delete("/assistant/commitments/{cid}")
 async def assistant_delete(cid: str) -> dict[str, Any]:
-    """Cancel/delete a commitment. For a real calendar event, ask the Swift app
-    to remove it from macOS Calendar (it holds the write grant); the re-sync then
-    drops it from the store. Manual items are deleted outright."""
+    """Cancel/delete a commitment everywhere it exists, through the same verified path as
+    Ask's cancel_event: a Calendar event is cancelled in macOS Calendar (one exact
+    occurrence, read back as gone; never a read-only calendar or someone else's event),
+    a reminder is deleted in Apple Reminders, and a Harbor-only item is deleted here.
+    ok is true only on a verified result."""
     c = assistant_store.get(cid)
-    if not c:
+    if not c or c.get("status") != "active":
         return {"ok": False, "error": "not found"}
-    if c["source"] == "calendar":
-        from service.assistant.outbox import request as app_request
-        if not c.get("source_id") or c.get("when_ts") is None:
-            return {"ok": False, "error": "Calendar identity is incomplete; nothing changed"}
-        result = await app_request("delete_calendar_event", {
-            "source_id": c["source_id"], "when_ts": c["when_ts"]})
-        if not result.get("ok"):
-            return result
-    elif c["source"] == "reminders":
-        from service.assistant.outbox import request as app_request
-        if not c.get("source_id") or c.get("when_ts") is None:
-            return {"ok": False, "error": "Reminders identity is incomplete; nothing changed"}
-        result = await app_request("delete_reminder", {
-            "source_id": c["source_id"], "expected_title": c["title"],
-            "expected_due_ts": c["when_ts"], **expected_date_fields(c)})
-        if result.get("ok") is not True:
-            return result
-    else:
-        assistant_store.delete(cid)
+    from service.tools.assistant_tools import _read_only_calendar_row, _retire
+    twins = [i for i in assistant_store.duplicate_ids(cid)
+             if (assistant_store.get(i) or {}).get("status") == "active"]
+    group = {**c, "duplicate_ids": twins}
+    if _read_only_calendar_row(group):
+        return {"ok": False, "error": "That event is on a read-only calendar; nothing changed"}
+    error = await _retire(group)
+    if error:
+        return {"ok": False, "error": error}
     await assistant_hub.publish({"type": "changed"})
     return {"ok": True}
 
@@ -4743,7 +4752,8 @@ async def assistant_send_message_draft(body: dict[str, Any]) -> dict[str, Any]:
         return {"ok": False, "result": "The message is empty."}
     with human_reviewed_content():
         result = await send_message(to=to, text=message)
-    ok = result.startswith("Message sent to ")
+    from service.tools.action_tools import MESSAGE_HANDED_OVER_LINE, MESSAGE_HANDED_OVER_PREFIX
+    ok = result.startswith(("Message sent to ", MESSAGE_HANDED_OVER_PREFIX))
     audit("draft_card_send", tool="send_message",
           args={"to": to, "text": message}, result=result, ok=ok)
     from service.tools.action_tools import QUIET_NOT_DELIVERED, quiet_not_delivered
@@ -4751,6 +4761,10 @@ async def assistant_send_message_draft(body: dict[str, Any]) -> dict[str, Any]:
         # TEMPORARY (owner, 2026-11-15): the audit line above keeps the failure;
         # the card shows no failure wording. See action_tools.QUIET_NOT_DELIVERED.
         return {"ok": False, "result": QUIET_NOT_DELIVERED}
+    if result.startswith(MESSAGE_HANDED_OVER_PREFIX):
+        # Not a failure and not a confirmed send: one meaning on every card.
+        return {"ok": True, "status": "handed_over", "result": result,
+                "message": MESSAGE_HANDED_OVER_LINE}
     return {"ok": ok, "result": result}
 
 
