@@ -14,7 +14,7 @@ See [docs/releases/0.1.7.md](docs/releases/0.1.7.md) for the release notes.
 - **Alarms** accept "7 a.m.", "at 6pm", "noon" and "midnight".
 
 ### Fixed
-- Cancelling in Ask removes the exact event or reminder from Calendar or Reminders (one occurrence of a repeating event), says "Cancelled" only after reading back that it is gone, and the approval card names the item, its date and time, and its calendar or list. Marking a reminder done completes it. Harbor says plainly when it cannot: someone else's invitation, read-only or subscribed calendars, a whole repeating series.
+- Cancelling in Ask removes the exact event or reminder from Calendar or Reminders (one occurrence of a repeating event), says "Cancelled" only after reading back that it is gone, and the approval card names the item, its date and time, and its calendar or list. Marking a reminder done completes it. Harbor says plainly when it cannot: someone else's invitation, read-only or subscribed calendars, a whole repeating series. Day shows Cancel next to a reminder's Plan time; it asks once in the row, then deletes that exact reminder in Reminders.
 - A text Messages gives no delivery evidence for is reported as handed to Messages, not "Sent"; no second copy after Messages reports an error having already queued it; a blocked or declined send gives a short reason.
 - A setting, clipboard or screenshot action that was refused is no longer reported as done.
 
