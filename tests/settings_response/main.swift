@@ -54,16 +54,6 @@ everything["roles"] = ["everything", "reasoning"]
 check(!SettingsResponseValidator.valid(everything, path: "inference/cloud"), "Mixed everything reply accepted")
 everything["roles"] = ["everything", "everything"]
 check(!SettingsResponseValidator.valid(everything, path: "inference/cloud"), "Repeated everything accepted")
-// The Gemini API's own provider is a live cloud reply like OpenRouter's; any other
-// provider name is not.
-var gemini = cloud
-gemini["provider"] = "gemini"
-gemini["provider_label"] = "Gemini API"
-gemini["base_url"] = "https://generativelanguage.googleapis.com"
-gemini["api_prefix"] = "/v1beta/openai"
-check(SettingsResponseValidator.valid(gemini, path: "inference/cloud"), "Gemini API reply rejected")
-gemini["provider"] = "google"
-check(!SettingsResponseValidator.valid(gemini, path: "inference/cloud"), "Unknown provider accepted")
 for key in ["credential_name", "provider", "base_url", "model_id"] {
     malformed = cloud
     malformed[key] = ""
@@ -368,5 +358,43 @@ staleFailure["checks"] = [["id": "call", "label": "Tool call", "ok": false]]
 check(SettingsResponseValidator.valid(staleFailure, path: "inference/local-provider/qualify"),
       "Valid current failure after an earlier saved pass rejected")
 check(!SettingsResponseValidator.qualificationSucceeded(staleFailure), "Earlier saved proof invented current test success")
+
+// The Gemini API (Intel key card, notch switch): provider "gemini" at Google's origin.
+var gemini = cloud
+gemini["provider"] = "gemini"
+gemini["provider_label"] = "Gemini API"
+gemini["base_url"] = "https://generativelanguage.googleapis.com"
+gemini["api_prefix"] = "/v1beta/openai"
+gemini["model_id"] = "gemini-3.8-flash"
+gemini["roles"] = ["everything"]
+check(SettingsResponseValidator.valid(gemini, path: "inference/cloud"), "Gemini API reply rejected")
+for key in gemini.keys {
+    var partial = gemini
+    partial.removeValue(forKey: key)
+    check(!SettingsResponseValidator.valid(partial, path: "inference/cloud"), "Gemini reply missing \(key) accepted")
+}
+malformed = gemini
+malformed["provider"] = "google"
+check(!SettingsResponseValidator.valid(malformed, path: "inference/cloud"), "Unknown provider accepted")
+malformed["provider"] = "Gemini"
+check(!SettingsResponseValidator.valid(malformed, path: "inference/cloud"), "Provider id is exact")
+// All of Harbor on the cloud keeps a million-token window; a single role keeps 262,144.
+for value in [1_000_000, 1_048_576] {
+    var wide = gemini
+    wide["context_window"] = value
+    check(SettingsResponseValidator.valid(wide, path: "inference/cloud"), "Everything window \(value) rejected")
+    wide["roles"] = ["reasoning"]
+    check(!SettingsResponseValidator.valid(wide, path: "inference/cloud"), "Single-role window \(value) accepted")
+    var openRouter = everything
+    openRouter["roles"] = ["everything"]
+    openRouter["context_window"] = value
+    check(SettingsResponseValidator.valid(openRouter, path: "inference/cloud"), "OpenRouter everything window rejected")
+    var localWide = local
+    localWide["context_window"] = value
+    check(!SettingsResponseValidator.valid(localWide, path: "inference/local-provider"), "Local window \(value) accepted")
+}
+var tooWide = gemini
+tooWide["context_window"] = 1_048_577
+check(!SettingsResponseValidator.valid(tooWide, path: "inference/cloud"), "Window above the profile limit accepted")
 
 print("\(checks) settings checks passed")

@@ -133,7 +133,13 @@ def test_nothing_asks_at_launch():
         text = sources[reader]
         helper = _body(text, "static func automationDecided(")
         assert "AEEventID(typeWildCard), false)" in helper, reader
-        assert "Self.automationDecided(" in text, reader
+        if reader == "MailReader.swift":
+            # Mail's own answer is asked for without prompting, and a scripted read needs a yes.
+            answer = _body(text, "static func automationState(")
+            assert "AEEventID(typeWildCard), false)" in answer, reader
+            assert "Self.automationState(Self.mailBundleID) == .granted" in text, reader
+        else:
+            assert "Self.automationDecided(" in text, reader
 
 
 def test_every_harbor_window_can_be_minimized():
@@ -800,6 +806,26 @@ def test_ask_always_asks_the_service_even_after_setup_said_no_model():
     send = srcs["AgentSend.swift"]
     assert 'case "setup_needed": return .setup' in send
     assert "choose a model in Settings › Models" in send
+
+
+def test_intel_key_only_setup_is_gated_on_the_signal():
+    """The one-field OpenRouter key step shows only through
+    IntelCloudPreset.offersKeyOnlySetup (Intel build and no engine), reuses the
+    Cloud form's credential name and request body, and uses no remote-only env."""
+    sources = _sources()
+    first_run = sources["FirstRunSetupView.swift"]
+    gate = first_run.index("IntelKeyCard(setup: setup)")
+    assert "IntelCloudPreset.offersKeyOnlySetup(status: setup.status)" in first_run[gate - 200:gate]
+    assert "Harbor can't set this up on its own" in first_run[gate:gate + 400]  # the else branch stays
+    preset = sources["IntelCloudPreset.swift"]
+    assert "compiledForIntel && engineAvailable == false" in preset
+    assert "#if arch(x86_64)" in preset
+    assert "CloudConnection.newCredentialName()" in preset and "CloudConnection.requestBody(" in preset
+    assert 'static let modelID = "google/gemini-3.8-flash"' in preset
+    assert "HARBOR_REMOTE_ONLY" not in preset
+    settings = sources["SettingsView.swift"]
+    assert "CloudConnection.newCredentialName()" in settings and "CloudConnection.requestBody(" in settings
+    assert "IntelCloudPreset.offersKeyOnlySetup(" in _body(settings, "func preselectIntelPreset")
 
 
 def test_a_yes_from_macos_counts_before_the_status_catches_up():
