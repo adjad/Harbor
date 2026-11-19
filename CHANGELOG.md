@@ -4,7 +4,7 @@ All notable changes to Harbor are documented here.
 
 ## [Unreleased]
 
-## [0.1.7] - TODO-COORDINATOR (release date)
+## [0.1.7] - 2026-11-18
 
 See [docs/releases/0.1.7.md](docs/releases/0.1.7.md) for the release notes.
 
