@@ -19,7 +19,7 @@ See [docs/releases/0.1.7.md](docs/releases/0.1.7.md) for the release notes.
 - A setting, clipboard or screenshot action that was refused is no longer reported as done.
 
 ### Security
-- Only the Harbor app can talk to Harbor's background service (a new key each launch). No compiled-code cache is kept in a user-writable folder (start is about a second slower). "Run in Terminal" shows the full script and asks first. The tool-server settings file is refused if it is a link or writable by others.
+- Only the Harbor app can talk to Harbor's background service (a new key each launch). No compiled-code cache is kept in a user-writable folder (start is about a second slower). "Run in Terminal" asks on a card inside the panel that shows the whole script; nothing runs until the second press. The tool-server settings file is refused if it is a link or writable by others.
 - For developers: the phone gateway and scripts that call the running app's service are refused by the new key.
 
 ## [0.1.6] - 2026-11-15
