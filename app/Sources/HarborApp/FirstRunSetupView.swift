@@ -463,12 +463,19 @@ enum FirstRunBrain: Equatable {
 
     /// Step 1's heading line. A setup that already answers with a remote model has
     /// nothing to download, so it isn't told about one (or that the model is local).
-    static func welcomeSubtitle(remoteOnly: Bool) -> String {
-        remoteOnly
-            ? "Harbor already answers with the model you set up, so there's nothing to download here."
-            : "The AI model runs on this Mac. Your mail, calendar and messages stay here; when you ask "
-                + "for something from the web, only the search terms are sent. First Harbor needs to "
-                + "download that model once."
+    /// `keyOnly`: a build with no local engine that still waits for its OpenRouter key
+    /// (`IntelCloudPreset.offersKeyOnlySetup`), so remote-only isn't true yet.
+    static func welcomeSubtitle(remoteOnly: Bool, keyOnly: Bool = false) -> String {
+        if remoteOnly {
+            return "Harbor already answers with the model you set up, so there's nothing to download here."
+        }
+        if keyOnly {
+            return "In this build Harbor's AI runs on a cloud model through OpenRouter or the Gemini API, "
+                + "so there's nothing to download. Connect your key below to start."
+        }
+        return "The AI model runs on this Mac. Your mail, calendar and messages stay here; when you ask "
+            + "for something from the web, only the search terms are sent. First Harbor needs to "
+            + "download that model once."
     }
 
     /// `stillLooking`: the person's own oMLX is still inside its search window
@@ -478,6 +485,11 @@ enum FirstRunBrain: Equatable {
     static func from(status: SetupStatus?, downloads: [SetupGuideModel.DownloadTask],
                      stillLooking: Bool = false) -> FirstRunBrain {
         guard let status else { return .checking }
+        // Remote-only: the card names the cloud model ("Gemini 3.8 Flash"),
+        // never the on-device model the local roster would pick.
+        if status.remoteOnly == true, let remote = status.remoteModel {
+            return .ready(label: CloudModelName.model(remote.id))
+        }
         if status.ready {
             let model = status.roles.first(where: { $0.endpoint == "local" })?.model ?? status.models.recommended
             let label = status.models.installed.first(where: { $0.id == model })?.label ?? model
@@ -1640,7 +1652,9 @@ struct FirstRunSetupView: View {
                     switch step {
                     case .brain: brainStep
                     case .permissions: permissionsStep
-                    case .google: OnboardingGoogleStep(model: google, refreshes: !qaFixture)
+                    case .google: OnboardingGoogleStep(model: google, refreshes: !qaFixture,
+                                                       cloud: howToCloudProvider != nil,
+                                                       cloudModel: setup.status?.remoteModel.map { CloudModelName.model($0.id) })
                     case .knowYou: knowYouStep
                     case .tour: tourStep
                     }
@@ -2084,8 +2098,17 @@ struct FirstRunSetupView: View {
     private var brainStep: some View {
         VStack(alignment: .leading, spacing: 0) {
             OnboardingHeading(title: "Welcome to Harbor",
-                              subtitle: FirstRunBrain.welcomeSubtitle(remoteOnly: setup.status?.remoteOnly == true))
-            if let hw = setup.status?.hardware {
+                              subtitle: FirstRunBrain.welcomeSubtitle(
+                                  remoteOnly: setup.status?.remoteOnly == true,
+                                  keyOnly: IntelCloudPreset.offersKeyOnlySetup(status: setup.status)))
+            if let note = IntelFirstLaunch.onboardingNote(backup: UserDefaults.standard.string(forKey: IntelFirstLaunch.backupKey)) {
+                Text(note).font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true).padding(.top, 4)
+            }
+            // A cloud model isn't picked for this Mac's chip, so the card is left out then,
+            // and while a build with no local engine waits for its key.
+            if let hw = setup.status?.hardware, setup.status?.remoteOnly != true,
+               !IntelCloudPreset.offersKeyOnlySetup(status: setup.status) {
                 OnboardingCard(icon: "cpu", title: "Picked for your Mac",
                                detail: "\(hw.chip) · \(hw.ramGb > 0 ? "\(hw.ramGb) GB memory" : "memory unknown")") {
                     EmptyView()
@@ -2175,8 +2198,12 @@ struct FirstRunSetupView: View {
                 }
             }
         case .unavailable(let reason):
-            OnboardingCard(icon: "exclamationmark.triangle", title: "Harbor can't set this up on its own", detail: reason) {
-                Button("Open detailed setup") { openDetailedSetup() }.buttonStyle(FirstRunButtonStyle(primary: true))
+            if IntelCloudPreset.offersKeyOnlySetup(status: setup.status) {
+                IntelKeyCard(setup: setup)
+            } else {
+                OnboardingCard(icon: "exclamationmark.triangle", title: "Harbor can't set this up on its own", detail: reason) {
+                    Button("Open detailed setup") { openDetailedSetup() }.buttonStyle(FirstRunButtonStyle(primary: true))
+                }
             }
         case .needsDownload(let model, let label, let size):
             OnboardingCard(icon: "arrow.down.circle", title: label + (size.map { String(format: " · %.1f GB", $0) } ?? ""),
@@ -2496,7 +2523,7 @@ struct FirstRunSetupView: View {
             Text("What Harbor is for").font(.system(size: 13, weight: .medium)).padding(.top, 4).padding(.bottom, 4)
             Text(Self.purposeLine).font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
                 .fixedSize(horizontal: false, vertical: true).padding(.bottom, 10)
-            ForEach(Self.helpsYourDay, id: \.title) { item in
+            ForEach(Self.helpsYourDay(cloudProvider: howToCloudProvider), id: \.title) { item in
                 OnboardingCard(icon: item.icon, title: item.title,
                                detail: Self.helpLine(title: item.title, line: item.line,
                                                      voiceKeyRegistered: voiceKeyRegistered)) { EmptyView() }
@@ -2654,9 +2681,49 @@ struct FirstRunSetupView: View {
         ("brain", "Remembers for you", "It slowly learns the people and plans in your mail, and the facts you tell it. "
             + "You can see and remove anything in Memory."),
         ("waveform", voiceTitle, voiceLine(registered: true)),
-        ("lock.shield", "Private by design", "Harbor's model runs on this Mac, so what it reads stays here "
+        ("lock.shield", privacyTitle, "Harbor's model runs on this Mac, so what it reads stays here "
             + "unless you choose a cloud model in Settings."),
     ]
+
+    nonisolated static let privacyTitle = "Private by design"
+    nonisolated static let cloudPrivacyTitle = "Where your data goes"
+
+    /// Who answers when everything runs on the cloud, from the remote model's host:
+    /// "openrouter.ai" reads as OpenRouter, Google's Gemini API host as Google. On the
+    /// Intel build those are the only two; before it reads the host it names neither.
+    nonisolated static func cloudProvider(host: String?, intel: Bool) -> String {
+        let host = (host ?? "").lowercased()
+        if host == "openrouter.ai" || host.hasSuffix(".openrouter.ai") { return "OpenRouter" }
+        if host == "generativelanguage.googleapis.com" { return "Google (Gemini API)" }
+        if intel || host.isEmpty { return "your cloud provider" }
+        return host
+    }
+
+    /// The privacy card's line when Harbor's AI runs on the cloud: what is sent, and where.
+    nonisolated static func cloudPrivacyLine(provider: String) -> String {
+        "Harbor's AI runs on \(provider). What you ask, and the mail, texts, calendar, notes, screenshots, "
+            + "pictures and audio Harbor reads to answer, are sent to \(provider) and the model you chose."
+    }
+
+    /// The How to use cards for this setup: on the cloud, the privacy card says what is
+    /// sent instead of claiming the model runs on this Mac.
+    nonisolated static func helpsYourDay(cloudProvider: String?) -> [(icon: String, title: String, line: String)] {
+        guard let cloudProvider else { return helpsYourDay }
+        return helpsYourDay.map { item in
+            item.title == privacyTitle
+                ? (icon: "icloud", title: cloudPrivacyTitle, line: cloudPrivacyLine(provider: cloudProvider))
+                : item
+        }
+    }
+
+    /// The cloud provider when this setup runs Harbor's AI there (remote-only, or a build
+    /// with no local engine waiting for its key); nil for a model on this Mac.
+    private var howToCloudProvider: String? {
+        let keyOnly = IntelCloudPreset.offersKeyOnlySetup(status: setup.status)
+        guard keyOnly || setup.status?.remoteOnly == true else { return nil }
+        return Self.cloudProvider(host: setup.status?.remoteModel?.host,
+                                  intel: keyOnly || IntelCloudPreset.compiledForIntel)
+    }
 
     nonisolated static let voiceTitle = "Voice"
 
