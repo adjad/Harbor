@@ -10,6 +10,7 @@ See [docs/releases/0.1.8.md](docs/releases/0.1.8.md) for the release notes.
 
 ### Changed
 - **Setup** asks only for Calendar, Reminders, Mail & Notes, and Full Disk Access. Harbor asks for each of the others when a task first needs it: Messages at the first approved text, Contacts from a row in Brief once texts show numbers, and Notifications at the first alert. The microphone, Screen Recording and Accessibility were already asked at first use. Settings › Privacy still lists every permission.
+- **Day**'s row of days starts on today: today is the first card, followed by the next six days.
 
 ## [0.1.7] - 2026-11-18
 
