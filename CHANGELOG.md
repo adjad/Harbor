@@ -4,6 +4,13 @@ All notable changes to Harbor are documented here.
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-11-20
+
+See [docs/releases/0.1.8.md](docs/releases/0.1.8.md) for the release notes.
+
+### Changed
+- **Setup** asks only for Calendar, Reminders, Mail & Notes, and Full Disk Access. Harbor asks for each of the others when a task first needs it: Messages at the first approved text, Contacts from a row in Brief once texts show numbers, and Notifications at the first alert. The microphone, Screen Recording and Accessibility were already asked at first use. Settings › Privacy still lists every permission.
+
 ## [0.1.7] - 2026-11-18
 
 See [docs/releases/0.1.7.md](docs/releases/0.1.7.md) for the release notes.
