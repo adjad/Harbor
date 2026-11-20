@@ -27,6 +27,23 @@ enum MailDBReaderRegression {
                          "Successful zero-account output must be known empty, not unavailable")
             return
         }
+        // Intel's closed-Mail index post is skipped only while the index is unchanged.
+        let throttle = MailIndexPostThrottle(enabled: true, maxSkip: 1800)
+        let start = Date()
+        let same = ["i|1|2", "i-wal|0|-1"]
+        precondition(!throttle.shouldSkip(same, now: start), "The first index read always posts")
+        throttle.recordPost(same, now: start)
+        precondition(throttle.shouldSkip(same, now: start.addingTimeInterval(300)), "An unchanged index skips")
+        precondition(!throttle.shouldSkip(["i|3|2", "i-wal|0|-1"], now: start.addingTimeInterval(300)),
+                     "A changed index posts")
+        precondition(!throttle.shouldSkip(same, now: start.addingTimeInterval(1801)), "Still posts every 30 minutes")
+        throttle.reset()
+        precondition(!throttle.shouldSkip(same, now: start.addingTimeInterval(300)),
+                     "After another source posted, the index posts again")
+        precondition(!throttle.shouldSkip([], now: start), "No index never skips")
+        let off = MailIndexPostThrottle(enabled: false)
+        off.recordPost(same, now: start)
+        precondition(!off.shouldSkip(same, now: start), "Disabled (Apple silicon) never skips")
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("harbor-mail-db-test-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -156,6 +173,7 @@ enum MailDBReaderRegression {
         precondition(MailDBReader(indexPath: root.appendingPathComponent("missing").path)
             .readHistory() == nil, "An unreadable index must fail the history-only read too")
         try closedReadFailureChecks(root: root)
+        readPlanChecks()
 
         // History-only entry point (used while Mail is running) and the
         // account-label trust rule that gates it.
@@ -201,16 +219,16 @@ enum MailDBReaderRegression {
 
         // The per-account history ceiling matches MailReader.historyCap.
         sql("DELETE FROM messages")
-        sql("WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x<12001) " +
+        sql("WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x<\(MailHistoryWindow.perAccount + 1)) " +
             "INSERT INTO messages (date_received, read, subject, sender, mailbox, message_id) " +
             "SELECT \(base) - x, 1, 1, 1, 1, 'cap-'||x FROM seq")
         sql("INSERT INTO messages (date_received, read, subject, sender, mailbox, message_id) " +
             "VALUES (\(base) - 5, 1, 1, 1, 2, 'other-one')")
         let capped = reader.readHistory()!.history.split(separator: "\n")
             .map { String($0).components(separatedBy: "\u{01}") }
-        precondition(capped.filter { $0[0] == "H2" && $0[4] == "fixture-account" }.count == 12000,
+        precondition(capped.filter { $0[0] == "H2" && $0[4] == "fixture-account" }.count == MailHistoryWindow.perAccount,
                      "History keeps at most historyCap rows per account")
-        precondition(capped.contains { $0 == ["C2", "Work", "fixture-account", "12000", "0", "0"] } &&
+        precondition(capped.contains { $0 == ["C2", "Work", "fixture-account", "\(MailHistoryWindow.perAccount)", "0", "0"] } &&
                      capped.contains { $0 == ["C2", "Work", "fixture-account", "0", "0", "1"] },
                      "A capped account reports attempted rows and a separate cap marker")
         precondition(capped.contains { $0 == ["C2", "Home", "other-account", "1", "0", "0"] } &&
@@ -287,8 +305,9 @@ enum MailDBReaderRegression {
         precondition(reader.readHistory() == nil, "Ambiguous duplicate Inbox rows decline")
         sql("DELETE FROM mailboxes WHERE ROWID = 4")
         sql("DELETE FROM messages")
+        // Two mailboxes past the build's total-row cap together (30,000; Intel 120,000).
         for mailbox in 1...2 {
-            sql("WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x<16000) " +
+            sql("WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x<\(MailHistoryWindow.totalRows / 2 + 1000)) " +
                 "INSERT INTO messages (date_received, read, subject, sender, mailbox) " +
                 "SELECT \(base) - x, 1, 1, 1, \(mailbox) FROM seq")
         }
@@ -382,13 +401,79 @@ enum MailDBReaderRegression {
         typealias R = MailDBReader
         let denied = R.closedReadFailure(mailDirectoryExists: true, listErrno: EPERM, hasIndex: false)
         precondition(denied.kind == "full_disk_access"
-                     && denied.reason == "Harbor reads Mail while Mail is open. Open Mail, or give Harbor "
-                        + "Full Disk Access to read it when Mail is closed.")
+                     && denied.reason == "Harbor can't read Apple Mail: open Mail once, or allow Full Disk Access for Harbor "
+                        + "in System Settings > Privacy & Security.")
         let unixDenied = R.closedReadFailure(mailDirectoryExists: true, listErrno: EACCES, hasIndex: false)
         precondition(unixDenied.kind == "" && !unixDenied.reason.contains("Full Disk Access"),
                      "a plain permission error is not a Full Disk Access problem")
         precondition(R.closedReadFailure(mailDirectoryExists: false, listErrno: 0, hasIndex: false).kind
                      == "mail_not_configured")
         precondition(R.closedReadFailure(mailDirectoryExists: true, listErrno: 0, hasIndex: true).kind == "")
+    }
+
+    /// Every combination of Mail open or closed, Full Disk Access, and Automation
+    /// allowed, denied or unknown, with a counting launcher: Mail is opened in one
+    /// case only.
+    static func readPlanChecks() {
+        typealias P = MailReadPlan
+        let fda = (kind: "full_disk_access", reason: P.openMailOrFullDiskAccess)
+        let notConfigured = (kind: "mail_not_configured", reason: "Mail isn't set up on this Mac yet.")
+        let damaged = (kind: "", reason: "Mail's saved index couldn't be read just now.")
+        let states: [MailAutomationState] = [.granted, .denied, .unknown]
+        var launches = 0
+        func plan(open: Bool, _ automation: MailAutomationState, folder: Bool,
+                  failure: (kind: String, reason: String)? = nil) -> P {
+            let chosen = P.decide(mailOpen: open, automation: automation, folderReadable: folder,
+                                  failure: failure ?? (folder ? damaged : fda))
+            _ = P.openIfPlanned(chosen) { launches += 1; return true }
+            return chosen
+        }
+        for automation in states {
+            // Full Disk Access: the index, headers only, never a launch (Mail closed or open
+            // without a usable Automation answer); Mail open and allowed scripts as before.
+            launches = 0
+            precondition(plan(open: false, automation, folder: true) == .localIndex)
+            precondition(launches == 0, "Full Disk Access reads the index without opening Mail")
+            precondition(plan(open: true, automation, folder: true) == (automation == .granted ? .appleScript : .localIndex))
+        }
+        // Mail closed, no Full Disk Access.
+        launches = 0
+        precondition(plan(open: false, .granted, folder: false) == .openHiddenThenAppleScript)
+        precondition(launches == 1, "the one case that opens Mail")
+        launches = 0
+        let denied = plan(open: false, .denied, folder: false)
+        precondition(denied == .cannotRead(kind: "mail_automation", reason: P.automationOff))
+        let unknown = plan(open: false, .unknown, folder: false)
+        precondition(unknown == .cannotRead(kind: "full_disk_access", reason: P.openMailOrFullDiskAccess))
+        precondition(launches == 0, "denied or never-asked Automation never opens Mail")
+        // Mail open, no Full Disk Access.
+        precondition(plan(open: true, .granted, folder: false) == .appleScript)
+        precondition(plan(open: true, .denied, folder: false)
+                     == .cannotRead(kind: "mail_automation", reason: P.automationOff))
+        precondition(plan(open: true, .unknown, folder: false)
+                     == .cannotRead(kind: "mail_automation", reason: P.automationUnasked))
+        precondition(launches == 0)
+        // Reasons that are not about permissions pass through, and no launch for a Mac without Mail.
+        precondition(plan(open: false, .granted, folder: false, failure: notConfigured)
+                     == .cannotRead(kind: "mail_not_configured", reason: notConfigured.reason))
+        precondition(plan(open: false, .unknown, folder: false, failure: damaged)
+                     == .cannotRead(kind: "", reason: damaged.reason))
+        precondition(plan(open: false, .denied, folder: false, failure: damaged)
+                     == .cannotRead(kind: "mail_automation", reason: P.automationOffOnly))
+        precondition(launches == 0)
+        // The switch that opens Mail for Full Disk Access users too: only when Automation is allowed.
+        for automation in states {
+            let chosen = P.decide(mailOpen: false, automation: automation, folderReadable: true,
+                                  failure: damaged, openHiddenWithFullDiskAccess: true)
+            precondition(chosen == (automation == .granted ? .openHiddenThenAppleScript : .localIndex))
+        }
+        precondition(!P.openHiddenWithFullDiskAccess, "off by default")
+        // A launcher that fails reports it; a plan that does not launch never calls it.
+        precondition(!P.openIfPlanned(.openHiddenThenAppleScript) { false })
+        precondition(P.openIfPlanned(.appleScript) { preconditionFailure("must not launch") })
+        precondition(!P.openIfPlanned(.localIndex) { preconditionFailure("must not launch") })
+        // Every sentence is one plain sentence naming the fix.
+        precondition(P.openMailOrFullDiskAccess == "Harbor can't read Apple Mail: open Mail once, or allow Full Disk Access for Harbor in System Settings > Privacy & Security.")
+        print("MailReadPlan: decision table checks passed")
     }
 }
