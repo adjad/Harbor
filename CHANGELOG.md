@@ -11,7 +11,7 @@ See [docs/releases/0.1.7.md](docs/releases/0.1.7.md) for the release notes.
 ### Changed
 - **Tab switches** from a short tab to a tall or wide one are one glide: the window grows before the panel. The two-column button slides the panel, and with Reduce Motion on it cuts straight to the final size.
 - **Setup** shows a permission as granted right away; a slower, older check can no longer overwrite a newer answer. Screen Recording and Full Disk Access can still need Harbor to reopen.
-- **Day** switches days in one fade: the day you leave stays faded until the next is ready, and the panel resizes once.
+- **Day** switches days in one fade: the row of days sits at the top and stays put, the day you leave stays faded until the next is ready, and the panel resizes once.
 - **The notch** fits the camera housing on every notched Mac: a body just inside it, with top corners that curve out into the menu bar.
 - **Alarms** accept "7 a.m.", "at 6pm", "noon" and "midnight".
 
