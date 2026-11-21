@@ -218,14 +218,14 @@ struct NotchStudyView: View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Image(systemName: "hand.raised").font(.harbor(size: 10.5)).foregroundStyle(Theme.warn)
                 .accessibilityHidden(true)
-            Text(StudyText.needsAccessibility)
+            Text(StudyText.needsAccessibilityNamed(name: PrivacyNames.accessibility, path: PrivacyNames.accessibilityPath))
                 .font(.harbor(.footnote)).foregroundStyle(Theme.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 6)
             NotchChrome.small("Open Settings") {
                 // Through Permissions, like every privacy page Harbor opens: it notes the
                 // pane (so a "Quit & Reopen" brings Harbor back) and steps the panel aside.
-                Permissions.openSettingsPane("com.apple.preference.security?Privacy_Accessibility")
+                Permissions.openSettingsPane(PrivacyNames.accessibilityPane)
             }
         }
     }
