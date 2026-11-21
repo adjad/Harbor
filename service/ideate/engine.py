@@ -1,0 +1,289 @@
+"""Ideate and the engine: where it is, whether Inkling is there and loaded, and residency (D5).
+
+Harbor keeps one chat model warm for Ask (main.py's keep-warm set; service/memory_saver.py
+parks it when Harbor is idle; service/idle_unloader.py drops other idle models). Ideate fits
+into that instead of fighting it:
+
+- Before a run, if Inkling isn't loaded, the run's first event says so and Ideate calls the
+  engine client's own swap helper, `OMLXClient.ensure_only(model, exclusive=True)`, the same
+  call a Research job makes for its model: on Harbor's bundled engine it evicts the other
+  models (Ask's included) and loads Inkling; on the user's own oMLX.app it unloads nothing
+  and only loads.
+- During the run Inkling is registered as in flight (`idle.begin`), so the idle unloader
+  never drops it mid-run, and the run counts as a foreground turn (`idle.begin_foreground`),
+  so background model work (mail gists, the Brief, Save memory's batch windows) stands
+  down instead of reloading Ask's model beside it.
+- After the run both are released (`idle.end`, `idle.end_foreground`). Nothing else is
+  pinned or unloaded: the idle unloader lets Inkling go after Harbor's idle minutes, and
+  Ask's model comes back on the next Ask turn (or Save memory's prewarm), as it always does.
+
+A run is a child process talking to the engine directly, so these calls are made from the
+runner's thread onto the service's own event loop (`bind_loop`), where the shared client
+state (prewarm task, epochs) lives.
+"""
+from __future__ import annotations
+
+import asyncio
+import ctypes
+import ctypes.util
+import errno
+import ipaddress
+import os
+import shutil
+import uuid
+from pathlib import Path
+from dataclasses import dataclass
+from urllib.parse import urlsplit
+
+from service.ideate import config
+from service.ideate.harness import EngineTarget
+
+
+class EngineUnavailable(RuntimeError):
+    pass
+
+
+@dataclass
+class ModelState:
+    reachable: bool
+    listed: bool
+    loaded: bool
+
+
+def target() -> EngineTarget:
+    """The engine Ideate's harness talks to: Harbor's configured oMLX, loopback only."""
+    from service.inference.remote_policy import remote_only_profile
+    if remote_only_profile() is not None:
+        raise EngineUnavailable("Ideate needs Harbor's on-Mac engine. This Mac uses a cloud model.")
+    from service.config import omlx_base_url
+    parts = urlsplit(omlx_base_url())
+    host = (parts.hostname or "").lower()
+    if host == "localhost":
+        host = "127.0.0.1"
+    try:
+        loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = False
+    if parts.scheme != "http" or not loopback:
+        raise EngineUnavailable("Ideate needs the engine on this Mac.")
+    port = parts.port or 80
+    netloc = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+    return EngineTarget(base_url=f"http://{netloc}/v1", port=port)
+
+
+def api_key() -> str:
+    """The engine's key, for the harness's environment only (never written to a file)."""
+    from service.config import omlx_api_key
+    try:
+        return omlx_api_key() or ""
+    except Exception:  # noqa: BLE001 - an engine without a key
+        return ""
+
+
+class Residency:
+    """The default engine hooks. Tests pass a stand-in with the same methods."""
+
+    def __init__(self):
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._client = None
+
+    def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        if self._loop is not loop:
+            self._loop = loop
+            self._client = None
+
+    def _get_client(self):
+        if self._client is None:
+            from service.inference.omlx_client import OMLXClient
+            self._client = OMLXClient()
+        return self._client
+
+    async def state(self) -> ModelState:
+        try:
+            rows = (await asyncio.wait_for(self._get_client().status(), 5))["models"]
+        except Exception:  # noqa: BLE001 - engine down or not oMLX
+            return ModelState(False, False, False)
+        row = next((r for r in rows if isinstance(r, dict) and r.get("id") == config.MODEL_ID), None)
+        return ModelState(True, row is not None, bool(row and row.get("loaded")))
+
+    async def _ensure(self) -> None:
+        await self._get_client().ensure_only(config.MODEL_ID, exclusive=True,
+                                             settle_timeout=config.LOAD_TIMEOUT_S)
+
+    def _on_loop(self, coro, timeout: float):
+        if self._loop is None or self._loop.is_closed():
+            coro.close()
+            raise EngineUnavailable("Harbor's engine isn't ready yet.")
+        return asyncio.run_coroutine_threadsafe(coro, self._loop).result(timeout)
+
+    # Called from the runner's thread.
+    def state_sync(self) -> ModelState:
+        return self._on_loop(self.state(), 15)
+
+    def ensure_sync(self) -> None:
+        self._on_loop(self._ensure(), config.LOAD_TIMEOUT_S + 15)
+
+    def begin(self) -> None:
+        from service import idle
+        idle.begin(config.MODEL_ID)
+        idle.begin_foreground()
+
+    def end(self) -> None:
+        from service import idle
+        idle.end(config.MODEL_ID)
+        idle.end_foreground()
+
+
+# --- A copy of the model that is already on this Mac ---------------------------------------
+
+class LinkRefused(RuntimeError):
+    """The link was not made; the text is plain words for the tab."""
+
+
+def _home() -> Path:
+    return Path.home()
+
+
+def models_dir() -> Path:
+    """The bundled engine's own models folder (the engine scans only this, plus folders added
+    in its admin page)."""
+    from service.engine import mode
+    return mode.engine_data_dir() / "models"
+
+
+def bundled() -> bool:
+    from service.engine import mode
+    return mode.is_bundled()
+
+
+def target_path() -> Path:
+    return models_dir() / config.MODEL_ORG / config.MODEL_ID
+
+
+def _valid_model_folder(path: Path) -> bool:
+    try:
+        if not path.is_dir():
+            return False
+        names = [p.name for p in path.iterdir()]
+    except OSError:
+        return False
+    return "config.json" in names and any(n.endswith(".safetensors") for n in names)
+
+
+def _search(base: Path, depth: int):
+    """Folders called MODEL_ID under base, at most `depth` levels down."""
+    if depth < 0 or not base.is_dir() or base.is_symlink():
+        return
+    try:
+        children = sorted(base.iterdir())
+    except OSError:
+        return
+    for child in children:
+        if child.name == config.MODEL_ID and child.is_dir() and not child.is_symlink():
+            yield child
+        elif depth > 0 and child.is_dir() and not child.is_symlink():
+            yield from _search(child, depth - 1)
+
+
+def find_local_copy() -> Path | None:
+    """A valid copy of the model outside Harbor's models folder, or None."""
+    home = _home()
+    own = target_path()
+    for rel in config.MODEL_SEARCH_DIRS:
+        for found in _search(home / rel, config.MODEL_SEARCH_DEPTH):
+            if found != own and _valid_model_folder(found):
+                return found
+    snapshots = (home / config.HF_CACHE_DIR / f"models--{config.MODEL_ORG}--{config.MODEL_ID}" / "snapshots")
+    try:
+        revisions = sorted(snapshots.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        revisions = []
+    for rev in revisions:
+        if _valid_model_folder(rev):
+            return rev
+    return None
+
+
+def link_pending() -> bool:
+    """Already cloned into the engine's folder (so it appears when the engine next starts)."""
+    return _valid_model_folder(target_path())
+
+
+def _clonefile(src: Path, dst: Path) -> None:
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    if libc.clonefile(os.fsencode(src), os.fsencode(dst), 0) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))
+
+
+def _same_volume(a: Path, b: Path) -> bool:
+    return os.stat(a).st_dev == os.stat(b).st_dev
+
+
+def _plan(source: Path) -> list[tuple[Path, Path]]:
+    """Every regular file to clone, as (real file, path relative to the model folder). Symlinks
+    are refused, except inside a Hugging Face snapshot, where a link is fine only when it lands
+    in that model's own blobs folder."""
+    hf_blobs = None
+    if source.parent.name == "snapshots" and source.parent.parent.name.startswith("models--"):
+        hf_blobs = (source.parent.parent / "blobs").resolve()
+    out: list[tuple[Path, Path]] = []
+    for dirpath, dirnames, filenames in os.walk(source, followlinks=False):
+        here = Path(dirpath)
+        for name in list(dirnames):
+            if (here / name).is_symlink():
+                raise LinkRefused("That copy contains a shortcut, so Harbor won't use it.")
+        for name in filenames:
+            f = here / name
+            real = f
+            if f.is_symlink():
+                real = f.resolve()
+                if hf_blobs is None or hf_blobs not in real.parents:
+                    raise LinkRefused("That copy contains a shortcut, so Harbor won't use it.")
+            if not real.is_file():
+                raise LinkRefused("That copy is incomplete, so Harbor won't use it.")
+            out.append((real, f.relative_to(source)))
+    return out
+
+
+def link_model(source: Path | None = None) -> Path:
+    """Clone the local copy into the engine's models folder (APFS clonefile: no extra disk,
+    no 13 GB copy). Refuses rather than copying when a clone isn't possible. The source is only
+    read. The clone is made under a temporary name, then renamed. Returns the final folder."""
+    if not bundled():
+        raise LinkRefused("Harbor is using your own oMLX. Add the folder in oMLX.")
+    source = source or find_local_copy()
+    if source is None:
+        raise LinkRefused(f"{config.MODEL_LABEL} isn't on this Mac.")
+    if source.is_symlink() or not _valid_model_folder(source):
+        raise LinkRefused("That copy is incomplete or is a shortcut, so Harbor won't use it.")
+    final = target_path()
+    if final.exists() or final.is_symlink():
+        raise LinkRefused("Harbor's model folder already has it. It shows up when Harbor's engine restarts.")
+    parent = final.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    if parent.is_symlink() or models_dir().is_symlink():
+        raise LinkRefused("Harbor's model folder is a shortcut, so nothing was linked.")
+    files = _plan(source)
+    if not _same_volume(source, parent):
+        raise LinkRefused("That copy is on another drive, and copying 13 GB isn't done here. "
+                          "Move it to this Mac's main drive first.")
+    tmp = parent / f".{config.MODEL_ID}.linking-{uuid.uuid4().hex[:8]}"
+    try:
+        tmp.mkdir()
+        for real, rel in files:
+            dst = tmp / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            _clonefile(real, dst)
+        if not _valid_model_folder(tmp):
+            raise LinkRefused("The copy came out incomplete. Nothing was linked.")
+        os.rename(tmp, final)
+    except LinkRefused:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    except OSError as exc:
+        shutil.rmtree(tmp, ignore_errors=True)
+        if exc.errno in (errno.ENOTSUP, errno.EXDEV, errno.EOPNOTSUPP, errno.ENOSYS):
+            raise LinkRefused("This drive can't share files without copying them, so nothing was linked.") from None
+        raise LinkRefused("Harbor couldn't link the model. Nothing was changed.") from None
+    return final
