@@ -210,6 +210,10 @@ PROFILE_TESTS = {
         "tests/test_ideate_bridge.py",
         # Finding Ideate's model on this Mac and cloning it into Harbor's engine folder (tmp trees only).
         "tests/test_ideate_model_link.py",
+        # Ideate's residency: a recording stand-in engine client (unload, load, hold, release order).
+        "tests/test_ideate_residency.py",
+        # Ideate's GPU-limit row: source checks that it reaches Terminal only through the code card.
+        "tests/test_ideate_gpu_row.py",
         "tests/test_shell_local_service_deny.py",
         # /resetharbor on a scratch home under pytest's temp dir; no Google, Keychain, TCC or live service.
         "tests/test_harbor_reset.py",
@@ -1390,6 +1394,7 @@ def _native_gates(build_dir: Path) -> list[tuple[str, list[str]]]:
                 TRUSTED_SWIFTC, "-parse-as-library", "-swift-version", "5",
                 "-module-cache-path", module_cache,
                 "app/Sources/HarborApp/IdeateKind.swift",
+                "app/Sources/HarborApp/IdeateGPULimit.swift",
                 "tests/IdeateChecks.swift", "-o", ideate,
             ],
         ),
