@@ -4,18 +4,25 @@ Harbor keeps one chat model warm for Ask (main.py's keep-warm set; service/memor
 parks it when Harbor is idle; service/idle_unloader.py drops other idle models). Ideate fits
 into that instead of fighting it:
 
-- Before a run, if Inkling isn't loaded, the run's first event says so and Ideate calls the
-  engine client's own swap helper, `OMLXClient.ensure_only(model, exclusive=True)`, the same
-  call a Research job makes for its model: on Harbor's bundled engine it evicts the other
-  models (Ask's included) and loads Inkling; on the user's own oMLX.app it unloads nothing
-  and only loads.
+- Right before Inkling loads, free memory is checked (vm_stat). Another app's model, such as
+  one loaded in the user's own oMLX.app, is invisible to Harbor's engine. Below Inkling's
+  15.1 GB plus a 3 GB margin, the run stops with plain words instead of loading. Loading into
+  too little memory froze a 24 GB Mac on 2026-11-21.
+- When a run starts, Ideate holds the engine for Inkling (service/inference/engine_hold.py)
+  and always calls the engine client's swap helper, `OMLXClient.ensure_only(model,
+  exclusive=True)`, the same call a Research job makes: on Harbor's bundled engine it first
+  unloads every other model (Ask's included), waits until they are gone, then loads Inkling,
+  so only Inkling is resident. On the user's own oMLX.app it unloads nothing and only loads.
 - During the run Inkling is registered as in flight (`idle.begin`), so the idle unloader
   never drops it mid-run, and the run counts as a foreground turn (`idle.begin_foreground`),
   so background model work (mail gists, the Brief, Save memory's batch windows) stands
-  down instead of reloading Ask's model beside it.
-- After the run both are released (`idle.end`, `idle.end_foreground`). Nothing else is
-  pinned or unloaded: the idle unloader lets Inkling go after Harbor's idle minutes, and
-  Ask's model comes back on the next Ask turn (or Save memory's prewarm), as it always does.
+  down. While the hold is set, loading any other model is refused with a plain message
+  (an Ask turn says Ideate is building and to ask again when it finishes): no swap mid-run,
+  never two models resident.
+- After the run the hold and both registrations are released, and Inkling is unloaded
+  RELEASE_AFTER_S later unless another run has started (a follow-up message reuses it).
+  Ask's model is not loaded back straight away: the next Ask, Brief or Day turn loads it,
+  as it always does. An Ask turn in that grace swaps Inkling out the normal way.
 
 A run is a child process talking to the engine directly, so these calls are made from the
 runner's thread onto the service's own event loop (`bind_loop`), where the shared client
@@ -28,6 +35,7 @@ import ctypes
 import ctypes.util
 import errno
 import ipaddress
+import logging
 import os
 import shutil
 import uuid
@@ -38,9 +46,43 @@ from urllib.parse import urlsplit
 from service.ideate import config
 from service.ideate.harness import EngineTarget
 
+log = logging.getLogger(__name__)
+
 
 class EngineUnavailable(RuntimeError):
     pass
+
+
+class NoRoom(RuntimeError):
+    """Not enough free memory to load Inkling now; the text is plain words for the tab."""
+
+    def __init__(self, free: int, need: int):
+        gb = 1024**3
+        super().__init__(f"There isn't enough free memory for {config.MODEL_LABEL} right now: it needs about "
+                         f"{need / gb:.0f} GB and {free / gb:.0f} GB is free. Quit oMLX or other big apps, "
+                         "then try again.")
+        self.free, self.need = free, need
+
+
+def available_bytes() -> int:
+    """Memory macOS can hand out now: free, inactive, speculative and purgeable pages (vm_stat)."""
+    import re
+    import subprocess
+    try:
+        out = subprocess.run(["/usr/bin/vm_stat"], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return -1
+    page = re.search(r"page size of (\d+) bytes", out)
+    size = int(page.group(1)) if page else 16384
+    total = 0
+    for name in ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable"):
+        m = re.search(rf"{name}:\s+(\d+)", out)
+        total += int(m.group(1)) if m else 0
+    return total * size if total else -1
+
+
+def room_needed() -> int:
+    return config.MODEL_RESIDENT_BYTES + config.MEMORY_MARGIN_BYTES
 
 
 @dataclass
@@ -107,8 +149,28 @@ class Residency:
         return ModelState(True, row is not None, bool(row and row.get("loaded")))
 
     async def _ensure(self) -> None:
-        await self._get_client().ensure_only(config.MODEL_ID, exclusive=True,
-                                             settle_timeout=config.LOAD_TIMEOUT_S)
+        """Make Inkling the only model loaded: Harbor's other models go first, then free memory is
+        checked right before the load (another app's model is invisible to Harbor's engine), then
+        Inkling loads. Raises NoRoom instead of loading into too little memory."""
+        client = self._get_client()
+        from service import memory_saver
+        loaded = set(await client.loaded_models())
+        if config.MODEL_ID in loaded and loaded == {config.MODEL_ID}:
+            return
+        if not memory_saver.omlx_app(client):
+            for other in loaded - {config.MODEL_ID}:
+                await client.unload(other)
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + config.EVICT_SETTLE_S
+            while loop.time() < deadline and set(await client.loaded_models()) - {config.MODEL_ID}:
+                await asyncio.sleep(1.0)
+        if config.MODEL_ID not in loaded:
+            free, need = await asyncio.to_thread(available_bytes), room_needed()
+            if 0 <= free < need:
+                log.info("ideate: not loading %s: %d MB free, %d MB needed", config.MODEL_ID,
+                         free // 2**20, need // 2**20)
+                raise NoRoom(free, need)
+        await client.ensure_only(config.MODEL_ID, exclusive=True, settle_timeout=config.LOAD_TIMEOUT_S)
 
     def _on_loop(self, coro, timeout: float):
         if self._loop is None or self._loop.is_closed():
@@ -125,13 +187,72 @@ class Residency:
 
     def begin(self) -> None:
         from service import idle
+        from service.inference import engine_hold
+        self._cancel_release()
+        engine_hold.hold(config.MODEL_ID, "Ideate")
         idle.begin(config.MODEL_ID)
         idle.begin_foreground()
 
     def end(self) -> None:
         from service import idle
+        from service.inference import engine_hold
         idle.end(config.MODEL_ID)
         idle.end_foreground()
+        engine_hold.release(config.MODEL_ID)
+        self._schedule_release()
+
+    def wait_for_ask(self, timeout: float = config.ASK_WAIT_S, poll: float = 0.5) -> None:
+        """Let an Ask turn that is answering right now finish before the run takes the engine."""
+        import time
+        from service import idle
+        deadline = time.monotonic() + timeout
+        while idle.foreground_busy() and time.monotonic() < deadline:
+            time.sleep(poll)
+
+    # --- Unloading Inkling after a run -----------------------------------------------------
+    _release_handle: asyncio.TimerHandle | None = None
+
+    def _schedule_release(self) -> None:
+        loop = self._loop
+        if loop is not None and not loop.is_closed():
+            loop.call_soon_threadsafe(self._arm_release)
+
+    def _cancel_release(self) -> None:
+        loop = self._loop
+        if loop is not None and not loop.is_closed():
+            loop.call_soon_threadsafe(self._disarm_release)
+
+    def _disarm_release(self) -> None:
+        if self._release_handle is not None:
+            self._release_handle.cancel()
+            self._release_handle = None
+
+    def _arm_release(self) -> None:
+        self._disarm_release()
+        loop = asyncio.get_running_loop()
+        self._release_handle = loop.call_later(
+            config.RELEASE_AFTER_S, lambda: loop.create_task(self.release_now()))
+
+    async def release_now(self) -> bool:
+        """Unload Inkling if no run holds it. Harbor's bundled engine only (on the user's own
+        oMLX, other apps may be using what is loaded). True when an unload was sent."""
+        from service import idle
+        from service.inference import engine_hold
+        self._release_handle = None
+        if engine_hold.holder() is not None or idle.in_flight(config.MODEL_ID) > 0:
+            return False
+        try:
+            client = self._get_client()
+            if not getattr(client, "managed", False) or not bundled():
+                return False
+            if config.MODEL_ID not in set(await client.loaded_models()):
+                return False
+            await client.unload(config.MODEL_ID)
+        except Exception as exc:  # noqa: BLE001 - best effort; the idle unloader is the backstop
+            log.info("ideate: unloading the model failed: %s", type(exc).__name__)
+            return False
+        log.info("ideate: unloaded %s after the run", config.MODEL_ID)
+        return True
 
 
 # --- A copy of the model that is already on this Mac ---------------------------------------
