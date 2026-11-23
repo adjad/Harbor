@@ -1226,4 +1226,4 @@ def test_a_due_reminder_already_planned_as_a_task_is_one_plan_block():
                    if b["title"] == "Streaming plan renews")
     attention = assess(DAY, ZONE, s, evidence(reminders=rows), now=NOW)["attention"]
     # The reminder and the task's own twin are both attention items; the day shows them as the one block.
-    assert sorted(a["source"] for a in attention if a["title"] == "Streaming plan renews") == ["reminders", "harbor"]
+    assert sorted(a["source"] for a in attention if a["title"] == "Streaming plan renews") == sorted(["reminders", "harbor"])

@@ -556,7 +556,9 @@ def test_the_event_loop_keeps_ticking_while_a_document_is_read(monkeypatch):
         return text, gaps
     text, gaps = run(go())
     assert text == "slow but fine"
-    assert len(gaps) > 30 and max(gaps) < 0.25
+    # The loop never stalled; the tick count only shows it ran throughout (a loaded
+    # host's 20 ms sleeps run long, so 1.5 s can hold far fewer than 75 ticks).
+    assert len(gaps) > 10 and max(gaps) < 0.25
 
 
 @CHILD

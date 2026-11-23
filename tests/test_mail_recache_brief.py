@@ -62,8 +62,9 @@ def test_mail_reader_never_asks_and_never_forces():
     assert "forceTerminate" not in block and "kill(" not in block
     assert "app.terminate()" in block
     # The permission probe never asks (askUserIfNeeded false), and nothing in the block asks macOS.
+    # (bug sweep #16: the probe returns macOS's status, so "not running" can fall back to the last answer)
     assert "AEDeterminePermissionToAutomateTarget(&target, AEEventClass(typeWildCard),\n" \
-           "                                                     AEEventID(typeWildCard), false) == noErr" in block
+           "                                                     AEEventID(typeWildCard), false)" in block
     for asking in ("requestAccess", "AXIsProcessTrustedWithOptions", "Permissions.ask", ", true)"):
         assert asking not in block, asking
     assert "config.activates = false" in block and "config.hides = true" in block \

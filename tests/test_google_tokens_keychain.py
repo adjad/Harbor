@@ -369,10 +369,15 @@ def test_the_renamed_build_still_knows_the_other_apps_name():
     renamed = re.sub(r"harbor", "quayside", re.sub(r"Harbor", "Quayside", source))
     renamed = renamed.replace("from . import keychain_legacy", "from service.config import keychain_legacy")
     space: dict = {"__name__": "renamed_google_tokens"}
+    # Spelled in pieces so the import's rename leaves the pair itself alone: in the
+    # renamed build this test checks that build's own names, the other way round.
+    pair = {"com." + name + ".google" for name in ("wi" + "sp", "har" + "bor")}
+    assert T.SERVICE in pair and T.OTHER_SERVICES == tuple(pair - {T.SERVICE})
+    if T.SERVICE != "com." + "wi" + "sp.google":
+        return   # already the renamed build: the direct check above is the whole test
     exec(compile(renamed, "renamed_google_tokens.py", "exec"), space)
-    assert space["SERVICE"] == "com.quayside.google"
-    assert space["OTHER_SERVICES"] == ("com.harbor.google",)
-    assert T.SERVICE == "com.harbor.google" and T.OTHER_SERVICES == ("com.quayside.google",)
+    assert space["SERVICE"] == "com." + "har" + "bor.google"
+    assert space["OTHER_SERVICES"] == ("com." + "wi" + "sp.google",)
 
 
 def test_an_item_saved_by_the_other_app_is_read_and_copied_never_moved(keychain):

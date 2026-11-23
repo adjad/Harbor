@@ -3,7 +3,12 @@ import CoreFoundation
 import Dispatch
 
 // Production reads Internet Accounts (MailDBReader.swift); these flows never do.
-enum MailAccountAddresses { static func read() -> [String: String] { [:] } }
+enum MailAccountAddresses {
+    static let defaultPath = "/nonexistent/Accounts4.sqlite"
+    static func read() -> [String: String] { [:] }
+}
+// Production retries a closed index after 5 s and 20 s (MailRecache.swift); these flows don't wait.
+enum MailRecache { static let closedRetryDelays: [TimeInterval] = [] }
 
 // Only inert collaborators execute here. Python inserts the exact production
 // scan/capture/order/post/account-observation and pure history-state bodies.
@@ -120,6 +125,10 @@ final class FakeDB {
     }
 }
 final class Reader {
+    // Production asks NSWorkspace whether Mail is fetching; these flows have no Mail running.
+    func mailFetchIsLive() -> Bool { false }
+    // Production asks the index why it would not open, as here.
+    func closedReadFailure() -> (kind: String, reason: String) { dbReader.closedReadFailure() }
     var which: String
     let identityScript = "identity"
     let accountsScript = "accounts"
