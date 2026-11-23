@@ -50,11 +50,12 @@ import time
 from . import keychain_legacy
 
 SERVICE = "com.harbor.google"
-# Both apps' names. The first is assembled so the Harbor -> Quayside rename, which
-# rewrites every spelled-out product name, leaves it alone: in the Quayside build
-# SERVICE becomes the Quayside name and this tuple still names the Harbor one.
+# Both apps' names, each assembled in pieces so the Harbor -> Quayside import leaves them
+# alone: it rewrites every spelled-out "harbor" to "quayside", and first every spelled-out
+# "quayside" to "quayside" (fixture names), so a literal of either would come out wrong.
+# In the Quayside build SERVICE becomes the Quayside name and this tuple still names both.
 # (Only keychain_legacy.py may carry the keychain-legacy-name marker.)
-_BOTH = ("com." + "wi" + "sp" + ".google", "com.quayside.google")
+_BOTH = ("com." + "wi" + "sp" + ".google", "com." + "har" + "bor" + ".google")
 OTHER_SERVICES = tuple(name for name in _BOTH if name != SERVICE)
 NOT_FOUND = keychain_legacy.NOT_FOUND
 # A token that can pass through `security -i` unquoted. Google refresh tokens
