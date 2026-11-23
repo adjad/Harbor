@@ -135,6 +135,19 @@ struct IdeateChecks {
         let live = IdeateGPULimit.read()
         check(live.physicalBytes == ProcessInfo.processInfo.physicalMemory && live.currentMB >= -1, "reads without a password")
 
+        // A failed poll: a vanished project ends the run at once, a silent service after ~30 s.
+        check(IdeatePoll.lost(httpStatus: 404, failures: 1) == IdeatePoll.goneLine, "a 404 ends the run")
+        check(IdeatePoll.lost(httpStatus: 0, failures: 1) == nil, "one missed poll keeps polling")
+        check(IdeatePoll.lost(httpStatus: 500, failures: IdeatePoll.giveUpAfter - 1) == nil, "short of the cap keeps polling")
+        check(IdeatePoll.lost(httpStatus: 0, failures: IdeatePoll.giveUpAfter) == IdeatePoll.lostLine,
+              "a service that stopped answering ends the run")
+        check(!IdeateProjectStatus.failed.isActive, "a lost run no longer counts as active")
+        // A refused start goes back to what the tab showed, never a stuck "Starting…".
+        check(IdeatePoll.afterRefusedStart(previous: .done) == .done, "a finished project stays finished")
+        check(IdeatePoll.afterRefusedStart(previous: .idle) == .idle, "the empty tab stays empty")
+        check(IdeatePoll.afterRefusedStart(previous: .failed) == .failed, "a failed project stays failed")
+        check(!IdeatePoll.afterRefusedStart(previous: .starting).isActive, "never left starting")
+
         print("IdeateChecks: \(count) checks passed")
     }
 }

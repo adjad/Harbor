@@ -76,6 +76,17 @@ assert rec["type"] == "prompt", rec
 out({"id": rec.get("id"), "type": "response", "command": "prompt", "success": True, "data": {"disposition": "started"}})
 if scenario == "crash":
     sys.exit(3)
+if scenario == "linger":
+    # Settles, leaves a detached grandchild behind, then keeps its stdout open and does not exit.
+    import subprocess
+    kid = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], start_new_session=True,
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    with open(os.path.join(os.environ["HOME"], "kid.pid"), "w") as fh:
+        fh.write(str(kid.pid))
+    say("ok"); out({"type": "agent_settled", "aborted": False})
+    time.sleep(120); sys.exit(0)
+if scenario == "silent":
+    time.sleep(120); sys.exit(0)
 if scenario == "guard" and (launches == 1 or os.environ.get("FAKE_ALWAYS_GUARD")):
     say("", stop="error", error="Prefill memory estimate 7.9 GB exceeds the limit")
     out({"type": "agent_settled", "aborted": False}); sys.exit(0)
@@ -122,6 +133,7 @@ class FakeResidency:
 
     def wait_for_ask(self):
         self.waited = getattr(self, "waited", 0) + 1
+        return not getattr(self, "ask_busy", False)
 
     def begin(self):
         self.begun += 1
@@ -347,6 +359,38 @@ def test_model_swap_is_announced_and_released(world, monkeypatch):
     assert residency.waited == 1
 
 
+def test_a_run_never_takes_the_engine_from_an_ask_reply(world, monkeypatch):
+    manager, client, residency = world
+    residency.ask_busy = True
+    project = start(client, monkeypatch, scenario="other_dialog")
+    wait_for(lambda: manager.active is None)
+    body = client.get(f"/ideate/projects/{project['id']}").json()
+    assert body["status"] == "failed" and "Ask is still answering" in body["events"][-1]["text"]
+    assert residency.begun == residency.ended == 0 and residency.ensured == 0
+
+
+def test_a_stop_while_pi_starts_never_sends_the_prompt(world, monkeypatch):
+    manager, client, residency = world
+    real = manager._popen
+    def popen_then_stop(*args, **kwargs):
+        proc = real(*args, **kwargs)
+        manager.active.cancel = True        # cancel() ran before the process was registered
+        return proc
+    monkeypatch.setattr(manager, "_popen", popen_then_stop)
+    sent = []
+    real_prompt = harness.PiSession.prompt
+    def recording_prompt(self, *args, **kwargs):
+        sent.append(args)
+        return real_prompt(self, *args, **kwargs)
+    monkeypatch.setattr(harness.PiSession, "prompt", recording_prompt)
+    project = start(client, monkeypatch, scenario="other_dialog")
+    wait_for(lambda: manager.active is None)
+    body = client.get(f"/ideate/projects/{project['id']}").json()
+    assert body["status"] == "cancelled" and sent == []
+    assert not any(e["kind"] == "tool" for e in body["events"])
+    assert residency.begun == residency.ended == 1
+
+
 def test_a_loaded_model_is_still_made_the_only_one(world, monkeypatch):
     """Inkling already loaded: the run still calls the swap helper, which unloads the rest."""
     manager, client, residency = world
@@ -448,6 +492,20 @@ def test_gate_judgements(tmp_path):
     assert gate.judge("grep", {"pattern": "x"}, work).action == gate.DENY
 
 
+def test_gate_judges_the_path_pi_opens(tmp_path):
+    # Pi drops one leading "@", reads a file:// URL as a path and turns Unicode spaces
+    # into spaces before it opens a file; the gate must judge that same path.
+    work = tmp_path / "work"
+    work.mkdir()
+    outside = "/Users/example/Documents/notes.txt"
+    for raw in ("@" + outside, "file://" + outside, "@~/Documents/notes.txt"):
+        assert gate.judge("read", {"path": raw}, work).action == gate.CONFIRM, raw
+        assert gate.judge("write", {"path": raw}, work).action != gate.ALLOW, raw
+    assert gate.judge("read", {"path": "@notes.txt"}, work).action == gate.ALLOW
+    assert gate.pi_path("my\u00a0file.txt") == "my file.txt"
+    assert gate.pi_path("file:///tmp/a%20b.txt") == "/tmp/a b.txt"
+
+
 def test_pi_translation():
     class Proc:
         stdin = None
@@ -487,6 +545,9 @@ def test_profile_writes_only_the_project(tmp_path):
     assert '(allow network-outbound (remote ip "localhost:8000"))' in text
     assert text.count("network-outbound") == 1 + sum(1 for l in text.splitlines() if "(deny network-outbound" in l)
     assert "/Library/Keychains" in text and "/.pi" in text and "/.config/opencode" in text
+    for name in ("/.git-credentials", "/.npmrc", "/.zsh_history", "/.claude", "/.codex",
+                 "/Library/Application Support/Claude"):
+        assert name in text, name
     with pytest.raises(sandbox.ProfileError):
         sandbox.build_profile(project, [tmp_path / "elsewhere"], 8000)
     with pytest.raises(sandbox.ProfileError):
@@ -608,3 +669,120 @@ def test_profile_hides_stores_parent_environment_and_ttys(tmp_path):
         ran = subprocess.run(sandbox.contain(["/bin/ls", str(mail)], profile), cwd=work,
                              capture_output=True, text=True, timeout=30)
         assert ran.returncode != 0
+
+
+# --- watchdog, descendants, locking (invented fixtures; only this test's own children) --------
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _ps_usable():
+    from service.ideate import procs
+    return any(pid == os.getpid() for pid, _, _ in procs._rows())
+
+
+def test_a_settled_harness_that_will_not_exit_is_stopped_and_releases_the_engine(world, monkeypatch):
+    if not _ps_usable():
+        pytest.skip("ps cannot list processes here")
+    manager, client, residency = world
+    monkeypatch.setattr(config, "CANCEL_GRACE_S", 0.5)
+    monkeypatch.setattr(config, "WATCHDOG_TICK_S", 0.1)
+    project = start(client, monkeypatch, scenario="linger")
+    kid = None
+    try:
+        wait_for(lambda: manager.active is None, timeout=20)
+        body = client.get(f"/ideate/projects/{project['id']}").json()
+        assert body["status"] == "done"
+        assert residency.begun == residency.ended == 1
+        p = manager.store.project(project["id"])
+        kid = int((p.agent / "home" / "kid.pid").read_text())
+        # The detached grandchild (its own session) went with the run.
+        wait_for(lambda: not _pid_alive(kid), timeout=10)
+    finally:
+        if kid and _pid_alive(kid):
+            os.kill(kid, 9)
+
+
+def test_a_silent_harness_is_stopped_after_the_inactivity_limit(world, monkeypatch):
+    manager, client, residency = world
+    monkeypatch.setattr(config, "INACTIVITY_LIMIT_S", 0.6)
+    monkeypatch.setattr(config, "WATCHDOG_TICK_S", 0.1)
+    project = start(client, monkeypatch, scenario="silent")
+    wait_for(lambda: manager.active is None, timeout=20)
+    body = client.get(f"/ideate/projects/{project['id']}").json()
+    assert body["status"] == "failed" and "stopped answering" in body["events"][-1]["text"]
+    assert residency.begun == residency.ended == 1
+
+
+def test_a_run_waiting_on_an_approval_is_not_counted_as_silent(world, monkeypatch):
+    manager, client, _ = world
+    monkeypatch.setattr(config, "INACTIVITY_LIMIT_S", 0.5)
+    monkeypatch.setattr(config, "WATCHDOG_TICK_S", 0.1)
+    project = start(client, monkeypatch, scenario="hang")
+    pending(client, project["id"])
+    time.sleep(1.5)
+    assert manager.active is not None
+    client.post(f"/ideate/projects/{project['id']}/cancel", json={})
+    wait_for(lambda: manager.active is None)
+
+
+def test_sweep_signals_only_the_processes_it_saw_as_descendants():
+    from service.ideate import procs
+    if not _ps_usable():
+        pytest.skip("ps cannot list processes here")
+    mine = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        known = procs.descendants(os.getpid())
+        assert mine.pid in known and other.pid in known
+        known.pop(other.pid)                              # not recorded: must survive
+        stale = {mine.pid: "Mon Jan  1 00:00:00 1990"}    # same pid, a different start time
+        assert procs.sweep(stale, grace=0.2) == 0 and mine.poll() is None
+        assert procs.sweep(known, grace=2.0) >= 1
+        mine.wait(timeout=5)
+        assert other.poll() is None
+    finally:
+        for proc in (mine, other):
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+
+
+def test_sweep_never_touches_pid_one_or_itself(monkeypatch):
+    from service.ideate import procs
+    sent = []
+    monkeypatch.setattr(os, "kill", lambda pid, sig: sent.append((pid, sig)))
+    monkeypatch.setattr(procs, "_rows", lambda: [(1, 0, "x"), (os.getpid(), 1, "y")])
+    assert procs.sweep({1: "x", os.getpid(): "y"}, grace=0.1) == 0 and sent == []
+
+
+def test_view_recovers_under_the_manager_lock(world, monkeypatch):
+    manager, client, _ = world
+    project = manager.store.create("An invented idea", "general", None)
+    owned = []
+    real = manager.store.recover
+    def recording(*args, **kwargs):
+        owned.append(manager._lock._is_owned())
+        return real(*args, **kwargs)
+    monkeypatch.setattr(manager.store, "recover", recording)
+    manager.view(project.id)
+    manager.cancel(project.id)
+    assert owned == [True, True]
+
+
+def test_events_start_from_the_newest_and_page_forward(tmp_path):
+    st = store.Store(tmp_path / "projects")
+    project = st.create("An invented idea", "general", None)
+    for n in range(10):
+        st.append(project, "text", text=f"line {n}")
+    seqs = lambda rows: [e["seq"] for e in rows]
+    newest = st.events(project, after=0, limit=3)
+    assert seqs(newest) == sorted(seqs(newest)) and newest[-1]["text"] == "line 9"
+    assert seqs(st.events(project, after=newest[-1]["seq"], limit=3)) == []
+    first = st.events(project, after=2, limit=3)
+    assert seqs(first) == [first[0]["seq"] + i for i in range(3)] and first[0]["seq"] == 3

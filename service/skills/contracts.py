@@ -54,6 +54,16 @@ def _inside_user_folders(path: str) -> bool:
     return any(resolved == home / f or (home / f) in resolved.parents for f in _USER_FOLDERS)
 
 
+def _decide_under_full_access(policy, category: str, args: dict, name: str):
+    """policy.decide as if Full access were on; the saved mode is put back before returning."""
+    was = policy._FULL_ACCESS
+    policy._FULL_ACCESS = True
+    try:
+        return policy.decide(category, args, tool=name)
+    finally:
+        policy._FULL_ACCESS = was
+
+
 def validate(skill: Skill, registry: dict | None = None) -> list[str]:
     """Problems with a workflow skill's contract; an empty list means it holds.
 
@@ -101,6 +111,7 @@ def validate(skill: Skill, registry: dict | None = None) -> list[str]:
         problems.append("no steps declared")
         steps = []
     used: set[str] = set()
+    skips_card_in_full_access = False
     for i, step in enumerate(steps):
         if not isinstance(step, dict) or "tool" not in step:
             problems.append(f"step {i}: not a tool step")
@@ -125,6 +136,15 @@ def validate(skill: Skill, registry: dict | None = None) -> list[str]:
             problems.append(f"step {i}: {name} is {decision.tier.value} under policy, not a confirm")
         if not asks and decision.tier is not policy.Tier.ALLOW:
             problems.append(f"step {i}: {name} is {decision.tier.value} under policy, not a plain read")
+        # The same step under Full access, which skips some cards (email triage): the skill's
+        # text must then say so rather than promise a card that never appears.
+        full = _decide_under_full_access(policy, tool.category, args, name)
+        if not asks and full.tier is not policy.Tier.ALLOW:
+            problems.append(f"step {i}: {name} is {full.tier.value} under full access, not a plain read")
+        if asks and full.tier is policy.Tier.DENY:
+            problems.append(f"step {i}: {name} is refused under full access")
+        if asks and full.tier is policy.Tier.ALLOW:
+            skips_card_in_full_access = True
         if name == "organize_files":
             folder, dest = str(args.get("folder", "")), str(args.get("destination", ""))
             if not _inside_user_folders(folder):
@@ -140,6 +160,9 @@ def validate(skill: Skill, registry: dict | None = None) -> list[str]:
         problems.append("a file-moving skill must declare `folders`")
 
     body = skill.body
+    if skips_card_in_full_access and "full access" not in " ".join(body.lower().split()):
+        problems.append("a confirmed step runs without a card under full access, but the instructions "
+                        "never say so (they must say it asks first unless the person gave full access)")
     for name in sorted(declared):
         if name not in body:
             problems.append(f"{name} is declared but the instructions never mention it")

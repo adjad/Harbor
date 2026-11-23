@@ -182,12 +182,24 @@ def test_begin_end_order_and_the_grace_timer(monkeypatch):
 def test_wait_for_ask_returns_when_the_turn_ends(monkeypatch):
     busy = iter([True, True, False])
     monkeypatch.setattr(idle, "foreground_busy", lambda: next(busy, False))
-    engine.Residency().wait_for_ask(timeout=2, poll=0.01)
+    assert engine.Residency().wait_for_ask(timeout=2, poll=0.01) is True
     monkeypatch.setattr(idle, "foreground_busy", lambda: True)
     import time
     t = time.monotonic()
-    engine.Residency().wait_for_ask(timeout=0.05, poll=0.01)
+    # Still answering at the deadline: the run must not take the engine from it.
+    assert engine.Residency().wait_for_ask(timeout=0.05, poll=0.01) is False
     assert time.monotonic() - t < 1
+
+
+def test_a_begin_that_fails_partway_releases_the_hold(monkeypatch):
+    def broken():
+        raise RuntimeError("boom")
+    monkeypatch.setattr(idle, "begin_foreground", broken)
+    before = idle.in_flight(config.MODEL_ID)
+    with pytest.raises(RuntimeError):
+        engine.Residency().begin()
+    assert engine_hold.holder() is None
+    assert idle.in_flight(config.MODEL_ID) == before
 
 
 def test_config_rules():
@@ -260,3 +272,39 @@ def test_available_bytes_reads_vm_stat():
     free = engine.available_bytes()
     assert free == -1 or 0 < free < 1024 * GB
     assert engine.room_needed() == config.MODEL_RESIDENT_BYTES + config.MEMORY_MARGIN_BYTES >= 18 * GB
+
+
+def test_release_rechecks_the_hold_right_before_the_unload(monkeypatch):
+    """A run that begins while the loaded-model list is coming back must keep its model."""
+    rec, res = _release_world(monkeypatch, [INK])
+    real = res.fake.loaded_models
+
+    async def begin_during_the_list():
+        rows = await real()
+        engine_hold.hold(INK, "Ideate")
+        return rows
+    monkeypatch.setattr(res.fake, "loaded_models", begin_during_the_list, raising=False)
+    assert asyncio.run(res.release_now()) is False
+    assert rec.calls == []
+
+
+def test_ensure_waits_for_a_release_that_is_unloading(monkeypatch):
+    rec, res = _release_world(monkeypatch, [INK])
+    order = []
+    real_unload = res.fake.unload
+
+    async def slow_unload(model):
+        order.append("unload-start")
+        await asyncio.sleep(0.2)
+        await real_unload(model)
+        order.append("unload-end")
+    monkeypatch.setattr(res.fake, "unload", slow_unload, raising=False)
+
+    async def go():
+        release = asyncio.create_task(res.release_now())
+        await asyncio.sleep(0.05)
+        async with res._swap_lock():
+            order.append("ensure-got-lock")
+        return await release
+    assert asyncio.run(go()) is True
+    assert order == ["unload-start", "unload-end", "ensure-got-lock"]

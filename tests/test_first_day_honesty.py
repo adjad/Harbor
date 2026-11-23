@@ -861,3 +861,20 @@ def test_cache_account_addresses_drops_anything_malformed(monkeypatch):
     assert E._native_account_addresses == {"ABCD-12": "a@b.com"}
     E.cache_account_addresses("garbage")
     assert E._native_account_addresses == {}
+
+
+def test_an_empty_account_address_read_clears_the_old_map_and_names_are_stripped(monkeypatch):
+    from service.tools import email_tools as E
+    address = "sam@school.example"
+    monkeypatch.setattr(E, "_native_account_addresses", {})
+    monkeypatch.setattr(E, "_external_accounts", {address: {"inferred_native_id": "stale"}})
+    monkeypatch.setattr(E, "native_email_accounts",
+                        lambda: [{"id": "AAAA-1111", "name": "  Sam@School.Example \n"}])
+    E.cache_account_addresses({"BBBB-2222": address})
+    assert E._native_account_addresses == {"BBBB-2222": address}
+    # A trailing space or newline in Mail's account name must not hide an exact match.
+    E._refresh_native_bindings()
+    assert E._external_accounts[address]["inferred_native_id"] == "AAAA-1111"
+    # A successful read that finds no addresses sends {}: the old map goes.
+    E.cache_account_addresses({})
+    assert E._native_account_addresses == {}

@@ -71,6 +71,36 @@ def test_national_phone_and_case_insensitive_email():
     assert m.unmask("[EMAIL_1]") == "Ada@Example.com"
 
 
+def test_unseparated_and_trunk_prefixed_us_phones_are_masked():
+    for phone in ("4155550134", "14155550134", "1-415-555-0134", "1 (415) 555-0134", "1.415.555.0134"):
+        m = Masker()
+        masked = m.mask(f"call {phone} today")
+        assert "0134" not in masked and "[PHONE_" in masked, phone
+        assert m.unmask(masked) == f"call {phone} today"
+    # An epoch timestamp, an order number and a short code stay as they are.
+    for other in ("1700000000", "0123456789", "order 1234567890", "id 55501340"):
+        assert m.mask(other) == other, other
+
+
+def test_a_placeholder_in_another_case_is_still_restored():
+    m = Masker()
+    m.mask(f"write {EMAIL}")
+    assert m.unmask("to [email_1] or [Email_1]") == f"to {EMAIL} or {EMAIL}"
+    un = m.stream()
+    assert un.feed("to [ema") == "to "
+    assert un.feed("il_1].") == f"{EMAIL}."
+    assert m.unmask_arguments('{"to": "[email_1]"}') == f'{{"to": "{EMAIL}"}}'
+
+
+def test_dict_keys_are_masked_like_values():
+    m = Masker()
+    out = m.mask_obj({EMAIL: {"note": f"cc {EMAIL}"}})
+    assert EMAIL not in json.dumps(out)
+    assert m.unmask_obj(out) == {EMAIL: {"note": f"cc {EMAIL}"}}
+    masked = m.mask_arguments(json.dumps({EMAIL: 1}))
+    assert EMAIL not in masked
+
+
 # 2. stable numbering across turns
 def test_numbering_is_stable_across_turns_and_per_conversation():
     with cloud_mask.conversation("A"):

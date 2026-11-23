@@ -9,12 +9,15 @@ import Foundation
     typealias S = DayCalendarSync
     static let now = 1_000_000.0
     static let hour = 3600.0
+    static let me = "install-me"
+    static let other = "install-other"
 
     static func main() {
         wantedChecks()
         planChecks()
         removalChecks()
         floatingChecks()
+        installChecks()
         settingsAndPickerChecks()
         cardChecks()
         print("synthetic day calendar sync checks passed")
@@ -35,8 +38,9 @@ import Foundation
     }
 
     static func event(_ id: String, block: String, _ title: String = "Reading: STAT 101", start: Double = now + 2 * hour,
-                      end: Double = now + 3 * hour, calendar: String = "cal-1") -> S.Existing {
-        S.Existing(eventID: id, blockID: block, title: title, start: start, end: end, calendarID: calendar)
+                      end: Double = now + 3 * hour, calendar: String = "cal-1", install: String? = me) -> S.Existing {
+        S.Existing(eventID: id, blockID: block, title: title, start: start, end: end, calendarID: calendar,
+                   installID: install)
     }
 
     // Only Harbor's own blocks: study blocks and kept work. Nothing the person already has.
@@ -72,36 +76,36 @@ import Foundation
     // Create what is missing, update what moved, never duplicate.
     static func planChecks() {
         let a = block("study-block:a1"), b = block("task:t1", "Homework 3", start: now + 4 * hour, end: now + 5 * hour)
-        let first = S.plan(wanted: [a, b], existing: [], scope: nil, canRemove: true, calendarID: "cal-1", now: now)
+        let first = S.plan(wanted: [a, b], existing: [], scope: nil, canRemove: true, calendarID: "cal-1", now: now, installID: me)
         check(first.creates == [a, b] && first.updates.isEmpty && first.deletes.isEmpty, "everything new is created")
 
         // Re-syncing what is already written does nothing: idempotent.
         let written = [event("e1", block: "study-block:a1"),
                        event("e2", block: "task:t1", "Homework 3", start: now + 4 * hour, end: now + 5 * hour)]
-        check(S.plan(wanted: [a, b], existing: written, scope: nil, canRemove: true, calendarID: "cal-1", now: now).isEmpty,
+        check(S.plan(wanted: [a, b], existing: written, scope: nil, canRemove: true, calendarID: "cal-1", now: now, installID: me).isEmpty,
               "a second sync changes nothing")
 
         // Moved (Replan, drag): the same event is updated, not a new one created.
         let moved = block("task:t1", "Homework 3", start: now + 6 * hour, end: now + 7 * hour)
-        let move = S.plan(wanted: [a, moved], existing: written, scope: nil, canRemove: true, calendarID: "cal-1", now: now)
+        let move = S.plan(wanted: [a, moved], existing: written, scope: nil, canRemove: true, calendarID: "cal-1", now: now, installID: me)
         check(move.creates.isEmpty && move.deletes.isEmpty, "a move creates and removes nothing")
         check(move.updates == [S.Update(eventID: "e2", block: moved, moveCalendar: false)], "a move updates its event")
 
         // Renamed, and moved to another calendar.
         let renamed = block("study-block:a1", "Reading: STAT 101 ch. 4")
-        let rename = S.plan(wanted: [renamed], existing: [written[0]], scope: nil, canRemove: true, calendarID: "cal-1", now: now)
+        let rename = S.plan(wanted: [renamed], existing: [written[0]], scope: nil, canRemove: true, calendarID: "cal-1", now: now, installID: me)
         check(rename.updates.first?.block.title == "Reading: STAT 101 ch. 4", "a new title updates the event")
-        let elsewhere = S.plan(wanted: [a], existing: [written[0]], scope: nil, canRemove: true, calendarID: "cal-2", now: now)
+        let elsewhere = S.plan(wanted: [a], existing: [written[0]], scope: nil, canRemove: true, calendarID: "cal-2", now: now, installID: me)
         check(elsewhere.updates == [S.Update(eventID: "e1", block: a, moveCalendar: true)], "another calendar moves the event")
 
         // A duplicate event for one block is removed, the one in the chosen calendar stays.
         let twins = [event("e9", block: "study-block:a1", calendar: "cal-2"), event("e1", block: "study-block:a1")]
-        let dedupe = S.plan(wanted: [a], existing: twins, scope: nil, canRemove: true, calendarID: "cal-1", now: now)
+        let dedupe = S.plan(wanted: [a], existing: twins, scope: nil, canRemove: true, calendarID: "cal-1", now: now, installID: me)
         check(dedupe.deletes == ["e9"] && dedupe.creates.isEmpty && dedupe.updates.isEmpty, "duplicates are removed: \(dedupe)")
 
         // A block that is already over is not written; one still ahead is.
         let over = block("task:old", "Done already", start: now - 3 * hour, end: now - 2 * hour)
-        check(S.plan(wanted: [over], existing: [], scope: nil, canRemove: true, calendarID: "cal-1", now: now).creates.isEmpty,
+        check(S.plan(wanted: [over], existing: [], scope: nil, canRemove: true, calendarID: "cal-1", now: now, installID: me).creates.isEmpty,
               "a block already over is not written")
     }
 
@@ -113,56 +117,105 @@ import Foundation
         let history = event("e3", block: "task:earlier", start: now - 5 * hour, end: now - 4 * hour)
         let kept = event("e4", block: "study-block:a1")
         let plan = S.plan(wanted: [block("study-block:a1")], existing: [ahead, later, history, kept],
-                          scope: day, canRemove: true, calendarID: "cal-1", now: now)
+                          scope: day, canRemove: true, calendarID: "cal-1", now: now, installID: me)
         check(plan.deletes == ["e1"], "only the vanished block inside the day is removed: \(plan.deletes)")
         check(plan.creates.isEmpty && plan.updates.isEmpty, "nothing else changes")
 
-        let blocked = S.plan(wanted: [], existing: [ahead], scope: day, canRemove: false, calendarID: "cal-1", now: now)
+        let blocked = S.plan(wanted: [], existing: [ahead], scope: day, canRemove: false, calendarID: "cal-1", now: now, installID: me)
         check(blocked.deletes.isEmpty, "nothing is removed while the plan is not whole")
-        let unscoped = S.plan(wanted: [], existing: [ahead], scope: nil, canRemove: true, calendarID: "cal-1", now: now)
+        let unscoped = S.plan(wanted: [], existing: [ahead], scope: nil, canRemove: true, calendarID: "cal-1", now: now, installID: me)
         check(unscoped.deletes.isEmpty, "nothing is removed without a day to judge by")
 
         // An event with no block id is not Harbor's to judge.
-        let stray = S.plan(wanted: [], existing: [event("e5", block: "")], scope: day, canRemove: true, calendarID: "cal-1", now: now)
+        let stray = S.plan(wanted: [], existing: [event("e5", block: "")], scope: day, canRemove: true, calendarID: "cal-1", now: now, installID: me)
         check(stray.isEmpty, "an event without a marker is never touched")
 
         // A block moved to another day updates its event even though that event is outside today.
         let tomorrow = block("task:later", start: now + 30 * hour, end: now + 31 * hour)
         let carry = S.plan(wanted: [tomorrow], existing: [event("e6", block: "task:later")], scope: nil, canRemove: true,
-                           calendarID: "cal-1", now: now)
+                           calendarID: "cal-1", now: now, installID: me)
         check(carry.updates.map(\.eventID) == ["e6"], "a carried block moves its event")
 
         // Turning the sync off removes what is still ahead, never what already happened.
-        let off = S.planRemovingAll(existing: [ahead, history, later, event("e7", block: "")], now: now)
+        let off = S.planRemovingAll(existing: [ahead, history, later, event("e7", block: "")], now: now, installID: me)
         check(off.deletes == ["e1", "e2"], "off removes the upcoming ones Harbor added: \(off.deletes)")
     }
 
     // A block that drifts with the clock does not thrash its event.
     static func floatingChecks() {
         let soon = block("task:f", start: now + 5 * 60, end: now + 65 * 60, floating: true)
-        check(S.plan(wanted: [soon], existing: [], scope: nil, canRemove: true, calendarID: "cal-1", now: now).creates.isEmpty,
+        check(S.plan(wanted: [soon], existing: [], scope: nil, canRemove: true, calendarID: "cal-1", now: now, installID: me).creates.isEmpty,
               "a floating block starting within minutes waits")
         let later = block("task:f", start: now + 2 * hour, end: now + 3 * hour, floating: true)
-        check(S.plan(wanted: [later], existing: [], scope: nil, canRemove: true, calendarID: "cal-1", now: now).creates == [later],
+        check(S.plan(wanted: [later], existing: [], scope: nil, canRemove: true, calendarID: "cal-1", now: now, installID: me).creates == [later],
               "a floating block further out is written")
         let drifted = block("task:f", start: now + 2 * hour + 120, end: now + 3 * hour + 120, floating: true)
         let have = [event("e1", block: "task:f", start: now + 2 * hour, end: now + 3 * hour)]
-        check(S.plan(wanted: [drifted], existing: have, scope: nil, canRemove: true, calendarID: "cal-1", now: now).isEmpty,
+        check(S.plan(wanted: [drifted], existing: have, scope: nil, canRemove: true, calendarID: "cal-1", now: now, installID: me).isEmpty,
               "a two minute drift leaves the event alone")
         let shifted = block("task:f", start: now + 4 * hour, end: now + 5 * hour, floating: true)
-        check(S.plan(wanted: [shifted], existing: have, scope: nil, canRemove: true, calendarID: "cal-1", now: now).updates.count == 1,
+        check(S.plan(wanted: [shifted], existing: have, scope: nil, canRemove: true, calendarID: "cal-1", now: now, installID: me).updates.count == 1,
               "a real shift moves it")
         let exact = block("task:p", start: now + 2 * hour + 120, end: now + 3 * hour + 120)
         check(S.plan(wanted: [exact], existing: [event("e2", block: "task:p")], scope: nil, canRemove: true,
-                     calendarID: "cal-1", now: now).updates.count == 1, "a pinned block moves for two minutes")
+                     calendarID: "cal-1", now: now, installID: me).updates.count == 1, "a pinned block moves for two minutes")
         // An event already under way is left alone.
         let underway = event("e3", block: "task:u", start: now - hour, end: now + hour)
         check(S.plan(wanted: [block("task:u", start: now + 3 * hour, end: now + 4 * hour)], existing: [underway],
-                     scope: nil, canRemove: true, calendarID: "cal-1", now: now).updates.count == 1,
+                     scope: nil, canRemove: true, calendarID: "cal-1", now: now, installID: me).updates.count == 1,
               "an event still ahead in part can move")
         let past = event("e4", block: "task:p2", start: now - 3 * hour, end: now - 2 * hour)
         check(S.plan(wanted: [block("task:p2", start: now + hour, end: now + 2 * hour)], existing: [past], scope: nil,
-                     canRemove: true, calendarID: "cal-1", now: now).isEmpty, "an event that is over is history")
+                     canRemove: true, calendarID: "cal-1", now: now, installID: me).isEmpty, "an event that is over is history")
+    }
+
+    // Two Macs on one calendar never touch each other's events; an ongoing block is never removed.
+    static func installChecks() {
+        let day = (now - 6 * hour)...(now + 18 * hour)
+        let a = block("task:t1", "Homework 3")
+        // The other Mac's event for the same block and its own strays: not updated, not removed.
+        let theirs = [event("t1", block: "task:t1", "Homework (old title)", start: now + 5 * hour, end: now + 6 * hour,
+                            install: other),
+                      event("t2", block: "task:gone", install: other),
+                      event("t3", block: "task:legacy", install: nil)]
+        let mine = S.plan(wanted: [a], existing: theirs, scope: day, canRemove: true, calendarID: "cal-1", now: now,
+                          installID: me)
+        check(mine.creates == [a] && mine.updates.isEmpty && mine.deletes.isEmpty,
+              "this Mac writes its own and leaves the other's alone: \(mine)")
+        let both = theirs + [event("m1", block: "task:gone"), event("m2", block: "task:t1", "Homework 3")]
+        let me2 = S.plan(wanted: [a], existing: both, scope: day, canRemove: true, calendarID: "cal-1", now: now, installID: me)
+        check(me2.deletes == ["m1"] && me2.creates.isEmpty && me2.updates.isEmpty, "only its own vanished event goes: \(me2)")
+        let them = S.plan(wanted: [], existing: both, scope: day, canRemove: true, calendarID: "cal-1", now: now, installID: other)
+        check(them.deletes == ["t1", "t2"], "the other Mac removes only its own: \(them.deletes)")
+        let off = S.planRemovingAll(existing: both, now: now, installID: me)
+        check(off.deletes == ["m1", "m2"], "turning off removes only this Mac's: \(off.deletes)")
+        check(S.planRemovingAll(existing: both, now: now, installID: "nobody").isEmpty, "a fresh install owns nothing")
+
+        // Under way: not removed (by plan or by off). Not started yet: removed.
+        let underway = event("u1", block: "task:u", start: now - hour, end: now + hour)
+        check(S.plan(wanted: [], existing: [underway], scope: day, canRemove: true, calendarID: "cal-1", now: now,
+                     installID: me).deletes.isEmpty, "an ongoing block is not removed")
+        check(S.planRemovingAll(existing: [underway], now: now, installID: me).isEmpty, "off leaves an ongoing block")
+        let dup = S.plan(wanted: [a], existing: [event("d1", block: "task:t1", "Homework 3"),
+                                                 event("d2", block: "task:t1", "Homework 3", start: now - hour, end: now + hour)],
+                         scope: nil, canRemove: true, calendarID: "cal-1", now: now, installID: me)
+        check(dup.deletes.isEmpty, "a duplicate already under way is left")
+
+        // Off does nothing per plan: no read, no write; the one removal waits for an on-to-off with something written.
+        check(DayCalendarSyncSettings.offAction(enabled: true, wroteEvents: true) == nil, "on: no off action")
+        check(DayCalendarSyncSettings.offAction(enabled: false, wroteEvents: false) == .nothing, "off, nothing written: nothing")
+        check(DayCalendarSyncSettings.offAction(enabled: false, wroteEvents: true) == .removeOnce, "off after writing: once")
+        let suite = UserDefaults(suiteName: "day-calendar-install-checks-" + UUID().uuidString)!
+        let id = DayCalendarSyncSettings.installID(suite)
+        check(!id.isEmpty && DayCalendarSyncSettings.installID(suite) == id, "the install id is made once")
+        check(id != DayCalendarSyncSettings.installID(UserDefaults(suiteName: "day-calendar-install-checks-" + UUID().uuidString)!),
+              "each install has its own")
+        check(!DayCalendarSyncSettings.wroteEvents(suite), "nothing written yet")
+        DayCalendarSyncSettings.setWroteEvents(true, suite)
+        check(DayCalendarSyncSettings.wroteEvents(suite), "the flag is kept")
+        DayCalendarSyncSettings.setWroteEvents(false, suite)
+        check(DayCalendarSyncSettings.offAction(enabled: false, wroteEvents: DayCalendarSyncSettings.wroteEvents(suite)) == .nothing,
+              "after the one removal, off does nothing again")
     }
 
     static func settingsAndPickerChecks() {

@@ -589,6 +589,17 @@ final class MailReader {
         mailAppOpen() && Self.automationAllowed("com.apple.mail")
     }
 
+    /// Mail is open and its index (or -wal) has been written since it launched. An open Mail that
+    /// is offline or signed out never writes, so it must not vouch for the read.
+    private func mailFetchIsLive() -> Bool {
+        guard let app = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == "com.apple.mail" })
+        else { return false }
+        let last = dbReader.indexFiles().compactMap {
+            (try? FileManager.default.attributesOfItem(atPath: $0))?[.modificationDate] as? Date
+        }.max()
+        return MailRecache.indexReadIsLive(launchDate: app.launchDate, lastIndexChange: last)
+    }
+
     private func mailAppOpen() -> Bool {
         NSWorkspace.shared.runningApplications.contains { $0.bundleIdentifier == "com.apple.mail" }
     }
@@ -793,6 +804,7 @@ final class MailReader {
     private var personTouchedMail = false
     private var userQuitMailAt: Date?
     private var recacheRunning = false
+    private var keptRetryScheduled = false
     private var mailObservers: [NSObjectProtocol] = []
     /// The network path (NWPathMonitor); guarded by recacheLock. Assumed online until it reports.
     private var online = true
@@ -861,14 +873,26 @@ final class MailReader {
 
     /// macOS already lets Harbor script this app. Undecided or refused is false, and nothing is asked.
     static func automationAllowed(_ bundleID: String) -> Bool {
+        let status = automationStatus(bundleID)
+        let key = MailAutomation.rememberedKey + "." + bundleID
+        let remembered = UserDefaults.standard.object(forKey: key) as? Bool
+        let verdict = MailAutomation.verdict(status: status, remembered: remembered)
+        if let remember = verdict.remember, remember != remembered {
+            UserDefaults.standard.set(remember, forKey: key)
+        }
+        return verdict.allowed
+    }
+
+    /// macOS's raw answer, never asking: 0 allowed, -600 not running, -1743 refused, -1744 undecided.
+    static func automationStatus(_ bundleID: String) -> Int32 {
         var target = AEAddressDesc()
         let created = bundleID.withCString { pointer in
             AECreateDesc(DescType(typeApplicationBundleID), pointer, strlen(pointer), &target)
         }
-        guard created == noErr else { return false }
+        guard created == noErr else { return Int32(created) }
         defer { AEDisposeDesc(&target) }
         return AEDeterminePermissionToAutomateTarget(&target, AEEventClass(typeWildCard),
-                                                     AEEventID(typeWildCard), false) == noErr
+                                                     AEEventID(typeWildCard), false)
     }
 
     /// Now is outside the person's working hours (GET /assistant/hours); false when the service
@@ -890,12 +914,14 @@ final class MailReader {
     }
 
     /// Google's mail accounts, as the service reports them; empty when it doesn't answer.
-    private static func gmailAccounts() async -> [MailRecache.GmailAccount] {
+    /// nil when the service didn't answer: that says nothing about Google, so it must not read
+    /// as "no Google account" and open Mail (at every launch, before the service is up).
+    private static func gmailAccounts() async -> [MailRecache.GmailAccount]? {
         var req = URLRequest(url: HarborClient.baseURL.appendingPathComponent("assistant/gmail/status"))
         req.timeoutInterval = 5
         guard let (data, response) = try? await URLSession.shared.data(for: req),
               (response as? HTTPURLResponse)?.statusCode == 200,
-              let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return [] }
+              let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
         let rows = json["accounts"] as? [[String: Any]] ?? []
         return rows.compactMap(GoogleStatus.Account.parse).map {
             MailRecache.GmailAccount(connected: $0.state == .connected, lastSync: $0.lastSync)
@@ -909,7 +935,11 @@ final class MailReader {
         Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
             let now = Date()
-            let accounts = await Self.gmailAccounts()
+            guard let accounts = await Self.gmailAccounts() else {
+                // The service isn't answering yet: decide on a later tick.
+                if let failure { self.reportClosedFailure(failure) }
+                return
+            }
             let covers = MailRecache.gmailCovers(accounts, now: now)
             let unchecked = MailRecache.gmailLeavesUnchecked(accounts, now: now)
             let offHours = await Self.offHours(now: now)
@@ -928,7 +958,7 @@ final class MailReader {
             if go { self.recacheRunning = true }
             self.recacheLock.unlock()
             guard go else {
-                if let failure { self.postDiagnostic(available: false, reason: failure.reason, kind: failure.kind) }
+                if let failure { self.reportClosedFailure(failure, offHours: offHours) }
                 return
             }
             NSLog(unchecked ? "Harbor: opening Mail hidden because a Google sign-in can't be checked"
@@ -936,6 +966,35 @@ final class MailReader {
             await self.openMailAndRead(failure: failure)
             self.recacheLock.lock(); self.recacheRunning = false; self.recacheLock.unlock()
         }
+    }
+
+    private func closedReadFailure() -> (kind: String, reason: String) { dbReader.closedReadFailure() }
+
+    /// Posts a closed-Mail failure, unless it is transient and a recent good read still stands (or
+    /// Harbor is deliberately not opening Mail off-hours): then the last read is kept and the next
+    /// one comes sooner.
+    private func reportClosedFailure(_ failure: (kind: String, reason: String), offHours: Bool = false) {
+        recacheLock.lock()
+        let last = lastMailRead
+        recacheLock.unlock()
+        guard MailRecache.reportsClosedFailure(kind: failure.kind, lastGoodRead: last, now: Date(),
+                                               offHours: offHours) else {
+            NSLog("Harbor: kept the last good mail read after a transient failure (not reported)")
+            markHeadersCompleted()
+            recacheLock.lock()
+            let schedule = !keptRetryScheduled
+            keptRetryScheduled = true
+            recacheLock.unlock()
+            if schedule {
+                DispatchQueue.main.asyncAfter(deadline: .now() + MailRecache.keptReadRetryAfter) { [weak self] in
+                    guard let self else { return }
+                    self.recacheLock.lock(); self.keptRetryScheduled = false; self.recacheLock.unlock()
+                    self.sync()
+                }
+            }
+            return
+        }
+        postDiagnostic(available: false, reason: failure.reason, kind: failure.kind)
     }
 
     private func postReadingMail() {
@@ -954,29 +1013,44 @@ final class MailReader {
     private func openMailAndRead(failure: (kind: String, reason: String)?) async {
         guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.mail"),
               !mailAppOpen() else {
-            if let failure { postDiagnostic(available: false, reason: failure.reason, kind: failure.kind) }
+            if let failure { reportClosedFailure(failure) }
             return
         }
         let config = NSWorkspace.OpenConfiguration()
         config.activates = false
         config.hides = true
         config.addsToRecentItems = false
+        let askedAt = Date()
         guard let app = try? await NSWorkspace.shared.openApplication(at: url, configuration: config) else {
-            if let failure { postDiagnostic(available: false, reason: failure.reason, kind: failure.kind) }
+            if let failure { reportClosedFailure(failure) }
             return
         }
-        UserDefaults.standard.set(Date(), forKey: Self.openedAtKey)
-        recacheLock.lock(); openedMail = app; personTouchedMail = false; recacheLock.unlock()
+        // openApplication returns the running Mail even when the person launched it between the
+        // check above and this call: only a Mail that started at/after the ask is Harbor's to quit.
+        let ownLaunch = MailRecache.launchWasHarborsOwn(launchDate: app.launchDate, askedAt: askedAt.addingTimeInterval(-1),
+                                                      wasRunningBefore: false)
+        if ownLaunch { UserDefaults.standard.set(Date(), forKey: Self.openedAtKey) }
+        recacheLock.lock()
+        openedMail = ownLaunch ? app : nil
+        personTouchedMail = false
+        recacheLock.unlock()
         postReadingMail()
         NSLog("Harbor: opened Mail hidden to read it (Google isn't covering mail)")
 
         // Wait until Mail answers a script (only when Harbor may script it).
         let answerBy = Date().addingTimeInterval(MailRecache.answerTimeout)
         var answered = false
-        while Self.automationAllowed("com.apple.mail") && Date() < answerBy && !app.isTerminated {
-            if run("tell application id \"com.apple.mail\" to count of accounts", tag: "recache-ready").text != nil {
-                answered = true
-                break
+        // Right after launch Mail may not answer Apple events yet (macOS says "not running"):
+        // that is a wait, not a refusal, or the reads below would be skipped.
+        waiting: while Date() < answerBy && !app.isTerminated {
+            switch MailAutomation.whileStarting(status: Self.automationStatus("com.apple.mail")) {
+            case .stop: break waiting
+            case .wait: break
+            case .script:
+                if run("tell application id \"com.apple.mail\" to count of accounts", tag: "recache-ready").text != nil {
+                    answered = true
+                    break waiting
+                }
             }
             try? await Task.sleep(nanoseconds: 2_000_000_000)
         }
@@ -1004,7 +1078,7 @@ final class MailReader {
                 quiet = busy ? 0 : quiet + 1
             }
         } else {
-            if let failure { postDiagnostic(available: false, reason: failure.reason, kind: failure.kind) }
+            if let failure { reportClosedFailure(failure) }
         }
         quitMailIfHarborOpenedIt(app)
     }
@@ -1111,13 +1185,25 @@ final class MailReader {
                     // this process observed zero enabled accounts. Unknown later
                     // metadata preserves that boundary until a known nonempty scan.
                     // Mail running (unscriptable) is fetching into the index: a live read.
-                    let live = self.mailAppOpen()
+                    let live = self.mailFetchIsLive()
                     if captured.lastKnownEmpty {
                         self.postEmptyAccounts(readSource: live ? "mail_fetch" : "local_index")
                         return
                     }
                     let generation = captured.generation
-                    if let (headers, history) = self.dbReader.readHeadersAndHistory() {
+                    var indexRead = self.dbReader.readHeadersAndHistory()
+                    var closedFailure: (kind: String, reason: String)?
+                    if indexRead == nil {
+                        closedFailure = self.closedReadFailure()
+                        // No permission cause: a lock or a busy index. Try again before reporting.
+                        for delay in MailRecache.closedRetryDelays where closedFailure?.kind == "" {
+                            Thread.sleep(forTimeInterval: delay)
+                            indexRead = self.dbReader.readHeadersAndHistory()
+                            if indexRead != nil { break }
+                            closedFailure = self.closedReadFailure()
+                        }
+                    }
+                    if let (headers, history) = indexRead {
                         // A completed read is complete even for an empty or old
                         // index. File modification time cannot tell us whether a
                         // provider sync is running (a quiet inbox may not change).
@@ -1139,7 +1225,7 @@ final class MailReader {
                         let failure = Permissions.unaskedAutomation(
                             app: "Mail", appRunning: self.mailAppOpen(),
                             automationDecided: Self.automationDecided("com.apple.mail"),
-                            failure: self.dbReader.closedReadFailure())
+                            failure: closedFailure ?? self.dbReader.closedReadFailure())
                         // (c): with Google not covering mail, open Mail hidden and read it, when
                         // Automation is already allowed and it's polite to (MailRecache). Otherwise
                         // today's report of why Mail can't be read.
@@ -1622,7 +1708,11 @@ final class MailReader {
         // account "Google"), so the service can match it to a connected Gmail.
         if available {
             let addresses = MailAccountAddresses.read()
-            if !addresses.isEmpty { payload["account_addresses"] = addresses }
+            // A successful read that finds none sends {} so the service forgets an old map.
+            // (An unreadable store also returns [:], so only a readable file counts as a read.)
+            if !addresses.isEmpty || FileManager.default.isReadableFile(atPath: MailAccountAddresses.defaultPath) {
+                payload["account_addresses"] = addresses
+            }
         }
         // An empty successful scan must clear older history, too. Bundle it
         // with the headers so a date lookup cannot see mismatched snapshots.

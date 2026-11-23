@@ -148,6 +148,22 @@ def test_key_and_credentials_never_reach_the_file(log, monkeypatch):
     assert "redacted credential" in text
 
 
+def test_credential_fields_inside_tool_json_never_reach_the_file(log, monkeypatch):
+    # Tool-call arguments and tool results are JSON inside a string: a "password" field
+    # there must be redacted like one in the record itself.
+    call = {"id": "call_9", "type": "function",
+            "function": {"name": "site_login", "arguments": '{"user":"sam","password":"invented-pw-42"}'}}
+    _fake_engine(monkeypatch, {"role": "assistant", "content": "", "tool_calls": [call]})
+    _ask(_client(), MSGS)
+    _fake_engine(monkeypatch)
+    msgs2 = MSGS + [{"role": "assistant", "content": "", "tool_calls": [call]},
+                    {"role": "tool", "tool_call_id": "call_9", "content": '{"ok":true,"secret":"invented-s3"}'}]
+    _ask(_client(), msgs2)
+    text = "".join(p.read_text() for p in log.glob("use-*.jsonl"))
+    assert text and "invented-pw-42" not in text and "invented-s3" not in text
+    assert "sam" in text                                     # the rest of the arguments survive
+
+
 def test_followup_is_linked_for_tool_results_and_next_user_message(log, monkeypatch):
     call = {"id": "call_1", "type": "function", "function": {"name": "calendar_list", "arguments": "{}"}}
     _fake_engine(monkeypatch, {"role": "assistant", "content": "", "tool_calls": [call]})

@@ -109,6 +109,10 @@ def test_caps_match_config():
 def test_bad_arguments_exit_two(tmp_path):
     result = run_loop(tmp_path, "--every", "1")
     assert result.returncode == 2 and "usage" in result.stdout
+    # The gate judges only exact --until/--do values, so an abbreviated flag never runs.
+    for flags in (("--unt", "true"), ("--until", "true", "--d", "true"), ("--until=true", "--d=true")):
+        result = run_loop(tmp_path, *flags)
+        assert result.returncode == 2 and "usage" in result.stdout, flags
 
 
 # 3. output capping and summary length ------------------------------------------------------
@@ -207,6 +211,45 @@ def test_cancel_kills_the_running_check_group(tmp_path, sig):
             break
         time.sleep(0.1)
     assert not alive(child)
+
+
+def test_a_loop_whose_parent_died_stops_and_takes_its_check_with_it(tmp_path):
+    """bash killed by the harness (SIGKILL) leaves the loop re-parented: it must notice."""
+    work = tmp_path / "work"
+    work.mkdir()
+    (tmp_path / "tmp").mkdir()
+    launcher = (
+        "import subprocess, sys, time\n"
+        f"p = subprocess.Popen([sys.executable, {str(LOOP_PY)!r}, '--until', 'echo $$ > check.pid; ' + {HANG!r}, "
+        "'--max', '300'], cwd=sys.argv[1], env={'PATH': sys.argv[2], 'TMPDIR': sys.argv[3]}, "
+        "stdout=subprocess.DEVNULL)\n"
+        "print(p.pid, flush=True)\n"
+        "time.sleep(300)\n")
+    parent = subprocess.Popen([sys.executable, "-c", launcher, str(work), os.environ["PATH"], str(tmp_path / "tmp") + "/"],
+                              stdout=subprocess.PIPE, text=True)
+    loop_pid = check = None
+    try:
+        loop_pid = int(parent.stdout.readline())
+        for _ in range(100):
+            if (work / "check.pid").exists() and (work / "check.pid").read_text().strip():
+                break
+            time.sleep(0.1)
+        check = int((work / "check.pid").read_text())
+        assert alive(check)
+        parent.kill()
+        parent.wait()
+        for _ in range(100):
+            if not alive(check) and not alive(loop_pid):
+                break
+            time.sleep(0.1)
+        assert not alive(check) and not alive(loop_pid)
+    finally:
+        for pid in (check, loop_pid):
+            if pid and alive(pid):
+                os.kill(pid, signal.SIGKILL)
+        if parent.poll() is None:
+            parent.kill()
+            parent.wait()
 
 
 # 6. approvals -----------------------------------------------------------------------------

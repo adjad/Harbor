@@ -167,7 +167,7 @@ import Foundation
         await HarborClient.wait { sameModel.signalState != .saving }
         HarborClient.check(sameModel.signalValue("notes") == false, "Latest off intent wins after cancellation")
 
-        // Work is bounded by the nine sources even under a rapid burst. The
+        // Work is bounded by the ten sources even under a rapid burst. The
         // newest pending value for each source replaces its superseded intent.
         HarborClient.reset(bounded)
         let burst = LearnedModel()
@@ -186,7 +186,7 @@ import Foundation
             HarborClient.release(index)
         }
         await HarborClient.wait { burst.signalState != .saving }
-        HarborClient.check(HarborClient.requests.count == 10, "At most one in-flight plus nine pending writes")
+        HarborClient.check(HarborClient.requests.count == names.count + 1, "At most one in-flight plus one pending write per source")
         HarborClient.check(names.allSatisfy { burst.signalValue($0) == false }, "Burst preserves all latest intents")
         HarborClient.check(burst.signals["default_block_minutes"] as? Int == 30, "Backend default duration survives")
 
@@ -308,6 +308,17 @@ import Foundation
         await mixed.refresh()
         HarborClient.check(mixed.signalState == .ready && mixed.signalValue("notes") == true, "Refresh recovery")
         await historyControls(wire["history"] as? [String: Any] ?? historyFixture(), scenario: cross)
+        // Writing, habit and usage kinds land in their own sections.
+        HarborClient.check(LearnedSection.of("writing_style") == .writing, "Writing style section")
+        HarborClient.check(LearnedSection.of("send_timing") == .habits && LearnedSection.of("reminder_habit") == .habits,
+                         "Habit kinds share Your habits")
+        HarborClient.check(LearnedSection.of("usage_stat") == .harbor && LearnedSection.of("harbor_usage") == .harbor,
+                         "Usage stats join How you use Harbor")
+        HarborClient.check(LearnedSection.of("habit") == .routines && LearnedSection.of("unknown_kind") == .other,
+                         "Existing mappings unchanged")
+        HarborClient.check(LearnedSection.writing.title == "How you write" && LearnedSection.writing.symbol == "pencil.line"
+                         && LearnedSection.habits.title == "Your habits" && LearnedSection.habits.symbol == "clock",
+                         "New section wording")
         print("synthetic signal settings checks passed: \(HarborClient.checks) assertions")
     }
 

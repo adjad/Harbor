@@ -12,11 +12,13 @@ import Foundation
 // - IMPORTANT: only Harbor's own blocks are written: a study block, and a block that
 //   comes from a task the person kept or Harbor holds. Never an event already on the
 //   calendar, never an unaccepted suggestion, never time Harbor only guesses is busy.
-// - IMPORTANT: the plan only ever names events carrying Harbor's marker. A person's own
-//   event is not in `existing`, so it can never be updated or removed.
+// - IMPORTANT: the plan only ever names events carrying THIS Mac's marker (its install id).
+//   A person's own event, an event another Mac running Harbor wrote, and one with the older
+//   marker that has no install id are all left alone: never updated, never removed.
 // - IMPORTANT: idempotent. A block with an event is updated in place (matched by block
 //   id), never created again; a second event for one block is removed.
-// - IMPORTANT: an event that ended before now is history. It is never moved or removed.
+// - IMPORTANT: an event that ended before now is history. It is never moved, and an event
+//   already under way is never removed: only one that starts after now is.
 // - IMPORTANT: a block Harbor keeps re-planning around the clock ("floating") does not
 //   move its event for a small shift, and is not written while it starts within minutes.
 
@@ -56,6 +58,8 @@ enum DayCalendarSync {
         var start: Double
         var end: Double
         var calendarID: String
+        /// The Mac that wrote it (the marker's install part); nil for the older marker.
+        var installID: String? = nil
     }
 
     struct Update: Equatable {
@@ -119,9 +123,10 @@ enum DayCalendarSync {
     ///     plan is removed only when its event lies in the scope, and only with `canRemove`.
     ///   - canRemove: false while the plan can't be trusted to be whole (Calendar not current).
     ///   - calendarID: the calendar the person chose.
-    static func plan(wanted: [Block], existing: [Existing], scope: ClosedRange<Double>?, canRemove: Bool,
-                     calendarID: String, now: Double) -> Plan {
+    static func plan(wanted: [Block], existing all: [Existing], scope: ClosedRange<Double>?, canRemove: Bool,
+                     calendarID: String, now: Double, installID: String) -> Plan {
         var plan = Plan()
+        let existing = all.filter { $0.installID == installID }
         var byBlock: [String: [Existing]] = [:]
         for event in existing where !event.blockID.isEmpty { byBlock[event.blockID, default: []].append(event) }
         let wantedIDs = Set(wanted.map(\.id))
@@ -137,7 +142,7 @@ enum DayCalendarSync {
                 continue
             }
             // A second event for the same block is a duplicate: it goes, unless it is history.
-            for extra in events.dropFirst() where extra.end > now { plan.deletes.append(extra.eventID) }
+            for extra in events.dropFirst() where extra.start > now { plan.deletes.append(extra.eventID) }
             if keep.end <= now { continue }
             let tolerance = block.floating ? floatingTolerance : exactTolerance
             let moved = abs(keep.start - block.start) >= tolerance
@@ -157,15 +162,16 @@ enum DayCalendarSync {
 
         guard canRemove, let scope else { return plan }
         for event in existing where !wantedIDs.contains(event.blockID) && !event.blockID.isEmpty {
-            guard event.end > now, event.start <= scope.upperBound, event.end >= scope.lowerBound else { continue }
+            guard event.start > now, event.start <= scope.upperBound, event.end >= scope.lowerBound else { continue }
             plan.deletes.append(event.eventID)
         }
         return plan
     }
 
-    /// Everything of Harbor's still ahead, to remove when the person turns the sync off.
-    static func planRemovingAll(existing: [Existing], now: Double) -> Plan {
-        Plan(creates: [], updates: [], deletes: existing.filter { $0.end > now && !$0.blockID.isEmpty }.map(\.eventID))
+    /// This Mac's events still ahead (starting after now), to remove once, when the person turns the sync off.
+    static func planRemovingAll(existing: [Existing], now: Double, installID: String) -> Plan {
+        Plan(creates: [], updates: [], deletes: existing.filter {
+            $0.installID == installID && $0.start > now && !$0.blockID.isEmpty }.map(\.eventID))
     }
 }
 
@@ -175,6 +181,8 @@ enum DayCalendarSync {
 enum DayCalendarSyncSettings {
     static let enabledKey = "dayCalendarSync.enabled"
     static let calendarKey = "dayCalendarSync.calendarID"
+    static let installKey = "dayCalendarSync.installID"
+    static let wroteKey = "dayCalendarSync.wroteEvents"
     static let changed = Notification.Name("harborDayCalendarSyncSettingsChanged")
 
     static func isEnabled(_ defaults: UserDefaults = .standard) -> Bool { defaults.bool(forKey: enabledKey) }
@@ -183,6 +191,26 @@ enum DayCalendarSyncSettings {
     static func calendarID(_ defaults: UserDefaults = .standard) -> String? {
         let id = defaults.string(forKey: calendarKey)
         return (id?.isEmpty ?? true) ? nil : id
+    }
+
+    /// This Mac's id in every marker it writes: a random UUID, made once. (Resetting Harbor clears
+    /// defaults, so a fresh start gets a new one, which only means its old events are no longer its own.)
+    static func installID(_ defaults: UserDefaults = .standard) -> String {
+        if let id = defaults.string(forKey: installKey), !id.isEmpty { return id }
+        let id = UUID().uuidString.lowercased()
+        defaults.set(id, forKey: installKey)
+        return id
+    }
+
+    /// Whether this Mac has written any event, so turning the sync off has something to remove.
+    static func wroteEvents(_ defaults: UserDefaults = .standard) -> Bool { defaults.bool(forKey: wroteKey) }
+    static func setWroteEvents(_ value: Bool, _ defaults: UserDefaults = .standard) { defaults.set(value, forKey: wroteKey) }
+
+    /// What a plan update does about the person's choice: with the sync off, nothing at all, and
+    /// the one removal happens only when something was written and the choice just went off.
+    enum OffAction: Equatable { case nothing, removeOnce }
+    static func offAction(enabled: Bool, wroteEvents: Bool) -> OffAction? {
+        enabled ? nil : (wroteEvents ? .removeOnce : OffAction.nothing)
     }
 
     static func set(enabled: Bool, calendarID: String?, _ defaults: UserDefaults = .standard) {

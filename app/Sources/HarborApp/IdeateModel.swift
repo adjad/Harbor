@@ -126,6 +126,8 @@ final class IdeateModel: ObservableObject {
     private var lastSeq = 0
     private var projectPath: String?
     private var pollTask: Task<Void, Never>?
+    private var pollGeneration = 0
+    private var pollFailures = 0
     private var visible = false
     private let networking: Bool
     private let persistsKind: Bool
@@ -207,21 +209,31 @@ final class IdeateModel: ObservableObject {
 
     /// Whether start(prompt:kind:) would begin a run now. Ask routes to Ideate only when
     /// this is true, so a routed prompt is never dropped.
-    var canStart: Bool { networking && !status.isActive }
+    /// A service that already said Ideate can't run here (model missing, no sandbox) is not
+    /// asked again from Ask: the prompt stays in Ask instead of being sent to a refusal.
+    var canStart: Bool {
+        networking && !status.isActive && !(availabilityKnown && !availability.available)
+    }
 
-    func start(prompt: String, kind: IdeateKind) {
+    /// `onRefused` hears the service's reason when it refuses the start (busy, model missing,
+    /// not answering), so a prompt routed from Ask can go back to Ask rather than be lost.
+    func start(prompt: String, kind: IdeateKind, onRefused: ((String) -> Void)? = nil) {
         let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !status.isActive else { return }
         self.kind = kind
         message = nil
         refreshGPULimit()
         guard networking else { return }
+        let previous = status
         status = .starting
         Task {
             switch await call("POST", "projects", body: ["prompt": text, "kind": kind.rawValue]) {
             case .refused(let why):
-                status = current == nil ? .idle : status
+                // Back to what the tab showed: an earlier finished project stays as it was,
+                // never a "Starting…" that nothing will ever move on.
+                status = IdeatePoll.afterRefusedStart(previous: previous)
                 message = why
+                onRefused?(why)
             case .ok(let json):
                 let project = (json["project"] as? [String: Any]) ?? json
                 guard let summary = IdeateProjectSummary(json: project) else {
@@ -326,6 +338,8 @@ final class IdeateModel: ObservableObject {
 
     private func ensurePolling() {
         guard networking, status.isActive, pollTask == nil, let id = current?.id else { return }
+        pollGeneration += 1
+        let generation = pollGeneration
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
@@ -333,17 +347,35 @@ final class IdeateModel: ObservableObject {
                 guard self.current?.id == id, self.status.isActive else { break }
                 await self.poll(id)
             }
-            self?.pollTask = nil
+            // Only this loop's own slot: a cancelled loop finishing late must not clear the
+            // newer loop's, or the next ensurePolling would start a second one beside it.
+            if let self, self.pollGeneration == generation { self.pollTask = nil }
         }
     }
 
     private func poll(_ id: String) async {
         guard networking else { return }
-        switch await call("GET", "projects/\(id)", query: [URLQueryItem(name: "after", value: String(lastSeq))]) {
+        let (reply, httpStatus) = await callWithStatus(
+            "GET", "projects/\(id)", query: [URLQueryItem(name: "after", value: String(lastSeq))])
+        switch reply {
         case .refused(let why):
-            if current?.id == id, status.isActive { message = why }
+            guard current?.id == id, status.isActive else { return }
+            pollFailures += 1
+            if let line = IdeatePoll.lost(httpStatus: httpStatus, failures: pollFailures) {
+                // The project is gone (a 404) or the service stopped answering: end the run on
+                // the tab, so it is never a spinner and Stop forever with every Ask "busy".
+                pollFailures = 0
+                status = .failed
+                if var project = current { project.status = .failed; current = project }
+                approvals = []
+                failure = line
+                message = nil
+            } else {
+                message = why
+            }
         case .ok(let json):
             guard current?.id == id else { return }
+            pollFailures = 0
             message = nil
             apply(json)
         }
@@ -383,6 +415,7 @@ final class IdeateModel: ObservableObject {
     private func reset(to project: IdeateProjectSummary?) {
         pollTask?.cancel()
         pollTask = nil
+        pollFailures = 0
         current = project
         status = project?.status ?? .idle
         events = []
@@ -402,12 +435,18 @@ final class IdeateModel: ObservableObject {
     /// escapes the "?"), so the one GET that needs one is built here.
     private func call(_ method: String, _ path: String, query: [URLQueryItem] = [],
                       body: [String: Any]? = nil) async -> MeetingClient.Reply {
+        await callWithStatus(method, path, query: query, body: body).reply
+    }
+
+    /// The reply and its HTTP status (0 when the service did not answer).
+    private func callWithStatus(_ method: String, _ path: String, query: [URLQueryItem] = [],
+                                body: [String: Any]? = nil) async -> (reply: MeetingClient.Reply, status: Int) {
         guard var parts = URLComponents(url: HarborClient.baseURL.appendingPathComponent("ideate/" + path),
                                         resolvingAgainstBaseURL: false) else {
-            return .refused("Harbor couldn't do that. Try again.")
+            return (.refused("Harbor couldn't do that. Try again."), 0)
         }
         if !query.isEmpty { parts.queryItems = query }
-        guard let url = parts.url else { return .refused("Harbor couldn't do that. Try again.") }
+        guard let url = parts.url else { return (.refused("Harbor couldn't do that. Try again."), 0) }
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.timeoutInterval = 30
@@ -415,11 +454,11 @@ final class IdeateModel: ObservableObject {
         if method != "GET" { request.httpBody = try? JSONSerialization.data(withJSONObject: body ?? [:]) }
         guard let (data, response) = try? await URLSession.shared.data(for: request),
               let http = response as? HTTPURLResponse else {
-            return .refused("Harbor isn't answering yet. Try again in a moment.")
+            return (.refused("Harbor isn't answering yet. Try again in a moment."), 0)
         }
         let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
-        if (200..<300).contains(http.statusCode) { return .ok(json) }
-        return .refused(json["detail"] as? String ?? "Harbor couldn't do that. Try again.")
+        if (200..<300).contains(http.statusCode) { return (.ok(json), http.statusCode) }
+        return (.refused(json["detail"] as? String ?? "Harbor couldn't do that. Try again."), http.statusCode)
     }
 
     // MARK: QA

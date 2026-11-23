@@ -429,7 +429,7 @@ def _refresh_native_bindings() -> None:
     observed = native_email_accounts()
     addresses = _native_account_addresses
     for address, item in _external_accounts.items():
-        exact = {row["id"] for row in observed if row["name"].casefold() == address}
+        exact = {row["id"] for row in observed if str(row["name"]).strip().casefold() == address}
         if not exact:
             exact = {row["id"] for row in observed if addresses.get(row["id"]) == address}
         item["inferred_native_id"] = next(iter(exact)) if len(exact) == 1 else ""

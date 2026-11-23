@@ -66,7 +66,9 @@ or "always" approval, and do not offer one.
 
 For each message in the approved group call `email_triage` with
 `action: "archive"` and its Message-ID. Harbor's own confirmation card appears
-for these calls; do not try to avoid it and never batch groups together. If a
+for these calls unless the person has given Harbor full access; do not try to
+avoid it and never batch groups together. Your own question in step 3 is what
+the person approved, so ask it even when no card follows. If a
 call fails, stop that group and say how many were archived and how many were
 not.
 

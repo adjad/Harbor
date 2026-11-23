@@ -165,6 +165,7 @@ final class OverlayModel: ObservableObject {
     @Published var tab: NotchTab = .ask {
         didSet {
             guard tab != oldValue else { return }
+            client.postBehaviorUsage(event: "tab_opened", detail: tab.title.lowercased())
             // A research plan holds the prompt queue only while it is on screen.
             // Leaving the tab lets a question asked in Ask, or a brief, run.
             if oldValue == .research { releaseResearchDispatch() }
@@ -963,16 +964,36 @@ final class OverlayModel: ObservableObject {
         if !researchMode, !hasAttachment {
             let routing = IdeateRoute.classify(prompt, ideateEnabled: ideateOn)
             if case .ideate = routing, !IdeateModel.shared.canStart {
-                // Ideate is busy with another build: answer here rather than drop it.
-                showTransientNotice("Ideate is busy with another build, so Ask is answering this one.", duration: 6, info: true)
+                // Ideate is busy with another build, or can't run on this Mac yet: answer here
+                // rather than drop it.
+                showTransientNotice(IdeateModel.shared.isActive
+                                    ? "Ideate is busy with another build, so Ask is answering this one."
+                                    : "Ideate can't run here yet, so Ask is answering this one.",
+                                    duration: 6, info: true)
             } else if case .ideate = routing {
                 input = ""
-                IdeateModel.shared.start(prompt: IdeateRoute.promptBody(prompt), kind: IdeateModel.shared.kind)
+                let typed = prompt
+                IdeateModel.shared.start(prompt: IdeateRoute.promptBody(prompt), kind: IdeateModel.shared.kind,
+                                         onRefused: { [weak self] why in
+                    // Ideate refused it (busy, model missing, not answering): the prompt comes
+                    // back to Ask's box, so nothing the person typed is lost.
+                    guard let self else { return }
+                    if self.input.isEmpty { self.input = typed }
+                    if self.tab == .ideate { self.tab = .ask }
+                    self.showTransientNotice("Ideate couldn't start that: \(why) It's back in Ask.",
+                                             duration: 8, info: true)
+                })
                 showTransientNotice(IdeateRoute.handoffLine(routing), duration: 6, info: true)
                 tab = .ideate
                 return
             }
-            if NotchCommand.routePrefix(prompt)?.route == .ask { prompt = IdeateRoute.promptBody(prompt) }
+            if NotchCommand.routePrefix(prompt) != nil {
+                // "/ask x", or "/ideate x" that Ask answers (Ideate off, busy or unavailable):
+                // the model gets the question, not the prefix.
+                prompt = IdeateRoute.promptBody(prompt)
+                // "/ask" or "ask:" alone: nothing to send, so keep it in the box.
+                guard !prompt.isEmpty else { return }
+            }
         }
         guard !corpusBusy else {
             showTransientNotice("Stop the corpus run before asking another question.")

@@ -49,6 +49,12 @@ struct AskSuggestionsChecks {
             let (status, body) = replies.isEmpty ? (500, [:]) : replies.removeFirst()
             return (json(body), status)
         }
+        // A first read that fails leaves the general starters, never a bare Ask.
+        let cold = AskSuggestions()
+        cold.load = { _ in nil }
+        await cold.refresh()
+        check(cold.prompts == [] && AskSuggestionPrompts.shown(personal: cold.prompts, general: general) == general,
+              "no answer at all shows the general starters")
         check(store.prompts == nil, "unknown at first")
         await store.refresh()
         check(urls.count == 2 && urls[0].hasSuffix("/assistant/ask/suggestions?nudge=1")

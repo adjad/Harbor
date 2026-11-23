@@ -349,11 +349,239 @@ def test_a_new_sign_in_reaches_the_file_before_keychain(keychain, monkeypatch):
         real(data)
     monkeypatch.setattr(G, "_write_file", write)
     accounts = {ANN: {"client_id": "fixture-client", "refresh_token": "1//0fake-newest"}}
-    with pytest.raises(OSError):
-        G._save_config({"client_id": "fixture-client", "client_secret": "fixture-secret", "accounts": accounts})
+    G._save_config({"client_id": "fixture-client", "client_secret": "fixture-secret", "accounts": accounts})
     monkeypatch.setattr(G, "_write_file", real)
+    # The first write put the newest token on disk; the rewrite that would take it out failed.
+    assert writes[0]["accounts"][ANN]["refresh_token"] == "1//0fake-newest" and len(writes) == 2
     # The newest token was on disk before Keychain was touched, so it wins on the next load.
     assert file_data()["accounts"][ANN]["refresh_token"] == "1//0fake-newest"
     T.forget_cache()
     assert G.connected_accounts(G.load_config())[ANN]["refresh_token"] == "1//0fake-newest"
     assert keychain.token(ANN) == "1//0fake-newest"
+
+
+# ---- Harbor and Quayside share gmail.json, each with its own Keychain name ----
+
+def test_the_renamed_build_still_knows_the_other_apps_name():
+    import re
+    source = Path(T.__file__).read_text(encoding="utf-8")
+    # What the Harbor -> Quayside import does to every spelled-out product name.
+    renamed = re.sub(r"harbor", "quayside", re.sub(r"Harbor", "Quayside", source))
+    renamed = renamed.replace("from . import keychain_legacy", "from service.config import keychain_legacy")
+    space: dict = {"__name__": "renamed_google_tokens"}
+    exec(compile(renamed, "renamed_google_tokens.py", "exec"), space)
+    assert space["SERVICE"] == "com.quayside.google"
+    assert space["OTHER_SERVICES"] == ("com.harbor.google",)
+    assert T.SERVICE == "com.harbor.google" and T.OTHER_SERVICES == ("com.quayside.google",)
+
+
+def test_an_item_saved_by_the_other_app_is_read_and_copied_never_moved(keychain):
+    other = T.OTHER_SERVICES[0]
+    keychain.items[(other, T.account_name(ANN))] = TOKEN_A
+    write_file(G.CONFIG_PATH, {"client_id": "fixture-client",
+                               "accounts": {ANN: {G.TOKEN_STORE_KEY: G.KEYCHAIN, "scopes": [G.SCOPE]}}})
+    cfg = G.load_config()
+    assert G.connected_accounts(cfg)[ANN]["refresh_token"] == TOKEN_A       # not "disconnected"
+    assert keychain.token(ANN) == TOKEN_A                                   # copied under our name
+    assert keychain.items[(other, T.account_name(ANN))] == TOKEN_A          # theirs untouched
+    T.forget_cache()
+    G.load_config()
+    finds = [c for c in keychain.calls if c[0] == "find-generic-password"]
+    assert finds[-1][2] == T.SERVICE                                        # ours is found first now
+    # A disconnect deletes only this app's item.
+    _disconnect(ANN)
+    assert keychain.token(ANN) is None
+    assert keychain.items[(other, T.account_name(ANN))] == TOKEN_A
+    assert not any(c[0] == "delete-generic-password" and c[2] == other for c in keychain.calls)
+
+
+# ---- Nothing runs `security` on the event loop except one bounded first read ----
+
+def _join_sync_threads():
+    import threading
+    for thread in threading.enumerate():
+        if thread.name == "gmail-keychain-sync":
+            thread.join(5)
+
+
+def test_a_sign_in_saved_on_the_event_loop_moves_to_keychain_on_a_worker(keychain):
+    import threading
+    seen = []
+
+    def spying(self, argv, input=None, **kwargs):
+        seen.append(threading.current_thread().name)
+        return FakeKeychain.__call__(self, argv, input=input, **kwargs)
+    keychain.__class__ = type("SpyKeychain", (FakeKeychain,), {"__call__": spying})
+
+    async def sign_in():
+        G._save_config({"client_id": "fixture-client", "client_secret": "fixture-secret",
+                        "accounts": {ANN: {"refresh_token": TOKEN_A}}})
+        return file_data()
+    on_disk = asyncio.run(sign_in())
+    assert on_disk["accounts"][ANN]["refresh_token"] == TOKEN_A            # on disk first
+    _join_sync_threads()
+    assert keychain.token(ANN) == TOKEN_A and "refresh_token" not in file_data()["accounts"][ANN]
+    assert seen and set(seen) == {"gmail-keychain-sync"}                    # never the loop's thread
+
+
+def test_a_read_on_the_event_loop_never_waits_for_another_keychain_call(keychain):
+    import threading
+    import time as clock
+    write_file(G.CONFIG_PATH, old_file((ANN, TOKEN_A)))
+    G.load_config()
+    T.forget_cache()
+    held, release = threading.Event(), threading.Event()
+
+    def busy():
+        with T._lock:
+            held.set()
+            release.wait(5)
+    worker = threading.Thread(target=busy)
+    worker.start()
+    held.wait(5)
+
+    async def poll():
+        started = clock.monotonic()
+        value = T.read(ANN)
+        return value, clock.monotonic() - started
+    try:
+        value, waited = asyncio.run(poll())
+    finally:
+        release.set()
+        worker.join(5)
+    assert value is None and waited < 1.0
+    assert T.read(ANN) == TOKEN_A                                           # off the loop it reads
+
+
+def test_store_and_delete_refuse_to_run_on_the_event_loop(keychain):
+    async def on_loop():
+        return T.store(ANN, TOKEN_A), T.delete(ANN)
+    assert asyncio.run(on_loop()) == (False, False)
+    assert keychain.calls == []
+
+
+# ---- A re-sign-in in one app never leaves the other on a stale item ----
+
+def test_after_a_re_sign_in_in_the_other_app_the_stale_item_is_never_used(keychain):
+    other = T.OTHER_SERVICES[0]
+    # Both apps hold the old token; this run has it cached.
+    write_file(G.CONFIG_PATH, old_file((ANN, TOKEN_A)))
+    G.load_config()
+    keychain.items[(other, T.account_name(ANN))] = TOKEN_A
+    assert T.cached(ANN) == TOKEN_A
+    # The other app reconnects: only its item and the shared file's fingerprint change.
+    keychain.items[(other, T.account_name(ANN))] = TOKEN_B
+    raw = file_data()
+    raw["accounts"][ANN][G.TOKEN_FINGERPRINT_KEY] = T.fingerprint(TOKEN_B)
+    write_file(G.CONFIG_PATH, raw)
+    cfg = G.load_config()
+    assert G.connected_accounts(cfg)[ANN]["refresh_token"] == TOKEN_B     # not the cached TOKEN_A
+    assert keychain.token(ANN) == TOKEN_B                                # our copy is brought up to date
+    assert keychain.items[(other, T.account_name(ANN))] == TOKEN_B
+    # A refresh that failed with the old token doesn't mark the shared entry expired.
+    G._mark_expired(ANN, {"refresh_token": TOKEN_A})
+    assert "auth_expired" not in file_data()["accounts"][ANN]
+    assert file_data()["accounts"][ANN][G.TOKEN_FINGERPRINT_KEY] == T.fingerprint(TOKEN_B)
+
+
+def test_no_matching_item_means_no_token_rather_than_a_stale_one(keychain):
+    keychain.items[(T.SERVICE, T.account_name(ANN))] = TOKEN_A
+    write_file(G.CONFIG_PATH, {"client_id": "fixture-client", "accounts": {ANN: {
+        G.TOKEN_STORE_KEY: G.KEYCHAIN, G.TOKEN_FINGERPRINT_KEY: T.fingerprint(TOKEN_B)}}})
+    assert ANN not in G.connected_accounts(G.load_config())
+    assert G.TOKEN_FINGERPRINT_KEY in file_data()["accounts"][ANN]       # the entry stays
+
+
+def test_the_fingerprint_is_not_the_token_and_both_apps_compute_it_alike():
+    import re
+    assert TOKEN_A not in T.fingerprint(TOKEN_A) and len(T.fingerprint(TOKEN_A)) == 64
+    source = Path(T.__file__).read_text(encoding="utf-8")
+    salt = re.search(r'_FINGERPRINT_SALT = (b"[^"]*")', source).group(1)
+    assert not re.search(r"(?i)harbor|quayside", salt)                         # the rename can't change it
+
+
+def test_a_save_while_a_disconnects_delete_is_pending_keeps_the_token_on_disk(keychain, monkeypatch):
+    write_file(G.CONFIG_PATH, old_file((ANN, TOKEN_A)))
+    G.load_config()
+    assert T.cached(ANN) == TOKEN_A
+    G._pending_deletes.add(ANN)            # a disconnect's delete not yet run
+    writes = []
+    real = G._write_file
+
+    def write(data):
+        writes.append(json.loads(json.dumps(data)))
+        real(data)
+    monkeypatch.setattr(G, "_write_file", write)
+    try:
+        G._save_config({"client_id": "fixture-client", "client_secret": "fixture-secret",
+                        "accounts": {ANN: {"refresh_token": TOKEN_A}}})
+    finally:
+        G._pending_deletes.discard(ANN)
+    assert writes[0]["accounts"][ANN]["refresh_token"] == TOKEN_A          # not the marker alone
+    assert keychain.token(ANN) == TOKEN_A
+
+
+def test_a_file_from_before_fingerprints_never_lets_a_stale_token_win(keychain):
+    # An older Keychain build left the marker with no fingerprint; this app's
+    # item is stale (TOKEN_A) and the other app's is current (TOKEN_B).
+    other = T.OTHER_SERVICES[0]
+    keychain.items[(T.SERVICE, T.account_name(ANN))] = TOKEN_A
+    keychain.items[(other, T.account_name(ANN))] = TOKEN_B
+    write_file(G.CONFIG_PATH, {"client_id": "fixture-client",
+                               "accounts": {ANN: {G.TOKEN_STORE_KEY: G.KEYCHAIN, "scopes": [G.SCOPE]}}})
+    cfg = G.load_config()
+    accounts = G.connected_accounts(cfg)
+    assert accounts[ANN]["refresh_token"] == TOKEN_A          # its own item, as before
+    accounts[ANN] = {**accounts[ANN], "workspace": False}     # any save from that view
+    G._save_config({"client_id": "fixture-client", "client_secret": "", "accounts": accounts})
+    entry = file_data()["accounts"][ANN]
+    assert G.TOKEN_FINGERPRINT_KEY not in entry and "refresh_token" not in entry
+    assert entry[G.TOKEN_STORE_KEY] == G.KEYCHAIN
+    # The other app's current item is untouched, so it keeps working.
+    assert keychain.items[(other, T.account_name(ANN))] == TOKEN_B
+    # The next sign-in here records a fingerprint, and from then on only it counts.
+    accounts[ANN] = {**accounts[ANN], "refresh_token": "1//0fake-signed-in-again"}
+    G._save_config({"client_id": "fixture-client", "client_secret": "", "accounts": accounts})
+    assert file_data()["accounts"][ANN][G.TOKEN_FINGERPRINT_KEY] == T.fingerprint("1//0fake-signed-in-again")
+
+
+def test_an_unverified_save_keeps_the_fingerprint_the_other_app_just_recorded(keychain):
+    other = T.OTHER_SERVICES[0]
+    keychain.items[(T.SERVICE, T.account_name(ANN))] = TOKEN_A
+    write_file(G.CONFIG_PATH, {"client_id": "fixture-client",
+                               "accounts": {ANN: {G.TOKEN_STORE_KEY: G.KEYCHAIN}}})
+    accounts = G.connected_accounts(G.load_config())            # TOKEN_A, unverified
+    # Meanwhile the other app signs in again and records its token's fingerprint.
+    keychain.items[(other, T.account_name(ANN))] = TOKEN_B
+    raw = file_data()
+    raw["accounts"][ANN][G.TOKEN_FINGERPRINT_KEY] = T.fingerprint(TOKEN_B)
+    write_file(G.CONFIG_PATH, raw)
+    G._save_config({"client_id": "fixture-client", "client_secret": "", "accounts": accounts})
+    assert file_data()["accounts"][ANN][G.TOKEN_FINGERPRINT_KEY] == T.fingerprint(TOKEN_B)
+    T.forget_cache()
+    assert G.connected_accounts(G.load_config())[ANN]["refresh_token"] == TOKEN_B
+
+
+def test_a_config_without_google_tokens_never_imports_the_keychain_module(tmp_path):
+    # The sealed proof harnesses (tests/test_behavior_availability.py,
+    # tests/test_daily_workspace.py) forbid any import outside their list.
+    import sys as _sys
+    probe = f"""
+import json, os, sys
+from pathlib import Path
+from service import gmail_source as G
+home = Path({str(tmp_path)!r})
+G.CONFIG_PATH = home / "gmail.json"
+G.MOE_DIR = home
+assert G.load_config() == {{}} and G.connected_accounts() == {{}}
+G._save_config({{"client_id": "fixture-client", "client_secret": "", "accounts": {{}}}})
+G.keychain_sync()
+(home / "gmail.json").write_text(json.dumps({{"accounts": {{"a@example.test": {{"scopes": []}}}}}}))
+G.load_config()
+print("service.config.google_tokens" in sys.modules)
+"""
+    env = {**os.environ, "HARBOR_HOME": str(tmp_path), "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
+    out = subprocess.run([_sys.executable, "-c", probe], capture_output=True, text=True, env=env,
+                         cwd=str(tmp_path), timeout=120)
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert out.stdout.strip().splitlines()[-1] == "False"

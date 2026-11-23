@@ -9,9 +9,12 @@ import Foundation
 // reaches Google Calendar too: no Google API and no new sign-in.
 //
 // Rules:
-// - IMPORTANT: off until the person says yes. Nothing is read or written while it is off.
-// - IMPORTANT: it only ever changes an event carrying Harbor's marker (DayCalendarMarker),
-//   re-checked on the event itself just before it is edited or removed.
+// - IMPORTANT: off until the person says yes. While it is off a plan update does nothing at
+//   all: no EventKit read, no write. The one removal of this Mac's upcoming events runs when
+//   the choice goes from on to off, and only if this Mac wrote any (a stored flag).
+// - IMPORTANT: it only ever changes an event carrying THIS Mac's marker (DayCalendarMarker with
+//   this install's id), re-checked on the event itself just before it is edited or removed. Another
+//   Mac's events, the older marker without an install id, and the person's own are never touched.
 // - IMPORTANT: the calendar is written with the full Calendar access setup already asks
 //   for. Without it nothing is written and the Settings row says so; it never asks on
 //   its own, only when the person turns the sync on.
@@ -88,20 +91,27 @@ final class DayCalendarWriter {
     }
 
     private func run() async {
-        guard Self.fullAccess else {
-            problem = DayCalendarSyncSettings.isEnabled() ? "Harbor needs full Calendar access to add to your calendar." : nil
-            return
-        }
         let enabled = DayCalendarSyncSettings.isEnabled()
         let chosen = DayCalendarSyncSettings.calendarID()
         let now = Date().timeIntervalSince1970
+        let install = DayCalendarSyncSettings.installID()
         guard enabled else {
-            // Turned off: what Harbor added and that is still ahead goes, nothing else.
-            let result = await Task.detached(priority: .utility) {
-                Self.apply(.removeAll, calendarID: chosen, now: now)
-            }.value
             problem = nil
+            // Off does nothing per plan. Only once, after this Mac wrote something, what it added
+            // and that is still ahead goes, nothing else.
+            guard DayCalendarSyncSettings.offAction(enabled: false,
+                    wroteEvents: DayCalendarSyncSettings.wroteEvents()) == .removeOnce else { return }
+            let result = await Task.detached(priority: .utility) {
+                Self.apply(.removeAll, calendarID: chosen, now: now, install: install)
+            }.value
+            // Cleared only once the removal went through: with Calendar access gone it fails at
+            // once (no EventKit work), and the next plan tries again (Auditor, b37a4421).
+            if result.problem == nil { DayCalendarSyncSettings.setWroteEvents(false) }
             if result.changed { didWrite?() }
+            return
+        }
+        guard Self.fullAccess else {
+            problem = "Harbor needs full Calendar access to add to your calendar."
             return
         }
         guard let plan = lastPlan, let scope = plan.calendarSyncScope,
@@ -109,7 +119,8 @@ final class DayCalendarWriter {
         let wanted = DayCalendarSync.wanted(from: plan.calendarSyncInputs)
         let canRemove = plan.calendarSyncCanRemove
         let result = await Task.detached(priority: .utility) {
-            Self.apply(.sync(wanted: wanted, scope: scope, canRemove: canRemove), calendarID: chosen, now: now)
+            Self.apply(.sync(wanted: wanted, scope: scope, canRemove: canRemove), calendarID: chosen, now: now,
+                       install: install)
         }.value
         problem = result.problem
         if result.changed { didWrite?() }
@@ -130,18 +141,18 @@ final class DayCalendarWriter {
     nonisolated static var fullAccess: Bool { EKEventStore.authorizationStatus(for: .event) == .fullAccess }
 
     /// Reads Harbor's own events, plans, and applies the plan with its own event store.
-    nonisolated static func apply(_ job: Job, calendarID: String?, now: Double) -> Result {
+    nonisolated static func apply(_ job: Job, calendarID: String?, now: Double, install: String) -> Result {
         guard fullAccess else { return Result(problem: "Harbor needs full Calendar access to add to your calendar.") }
         let store = EKEventStore()
         let from = Calendar.current.startOfDay(for: Date(timeIntervalSince1970: now)).addingTimeInterval(-86400)
         let until = from.addingTimeInterval(60 * 86400)
         let events = store.events(matching: store.predicateForEvents(withStart: from, end: until, calendars: nil))
         let existing: [DayCalendarSync.Existing] = events.compactMap { event in
-            guard let blockID = DayCalendarMarker.blockID(url: event.url?.absoluteString, notes: event.notes),
+            guard let marker = DayCalendarMarker.parse(url: event.url?.absoluteString, notes: event.notes),
                   let id = event.eventIdentifier, let start = event.startDate, let end = event.endDate else { return nil }
-            return DayCalendarSync.Existing(eventID: id, blockID: blockID, title: event.title ?? "",
+            return DayCalendarSync.Existing(eventID: id, blockID: marker.blockID, title: event.title ?? "",
                                             start: start.timeIntervalSince1970, end: end.timeIntervalSince1970,
-                                            calendarID: event.calendar?.calendarIdentifier ?? "")
+                                            calendarID: event.calendar?.calendarIdentifier ?? "", installID: marker.install)
         }
         let target: EKCalendar?
         if let calendarID, let chosen = store.calendar(withIdentifier: calendarID), chosen.allowsContentModifications {
@@ -154,31 +165,35 @@ final class DayCalendarWriter {
         let plan: DayCalendarSync.Plan
         switch job {
         case .removeAll:
-            plan = DayCalendarSync.planRemovingAll(existing: existing, now: now)
+            plan = DayCalendarSync.planRemovingAll(existing: existing, now: now, installID: install)
         case .sync(let wanted, let scope, let canRemove):
             guard let target else {
                 return Result(problem: "The calendar you chose can't be changed. Pick another one in Settings.")
             }
             plan = DayCalendarSync.plan(wanted: wanted, existing: existing, scope: scope, canRemove: canRemove,
-                                        calendarID: target.calendarIdentifier, now: now)
+                                        calendarID: target.calendarIdentifier, now: now, installID: install)
         }
         guard !plan.isEmpty else { return Result() }
 
         var result = Result()
         var failures = 0
         func isOwn(_ event: EKEvent) -> Bool {
-            DayCalendarMarker.isOwn(url: event.url?.absoluteString, notes: event.notes)
+            DayCalendarMarker.parse(url: event.url?.absoluteString, notes: event.notes)?.install == install
         }
         for block in plan.creates {
             guard let target else { continue }
             let event = EKEvent(eventStore: store)
-            fill(event, from: block, calendar: target)
-            do { try store.save(event, span: .thisEvent, commit: false); result.changed = true } catch { failures += 1 }
+            fill(event, from: block, calendar: target, install: install)
+            do {
+                try store.save(event, span: .thisEvent, commit: false)
+                result.changed = true
+                DayCalendarSyncSettings.setWroteEvents(true)
+            } catch { failures += 1 }
         }
         for update in plan.updates {
             // Looked up again and checked for the marker: never an event that isn't Harbor's.
             guard let event = store.event(withIdentifier: update.eventID), isOwn(event) else { continue }
-            fill(event, from: update.block, calendar: update.moveCalendar ? target : nil)
+            fill(event, from: update.block, calendar: update.moveCalendar ? target : nil, install: install)
             do { try store.save(event, span: .thisEvent, commit: false); result.changed = true } catch { failures += 1 }
         }
         for eventID in plan.deletes {
@@ -190,13 +205,14 @@ final class DayCalendarWriter {
         return result
     }
 
-    nonisolated private static func fill(_ event: EKEvent, from block: DayCalendarSync.Block, calendar: EKCalendar?) {
+    nonisolated private static func fill(_ event: EKEvent, from block: DayCalendarSync.Block, calendar: EKCalendar?,
+                                         install: String) {
         event.title = block.title
         event.startDate = Date(timeIntervalSince1970: block.start)
         event.endDate = Date(timeIntervalSince1970: block.end)
         event.isAllDay = false
-        event.url = URL(string: DayCalendarMarker.url(forBlock: block.id))
-        event.notes = DayCalendarMarker.notes(forBlock: block.id, keeping: event.notes)
+        event.url = URL(string: DayCalendarMarker.url(forBlock: block.id, install: install))
+        event.notes = DayCalendarMarker.notes(forBlock: block.id, install: install, keeping: event.notes)
         if let calendar { event.calendar = calendar }
     }
 

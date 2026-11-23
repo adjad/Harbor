@@ -138,6 +138,33 @@ def test_messages_with_no_matching_words_fall_back_to_the_newest():
     assert "more messages not shown" in out
 
 
+def test_a_blank_line_inside_a_message_does_not_end_the_rows():
+    result = _messages(120, special=90)
+    lines = result.split("\n")
+    # Row 10's own text has a paragraph break and a "(+" line, as a pasted text can.
+    lines[2 + 10] += "\n\nsecond paragraph of that text\n(+1 more photo)"
+    result = "\n".join(lines) + "\n\n(Messages from 3 chats.)"
+    out = shape_result(result, "view_messages", LIMIT, "what was the locker code from linus")
+    assert len(out) <= LIMIT and "locker code is 4471" in out
+    assert "more messages not shown" in out and out.endswith("(Messages from 3 chats.)")
+
+
+def test_list_dir_sorted_by_size_keeps_the_largest_first():
+    # sort=size: largest first, the biggest one old. It must not lose to newer small files.
+    rows = [f"zz-backup-{i:03d}.iso  {900 - i} GB  modified Jan {1 + i % 27}, 2019 4:15 PM" for i in range(6)]
+    rows += [f"small-{i:03d}.txt  {i} KB  modified Mar {1 + i % 27}, 2026 4:15 PM" for i in range(300)]
+    out = shape_result("\n".join(rows), "list_dir", LIMIT, "largest files")
+    assert len(out) <= LIMIT and "entries not shown" in out
+    assert all(f"zz-backup-{i:03d}.iso" in out for i in range(6))
+
+
+def test_list_dir_by_name_still_prefers_newer_entries():
+    rows = [f"file-{i:04d}.txt  1 KB  modified Jan 1, 2019 4:15 PM" for i in range(300)]
+    rows[250] = "file-0250.txt  1 KB  modified Mar 3, 2026 4:15 PM"
+    out = shape_result("\n".join(rows), "list_dir", LIMIT, "anything")
+    assert "file-0250.txt" in out and "file-0299.txt" not in out
+
+
 def test_messages_very_long_rows_are_clipped():
     rows = [f"[Mon Mar {1 + i}, 9:00 AM] Ada — " + "word " * 400 for i in range(8)]
     out = shape_result("\n".join(rows), "view_messages", LIMIT, "word")

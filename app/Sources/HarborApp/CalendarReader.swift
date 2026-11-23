@@ -186,7 +186,8 @@ final class CalendarReader {
             guard let id = DayCalendarMarker.blockID(url: ev.url?.absoluteString, notes: ev.notes),
                   let start = ev.startDate else { return nil }
             var row: [String: Any] = ["block_id": id, "title": RemindersWriter.syncedTitle(ev.title),
-                                      "when_ts": start.timeIntervalSince1970]
+                                      "when_ts": start.timeIntervalSince1970,
+                                      "calendar": ev.calendar?.title ?? ""]
             if let end = ev.endDate { row["end_ts"] = end.timeIntervalSince1970 }
             return row
         }
@@ -540,17 +541,26 @@ final class CalendarReader {
 /// reader recognises them. Pure rules, checked by tests/CalendarReaderChecks.swift.
 ///
 /// Rules:
-/// - IMPORTANT: an event is Harbor's own when its link starts "harbor-day://block/" or a
-///   line of its notes holds that link. The link is set on the event, and the same
-///   link is written into the notes, because a calendar that syncs through an account
-///   (Google) can keep the notes and drop the link.
-/// - IMPORTANT: the block id follows the prefix, percent-encoded, and is the only key
-///   a sync matches on. An event with neither marker is never touched.
+/// - IMPORTANT: an event is Harbor's own when its link starts "harbor-day://block/" or the FIRST
+///   line of its notes holds that link. The link is preferred; the notes line is there
+///   because a calendar that syncs through an account (Google) can keep the notes and drop
+///   the link. A marker further down someone's notes is not a marker.
+/// - IMPORTANT: the written form is harbor-day://block/<install>/<block id>, both percent-encoded:
+///   <install> is a random id kept per Mac (DayCalendarSyncSettings.installID), so one Mac
+///   never updates or removes what another Mac running Harbor wrote. A marker with no install
+///   part (the older form) still counts as Harbor's for every READ (meetings, dedupe); it is
+///   never anyone's to change.
 /// - IMPORTANT: every calendar read (CalendarReader, the service's ingestion) leaves
 ///   marked events out of the meetings, since Day already shows the block.
 enum DayCalendarMarker {
     static let urlPrefix = "harbor-day://block/"
     static let notesLead = "Added by Harbor: "
+
+    struct Parsed: Equatable {
+        /// The Mac that wrote it; nil for the older form.
+        var install: String?
+        var blockID: String
+    }
 
     private static let unreserved: CharacterSet = {
         var set = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
@@ -558,40 +568,57 @@ enum DayCalendarMarker {
         return set
     }()
 
-    /// The link for a block, the event's URL.
-    static func url(forBlock id: String) -> String {
-        urlPrefix + (id.addingPercentEncoding(withAllowedCharacters: unreserved) ?? id)
+    private static func encode(_ text: String) -> String {
+        text.addingPercentEncoding(withAllowedCharacters: unreserved) ?? text
+    }
+
+    /// The link for a block, the event's URL. Without an install id, the older form.
+    static func url(forBlock id: String, install: String? = nil) -> String {
+        urlPrefix + (install.map { encode($0) + "/" } ?? "") + encode(id)
     }
 
     /// The notes line for a block.
-    static func notesLine(forBlock id: String) -> String { notesLead + url(forBlock: id) }
+    static func notesLine(forBlock id: String, install: String? = nil) -> String {
+        notesLead + url(forBlock: id, install: install)
+    }
 
-    /// The block id a marker names, from the event's URL first, else a notes line.
-    static func blockID(url: String?, notes: String?) -> String? {
-        if let url, let id = id(in: url, anchoredAtStart: true) { return id }
-        if let notes, let id = id(in: notes, anchoredAtStart: false) { return id }
+    /// What the marker says, from the event's URL first, else the first line of its notes.
+    static func parse(url: String?, notes: String?) -> Parsed? {
+        if let url, let parsed = parse(in: url, anchoredAtStart: true) { return parsed }
+        if let notes {
+            let first = notes.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? ""
+            if let parsed = parse(in: first, anchoredAtStart: false) { return parsed }
+        }
         return nil
     }
 
-    static func isOwn(url: String?, notes: String?) -> Bool { blockID(url: url, notes: notes) != nil }
+    /// The block id a marker names, whichever Mac wrote it.
+    static func blockID(url: String?, notes: String?) -> String? { parse(url: url, notes: notes)?.blockID }
 
-    /// Notes for a written event: the marker line, then whatever the person added.
-    static func notes(forBlock id: String, keeping existing: String?) -> String {
-        let line = notesLine(forBlock: id)
+    static func isOwn(url: String?, notes: String?) -> Bool { parse(url: url, notes: notes) != nil }
+
+    /// Notes for a written event: the marker line FIRST, then whatever the person added.
+    static func notes(forBlock id: String, install: String? = nil, keeping existing: String?) -> String {
+        let line = notesLine(forBlock: id, install: install)
         let rest = (existing ?? "").split(separator: "\n", omittingEmptySubsequences: false)
             .filter { !$0.contains(urlPrefix) }.joined(separator: "\n")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return rest.isEmpty ? line : line + "\n" + rest
     }
 
-    private static func id(in text: String, anchoredAtStart: Bool) -> String? {
+    private static func parse(in text: String, anchoredAtStart: Bool) -> Parsed? {
         guard let found = text.range(of: urlPrefix) else { return nil }
         if anchoredAtStart && found.lowerBound != text.startIndex { return nil }
-        let tail = text[found.upperBound...]
-        let token = tail.prefix { !$0.isWhitespace }
-        guard !token.isEmpty, let decoded = String(token).removingPercentEncoding, !decoded.isEmpty,
-              decoded.count <= 400 else { return nil }
-        return decoded
+        let token = String(text[found.upperBound...].prefix { !$0.isWhitespace })
+        let parts = token.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        guard parts.count <= 2, let last = parts.last, !last.isEmpty,
+              let id = last.removingPercentEncoding, !id.isEmpty, id.count <= 400 else { return nil }
+        if parts.count == 2 {
+            guard !parts[0].isEmpty, let install = parts[0].removingPercentEncoding, !install.isEmpty,
+                  install.count <= 80 else { return nil }
+            return Parsed(install: install, blockID: id)
+        }
+        return Parsed(install: nil, blockID: id)
     }
 }
 

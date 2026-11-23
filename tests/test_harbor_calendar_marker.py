@@ -41,7 +41,11 @@ def event(title, when, **more):
 
 def test_marker_is_recognised_by_link_or_notes_and_never_by_a_lookalike():
     assert harbor_events.is_marked({"url": MARK + "task%3Aabc"})
-    assert harbor_events.is_marked({"notes": "Room 4\nAdded by Harbor: " + MARK + "study-block%3A1"})
+    assert harbor_events.is_marked({"notes": "Added by Harbor: " + MARK + "install-1/study-block%3A1\nRoom 4"})
+    assert harbor_events.is_marked({"url": MARK + "install-1/task%3Aabc"})
+    # Only the first line of notes, and only a link that starts the URL.
+    assert not harbor_events.is_marked({"notes": "Room 4\nAdded by Harbor: " + MARK + "study-block%3A1"})
+    assert not harbor_events.is_marked({"url": "https://example.com/?" + MARK + "x"})
     assert harbor_events.is_marked({"harbor_block_id": "task:abc"})
     assert not harbor_events.is_marked({"title": "Reading: STAT 101", "url": "https://example.com/x", "notes": "Agenda"})
     assert not harbor_events.is_marked({"title": "harbor-day block", "location": "Room 4"})
@@ -60,37 +64,54 @@ def test_the_sync_route_keeps_meetings_and_drops_marked_events(store):
 
 def test_the_app_lists_its_own_events_apart_and_they_are_remembered(store):
     now = time.time() + 7200
-    own = [{"block_id": "task:t1", "title": "Homework 3", "when_ts": now, "end_ts": now + 3600}]
+    own = [{"block_id": "task:t1", "title": "Homework 3", "when_ts": now, "end_ts": now + 3600, "calendar": "Sam"}]
     assert sync([event("Office hours", now + 7200)], harbor_events=own).status_code == 200
-    assert harbor_events.recorded_keys() == {harbor_events.key("Homework 3", now)}
+    expected = {(*harbor_events.key("Homework 3", now), int(round((now + 3600) / 60.0)), "sam")}
+    assert harbor_events.recorded_keys() == expected
     # An older app that sends no list leaves what was remembered alone; an empty list clears it.
     assert sync([event("Office hours", now + 7200)]).status_code == 200
-    assert harbor_events.recorded_keys() == {harbor_events.key("Homework 3", now)}
+    assert harbor_events.recorded_keys() == expected
     assert sync([event("Office hours", now + 7200)], harbor_events=[]).status_code == 200
     assert harbor_events.recorded_keys() == set()
+
+
+def google(title, when, *, end=None, calendar="Sam", sid="g1"):
+    return {"source_id": "gcal:sam@example.com:" + sid, "kind": "meeting", "title": title, "when_ts": when,
+            "end_ts": when + 3600 if end is None else end, "context": calendar, "account": "sam@example.com"}
 
 
 def test_a_google_copy_of_a_harbor_event_is_not_a_second_meeting(store):
     now = time.time() + 7200
     sync([event("Office hours", now + 7200)], harbor_events=[
-        {"block_id": "task:t1", "title": "Homework 3", "when_ts": now, "end_ts": now + 3600}])
-    copy = {"source_id": "gcal:sam@example.com:g1", "kind": "meeting", "title": "Homework 3", "when_ts": now,
-            "end_ts": now + 3600, "account": "sam@example.com"}
-    own = {"source_id": "gcal:sam@example.com:g2", "kind": "meeting", "title": "Dentist", "when_ts": now,
-           "end_ts": now + 3600, "account": "sam@example.com"}
-    same_title_other_time = {**copy, "source_id": "gcal:sam@example.com:g3", "when_ts": now + 86400}
-    with patch.object(G, "stored_items", return_value=[copy, own, same_title_other_time]):
+        {"block_id": "task:t1", "title": "Homework 3", "when_ts": now, "end_ts": now + 3600, "calendar": "Sam"}])
+    copy, own = google("Homework 3", now, sid="g1"), google("Dentist", now, sid="g2")
+    later = google("Homework 3", now + 86400, sid="g3")
+    with patch.object(G, "stored_items", return_value=[copy, own, later]):
         merged = G.merge_native_items([event("Office hours", now + 7200)], store)
     assert sorted(i["title"] for i in merged) == ["Dentist", "Homework 3", "Office hours"]
     assert [i for i in merged if i["title"] == "Homework 3"][0]["when_ts"] == now + 86400, "only the exact copy goes"
 
 
+def test_a_real_google_meeting_is_hidden_only_when_title_start_end_and_calendar_all_match(store):
+    now = time.time() + 7200
+    harbor_events.record([{"block_id": "task:t1", "title": "Homework 3", "when_ts": now, "end_ts": now + 3600,
+                         "calendar": "Sam"}])
+    meetings = [google("Homework 3", now, calendar="Work", sid="a"),           # another calendar
+                google("Homework 3", now, end=now + 5400, sid="b"),            # another end
+                google("Homework 3", now, calendar="", sid="c"),               # no calendar named
+                google("Homework 3", now, sid="d")]                            # the copy
+    kept = harbor_events.without_recorded(meetings)
+    assert [m["source_id"][-1] for m in kept] == ["a", "b", "c"]
+    # An app that reported no calendar or end for its events hides nothing.
+    harbor_events.record([{"block_id": "task:t1", "title": "Homework 3", "when_ts": now, "end_ts": now + 3600}])
+    assert len(harbor_events.without_recorded(meetings)) == 4
+
+
 def test_google_refresh_drops_the_copy_too(store):
     now = time.time() + 7200
-    harbor_events.record([{"block_id": "task:t1", "title": "Homework 3", "when_ts": now, "end_ts": now + 3600}])
-    items = [{"source_id": G._prefix("sam@example.com") + "g1", "kind": "meeting", "title": "Homework 3",
-              "when_ts": now, "end_ts": now + 3600},
-             {"source_id": G._prefix("sam@example.com") + "g2", "kind": "meeting", "title": "Dentist",
-              "when_ts": now, "end_ts": now + 3600}]
+    harbor_events.record([{"block_id": "task:t1", "title": "Homework 3", "when_ts": now, "end_ts": now + 3600,
+                         "calendar": "Sam"}])
+    items = [{**google("Homework 3", now, sid="g1"), "source_id": G._prefix("sam@example.com") + "g1"},
+             {**google("Dentist", now, sid="g2"), "source_id": G._prefix("sam@example.com") + "g2"}]
     assert G.store_events("sam@example.com", items, store) == 1
     assert [i["title"] for i in G.stored_items(store, {"sam@example.com"})] == ["Dentist"]

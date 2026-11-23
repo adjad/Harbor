@@ -180,10 +180,59 @@ struct MailRecacheChecks {
               "index quiet 20 s: read")
         check(M.fetchTimeout == 300 && M.fetchIdlePolls == 2, "5-minute fetch cap, two idle polls")
 
+        // A transient closed-read failure keeps the last good read; fixable ones are always shown.
+        check(M.closedRetryDelays == [5, 20], "two retries, 5 s then 20 s")
+        let good = now.addingTimeInterval(-600)
+        check(!M.reportsClosedFailure(kind: "", lastGoodRead: good, now: now, offHours: false),
+              "transient failure, good read 10 min ago: stay quiet")
+        check(M.reportsClosedFailure(kind: "", lastGoodRead: now.addingTimeInterval(-66 * 60), now: now, offHours: false),
+              "good read older than 65 min: report")
+        check(!M.reportsClosedFailure(kind: "", lastGoodRead: now.addingTimeInterval(-64 * 60), now: now, offHours: false),
+              "good read 64 min ago: still quiet")
+        check(M.reportsClosedFailure(kind: "", lastGoodRead: nil, now: now, offHours: false), "no good read yet: report")
+        check(M.reportsClosedFailure(kind: "full_disk_access", lastGoodRead: good, now: now, offHours: false),
+              "a permission cause is always reported")
+        check(M.reportsClosedFailure(kind: "mail_not_configured", lastGoodRead: good, now: now, offHours: true),
+              "a fixable cause is reported even off-hours")
+        check(!M.reportsClosedFailure(kind: "", lastGoodRead: nil, now: now, offHours: true),
+              "off-hours skip never posts a transient error")
+
+        // Mail open is not a live read: the index must have moved since Mail launched.
+        let launch = now.addingTimeInterval(-600)
+        check(M.indexReadIsLive(launchDate: launch, lastIndexChange: launch.addingTimeInterval(30)),
+              "index written after launch: live")
+        check(M.indexReadIsLive(launchDate: launch, lastIndexChange: launch), "written at launch: live")
+        check(!M.indexReadIsLive(launchDate: launch, lastIndexChange: launch.addingTimeInterval(-3600)),
+              "offline Mail, index older than launch: not live")
+        check(!M.indexReadIsLive(launchDate: launch, lastIndexChange: nil), "no index files: not live")
+        check(!M.indexReadIsLive(launchDate: nil, lastIndexChange: now), "unknown launch: not vouched for")
+        // Only a Mail Harbor started is Harbor's to quit.
+        let asked = now
+        check(M.launchWasHarborsOwn(launchDate: asked.addingTimeInterval(1), askedAt: asked, wasRunningBefore: false),
+              "launched just after the ask: Harbor's own")
+        check(M.launchWasHarborsOwn(launchDate: asked, askedAt: asked, wasRunningBefore: false), "launched at the ask: Harbor's own")
+        check(!M.launchWasHarborsOwn(launchDate: asked.addingTimeInterval(-2), askedAt: asked, wasRunningBefore: false),
+              "launched before the ask: the person's")
+        check(!M.launchWasHarborsOwn(launchDate: asked.addingTimeInterval(1), askedAt: asked, wasRunningBefore: true),
+              "running just before: the person's")
+        check(!M.launchWasHarborsOwn(launchDate: nil, askedAt: asked, wasRunningBefore: false), "no launch date: never quit it")
+
         // The limits and the words Brief shows.
         check(M.openEvery == 1800 && M.userQuitGrace == 900 && M.staleAfter == 1800 && M.gmailFreshFor == 1800,
               "30-minute rate limit, 15-minute quit grace, 30-minute staleness")
         check(M.readingNote == "Reading Mail…" && M.readingKind == "mail_recaching", "Brief's words and kind")
+
+        // Automation while Mail is closed: macOS says "not running", which must not read as refused.
+        let A = MailAutomation.self
+        check(A.verdict(status: 0, remembered: nil) == (true, true), "allowed is allowed and remembered")
+        check(A.verdict(status: A.procNotFound, remembered: true) == (true, nil), "closed Mail: the last yes stands")
+        check(A.verdict(status: A.procNotFound, remembered: false) == (false, nil), "closed Mail: the last no stands")
+        check(A.verdict(status: A.procNotFound, remembered: nil) == (false, nil), "never seen: not allowed")
+        check(A.verdict(status: A.notPermitted, remembered: true) == (false, false), "a refusal replaces a yes")
+        check(A.verdict(status: A.needsConsent, remembered: true) == (false, false), "undecided replaces a yes")
+        check(A.whileStarting(status: A.procNotFound) == .wait, "a Mail still starting is waited for")
+        check(A.whileStarting(status: 0) == .script && A.whileStarting(status: A.notPermitted) == .stop,
+              "allowed scripts, refused stops")
 
         if failed > 0 { print("MailRecacheChecks: \(failed) of \(count) failed"); exit(1) }
         print("MailRecacheChecks: \(count) checks passed")

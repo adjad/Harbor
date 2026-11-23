@@ -332,3 +332,24 @@ def test_workflow_skills_register_no_tools(loaded) -> None:
     # No skill-defined tools, so no grants or tool-consolidation map needs an entry.
     assert all(not loaded[n].tools for n in WORKFLOWS)
     json.dumps({n: loaded[n].contract for n in WORKFLOWS})   # contracts are plain data
+
+
+def test_archive_skips_its_card_under_full_access_and_the_skill_text_says_so(loaded, monkeypatch) -> None:
+    args = {"message_id": "<m1.invented@example.test>", "action": "archive"}
+    monkeypatch.setattr(policy, "_FULL_ACCESS", True, raising=False)
+    assert policy.decide("email_triage", args, tool="email_triage").tier is policy.Tier.ALLOW
+    monkeypatch.setattr(policy, "_FULL_ACCESS", False, raising=False)
+    skill = loaded["inbox-cleanup"]
+    assert "full access" in " ".join(skill.body.lower().split())
+    assert contracts.validate(skill) == []
+    # validate restores the mode it borrowed, and flags text that promises a card regardless.
+    assert policy._FULL_ACCESS is False
+    tampered = copy.deepcopy(skill)
+    tampered.body = tampered.body.replace("full access", "other access")
+    assert any("full access" in p for p in contracts.validate(tampered))
+
+
+def test_file_tidy_move_still_asks_under_full_access_so_its_text_needs_no_caveat(loaded) -> None:
+    skill = copy.deepcopy(loaded["file-tidy"])
+    skill.body = skill.body.replace("full access", "other access")
+    assert contracts.validate(skill) == []

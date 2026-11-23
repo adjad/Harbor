@@ -21,6 +21,7 @@ keeps the two equal):
               its last lines are kept, so memory and the summary stay small
 The summary printed at the end (the only thing the model sees) is at most SUMMARY_CHARS.
 
+If the process that started the loop disappears, the loop does the same as for SIGHUP.
 SIGTERM, SIGINT and SIGHUP (Ideate's cancel, the harness aborting its tool) kill the running
 check's whole group and end the loop with exit 143. Exit codes: 0 done, 1 wall-time cap,
 3 iteration cap, 143 cancelled, 2 bad arguments.
@@ -51,6 +52,26 @@ class _Cancel(Exception):
 
 def _on_signal(signum, frame):  # noqa: ARG001
     raise _Cancel(signum)
+
+
+_PARENT = os.getppid()
+
+
+def _orphaned() -> bool:
+    """True once the process that started the loop has gone (bash killed by the harness):
+    the loop then stops and takes its checks with it instead of running on unseen."""
+    return os.getppid() != _PARENT
+
+
+def _nap(seconds: float) -> None:
+    end = time.monotonic() + max(0.0, seconds)
+    while True:
+        left = end - time.monotonic()
+        if left <= 0:
+            return
+        if _orphaned():
+            raise _Cancel(signal.SIGHUP)
+        time.sleep(min(0.25, left))
 
 
 def _kill_group(proc: subprocess.Popen) -> None:
@@ -91,6 +112,8 @@ def _run(command: str, out, limit_s: float, tracker: list) -> tuple[str, int | N
             if time.monotonic() >= end:
                 _kill_group(proc)
                 return "timeout", None
+            if _orphaned():
+                raise _Cancel(signal.SIGHUP)
             time.sleep(0.05)
     finally:
         tracker.remove(proc)
@@ -169,10 +192,10 @@ def run_loop(until: str, do: str = "", every: float = DEFAULT_EVERY_S, max_s: fl
                     status, code = "hit the iteration cap", 3
                     break
                 if time.monotonic() + every >= deadline:
-                    time.sleep(max(0.0, deadline - time.monotonic()))
+                    _nap(deadline - time.monotonic())
                     status, code = "hit the time cap", 1
                     break
-                time.sleep(every)
+                _nap(every)
     except _Cancel:
         for proc in list(tracker):
             _kill_group(proc)
@@ -189,7 +212,9 @@ def run_loop(until: str, do: str = "", every: float = DEFAULT_EVERY_S, max_s: fl
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(prog="ideate-loop", add_help=False)
+    # No abbreviations: the gate judges only the exact --until/--do values, so "--unt" or "--d"
+    # must not reach a command it never saw.
+    parser = argparse.ArgumentParser(prog="ideate-loop", add_help=False, allow_abbrev=False)
     parser.add_argument("--until", required=True)
     parser.add_argument("--do", default="")
     parser.add_argument("--every", type=float, default=DEFAULT_EVERY_S)

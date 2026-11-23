@@ -148,7 +148,21 @@ class Residency:
         row = next((r for r in rows if isinstance(r, dict) and r.get("id") == config.MODEL_ID), None)
         return ModelState(True, row is not None, bool(row and row.get("loaded")))
 
+    def _swap_lock(self) -> asyncio.Lock:
+        """One lock per event loop shared by `_ensure` and `release_now`, so a release that is
+        deciding to unload can't interleave with a run's load."""
+        loop = asyncio.get_running_loop()
+        held = getattr(self, "_swap_lock_for", None)
+        if held is None or held[0] is not loop:
+            held = (loop, asyncio.Lock())
+            self._swap_lock_for = held
+        return held[1]
+
     async def _ensure(self) -> None:
+        async with self._swap_lock():
+            await self._ensure_locked()
+
+    async def _ensure_locked(self) -> None:
         """Make Inkling the only model loaded: Harbor's other models go first, then free memory is
         checked right before the load (another app's model is invisible to Harbor's engine), then
         Inkling loads. Raises NoRoom instead of loading into too little memory."""
@@ -190,8 +204,18 @@ class Residency:
         from service.inference import engine_hold
         self._cancel_release()
         engine_hold.hold(config.MODEL_ID, "Ideate")
-        idle.begin(config.MODEL_ID)
-        idle.begin_foreground()
+        try:
+            idle.begin(config.MODEL_ID)
+            try:
+                idle.begin_foreground()
+            except BaseException:
+                idle.end(config.MODEL_ID)
+                raise
+        except BaseException:
+            # The run never counts as begun, so nothing else would release the hold
+            # and every Ask would be refused until Harbor restarts.
+            engine_hold.release(config.MODEL_ID)
+            raise
 
     def end(self) -> None:
         from service import idle
@@ -201,13 +225,17 @@ class Residency:
         engine_hold.release(config.MODEL_ID)
         self._schedule_release()
 
-    def wait_for_ask(self, timeout: float = config.ASK_WAIT_S, poll: float = 0.5) -> None:
-        """Let an Ask turn that is answering right now finish before the run takes the engine."""
+    def wait_for_ask(self, timeout: float = config.ASK_WAIT_S, poll: float = 0.5) -> bool:
+        """Let an Ask turn that is answering right now finish before the run takes the engine.
+        False when it is still answering at the deadline: the run must not take the engine."""
         import time
         from service import idle
         deadline = time.monotonic() + timeout
-        while idle.foreground_busy() and time.monotonic() < deadline:
+        while idle.foreground_busy():
+            if time.monotonic() >= deadline:
+                return False
             time.sleep(poll)
+        return True
 
     # --- Unloading Inkling after a run -----------------------------------------------------
     _release_handle: asyncio.TimerHandle | None = None
@@ -239,15 +267,25 @@ class Residency:
         from service import idle
         from service.inference import engine_hold
         self._release_handle = None
-        if engine_hold.holder() is not None or idle.in_flight(config.MODEL_ID) > 0:
+
+        def _busy() -> bool:
+            return engine_hold.holder() is not None or idle.in_flight(config.MODEL_ID) > 0
+
+        if _busy():
             return False
         try:
-            client = self._get_client()
-            if not getattr(client, "managed", False) or not bundled():
-                return False
-            if config.MODEL_ID not in set(await client.loaded_models()):
-                return False
-            await client.unload(config.MODEL_ID)
+            async with self._swap_lock():
+                if _busy():
+                    return False
+                client = self._get_client()
+                if not getattr(client, "managed", False) or not bundled():
+                    return False
+                if config.MODEL_ID not in set(await client.loaded_models()):
+                    return False
+                # A run may have begun while the model list was coming back.
+                if _busy():
+                    return False
+                await client.unload(config.MODEL_ID)
         except Exception as exc:  # noqa: BLE001 - best effort; the idle unloader is the backstop
             log.info("ideate: unloading the model failed: %s", type(exc).__name__)
             return False

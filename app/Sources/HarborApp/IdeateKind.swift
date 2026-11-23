@@ -106,6 +106,26 @@ enum IdeateProjectStatus: String, CaseIterable, Equatable, Codable {
     }
 }
 
+/// What the tab does when a poll of a running project fails.
+enum IdeatePoll {
+    /// About thirty seconds of failed polls (one a second) and the run counts as lost.
+    static let giveUpAfter = 30
+    static let goneLine = "That idea isn't on this Mac any more. Start a new one."
+    static let lostLine = "Harbor lost touch with this run. Your files are kept; start again when it's back."
+
+    /// The line that ends the run on the tab, or nil to keep polling. `httpStatus` is 0 when
+    /// the service did not answer at all; `failures` counts failed polls in a row, this one included.
+    static func lost(httpStatus: Int, failures: Int) -> String? {
+        if httpStatus == 404 { return goneLine }
+        return failures >= giveUpAfter ? lostLine : nil
+    }
+
+    /// The status to go back to when the service refuses a start: what the tab showed before.
+    static func afterRefusedStart(previous: IdeateProjectStatus) -> IdeateProjectStatus {
+        previous.isActive ? .idle : previous
+    }
+}
+
 // MARK: - Service events
 
 /// One event from `GET /ideate/projects/{id}`: `{seq, kind, text, tool, path, status, ts}`.

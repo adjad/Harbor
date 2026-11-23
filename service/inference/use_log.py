@@ -332,9 +332,36 @@ def _tool_followup(prev: dict, messages: list) -> list[dict]:
     return out
 
 
+def _scrub_embedded_json(value: Any, depth: int = 0) -> Any:
+    """Tool-call arguments and tool results are JSON inside a string, so a field named
+    "password" or "api_key" there is invisible to scrub_obj's key check. Parse such strings,
+    scrub them as data, and write them back as JSON (unparsable text is left to scrub)."""
+    from service.safety.redaction import scrub_obj
+    if depth > 12:
+        return value
+    if isinstance(value, str):
+        head = value.lstrip()[:1]
+        if head in ("{", "["):
+            try:
+                parsed = json.loads(value)
+            except ValueError:
+                return value
+            if isinstance(parsed, (dict, list)):
+                cleaned = scrub_obj(_scrub_embedded_json(parsed, depth + 1))
+                # Unchanged text is kept byte for byte.
+                return value if cleaned == parsed else json.dumps(cleaned, ensure_ascii=False)
+        return value
+    if isinstance(value, dict):
+        return {k: _scrub_embedded_json(v, depth + 1) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_scrub_embedded_json(v, depth + 1) for v in value]
+    return value
+
+
 def _write_line(record: dict) -> None:
     from service.safety.redaction import scrub_obj
-    line = json.dumps(scrub_obj(record), ensure_ascii=False, separators=(",", ":")) + "\n"
+    line = json.dumps(scrub_obj(_scrub_embedded_json(record)), ensure_ascii=False,
+                      separators=(",", ":")) + "\n"
     now = time.time()
     with _lock:
         directory = _ensure_dir()

@@ -144,7 +144,9 @@ def merge(items: list[dict], day_rows: list[dict]) -> list[dict]:
     flow recorded. A Day due item that a Reminders row already lists is dropped for it."""
     if not day_rows:
         return items
-    blocks = [r for r in day_rows if r["kind"] == "block"]
+    # Only a planned or kept block stands for a calendar event; a suggestion the person has not
+    # kept never relabels a real meeting that happens to share its title and start.
+    blocks = [r for r in day_rows if r["kind"] == "block" and r.get("state") != "suggested"]
     block_keys = {_key(r["title"], r["when_ts"]) for r in blocks}
     event_ids = {r["event_source_id"] for r in blocks if r.get("event_source_id")}
     kept = []

@@ -23,19 +23,29 @@ import Foundation
     // calendar reader shows one as a meeting; a person's event is never mistaken for one.
     static func markerChecks() {
         typealias M = DayCalendarMarker
-        check(M.url(forBlock: "task:abc") == "harbor-day://block/task%3Aabc", "the block id is in the link")
-        check(M.blockID(url: M.url(forBlock: "study-block:a/1"), notes: nil) == "study-block:a/1", "the link names the block")
-        check(M.blockID(url: nil, notes: M.notesLine(forBlock: "task:abc")) == "task:abc", "the notes line names the block")
+        check(M.url(forBlock: "task:abc") == "harbor-day://block/task%3Aabc", "the older form has no install part")
+        check(M.url(forBlock: "task:abc", install: "i-1") == "harbor-day://block/i-1/task%3Aabc", "the install id leads the block id")
+        check(M.parse(url: M.url(forBlock: "study-block:a/1", install: "i-1"), notes: nil)
+              == M.Parsed(install: "i-1", blockID: "study-block:a/1"), "the link names the Mac and the block")
+        check(M.parse(url: M.url(forBlock: "task:abc"), notes: nil) == M.Parsed(install: nil, blockID: "task:abc"),
+              "the older form still reads, with no Mac")
+        check(M.blockID(url: nil, notes: M.notesLine(forBlock: "task:abc", install: "i-1")) == "task:abc", "the notes line names the block")
         check(M.blockID(url: "https://example.com/harbor-day://block/x", notes: nil) == nil, "only a link that starts with it counts")
-        check(M.blockID(url: nil, notes: "Bring the slides\n" + M.notesLine(forBlock: "task:q") + "\nRoom 4") == "task:q",
-              "the notes line is found among the person's own lines")
+        // The notes marker counts on the first line only, and the link is preferred.
+        check(M.blockID(url: nil, notes: M.notesLine(forBlock: "task:q", install: "i-1") + "\nRoom 4") == "task:q",
+              "the first notes line is the marker")
+        check(M.blockID(url: nil, notes: "Bring the slides\n" + M.notesLine(forBlock: "task:q")) == nil,
+              "a marker further down someone's notes is not one")
+        check(M.parse(url: M.url(forBlock: "task:a", install: "i-1"), notes: M.notesLine(forBlock: "task:b", install: "i-2"))
+              == M.Parsed(install: "i-1", blockID: "task:a"), "the link wins over the notes")
         for (url, notes) in [(nil, nil), ("https://example.com/meet", "Agenda: budget"), ("harbor-day://block/", ""),
-                             (nil, "harbor-day://block/"), ("harbor-day:/other", nil)] as [(String?, String?)] {
+                             (nil, "harbor-day://block/"), ("harbor-day:/other", nil), ("harbor-day://block/a/b/c", nil),
+                             ("harbor-day://block//x", nil)] as [(String?, String?)] {
             check(!M.isOwn(url: url, notes: notes), "a person's event is not Harbor's: \(url ?? "-") \(notes ?? "-")")
         }
-        check(M.isOwn(url: nil, notes: M.notesLine(forBlock: "task:1")), "a Google copy that kept only the notes is Harbor's")
-        let notes = M.notes(forBlock: "task:1", keeping: "Room 4\n" + M.notesLine(forBlock: "task:old"))
-        check(notes == M.notesLine(forBlock: "task:1") + "\nRoom 4", "the marker line is replaced, the rest kept: \(notes)")
+        check(M.isOwn(url: nil, notes: M.notesLine(forBlock: "task:1", install: "i-1")), "a Google copy that kept only the notes is Harbor's")
+        let notes = M.notes(forBlock: "task:1", install: "i-1", keeping: "Room 4\n" + M.notesLine(forBlock: "task:old"))
+        check(notes == M.notesLine(forBlock: "task:1", install: "i-1") + "\nRoom 4", "the marker line is replaced and first: \(notes)")
         check(M.notes(forBlock: "task:1", keeping: nil) == M.notesLine(forBlock: "task:1"), "a new event's notes are the line")
     }
 

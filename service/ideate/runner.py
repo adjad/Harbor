@@ -28,9 +28,10 @@ import secrets
 import signal
 import subprocess
 import threading
+import time
 from dataclasses import dataclass, field
 
-from service.ideate import config, gate, harness, sandbox, store
+from service.ideate import config, gate, harness, procs, sandbox, store
 from service.ideate import engine as engine_mod
 
 log = logging.getLogger(__name__)
@@ -84,6 +85,11 @@ class Run:
     texts: list = field(default_factory=list)
     error: str = ""
     guard: bool = False
+    # Descendants of the harness seen so far, (pid -> start time), swept when the run ends.
+    tree: dict = field(default_factory=dict)
+    settled_at: float | None = None
+    last_event: float = field(default_factory=time.monotonic)
+    stalled: bool = False
     thread: threading.Thread | None = None
     done: threading.Event = field(default_factory=threading.Event)
 
@@ -189,7 +195,10 @@ class Manager:
                 return
             # An Ask turn answering right now finishes first; then the run holds the engine
             # and makes Inkling the only model loaded (engine.py), even when it already is.
-            self.residency.wait_for_ask()
+            if self.residency.wait_for_ask() is False:
+                # Taking the engine now would unload Ask's model under a reply in progress.
+                run.error = "Ask is still answering. Try again when it finishes."
+                return
             self.residency.begin()
             begun = True
             if not state.loaded:
@@ -291,12 +300,28 @@ class Manager:
         turns = int(self.store.meta(project).get("turns") or 0) + 1
         self.store.update(project, status="running", turns=turns)
         outcome = None
+        run.settled_at, run.last_event, run.stalled = None, time.monotonic(), False
+        watch_stop = threading.Event()
+        watchdog = threading.Thread(target=self._watch, args=(run, proc, watch_stop),
+                                    name=f"ideate-watch-{project.id}", daemon=True)
+        watchdog.start()
         try:
             if run.cancel:
+                # Stopped while Pi was starting: cancel() saw no process to kill, so the
+                # prompt is never sent and Pi is stopped here (the finally reaps it).
                 session.abort()
+                _kill_group(proc, run.tree)
+                return "cancelled"
             session.prompt(prompt)
             for event in session.events():
+                run.last_event = time.monotonic()
                 if event.kind == "settled":
+                    run.settled_at = run.last_event
+                    try:
+                        if proc.poll() is None:   # a reaped pid may already belong to someone else
+                            procs.remember(run.tree, proc.pid)
+                    except Exception:  # noqa: BLE001
+                        pass
                     if event.aborted or run.cancel:
                         outcome = "cancelled"
                     elif run.guard:
@@ -313,7 +338,9 @@ class Manager:
                         elif run.guard:
                             outcome = "guard"
                         else:
-                            run.error = run.error or "The coding agent stopped unexpectedly. Your files are kept."
+                            run.error = run.error or ("The coding agent stopped answering. Your files are kept."
+                                                      if run.stalled
+                                                      else "The coding agent stopped unexpectedly. Your files are kept.")
                             outcome = "failed"
                     break
                 else:
@@ -324,11 +351,39 @@ class Manager:
                     if pending.timer:
                         pending.timer.cancel()
                 run.pending.clear()
+            watch_stop.set()
             session.close()
-            _reap(proc)
+            _reap(proc, run.tree)
             with self._lock:
                 run.proc, run.session = None, None
         return outcome or "failed"
+
+    def _watch(self, run: Run, proc: subprocess.Popen, stop: threading.Event) -> None:
+        """Keeps the run from outliving what it is for. Runs beside the event loop, which
+        blocks while Pi's output stays open: records the harness's descendants (so a sweep
+        can find them after their parent is gone), stops a harness that settled but did not
+        exit, and stops one that has said nothing for config.INACTIVITY_LIMIT_S."""
+        while not stop.wait(config.WATCHDOG_TICK_S):
+            alive = proc.poll() is None
+            if not alive and not run.tree:
+                continue
+            try:
+                # Only while the harness is alive: once reaped, its pid can be reused by an
+                # unrelated process, whose children must never be recorded (Auditor, b37a4421).
+                if alive:
+                    procs.remember(run.tree, proc.pid)
+            except Exception:  # noqa: BLE001
+                log.debug("ideate: process listing failed", exc_info=True)
+            now = time.monotonic()
+            if run.settled_at is not None and now - run.settled_at >= config.CANCEL_GRACE_S:
+                log.info("ideate: harness settled but did not exit; stopping it")
+                _kill_group(proc, run.tree)
+                return
+            if run.settled_at is None and not run.pending and now - run.last_event >= config.INACTIVITY_LIMIT_S:
+                log.info("ideate: no harness activity for %.0fs; stopping it", config.INACTIVITY_LIMIT_S)
+                run.stalled = True
+                _kill_group(proc, run.tree)
+                return
 
     # ------------------------------------------------------------------------ events ----
     def _event(self, run: Run, event: harness.HarnessEvent) -> None:
@@ -427,6 +482,7 @@ class Manager:
         with self._lock:
             run = self.active
             if run is None or run.project.id != project_id:
+                # Under the lock: a message() launch can't slip in and be marked failed.
                 self.store.recover(project, running=False)
                 return
             run.cancel = True
@@ -437,7 +493,7 @@ class Manager:
         if session is not None:
             session.abort()
         if proc is not None:
-            killer = threading.Timer(config.CANCEL_GRACE_S, _kill_group, args=(proc,))
+            killer = threading.Timer(config.CANCEL_GRACE_S, _kill_group, args=(proc, run.tree))
             killer.daemon = True
             killer.start()
 
@@ -446,7 +502,8 @@ class Manager:
         with self._lock:
             run = self.active if self.active and self.active.project.id == project_id else None
             approvals = [p.public() for p in run.pending.values()] if run else []
-        self.store.recover(project, running=run is not None)
+            # Inside the lock: a message() launch can't start between the read and the check.
+            self.store.recover(project, running=run is not None)
         meta = self.store.meta(project)
         out = store.summary(meta)
         out["path"] = str(project.work)
@@ -461,7 +518,7 @@ class Manager:
         if run is not None:
             run.cancel = True
             if run.proc is not None:
-                _kill_group(run.proc)
+                _kill_group(run.proc, run.tree)
 
 
 def _describe(tool: str, args: dict, work) -> tuple[str, str]:
@@ -473,26 +530,41 @@ def _describe(tool: str, args: dict, work) -> tuple[str, str]:
     return "", store.relative_display(work, raw) if isinstance(raw, str) and raw else ""
 
 
-def _kill_group(proc: subprocess.Popen) -> None:
-    if proc.poll() is not None:
-        return
-    for sig in (signal.SIGTERM, signal.SIGKILL):
+def _kill_group(proc: subprocess.Popen, known: dict | None = None) -> None:
+    """Stop the harness: its process group, then every descendant seen (a check that started
+    its own session, a backgrounded child). `known` is the run's record of descendants;
+    the current ones are added before anything is signalled, since they can no longer be
+    traced once their parent has died."""
+    if known is None:
+        known = {}
+    if proc.poll() is None:
         try:
-            os.killpg(proc.pid, sig)
-        except (ProcessLookupError, PermissionError, OSError):
-            return
-        try:
-            proc.wait(timeout=2)
-            return
-        except subprocess.TimeoutExpired:
-            continue
+            procs.remember(known, proc.pid)
+        except Exception:  # noqa: BLE001
+            log.debug("ideate: process listing failed", exc_info=True)
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(proc.pid, sig)
+            except (ProcessLookupError, PermissionError, OSError):
+                break
+            try:
+                proc.wait(timeout=2)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+    try:
+        procs.sweep(known)
+    except Exception:  # noqa: BLE001
+        log.debug("ideate: sweeping descendants failed", exc_info=True)
 
 
-def _reap(proc: subprocess.Popen) -> None:
+def _reap(proc: subprocess.Popen, known: dict | None = None) -> None:
     try:
         proc.wait(timeout=config.CANCEL_GRACE_S)
     except subprocess.TimeoutExpired:
-        _kill_group(proc)
+        pass
+    # Always sweep: a clean exit can leave a backgrounded child behind.
+    _kill_group(proc, known)
     for stream in (proc.stdout, proc.stdin):
         try:
             if stream:

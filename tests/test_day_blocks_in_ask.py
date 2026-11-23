@@ -133,6 +133,13 @@ def test_what_is_due_that_day_is_listed_once():
     assert upcoming(period="tomorrow").count("Lab report due") == 1
 
 
+def test_a_real_meeting_is_not_relabelled_by_an_unkept_suggestion():
+    world.rows["calendar"].append(cal("Review: 3 emails", 3, 12, id_="c7"))   # same title and start as the suggestion
+    text = upcoming(period="tomorrow")
+    line = next(l for l in text.splitlines() if "Review: 3 emails" in l)
+    assert text.count("Review: 3 emails") == 1 and "suggested" not in line
+
+
 def test_a_block_already_on_the_calendar_counts_once():
     # The older "Add to calendar" copy: same title and start, and the event id the study flow recorded.
     world.rows["calendar"] += [cal("Homework 3", 3, 10, 30, id_="c3"),

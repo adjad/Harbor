@@ -1,5 +1,6 @@
 import Foundation
 import SQLite3
+import os
 
 // Reads Mail headers/history straight from Mail's own on-disk index
 // (~/Library/Mail/V*/MailData/Envelope Index) instead of scripting Mail.app —
@@ -177,10 +178,19 @@ final class MailDBReader {
         var empty = false
     }
 
+    private static let log = Logger(subsystem: "com.harbor.assistant", category: "mail-index")
+
+    /// Logs why a read of the index failed: stage and SQLite result codes only, never mail content.
+    private static func logFailure(_ stage: String, db: OpaquePointer?, rc: Int32) {
+        log.error("mail index read failed at \(stage, privacy: .public): rc=\(rc, privacy: .public) extended=\(db == nil ? -1 : sqlite3_extended_errcode(db), privacy: .public) errno=\(errno, privacy: .public)")
+    }
+
     private func scanIndex(inboxOnly: Bool) -> IndexScan? {
         guard let path = indexPath ?? envelopeIndexPath() else { return nil }
         var db: OpaquePointer?
-        guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
+        let openRC = sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil)
+        guard openRC == SQLITE_OK else {
+            Self.logFailure("open", db: db, rc: openRC)
             sqlite3_close(db)
             return nil
         }
@@ -189,7 +199,10 @@ final class MailDBReader {
 
         let cutoff = Date().timeIntervalSince1970 - Double(historyCutoffDays) * 86400
 
-        guard let mailboxIDs = sourceMailboxIDs(db, inboxOnly: inboxOnly) else { return nil }
+        guard let mailboxIDs = sourceMailboxIDs(db, inboxOnly: inboxOnly) else {
+            Self.logFailure("mailboxes", db: db, rc: sqlite3_errcode(db))
+            return nil
+        }
         var scan = IndexScan()
         scan.orderedUUIDs = accountUUIDsByFirstAppearance(db)
         let labels = AccountLabelCache.stored()
@@ -229,7 +242,11 @@ final class MailDBReader {
         LIMIT \(totalRowCap)
         """
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
+        let prepareRC = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
+        guard prepareRC == SQLITE_OK else {
+            Self.logFailure("prepare", db: db, rc: prepareRC)
+            return nil
+        }
         defer { sqlite3_finalize(stmt) }
 
         var step = sqlite3_step(stmt)
@@ -285,7 +302,10 @@ final class MailDBReader {
             scan.byAccount[accountKey, default: []].append(line)
         }
         // SQLITE_BUSY/IOERR are failures, not a successful empty/partial scan.
-        guard step == SQLITE_DONE else { return nil }
+        guard step == SQLITE_DONE else {
+            Self.logFailure("step", db: db, rc: step)
+            return nil
+        }
         return scan
     }
 

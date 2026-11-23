@@ -42,7 +42,12 @@ def denied_read_roots() -> list[Path]:
     roots = [root for root in shell_sandbox.protected_roots() if root != bundle]
     roots += [home / ".omlx", home / ".pi", home / ".config" / "opencode",
               home / ".local" / "share" / "opencode", home / ".ssh", home / ".aws", home / ".gnupg",
-              home / ".netrc", home / ".docker", home / ".kube", home / ".config" / "gh"]
+              home / ".netrc", home / ".docker", home / ".kube", home / ".config" / "gh",
+              # Other credentials and agents' state a read-only `cat` would otherwise reach
+              # with no card (the agent's own HOME is its private folder, so it needs none).
+              home / ".git-credentials", home / ".config" / "git" / "credentials", home / ".npmrc",
+              home / ".pypirc", home / ".zsh_history", home / ".bash_history", home / ".claude",
+              home / ".claude.json", home / ".codex", home / ".cursor", home / ".gemini"]
     # The person's own data stores (the folders Harbor's readers use, plus their neighbours).
     # Harbor holds Full Disk Access and a child inherits it, so these are denied by name.
     lib = home / "Library"
@@ -50,7 +55,7 @@ def denied_read_roots() -> list[Path]:
                                       "Cookies", "Preferences", "Calendars", "Reminders", "Notes",
                                       "Keychains", "Suggestions", "HomeKit", "Accounts")]
     roots += [lib / "Application Support" / name for name in ("AddressBook", "Google", "Firefox",
-                                                              "com.apple.sharedfilelist")]
+                                                              "com.apple.sharedfilelist", "Claude")]
     return list(dict.fromkeys(roots))
 
 

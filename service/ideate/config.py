@@ -71,6 +71,10 @@ CARRY_SUMMARY_CHARS = 500
 APPROVAL_TIMEOUT_S = 600.0
 # Cancel: abort first, then the process group is killed after this long.
 CANCEL_GRACE_S = 5.0
+# A run with no event at all for this long (no approval waiting) is stopped and releases the engine.
+INACTIVITY_LIMIT_S = 1800.0
+# How often the run's watchdog looks (settled-but-not-exited, silence, the process list).
+WATCHDOG_TICK_S = 1.0
 # Model swap: how long loading the model may take before the run fails.
 LOAD_TIMEOUT_S = 240.0
 # After a run ends, Inkling stays loaded this long for a follow-up message, then Ideate unloads

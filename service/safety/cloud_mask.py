@@ -31,13 +31,18 @@ _EMAIL = r"(?<![\w.+%-])[A-Za-z0-9][A-Za-z0-9._%+-]*@[A-Za-z0-9](?:[A-Za-z0-9-]*
 _CARD = r"(?<![\d-])\d(?:[ -]?\d){12,18}(?![\d-])"
 # An international number must start with "+"; a national one is the 3-3-4 shape.
 _PHONE_INTL = r"(?<![\w+])\+\d{1,3}(?:[ .\-]?\(?\d{1,4}\)?){2,5}(?!\d)"
-_PHONE_NATIONAL = r"(?<![\w+.-])(?:\(\d{3}\)[ ]?|\d{3}[ .-])\d{3}[ .-]\d{4}(?![\w-])"
+# A national one is the 3-3-4 shape, optionally after a "1" trunk prefix ("1-415-555-0134").
+_PHONE_NATIONAL = r"(?<![\w+.-])(?:1[ .-]?)?(?:\(\d{3}\)[ ]?|\d{3}[ .-])\d{3}[ .-]\d{4}(?![\w-])"
+# Ten digits with no separators ("4155550134"): only the North American shape (area code and
+# exchange start 2-9), so an epoch timestamp or an order number starting with 1 or 0 is left alone.
+_PHONE_BARE = r"(?<![\w+.-])(?:1)?[2-9]\d{2}[2-9]\d{6}(?![\w-])"
 _DETECT = re.compile(
-    f"(?P<email>{_EMAIL})|(?P<card>{_CARD})|(?P<phone>{_PHONE_INTL}|{_PHONE_NATIONAL})")
+    f"(?P<email>{_EMAIL})|(?P<card>{_CARD})|(?P<phone>{_PHONE_INTL}|{_PHONE_NATIONAL}|{_PHONE_BARE})")
 _NAME_KIND = "NAME"
-_PLACEHOLDER = re.compile(r"\[(EMAIL|PHONE|NUMBER|NAME)_(\d+)\]")
+# A model may write a placeholder back in another case ("[email_1]"); it is still that value.
+_PLACEHOLDER = re.compile(r"\[(EMAIL|PHONE|NUMBER|NAME)_(\d+)\]", re.IGNORECASE)
 # The longest placeholder is "[NUMBER_999999]"; anything longer is not one.
-_PARTIAL = re.compile(r"\[[A-Z]{0,6}(?:_\d{0,6})?")
+_PARTIAL = re.compile(r"\[[A-Za-z]{0,6}(?:_\d{0,6})?")
 _MAX_PARTIAL = 16
 _MAX_DEPTH = 40
 _MAX_CONVERSATIONS = 32
@@ -126,7 +131,8 @@ class Masker:
     def unmask(self, text: str) -> str:
         if not isinstance(text, str) or "[" not in text or not self._reverse:
             return text
-        return _PLACEHOLDER.sub(lambda m: self._reverse.get(m.group(0), m.group(0)), text)
+        return _PLACEHOLDER.sub(
+            lambda m: self._reverse.get(f"[{m.group(1).upper()}_{m.group(2)}]", m.group(0)), text)
 
     def unmask_obj(self, value: Any, _depth: int = 0) -> Any:
         """Unmask every string (and dict key) inside JSON-like data, such as tool-call
@@ -148,7 +154,9 @@ class Masker:
         if isinstance(value, str):
             return self.mask(value)
         if isinstance(value, dict):
-            return {k: self.mask_obj(v, _depth + 1) for k, v in value.items()}
+            # Keys too: {"sam@example.com": ...} must not leave as it is (unmask_obj restores keys).
+            return {(self.mask(k) if isinstance(k, str) else k): self.mask_obj(v, _depth + 1)
+                    for k, v in value.items()}
         if isinstance(value, (list, tuple)):
             return [self.mask_obj(v, _depth + 1) for v in value]
         return value

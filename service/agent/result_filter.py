@@ -156,18 +156,21 @@ def _split_rows(text: str, is_row, *, joiner: str = "\n") -> tuple[str, list[str
     if first is None:
         return text, [], ""
     pre = "\n".join(lines[:first])
+    # The trailer can only start after the last row: a blank line or a "(+" line inside a
+    # message's own text continues that message, or every row after it would go out unranked.
+    last_row = max(i for i, ln in enumerate(lines) if is_row(ln))
     rows: list[list[str]] = []
     trailer_at = len(lines)
     for i in range(first, len(lines)):
         ln = lines[i]
         if is_row(ln):
             rows.append([ln])
-        elif ln == "" and i + 1 < len(lines) and not is_row(lines[i + 1]) \
+        elif i > last_row and ln == "" and i + 1 < len(lines) and not is_row(lines[i + 1]) \
                 and any(x.strip() for x in lines[i + 1:]):
             # a blank line followed by non-row text: the rest is Harbor's trailer
             trailer_at = i
             break
-        elif ln.startswith(("…[", "(\"at least\"", "(+")) and rows:
+        elif i > last_row and ln.startswith(("…[", "(\"at least\"", "(+")) and rows:
             trailer_at = i
             break
         else:
@@ -508,12 +511,17 @@ def _shape_list_dir(result: str, limit: int, terms: tuple[str, ...]) -> str | No
     trailer = "\n".join(lines[end:]).strip("\n")
     if len(rows_text) < 2:
         return None
+    names = [re.split(r"  +", text, maxsplit=1)[0] for text in rows_text]
+    # Listed by name (the default): newer entries win ties. Listed largest or newest first
+    # (sort=size / sort=modified): that order is what was asked for, so it wins ties.
+    by_name = names == sorted(names, key=str.casefold)
     rows = []
     for i, text in enumerate(rows_text):
-        name = re.split(r"  +", text, maxsplit=1)[0].rstrip("/")
+        name = names[i].rstrip("/")
         leaf = name.rsplit("/", 1)[-1]
         ext = ("." + leaf.rsplit(".", 1)[1].casefold()) if "." in leaf.strip(".") and not text.split("  ")[0].endswith("/") else ""
-        rows.append(_Row(text, i, _score(terms, leaf, name), _date_stamp(text) - i * 1e-3, ext))
+        recency = _date_stamp(text) - i * 1e-3 if by_name else -float(i)
+        rows.append(_Row(text, i, _score(terms, leaf, name), recency, ext))
     if sum(len(r.text) + 1 for r in rows) + len(trailer) <= limit:
         kept, remainder = rows, ""
     else:

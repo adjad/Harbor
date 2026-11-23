@@ -64,11 +64,18 @@ final class AskSuggestions: ObservableObject {
 
     /// Ask the service for the prompts now. Called each time Ask's empty state appears,
     /// so a calendar, inbox or note that arrived since shows up. A newer call wins; a
-    /// failed one keeps what was known.
+    /// failed one keeps what was known, or settles on the general starters when nothing was.
     func refresh() async {
         generation += 1
         let mine = generation
-        guard let first = await fetch(nudge: true), mine == generation else { return }
+        guard let first = await fetch(nudge: true) else {
+            // No answer at all (service starting, an older service, a timeout): with nothing
+            // known yet, Ask shows its general starters rather than an empty state. A later
+            // refresh brings the person's own prompts.
+            if mine == generation, prompts == nil { apply([]) }
+            return
+        }
+        guard mine == generation else { return }
         apply(first.prompts)
         guard !first.nudged.isEmpty else { return }
         // The app was asked to read a source that had nothing cached (right after setup, say).

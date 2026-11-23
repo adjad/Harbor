@@ -15,6 +15,7 @@ the gate extension or the events the tab reads.
 """
 from __future__ import annotations
 
+import collections
 import json
 import os
 import re
@@ -305,7 +306,9 @@ class Store:
             return event
 
     def events(self, project: Project, after: int = 0, limit: int = config.EVENTS_PER_REPLY) -> list[dict]:
-        out = []
+        # From the start (after == 0) the newest `limit` events are returned, so a tab opened on a
+        # long run sees where it is now; after a seq, the next `limit` events follow in order.
+        out: collections.deque = collections.deque(maxlen=limit if after <= 0 else None)
         with self.lock(project.id):
             try:
                 with project.events_path.open(encoding="utf-8") as handle:
@@ -318,7 +321,7 @@ class Store:
                             out.append(event)
             except FileNotFoundError:
                 return []
-        return out[:limit]
+        return list(out)[:limit] if after > 0 else list(out)
 
     # files --------------------------------------------------------------------------------
     def files(self, project: Project, limit: int = config.FILES_LISTED) -> list[dict]:

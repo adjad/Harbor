@@ -34,7 +34,9 @@ def coverage_fraction(ranges, source, start, end):
     return min(1.0, seconds / (end - start)) if end > start else 0.0
 
 
-def weekly_report(observations, coverage, now, tz):
+def weekly_report(observations, coverage, now, tz, usage_rows=None):
+    """Calendar and reminder measurements, plus ``usage`` (counter-only use of the
+    app, from ``service.behavior.usage``) when ``usage_rows`` is supplied."""
     today = local_dt(now, tz).date()
     windows = []
     for i in range(5):
@@ -208,7 +210,9 @@ def weekly_report(observations, coverage, now, tz):
                 "comparison": "available" if full else "insufficient_coverage",
             }
         )
+    from service.behavior.usage import usage_report
     return {
+        **({"usage": usage_report(usage_rows, now, tz)} if usage_rows is not None else {}),
         "timezone": str(tz),
         "start_date": windows[0][0].isoformat(),
         "end_date_exclusive": today.isoformat(),
@@ -235,4 +239,6 @@ def render_report(report):
         else:
             text += "; observed records only — insufficient coverage for comparison"
         lines.append(text)
+    # The usage block (report["usage"]) is shown by the Learned window from its own `lines`;
+    # it is deliberately not in this text, which tool answers can carry to a model.
     return "\n".join(lines + [report["note"]])

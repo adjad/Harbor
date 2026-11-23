@@ -92,8 +92,29 @@ def judge(tool: str, args: dict, work: Path, engine_port: int | None = None) -> 
     return Verdict(DENY, "Ideate only uses its file and shell tools.", tool=tool)
 
 
+# Pi resolves a tool's path itself before it reads or writes (its utils/paths.js
+# normalizePath): Unicode spaces become plain spaces, one leading "@" is dropped, "~/" is
+# the home folder and a file:// URL is a path. Judge that same path, never the raw text,
+# or "@/Users/x/notes.txt" would look like a file inside the project.
+_UNICODE_SPACES = re.compile("[\u00A0\u2000-\u200A\u202F\u205F\u3000]")
+
+
+def pi_path(raw: str) -> str:
+    """The path Pi will actually open for `raw`."""
+    text = _UNICODE_SPACES.sub(" ", raw)
+    if text.startswith("@"):
+        text = text[1:]
+    if text.startswith("file://"):
+        from urllib.parse import unquote, urlsplit
+        parts = urlsplit(text)
+        text = unquote(parts.path) if parts.netloc in ("", "localhost") else text
+    return text
+
+
 def _judge_read(tool: str, args: dict, work: Path) -> Verdict:
     raw = args.get("path")
+    if isinstance(raw, str):
+        raw = pi_path(raw)
     if not isinstance(raw, str) or not raw.strip():
         return Verdict(DENY, "That read names no file.", tool=tool)
     if store.inside(work, raw) is not None:
@@ -109,6 +130,8 @@ def _judge_read(tool: str, args: dict, work: Path) -> Verdict:
 
 def _judge_write(tool: str, args: dict, work: Path) -> Verdict:
     raw = args.get("path")
+    if isinstance(raw, str):
+        raw = pi_path(raw)
     if not isinstance(raw, str) or not raw.strip():
         return Verdict(DENY, "That edit names no file.", tool=tool)
     if store.inside(work, raw) is not None:

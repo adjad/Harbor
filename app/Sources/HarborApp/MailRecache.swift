@@ -132,6 +132,41 @@ enum MailRecache {
         now.timeIntervalSince(openedAt) >= indexMinWait && now.timeIntervalSince(lastChange) >= indexQuietFor
     }
 
+    /// A closed-index read that failed with no permission cause (a lock, a busy WAL, an open error)
+    /// is retried after these delays before anything is reported.
+    static let closedRetryDelays: [TimeInterval] = [5, 20]
+    /// How long a good read keeps vouching for the mail (service/tools/email_tools.py
+    /// _MAIL_LIVE_MAX_AGE).
+    static let goodReadFreshFor: TimeInterval = 65 * 60
+    /// Next read after a failure was kept quiet because a recent good read stands.
+    static let keptReadRetryAfter: TimeInterval = 90
+
+    /// Whether a failed closed read is posted as "couldn't read Mail". A failure with a cause the
+    /// person can fix (kind not "") always is. A transient one (kind "") is held back while the last
+    /// good read is recent, and during off-hours, where Harbor deliberately doesn't open Mail.
+    static func reportsClosedFailure(kind: String, lastGoodRead: Date?, now: Date, offHours: Bool) -> Bool {
+        if !kind.isEmpty { return true }
+        if offHours { return false }
+        guard let lastGoodRead else { return true }
+        return now.timeIntervalSince(lastGoodRead) >= goodReadFreshFor || lastGoodRead > now
+    }
+
+    /// Mail being open is not a fetch: signed out or offline it never writes its index. A read of
+    /// the on-disk index counts as live only if the index (or its -wal) was written after Mail
+    /// launched. `launchDate` unknown: not vouched for.
+    static func indexReadIsLive(launchDate: Date?, lastIndexChange: Date?) -> Bool {
+        guard let launchDate, let lastIndexChange else { return false }
+        return lastIndexChange >= launchDate
+    }
+
+    /// Harbor may treat a Mail it asked to open as its own (and later quit it) only if that process
+    /// started at or after the moment Harbor asked and Mail wasn't running just before. A Mail the
+    /// person launched in between is theirs.
+    static func launchWasHarborsOwn(launchDate: Date?, askedAt: Date, wasRunningBefore: Bool) -> Bool {
+        guard !wasRunningBefore, let launchDate else { return false }
+        return launchDate >= askedAt
+    }
+
     /// Mail has finished fetching: its background activity count read 0 for the last
     /// fetchIdlePolls polls (newest last). An unreadable poll (nil) isn't idle.
     static func fetchSettled(_ polls: [Int?]) -> Bool {
@@ -174,3 +209,34 @@ enum MailRecache {
     /// A Mail that quit counts as the person's quit unless Harbor asked it to.
     static func quitWasPerson(harborAskedToQuit: Bool) -> Bool { !harborAskedToQuit }
 }
+
+/// What macOS's Automation check means for Mail. `AEDeterminePermissionToAutomateTarget`
+/// answers procNotFound (-600), not "allowed", while Mail isn't running, so a closed Mail would
+/// always read as "not allowed" and a person who allowed Automation without Full Disk Access
+/// would never get Mail opened and read. The last definite answer stands in for that case.
+enum MailAutomation {
+    static let rememberedKey = "harbor.mail.automationAllowed"
+    static let procNotFound: Int32 = -600
+    static let notPermitted: Int32 = -1743
+    static let needsConsent: Int32 = -1744
+
+    /// (allowed now, the answer to remember or nil to keep the remembered one).
+    static func verdict(status: Int32, remembered: Bool?) -> (allowed: Bool, remember: Bool?) {
+        switch status {
+        case 0: return (true, true)
+        case notPermitted, needsConsent: return (false, false)
+        default: return (remembered ?? false, nil)       // not running, or no answer this time
+        }
+    }
+
+    /// While Mail starts up: keep waiting for an answer, try a script, or give up.
+    enum Wait: Equatable { case script, wait, stop }
+    static func whileStarting(status: Int32) -> Wait {
+        switch status {
+        case 0: return .script
+        case notPermitted, needsConsent: return .stop
+        default: return .wait
+        }
+    }
+}
+

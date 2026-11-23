@@ -6,7 +6,7 @@ answers it is present and recent enough, and only when the tool Ask's agent
 would call for it can answer from that cache:
 
   due_week       "What's due this week?"                    get_upcoming(period="this week")
-  mail_sender    "What did Priya say about the lab report?" view_emails(query=<first name>, strict_match=True)
+  mail_sender    "What did Priya say recently?"             view_emails(query=<first name>, strict_match=True)
   course         "What's left for STAT 101 this week?"      get_upcoming(period="this week", query="STAT 101")
   free_tomorrow  "When am I free tomorrow for two hours?"   find_free_time(period="tomorrow", minutes=120)
   reply          "Anything in my email I still need to reply to?"  summarize_emails()
@@ -124,7 +124,8 @@ def _is_due_item(row: dict) -> bool:
         return True
     if row.get("kind") in _DUE_KINDS:
         return True
-    return bool(row.get("all_day")) or bool(_DUE_WORDS.search(str(row.get("title") or "")))
+    # An all-day entry alone (a birthday, "Out of office") is not something due.
+    return bool(_DUE_WORDS.search(str(row.get("title") or "")))
 
 
 def due_week(now: float) -> Suggestion | None:
@@ -244,58 +245,46 @@ def _is_person(row: dict, own: set[str]) -> bool:
             and not mail.is_broadcast(probe) and not mail.is_summary_noise(sender, str(row.get("subject") or "")))
 
 
-_SUBJECT_PREFIX = re.compile(r"^\s*(?:(?:re|fw|fwd|aw)\s*:|\[[^\]]{1,30}\])\s*", re.I)
-_LOWER_FIRST = {"the", "a", "an", "my", "our", "your", "this", "that", "quick", "question", "update",
-                "notes", "meeting", "lunch", "dinner", "plans", "plan"}
+def _sent_to() -> set[str]:
+    """Addresses the user has mailed lately, from the sent rows already cached (Google's
+    and Apple Mail's Sent list as the proactive cycle last read them). Reads nothing."""
+    from service.proactive import sent_check
+    from service.proactive.sources import cached_native_sent, sent_rows
+    out: set[str] = set()
+    for row in sent_rows() + cached_native_sent():
+        out.update(address for _name, address in sent_check.recipients(row.get("to")))
+    return out
 
 
-def _topic(subject: str) -> str:
-    """A short phrase from a subject line, or "" when it isn't one a person would say."""
-    text = str(subject or "")
-    while True:
-        stripped = _SUBJECT_PREFIX.sub("", text)
-        if stripped == text:
-            break
-        text = stripped
-    text = re.sub(r"\s+", " ", text).strip(" \t.!?:;,-")
-    words = text.split()
-    if not 1 <= len(words) <= 8 or len(text) < 4 or len(text) > 48:
-        return ""
-    letters = sum(c.isalpha() for c in text)
-    if letters < len(text) * 0.6 or re.search(r"[<>@#]|https?:|\d{5,}", text):
-        return ""
-    from service.tools import email_tools as mail
-    if mail._MARKETING_SUBJECT.search(text):
-        return ""
-    if words[0].casefold() in _LOWER_FIRST:
-        words[0] = words[0].lower()
-    return " ".join(words)
+def _in_contacts(address: str) -> bool:
+    from service.tools.imessage_tools import contact_name_for_handle
+    return bool(address) and bool(contact_name_for_handle(address))
 
 
 def mail_sender(now: float) -> Suggestion | None:
-    """A person the user trades mail with and the subject of their latest message.
-    Needs the body cache, which view_emails reads."""
+    """"What did Priya say recently?" for a person who is in Contacts or whom the user has
+    mailed. Only the first name goes into the prompt: a subject line is chosen by its
+    sender, so it never reaches the panel. Needs the body cache, which view_emails reads."""
     from service.tools import email_tools as mail
     if not _mail_fresh("raw", now, MAIL_BODIES_MAX_AGE_S):
         return None
     own = _own_addresses()
     rows = [r for r in mail._parse_raw() if now - MAIL_LOOKBACK_S <= r["ts"] <= now + 3600]
     rows.sort(key=lambda r: r["ts"], reverse=True)
-    per_address: dict[str, int] = {}
-    for r in rows:
-        address = parseaddr(r["sender"])[1].casefold()
-        per_address[address] = per_address.get(address, 0) + 1
+    replied = None
     for r in rows:
         if not _is_person(r, own):
             continue
         address = parseaddr(r["sender"])[1].casefold()
-        # Someone who writes more than once, or whose message answers a thread.
-        if per_address.get(address, 0) < 2 and not re.match(r"\s*re\s*:", r["subject"], re.I):
+        if not address:
             continue
-        topic = _topic(r["subject"])
+        if replied is None:
+            replied = _sent_to()
+        if address not in replied and not _in_contacts(address):
+            continue
         first = _person_name(r["sender"]).split()[0]
-        if topic and len(first) >= 2:
-            return _suggestion("mail_sender", f"What did {first} say about {topic}?", "email",
+        if len(first) >= 2:
+            return _suggestion("mail_sender", f"What did {first} say recently?", "email",
                                "view_emails", {"query": first, "strict_match": True})
     return None
 
