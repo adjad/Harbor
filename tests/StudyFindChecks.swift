@@ -34,6 +34,22 @@ struct StudyFindChecks {
         check(course.host == "canvas.example.edu", "host is lowercased")
         check(course.modulesURL?.absoluteString == "https://canvas.example.edu/courses/42/modules", "modules URL")
 
+        // A course saved without an address takes its number from its id and the one Canvas site its sisters name.
+        let T = StudyFindTarget.self
+        check(T.derivedCourseURL(courseID: "canvas:77", knownHosts: ["Canvas.Example.edu", "canvas.example.edu"])
+              == "https://canvas.example.edu/courses/77", "derived from one shared host")
+        check(T.derivedCourseURL(courseID: "canvas:77", knownHosts: ["a.example.edu", "b.example.edu"]) == nil,
+              "two Canvas sites: not guessed")
+        check(T.derivedCourseURL(courseID: "canvas:77", knownHosts: []) == nil, "no known site: not guessed")
+        check(T.derivedCourseURL(courseID: "canvas:abc123def456", knownHosts: ["canvas.example.edu"]) == nil,
+              "a name-hash id has no course number")
+        check(T.derivedCourseURL(courseID: "canvas:7/../8", knownHosts: ["canvas.example.edu"]) == nil, "digits only")
+        check(T.derivedCourseURL(courseID: "sample:77", knownHosts: ["canvas.example.edu"]) == nil, "Canvas ids only")
+        if let derived = T.derivedCourseURL(courseID: "canvas:77", knownHosts: ["canvas.example.edu"]),
+           let ref = T.courseRef(derived) {
+            check(ref.host == "canvas.example.edu" && ref.id == "77", "the derived address reads back as that course")
+        }
+
         let page = "https://canvas.example.edu/courses/42/pages/week-3"
         check(course.allowedURL(page) != nil, "a course page is allowed")
         check(course.openableURL(page) != nil, "a course page is openable")

@@ -165,8 +165,12 @@ def test_gone_only_after_a_fresh_sync_well_after_the_booking():
 def test_a_moved_event_with_a_new_identifier_is_not_gone():
     same = {"EVT-9": (BLOCK["start"], BLOCK["end"], BLOCK["title"])}
     assert blocks_api.gone(_rec(), FRESH, same, now=2010.0) is False
+    # Moved to a new time and re-issued: the title is the booking's stable identity, so it is not gone
+    # (offering the block again would book it twice).
     other = {"EVT-9": (BLOCK["start"] + 600, BLOCK["end"] + 600, BLOCK["title"])}
-    assert blocks_api.gone(_rec(), FRESH, other, now=2010.0) is True
+    assert blocks_api.gone(_rec(), FRESH, other, now=2010.0) is False
+    renamed = {"EVT-9": (BLOCK["start"] + 600, BLOCK["end"] + 600, "Something else")}
+    assert blocks_api.gone(_rec(), FRESH, renamed, now=2010.0) is True
 
 
 def test_a_booking_without_its_timezone_is_never_judged_gone():

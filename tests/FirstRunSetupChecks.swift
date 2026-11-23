@@ -1129,7 +1129,7 @@ struct FirstRunSetupChecks {
         // No score: every row is optional, and a Mac without that data is not "off".
         check(FirstRunPermissions.summary([.calendar: .notAsked, .reminders: .notAllowed, .mail: .notAsked,
                                            .fullDiskAccess: .notAllowed, .contacts: .allowed, .notifications: .allowed])
-              == "All optional · 2 still off", "Counts only Calendar and Reminders: Mail and Full Disk Access are asked later")
+              == "All optional · 2 still off", "Counts Calendar, Reminders and Contacts: Mail and Full Disk Access are asked on the last page")
         check(FirstRunPermissions.summary([.calendar: .allowed, .fullDiskAccess: .notOnThisMac]) == "All optional · nothing left off",
               "Nothing left")
         // Contacts and Full Disk Access: no dead end on a Mac with nothing for Full Disk Access to read.
@@ -1141,19 +1141,22 @@ struct FirstRunSetupChecks {
         noData[.contacts] = .notAsked
         check(!FirstRunPermissions.contactsWaits(noData, messagesReadable: false),
               "Full Disk Access not needed here: Contacts has its own Allow, never After Full Disk Access")
-        check(FirstRunPermissions.summary(noData, messagesReadable: false) == "All optional · nothing left off"
-              && FirstRunPermissions.allAnswered(noData, messagesReadable: false),
-              "...and Contacts isn't asked in setup, so it is never the one still off")
-        // Setup asks for two; the rest wait for the task that needs them.
-        check(FirstRunPermissions.Item.setup == [.calendar, .reminders],
-              "Setup's rows: Calendar and Reminders only")
+        check(FirstRunPermissions.summary(noData, messagesReadable: false) == "All optional · 1 still off"
+              && !FirstRunPermissions.allAnswered(noData, messagesReadable: false),
+              "...and Contacts is a setup row, so unasked it is the one still off")
+        // Setup asks for three; Full Disk Access and Automation come on the last page, the rest at use.
+        check(FirstRunPermissions.Item.setup == [.calendar, .reminders, .contacts],
+              "Setup's rows: Calendar, Reminders and Contacts only")
+        check(![.fullDiskAccess, .mail, .messages, .notifications, .screenRecording, .accessibility]
+                .contains(where: FirstRunPermissions.Item.setup.contains),
+              "Setup never asks for Full Disk Access, Automation, Notifications, Screen Recording or Accessibility")
         // Brief and Day's rows for what Setup no longer asks (BriefAccessRows).
         typealias Rows = BriefAccessRows
         func rows(_ edit: (inout Rows.Facts) -> Void) -> Rows.Shown { var f = Rows.Facts(); edit(&f); return Rows.decide(f) }
         check(rows { _ in }.isEmpty, "Nothing known (probe unknown, Automation decided): no rows")
         check(rows { $0.automationUndecided = true }.allowMail
-              && rows { $0.automationUndecided = true }.rows == [.allowMail],
-              "Mail Automation undecided, nothing else covering mail: the Allow Harbor to read Mail row")
+              && rows { $0.automationUndecided = true }.sources == [.mail],
+              "Mail Automation undecided, nothing else covering mail: mail is missing")
         check(!rows { $0.automationUndecided = true; $0.gmailCovers = true }.allowMail,
               "Google covers mail: no Mail Automation row")
         check(!rows { $0.automationUndecided = true; $0.outcomes = [.mail: .readable]; $0.probe = .on }.allowMail,
@@ -1168,8 +1171,8 @@ struct FirstRunSetupChecks {
               && !rows { $0.probe = .unknown }.seeTexts,
               "Messages readable, probe on or unknown: no texts row")
         check(rows { $0.probe = .off; $0.outcomes = [.mail: .refused, .notes: .refused] }.closed == [.mail, .notes]
-              && rows { $0.probe = .off; $0.outcomes = [.mail: .refused, .notes: .refused] }.rows == [.seeClosed],
-              "Mail and Notes closed and unreadable: one row for both")
+              && rows { $0.probe = .off; $0.outcomes = [.mail: .refused, .notes: .refused] }.sources == [.mail, .notes],
+              "Mail and Notes closed and unreadable: both missing")
         check(rows { $0.probe = .off; $0.outcomes = [.mail: .refused, .notes: .refused]; $0.mailOpen = true }.closed == [.notes]
               && rows { $0.probe = .off; $0.outcomes = [.mail: .refused, .notes: .refused]; $0.mailOpen = true; $0.notesOpen = true }.closed.isEmpty,
               "An open app is read through the app: no row for it")
@@ -1182,28 +1185,71 @@ struct FirstRunSetupChecks {
               "A store that isn't on this Mac gets no row")
         check(rows { $0.probe = .off; $0.outcomes = [:] }.seeTexts,
               "Off with no outcomes recorded: treated as every store, so texts still shows")
-        check(Rows.closedTitle([.mail, .notes]) == "See your mail and notes when they're closed"
-              && Rows.closedTitle([.mail]) == "See your mail when Mail is closed"
-              && Rows.closedTitle([.notes]) == "See your notes when Notes is closed"
-              && Rows.seeTextsTitle == "See your texts" && Rows.allowMailTitle == "Allow Harbor to read Mail",
-              "The rows' words")
-        var comps = DateComponents(); comps.year = 2026; comps.month = 11; comps.day = 21; comps.hour = 9
-        let day = Calendar.current.date(from: comps) ?? Date()
-        check(Rows.dayKey(day) == "2026-11-21" && Rows.isDismissed(stored: "2026-11-21", today: Rows.dayKey(day))
-              && !Rows.isDismissed(stored: "2026-11-20", today: Rows.dayKey(day)) && !Rows.isDismissed(stored: nil, today: "2026-11-21"),
-              "A row put away stays away that day only")
-        let all = rows { $0.automationUndecided = true; $0.probe = .off; $0.outcomes = [.messages: .refused, .mail: .refused, .notes: .refused] }
-        check(all.rows == [.allowMail, .seeTexts, .seeClosed]
-              && Rows.visible(all, dismissed: [.seeTexts]).rows == [.allowMail, .seeClosed]
-              && Rows.visible(all, dismissed: Set(Rows.Row.allCases)).isEmpty,
-              "Dismissed rows drop out, the others stay")
+        // One Finish setup row, never the same source twice, none once onboarding is done.
+        let everything = rows { $0.automationUndecided = true; $0.probe = .off; $0.outcomes = [.messages: .refused, .mail: .refused, .notes: .refused] }
+        check(everything.sources == [.mail, .texts, .notes], "Mail, texts and notes missing: each counted once")
+        let planAll: Set<Rows.Source> = [.calendar, .reminders, .mail, .texts, .contacts]
+        let beforeAll = Rows.finishRow(everything, planMissing: planAll, onboardingDone: false)
+        check(beforeAll?.sources == [.calendar, .reminders, .mail, .texts, .notes, .contacts] && beforeAll?.count == 6
+              && beforeAll?.title == "Finish setup · 6",
+              "The probe and the plan both naming mail and texts: one row, six distinct sources, no duplicates")
+        check(Set(beforeAll?.sources ?? []).count == beforeAll?.sources.count,
+              "Finish setup lists no source twice")
+        check(Rows.finishRow(everything, planMissing: planAll, onboardingDone: true) == nil
+              && Rows.finishRow(Rows.Shown(), planMissing: [], onboardingDone: false) == nil
+              && Rows.finishRow(Rows.Shown(), planMissing: [.reminders], onboardingDone: true) == nil,
+              "Onboarding done: no setup row at all; nothing missing: none either")
+        check(Rows.finishRow(Rows.Shown(), planMissing: [.mail], onboardingDone: false)?.title == "Finish setup · 1"
+              && Rows.finishRow(rows { $0.automationUndecided = true }, planMissing: [.mail], onboardingDone: false)?.count == 1,
+              "Mail named by the probe and the plan counts once")
+        check(Rows.onboardingDone { $0 == FirstRunSetup.doneKey }
+              && Rows.onboardingDone { _ in false }
+              && !Rows.onboardingDone { $0 == FirstRunSetup.startedKey },
+              "Onboarding is done when finished, or never started (an upgrade); not while started and unfinished")
+        // Day: one quiet line after onboarding, only for Calendar or Reminders.
+        check(Rows.dayLine(planMissing: [.mail, .texts, .contacts], onboardingDone: true).isEmpty
+              && Rows.dayLine(planMissing: [.reminders, .mail], onboardingDone: true) == [.reminders]
+              && Rows.dayLine(planMissing: [.calendar, .reminders], onboardingDone: true) == [.calendar, .reminders]
+              && Rows.dayLine(planMissing: [.calendar, .reminders], onboardingDone: false).isEmpty,
+              "Day keeps a line for Calendar or Reminders after onboarding, none for the rest, and none before (the setup row speaks)")
+        // The plan's unread sources become setup sources only when a permission is the reason.
+        func unreadSource(_ source: String, _ blocked: String?) -> SourceAccess {
+            SourceAccess(source: source, ready: false, state: "unavailable", blocked: blocked)
+        }
+        check(Rows.missing([unreadSource("email", "mail_automation"), unreadSource("messages", "full_disk_access"),
+                            unreadSource("calendar", "calendar_access"), unreadSource("reminders", "reminders_access"),
+                            unreadSource("contacts", "contacts_access")])
+                == [.mail, .texts, .calendar, .reminders, .contacts]
+              && Rows.missing([unreadSource("email", "no_accounts"), unreadSource("email", "google_mail"),
+                               unreadSource("messages", nil)]).isEmpty
+              && Rows.missing([SourceAccess(source: "calendar", ready: true)]).isEmpty,
+              "A permission names the source; no accounts, a Google sign-in or a passing read do not")
+        // The Brief is always today: Day's day change leaves it on today, and Day gets its day back.
+        MainActor.assumeIsolated {
+            var comps = DateComponents(); comps.year = 2026; comps.month = 11; comps.day = 23; comps.hour = 10
+            let zone = TimeZone(identifier: "America/Chicago") ?? .current
+            var cal = Calendar(identifier: .gregorian); cal.timeZone = zone
+            let monday = cal.date(from: comps) ?? Date()
+            let tuesday = cal.date(byAdding: .day, value: 1, to: monday) ?? monday
+            let model = TodayModel(now: { monday }, timeZoneProvider: { zone }, transport: { _ in throw URLError(.notConnectedToInternet) })
+            BriefFollowsToday.forget()
+            check(!BriefFollowsToday.pin(model) && model.followsToday, "The Brief on today changes nothing")
+            model.selectDate(tuesday)
+            check(!model.followsToday && !model.isShowingCurrentDay, "Day moved to another day")
+            check(BriefFollowsToday.pin(model) && model.followsToday && model.isShowingCurrentDay && model.day == "2026-11-23",
+                  "The Brief opens: the model is back on today, so the Brief shows today")
+            check(BriefFollowsToday.restore(model) && !model.followsToday && model.day == "2026-11-24",
+                  "Day opens again on the day it had")
+            check(!BriefFollowsToday.restore(model), "Nothing left to restore")
+            BriefFollowsToday.forget()
+        }
         let restUnasked: [FirstRunPermissions.Item: FirstRunPermissions.State] = [
             .calendar: .allowed, .reminders: .allowed, .mail: .allowed, .fullDiskAccess: .allowed,
-            .messages: .notAsked, .contacts: .notAsked, .notifications: .notAsked,
+            .messages: .notAsked, .contacts: .allowed, .notifications: .notAsked,
             .screenRecording: .notAsked, .accessibility: .notAsked]
         check(FirstRunPermissions.summary(restUnasked) == "All optional · nothing left off"
               && FirstRunPermissions.allAnswered(restUnasked, messagesReadable: true),
-              "Messages, Contacts, Notifications and the rest, never asked yet: setup is done")
+              "Messages, Notifications and the rest, never asked yet: setup is done")
         noData[.contacts] = .allowed
         check(FirstRunPermissions.allAnswered(noData, messagesReadable: false)
               && FirstRunPermissions.summary(noData, messagesReadable: false) == "All optional · nothing left off",
@@ -1213,10 +1259,13 @@ struct FirstRunSetupChecks {
         fdaOff[.contacts] = .notAsked
         check(FirstRunPermissions.contactsWaits(fdaOff, messagesReadable: false),
               "Full Disk Access still off with Messages unread: Contacts waits for it")
-        check(FirstRunPermissions.summary(fdaOff, messagesReadable: false) == "All optional · nothing left off",
-              "Full Disk Access is not a setup row, so off never counts and a waiting Contacts isn't counted either")
-        check(FirstRunPermissions.allAnswered(fdaOff, messagesReadable: false),
-              "A waiting Contacts follows Full Disk Access's answer, so the step can still tick")
+        check(FirstRunPermissions.summary(fdaOff, messagesReadable: false) == "All optional · 1 still off",
+              "Full Disk Access is not a setup row, so off never counts; the unasked Contacts does")
+        var fdaOffContactsDone = fdaOff
+        fdaOffContactsDone[.contacts] = .allowed
+        check(FirstRunPermissions.allAnswered(fdaOffContactsDone, messagesReadable: false)
+              && FirstRunPermissions.summary(fdaOffContactsDone, messagesReadable: false) == "All optional · nothing left off",
+              "Full Disk Access off never holds the step open")
         var fdaOn = fdaOff
         fdaOn[.fullDiskAccess] = .allowed
         check(!FirstRunPermissions.contactsWaits(fdaOn, messagesReadable: false)
@@ -1292,6 +1341,8 @@ struct FirstRunSetupChecks {
 
         // /resetharbor brings all of the above back to a fresh Mac (tests/HarborResetChecks.swift).
         HarborResetChecks.run()
+        // The one-time fresh start reuses that clearing (tests/FreshStartChecks.swift).
+        FreshStartChecks.run()
         print("PASS: first-run setup — model gate, Move to Applications, readers re-post when the service comes up, show and resume rules, 11 step-1 states, download click, time left, tour hints, readers never ask, ready notification, remote-only, reopen cap, Full Disk Access, Contacts on its own, slow service, one Return per state, open at login")
     }
 
@@ -1350,6 +1401,40 @@ struct FirstRunSetupChecks {
               && FirstRunSetup.owesFirstBrief(after: .google) && FirstRunSetup.owesFirstBrief(after: .tour),
               "The first Brief is owed once Permissions is behind the person")
         check(OnboardingTour.pages.map(\.tab) == ["Brief", "Day", "Ask"], "The tour follows the notch's tabs")
+        // The tour's mockups: invented samples drawn from the notch's own pieces, marked Example.
+        check(OnboardingMockups.freeTimeCard.title == "Study for STAT 101 midterm"
+              && OnboardingMockups.freeTimeCard.body == "You're free 2\u{2013}3 PM after Lab. I can hold that hour."
+              && OnboardingMockups.freeTimeCard.action?.label == "Block 2\u{2013}3 PM?"
+              && BriefReady.cardTag(method: OnboardingMockups.freeTimeCard.action?.method ?? "", hasDraft: false) == "FREE TIME",
+              "The Brief tour shows the free-time card with its Block button")
+        check(OnboardingMockups.mailCard.title == "Reply to Sam about Friday's dinner"
+              && BriefReady.cardTag(method: OnboardingMockups.mailCard.action?.method ?? "", hasDraft: true) == "DRAFTED",
+              "...and the mail card")
+        check(OnboardingMockups.dayRows.map(\.title) == ["Team stand-up", "Lunch with Priya", "Send the budget draft", "Call the dentist"]
+              && OnboardingMockups.dayRows.map(\.top) == ["9:30 AM", "12:00 PM", "5:00 PM", "Anytime"]
+              && OnboardingMockups.dayRows[2].bottom == "Due",
+              "The Day tour's four rows, in the agenda's gutter wording")
+        check(OnboardingTour.askQuestion == "What's due this week?"
+              && !OnboardingTour.askAnswer.contains("|") && !OnboardingTour.askAnswer.contains("\n"),
+              "The Ask tour answers in a plain sentence, never a table")
+        check(OnboardingTour.cardMark == "EXAMPLE", "Every mockup says Example")
+        // The last page: Get more from Harbor.
+        check(OnboardingStep.allCases.last == .access && OnboardingStep.tour.next == .access
+              && OnboardingStep.access.next == nil && OnboardingStep.access.title == "Get more",
+              "The access page comes after How to use and is last")
+        check(OnboardingAccessPage.title == "Get more from Harbor"
+              && OnboardingAccessPage.order == [.fullDiskAccess, .messagesAutomation, .mailNotesAutomation]
+              && Set(OnboardingAccessPage.order) == Set(OnboardingAccessPage.Row.allCases),
+              "Full Disk Access first, then Messages, then Mail and Notes automation")
+        check(OnboardingAccessPage.order.filter(OnboardingAccessPage.isProminent) == [.fullDiskAccess]
+              && OnboardingAccessPage.Row.fullDiskAccess.detail.contains("Mail, Messages and Notes")
+              && OnboardingAccessPage.Row.fullDiskAccess.detail.contains("closed")
+              && OnboardingAccessPage.openSettingsTitle == "Open System Settings",
+              "Full Disk Access is the one prominent row and says it reads closed apps")
+        check(OnboardingAccessPage.canFinishWithNothingGranted && OnboardingAccessPage.doneTitle.hasPrefix("Done")
+              && OnboardingAccessPage.footnote.contains("Screen Recording") && OnboardingAccessPage.footnote.contains("microphone")
+              && !OnboardingAccessPage.order.map(\.title).joined().contains("Screen"),
+              "Nothing is required, and Screen Recording and the microphone are left for first use")
         check(OnboardingTour.step(0, by: -1) == 0 && OnboardingTour.step(2, by: 1) == 2
               && OnboardingTour.step(2, by: -2) == 0 && OnboardingTour.position(1) == "2 of 3",
               "Back and Next stay on the pages; Start over goes to the first")

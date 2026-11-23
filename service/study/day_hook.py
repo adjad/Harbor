@@ -230,6 +230,10 @@ def attach(result: dict, *, now: float, timezone: str) -> None:
         # Day draws the workspace's proposed plan (its Suggested and usual-time blocks too), so a
         # study block must fit around those as well as the plan's own blocks.
         busy = _busy(current) + _busy(_proposed_blocks(result))
+        # A study block already booked stays where it was booked, even when its calendar copy is not in
+        # the lists above (Harbor's own events can be left out on read): a new block never starts there.
+        busy += _busy([{"start": v.get("start"), "end": v.get("end")} for v in booked.values()
+                       if isinstance(v, dict) and v.get("day") == day])
         blocks = plan.study_blocks(rows, busy, now=now, timezone=timezone, day=day, slides=slides,
                                    booked=mine)
         try:

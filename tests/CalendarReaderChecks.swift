@@ -13,10 +13,31 @@ import Foundation
         accessChecks()
         paceChecks()
         readGateChecks()
+        markerChecks()
         print("synthetic calendar reader checks passed")
     }
 
     static func check(_ ok: Bool, _ message: String) { precondition(ok, message) }
+
+    // Harbor's own Day events are recognised by their link or their notes line, so no
+    // calendar reader shows one as a meeting; a person's event is never mistaken for one.
+    static func markerChecks() {
+        typealias M = DayCalendarMarker
+        check(M.url(forBlock: "task:abc") == "harbor-day://block/task%3Aabc", "the block id is in the link")
+        check(M.blockID(url: M.url(forBlock: "study-block:a/1"), notes: nil) == "study-block:a/1", "the link names the block")
+        check(M.blockID(url: nil, notes: M.notesLine(forBlock: "task:abc")) == "task:abc", "the notes line names the block")
+        check(M.blockID(url: "https://example.com/harbor-day://block/x", notes: nil) == nil, "only a link that starts with it counts")
+        check(M.blockID(url: nil, notes: "Bring the slides\n" + M.notesLine(forBlock: "task:q") + "\nRoom 4") == "task:q",
+              "the notes line is found among the person's own lines")
+        for (url, notes) in [(nil, nil), ("https://example.com/meet", "Agenda: budget"), ("harbor-day://block/", ""),
+                             (nil, "harbor-day://block/"), ("harbor-day:/other", nil)] as [(String?, String?)] {
+            check(!M.isOwn(url: url, notes: notes), "a person's event is not Harbor's: \(url ?? "-") \(notes ?? "-")")
+        }
+        check(M.isOwn(url: nil, notes: M.notesLine(forBlock: "task:1")), "a Google copy that kept only the notes is Harbor's")
+        let notes = M.notes(forBlock: "task:1", keeping: "Room 4\n" + M.notesLine(forBlock: "task:old"))
+        check(notes == M.notesLine(forBlock: "task:1") + "\nRoom 4", "the marker line is replaced, the rest kept: \(notes)")
+        check(M.notes(forBlock: "task:1", keeping: nil) == M.notesLine(forBlock: "task:1"), "a new event's notes are the line")
+    }
 
     // Whole words only: these titles used to read as exams and assignments.
     static func classifyChecks() {

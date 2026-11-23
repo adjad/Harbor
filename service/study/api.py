@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, ValidationError
 
 from service.memory_saver_api import native_only
-from service.study import canvas_parse, connector, generate, ready
+from service.study import canvas_parse, connector, find, generate, ready
 from service.study import sample
 from service.study.store import study_exists, study_store
 
@@ -202,6 +202,7 @@ def state(now: float | None = None, *, connector_state: dict | None = None) -> d
     store = _existing_store()
     if store is None:
         return _empty_state(connector_state)
+    find.reconcile(store)
     courses = store.courses()
     names = {c["id"]: _shown_name(c) for c in courses}
     rows = store.assignments()   # already due_ts ascending, nulls last

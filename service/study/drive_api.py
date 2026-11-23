@@ -59,6 +59,28 @@ async def drive_status():
     return drive.status()
 
 
+class AccountBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    account: StrictStr | None = Field(default=None, max_length=320)
+
+
+@router.post("/drive/account", dependencies=[Depends(native_only)])
+@api._answer
+async def drive_account(request: Request):
+    """Choose which connected Google account Study reads Drive with (null: automatic)."""
+    try:
+        data = await request.json()
+        body = AccountBody(**data) if isinstance(data, dict) else None
+    except (ValueError, ValidationError, TypeError):
+        body = None
+    if body is None:
+        raise api.Refusal(422, "invalid", api.BAD_BODY)
+    try:
+        return drive.choose_account(body.account)
+    except drive.DriveError as exc:
+        raise _refusal(exc) from exc
+
+
 @router.get("/drive/files", dependencies=[Depends(native_only)])
 @api._answer
 async def drive_files(request: Request):

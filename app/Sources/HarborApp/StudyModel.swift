@@ -56,6 +56,9 @@ final class StudyModel: ObservableObject {
     @Published private(set) var addingFile: String?
     /// A failed add, shown inside the picker.
     @Published var driveNotice: String?
+    /// The Google account Drive is read with, and every account that could be.
+    @Published private(set) var driveAccount: String?
+    @Published private(set) var driveAccounts: [String] = []
     /// Counts list requests, so a slow answer to an older search is dropped.
     private var driveRequest = 0
 
@@ -252,6 +255,8 @@ final class StudyModel: ObservableObject {
                 drivePhase = .failed(StudyText.problem(code: ""))
                 return nil
             }
+            driveAccount = status.account
+            driveAccounts = status.accounts
             return status
         case .failed(let status, let data):
             drivePhase = status == 404 && (try? JSONDecoder().decode(StudyErrorReply.self, from: data))?.code == nil
@@ -275,6 +280,29 @@ final class StudyModel: ObservableObject {
             return
         }
         await driveFiles(query: driveQuery)
+    }
+
+    /// Chooses the Google account Drive is read with (nil: automatic), then lists again.
+    func chooseDriveAccount(_ account: String?) async {
+        guard account != driveAccount else { return }
+        struct Body: Encodable { let account: String? 
+            func encode(to encoder: Encoder) throws {
+                var c = encoder.container(keyedBy: CodingKeys.self)
+                try c.encode(account, forKey: .account)
+            }
+            enum CodingKeys: String, CodingKey { case account }
+        }
+        guard let data = try? JSONEncoder().encode(Body(account: account)) else { return }
+        driveNotice = nil
+        switch await call(makeRequest("POST", "study/drive/account", body: data)) {
+        case .ok:
+            driveList = []
+            await openDrive()
+        case .failed(let status, let reply):
+            driveNotice = Self.problem(status: status, data: reply)
+        case .offline:
+            driveNotice = StudyText.problem(code: "offline")
+        }
     }
 
     func closeDrive() {
@@ -530,6 +558,33 @@ final class StudyModel: ObservableObject {
         let request = makeRequest("POST", "study/sample", body: Data("{}".utf8))
         guard let next = await send(request, as: StudyState.self) else { return }
         state = next
+        watchDecks()
+    }
+
+    // MARK: Decks still being read
+
+    private var deckWatch: Task<Void, Never>?
+    /// How often a deck still reading is looked at again, and how many looks
+    /// before giving up (the service itself fails a stale read).
+    static let deckWatchInterval: UInt64 = 4_000_000_000
+    static let deckWatchLooks = 150
+
+    /// While any source's deck shows "reading", looks at the state again every
+    /// few seconds so the row shows the real status without a manual refresh.
+    func watchDecks() {
+        guard deckWatch == nil, state?.sources.contains(where: { $0.deckState == .reading }) == true else { return }
+        deckWatch = Task { [weak self] in
+            var looks = 0
+            while !Task.isCancelled, looks < Self.deckWatchLooks {
+                try? await Task.sleep(nanoseconds: Self.deckWatchInterval)
+                guard let self, !Task.isCancelled else { return }
+                looks += 1
+                let request = self.makeRequest("GET", "study/state")
+                if let next = await self.send(request, as: StudyState.self) { self.state = next }
+                if self.state?.sources.contains(where: { $0.deckState == .reading }) != true { break }
+            }
+            self?.deckWatch = nil
+        }
     }
 
     func clearAll() async {

@@ -56,7 +56,9 @@ def store(tmp_path):
 def test_off_until_a_yes_and_the_yes_is_dated(setting):
     assert acting.state() == {"enabled": False, "enabled_at": None, "asked": False,
                               "does": acting.DOES, "never": acting.NEVER, "scope": acting.SCOPE,
-                              "agreed": [], "new": []}
+                              "agreed": [], "new": [],
+                              "kinds": {"add": {"on": False, "ask": True}, "hold": {"on": False, "ask": True},
+                                        "follow_up": {"on": False, "ask": True}}}
     assert "after you say yes" in acting.SCOPE and "already there" in acting.SCOPE
     assert acting.DOES and "never sends" in acting.NEVER
     assert not acting.allows(NOW, "add") and acting.still_ok("add") == "Acting for you was turned off"
@@ -326,36 +328,156 @@ def test_a_module_can_read_its_own_records_and_count(setting, store):
     assert store.auto_added()["h-1"]["status"] == "added"
 
 
-def test_the_brief_always_shows_the_feature_in_each_of_its_three_states(setting):
-    """Never answered: the question. "Not now": one line with Turn on. On: one line with today's
-    count. The app must load the state on a view that always exists (a .task on the question card
-    itself never ran, because that view is empty until the state is loaded)."""
+def test_the_brief_no_longer_shows_the_big_card(setting):
+    """The Brief never asks "Let Harbor act for you?" any more: the row and its card are gone, and the
+    gate's state is still loaded on a view that always exists. The question is one short line on the
+    card of an action Harbor could have done itself (ActForConsent)."""
     import re
     from pathlib import Path
     app = Path(__file__).resolve().parents[1] / "app" / "Sources" / "HarborApp"
     strip = lambda text: "\n".join(line.split("//", 1)[0] for line in text.splitlines())   # noqa: E731
     cards, act = strip((app / "ProactiveCards.swift").read_text()), strip((app / "ActForMe.swift").read_text())
+    assert "ActForMeBriefRow" not in cards and "ActForMeBriefRow" not in act
+    assert "ActForMeAskCard" not in cards and "briefTurnOn" not in cards + act and "briefOff" not in cards + act
     brief = cards[cards.index("func beforeYouAsk("):cards.index("private func otherCards(")]
-    assert "ActForMeBriefRow()" in brief and "ActForMeAskCard" not in brief
     assert re.search(r"\.task\(id: shown\.cards\.map\(\\\.id\)\) \{ await ActForMeModel\.shared\.refresh\(\) \}", brief)
-    row = act[act.index("struct ActForMeBriefRow: View"):]
-    never, off, on = row.index("if !state.asked {"), row.index("} else if !state.enabled {"), row.index("line(state.briefOn)")
-    assert never < off < on
-    assert "ActForMeAskCard(place: .brief)" in row[never:off]                       # the question itself
-    assert "line(ActForMe.briefOff)" in row[off:on] and "Button(ActForMe.briefTurnOn) { asking = true }" in row[off:on]
-    assert "ActForMeAskCard(place: .brief, forced: true" in row[off:on]              # Turn on opens the same question
-    assert "model.set(" not in row                                                   # the row itself never says yes
-    assert 'static let briefOff = "Let Harbor act for me is off"' in act and 'static let briefTurnOn = "Turn on"' in act
     assert '"Harbor is acting for you · \\(today) today"' in act and "perDay" not in act
-    # The service gives the three states and the count.
+    # The full explanatory list stays in Settings.
+    assert "ActForMeSettingsRow" in act and "state.consent" in act or "model.state?.consent" in act
+    # The service still gives the states and the count.
     client = _client()
-    assert client.get("/assistant/proactive/act").json()["asked"] is False           # never answered
+    assert client.get("/assistant/proactive/act").json()["asked"] is False
     acting.mark_asked()
     state = client.get("/assistant/proactive/act").json()
-    assert state["asked"] is True and state["enabled"] is False                      # "Not now"
+    assert state["asked"] is True and state["enabled"] is False
     acting.set_enabled(True, now=NOW)
     state = client.get("/assistant/proactive/act").json()
-    assert state["asked"] is True and state["enabled"] is True and state["today"] == 0  and "per_day" not in state
+    assert state["asked"] is True and state["enabled"] is True and state["today"] == 0 and "per_day" not in state
+
+
+def _swift():
+    from pathlib import Path
+    app = Path(__file__).resolve().parents[1] / "app" / "Sources" / "HarborApp"
+    strip = lambda text: "\n".join(line.split("//", 1)[0] for line in text.splitlines())   # noqa: E731
+    return strip((app / "ProactiveCards.swift").read_text()), strip((app / "ActForMe.swift").read_text())
+
+
+def test_the_question_appears_only_after_a_successful_tapped_action_of_that_kind(setting):
+    cards, act = _swift()
+    # It is asked from fire(), after the service said the action succeeded and nothing was handed back.
+    fire = cards[cards.index("func fire(_ card: ProactiveCard"):cards.index("func answerConsent(")]
+    ok, handed, ask = fire.index("guard outcome.ok else"), fire.index("guard !handedBack else { return }"), \
+        fire.index("ActForConsent.kindToAsk(")
+    assert ok < handed < ask
+    assert fire.count("ActForConsent.kindToAsk(") == 1 and "catch {" in fire and fire.index("catch {") > ask
+    # One kind per kind of tapped action; a reply or a read is never one.
+    kind = act[act.index("static func kind(method: String"):act.index("static func kindToAsk")]
+    assert 'case "block_time", "add_to_day": return .hold' in kind and 'case "calendar_event": return .add' in kind
+    assert '"reminder"' in kind and "followUp" in kind and "default: return nil" in kind
+    assert "email_reply" not in kind and "text_reply" not in kind and '"read"' not in kind
+    # The service decides whether to ask; the app never asks a kind that is on or put aside.
+    assert "!row.on, row.ask" in act and "model.refresh()" in act
+    # Both card shapes show the one line, and nothing else does.
+    assert cards.count("consentLine(card, kind)") == 2 and cards.count("ActForConsentLine(") == 1
+    # The exact copy: short, plain, no list.
+    for text in ("Done. Want Harbor to add things like this on its own next time?",
+                 "Done. Want Harbor to hold time like this on its own next time?",
+                 "Done. Want Harbor to set reply reminders like this on its own next time?"):
+        assert f'"{text}"' in act
+    assert 'static let yes = "Yes"' in act and 'static let notNow = "Not now"' in act
+    # The state of the question stays app-side only until answered; the yes is the person's tap.
+    ans = cards[cards.index("func answerConsent("):cards.index("func dismiss(")]
+    assert "setKind(kind.rawValue, on: yes)" in ans
+    model = act[act.index("func setKind("):act.index("func putAside()")]
+    assert '"/kind"' in model and "set(true" not in model
+
+
+def test_a_yes_turns_on_only_that_kind(setting):
+    client = _client()
+    assert not acting.enabled()
+    reply = client.put("/assistant/proactive/act/kind", json={"kind": "hold"}).json()
+    assert reply["enabled"] is True
+    assert acting.enabled("hold") and not acting.enabled("add") and not acting.enabled("add_more")
+    assert not acting.enabled("follow_up")
+    assert reply["kinds"]["hold"] == {"on": True, "ask": False}
+    assert reply["kinds"]["add"] == {"on": False, "ask": True}
+    assert read(setting)["covers"].keys() == {"hold"}
+    # Another kind adds to it; the add kind names both of its keys and nothing else.
+    acting.set_kind("add", now=NOW + 10)
+    assert acting.enabled("add") and acting.enabled("add_more") and acting.enabled("hold")
+    assert not acting.enabled("follow_up")
+    assert read(setting)["covers"].keys() == {"hold", "add", "add_more"}
+    assert acting.pending() == ["follow_up"]
+    # Only later messages count, per action, and the safety rules are untouched.
+    assert not acting.allows(NOW - 1, "add") and acting.allows(NOW + 11, "add")
+    assert acting.still_ok("follow_up") is not None
+    # Off is the master: it clears every kind at once.
+    acting.set_enabled(False)
+    assert not any(acting.enabled(key) for key in acting.ACTIONS)
+    assert all(not row["on"] for row in acting.state()["kinds"].values())
+    # An unknown kind turns nothing on.
+    assert client.put("/assistant/proactive/act/kind", json={"kind": "everything"}).status_code == 422
+    assert not acting.enabled()
+
+
+def test_a_kind_yes_needs_the_app_and_a_failed_save_leaves_it_off(setting, monkeypatch):
+    from service.proactive import api
+    from fastapi import HTTPException
+
+    def refuse(request):
+        raise HTTPException(403, "Only the Harbor app can turn this on.")
+    monkeypatch.setattr(api, "_require_app", refuse)
+    client = _client()
+    assert client.put("/assistant/proactive/act/kind", json={"kind": "hold"}).status_code == 403
+    assert not acting.enabled()
+    # "Not now" turns nothing on and needs no proof.
+    assert client.put("/assistant/proactive/act/kind", json={"kind": "hold", "enabled": False}).status_code == 200
+    assert not acting.enabled() and not setting.exists()
+    monkeypatch.setattr(api, "_require_app", lambda request: None)
+    monkeypatch.setattr(acting, "_write", _refuse)
+    assert client.put("/assistant/proactive/act/kind", json={"kind": "hold"}).status_code == 409
+    assert not acting.enabled()
+
+
+def test_not_now_holds_that_kind_for_a_week_and_only_that_kind(setting):
+    client = _client()
+    client.put("/assistant/proactive/act/kind", json={"kind": "hold", "enabled": False})
+    assert not setting.exists()                                      # the gate's own file is untouched
+    assert acting.should_ask("hold", now=time_now()) is False
+    assert acting.should_ask("add", now=time_now()) and acting.should_ask("follow_up", now=time_now())
+    said = read(notes(setting))["kind_aside"]["hold"]
+    assert acting.should_ask("hold", now=said + acting.KIND_ASIDE_S - 1) is False
+    assert acting.should_ask("hold", now=said + acting.KIND_ASIDE_S + 1) is True
+    assert acting.KIND_ASIDE_S >= 7 * acting.DAY_S
+    # Putting the old question aside keeps it; so does the master "Not now".
+    acting.mark_asked()
+    assert "hold" in read(notes(setting))["kind_aside"]
+    # The state tells the app.
+    assert client.get("/assistant/proactive/act").json()["kinds"]["hold"]["ask"] is False
+    # A yes still works after a "Not now" (the person can say it later, in Settings or here).
+    acting.set_kind("hold", now=NOW)
+    assert acting.enabled("hold") and acting.should_ask("hold") is False
+
+
+def time_now():
+    import time
+    return time.time()
+
+
+def test_a_kind_that_is_already_on_never_asks(setting):
+    # An existing master yes names every action: every kind is on, nothing asks, nothing is written.
+    acting.set_enabled(True, now=NOW)
+    before = setting.read_bytes()
+    kinds = acting.state()["kinds"]
+    assert all(row == {"on": True, "ask": False} for row in kinds.values())
+    assert not any(acting.should_ask(kind) for kind in acting.KIND_KEYS)
+    acting.set_kind("hold", now=NOW + 5)                             # a yes that changes nothing writes nothing
+    assert setting.read_bytes() == before
+    # A yes that named fewer actions (an older file) keeps asking about the rest.
+    _write(setting, enabled=True, enabled_at=NOW, asked=True, covers={"add": NOW})
+    assert acting.kind_on("hold") is False and acting.should_ask("hold")
+    assert acting.kind_on("add") is False                            # add_more was never named
+    assert acting.should_ask("add")
 
 
 def test_todays_count_is_what_counts_toward_the_limit(setting, store, monkeypatch):

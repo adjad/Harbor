@@ -8,7 +8,7 @@ import Foundation
 /// The steps of the one onboarding window, in order. The raw value is what is
 /// saved under FirstRunSetup.stepKey, so a quit comes back to the same step.
 enum OnboardingStep: Int, CaseIterable, Equatable {
-    case brain, permissions, google, knowYou, customize, tour
+    case brain, permissions, google, knowYou, customize, tour, access
 
     var title: String {
         switch self {
@@ -18,6 +18,7 @@ enum OnboardingStep: Int, CaseIterable, Equatable {
         case .knowYou: return "About you"
         case .customize: return "You"
         case .tour: return "How to use"
+        case .access: return "Get more"
         }
     }
 

@@ -276,7 +276,8 @@ an `Origin`, 415 `{"detail": "Content-Type must be application/json."}` otherwis
 | `POST /study/connector` | `{"provider", "model_id"}` | `<state>.connector` |
 | `POST /study/generate` | `{"kind", "course_id"?, "assignment_id"?, "topic"?, "count"?, "source_ids"?: [str] (<= 20), "whole_course"?: bool}` | full material |
 | `DELETE /study/sources/{id}` | | `{"state": <state>}` |
-| `GET /study/drive/status` | | `{"connected": bool, "drive": bool, "account": str\|null, "message": str\|null}` |
+| `GET /study/drive/status` | | `{"connected": bool, "drive": bool, "account": str\|null, "accounts": [str], "message": str\|null}` |
+| `POST /study/drive/account` | `{"account": str\|null}` | the status above; 422 `invalid` unless the account is connected with Drive; null goes back to automatic |
 | `GET /study/drive/files?q=&limit=` | | `{"files": [{"id", "name", "kind": "doc"\|"slides", "modified": float\|null, "url": str\|null}]}` |
 | `POST /study/drive/add` | `{"file_id", "course_id"?}` | `{"source": <source summary>, "state": <state>}` |
 | `GET /study/materials/{id}` | | full material |
@@ -405,9 +406,11 @@ Study can add a Google Doc or Slides file as a source (kind `drive`), read-only,
 Google sign-in Harbor already has (Settings ▸ Google). No new sign-in or scope is asked for: the
 account needs `drive.readonly`, which the Workspace consent already requests.
 
-- Account: the first connected Google account whose sign-in granted `drive.readonly`
-  (preferring one whose sign-in has not expired). Study has no account picker, so the choice
-  follows the order the accounts were connected.
+- Account: the one the student chose in the Drive picker (saved in `study.db` meta
+  `drive_account`) while it is still connected with `drive.readonly`. Otherwise, or after
+  "Automatic", the first connected account whose sign-in granted `drive.readonly` (preferring
+  one whose sign-in has not expired), in the order the accounts were connected. The picker
+  only shows when two or more accounts have Drive.
 - Only `https://www.googleapis.com` is contacted (`service/study/drive.py`); every call has a
   10 s connect and 30 s total limit.
 - Listing (`GET /study/drive/files?q=&limit=`) asks for Docs and Slides that are not in the
@@ -418,7 +421,7 @@ account needs `drive.readonly`, which the Workspace consent already requests.
   The export is streamed and stops at `SOURCE_CHARS`; the rest is never downloaded.
 - The text is untrusted data: stored as-is and only ever placed inside generation's delimited
   data block. Tokens and document text are never logged.
-- `GET /study/drive/status` → `{connected, drive, account, message}`.
+- `GET /study/drive/status` → `{connected, drive, account, accounts, message}`.
 - Refusals: `google_missing` 409 (no account, no Drive scope, or an expired sign-in: reconnect
   Google in Settings), `google_error` 502 (Google unreachable, timed out, or the Drive API is
   off), `too_large` 413 (Google's export size limit), `not_found` 404 (file or course), and

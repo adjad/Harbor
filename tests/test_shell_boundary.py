@@ -12,6 +12,9 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 _scratch = tempfile.TemporaryDirectory(prefix="harbor-shell-boundary-")
+# Fixture files live beside HARBOR_HOME, never under it: where a sandbox can be applied the shell
+# write guard protects HARBOR_HOME, so a marker written there is (correctly) refused.
+_fixtures = tempfile.TemporaryDirectory(prefix="harbor-shell-fixtures-")
 os.environ["HARBOR_HOME"] = _scratch.name
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -21,9 +24,7 @@ from service.tools import builtin  # noqa: E402
 
 class ShellBoundary(unittest.TestCase):
     def setUp(self):
-        # Outside HARBOR_HOME (_scratch): run_shell's sandbox denies writes under it, so a
-        # marker written there would be refused wherever sandbox-exec can be applied.
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="harbor-shell-fixture-")))
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory(dir=_fixtures.name)))
         self.enterContext(patch.object(Path, "home", return_value=self.root))
         self.enterContext(patch.object(policy, "_READ_ONLY", True))
         self.enterContext(patch.object(policy, "_FULL_ACCESS", False))

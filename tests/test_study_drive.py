@@ -96,7 +96,7 @@ def google(tmp_path, monkeypatch):
 
     store = FakeStore(StudyStore(tmp_path / "study" / "study.db"))
     g.store = store
-    for module in (api, drive_api):
+    for module in (api, drive_api, drive):
         monkeypatch.setattr(module, "study_store", lambda: store)
         monkeypatch.setattr(module, "study_exists", lambda: True)
 
@@ -124,7 +124,8 @@ def add(client, **body):
 def test_status_without_an_account(client, google):
     google.accounts = {}
     got = client.get("/study/drive/status").json()
-    assert got == {"connected": False, "drive": False, "account": None, "message": drive.NOT_CONNECTED}
+    assert got == {"connected": False, "drive": False, "account": None, "accounts": [],
+                   "message": drive.NOT_CONNECTED}
 
 
 def test_status_without_the_drive_scope(client, google):
@@ -141,7 +142,47 @@ def test_status_picks_the_first_account_with_drive(client, google):
         "school@example.com": {"refresh_token": "r", "client_id": "c", "scopes": [DRIVE]},
     }
     got = client.get("/study/drive/status").json()
-    assert got == {"connected": True, "drive": True, "account": "school@example.com", "message": None}
+    assert got == {"connected": True, "drive": True, "account": "school@example.com",
+                   "accounts": ["expired@example.com", "school@example.com"], "message": None}
+
+
+def _two_accounts(google):
+    google.accounts = {
+        "first@example.com": {"refresh_token": "r", "client_id": "c", "scopes": [DRIVE]},
+        "second@example.com": {"refresh_token": "r", "client_id": "c", "scopes": [DRIVE]},
+        "mail-only@example.com": {"refresh_token": "r", "client_id": "c", "scopes": [gmail_source.SCOPE]},
+    }
+
+
+def test_a_chosen_account_is_the_one_drive_uses(client, google):
+    _two_accounts(google)
+    assert client.get("/study/drive/status").json()["account"] == "first@example.com"
+    got = client.post("/study/drive/account", json={"account": "second@example.com"})
+    assert got.status_code == 200 and got.json()["account"] == "second@example.com"
+    assert client.get("/study/drive/status").json()["account"] == "second@example.com"
+    google.files = []
+    assert client.get("/study/drive/files").status_code == 200
+    assert google.bound == "second@example.com"
+
+
+def test_only_a_connected_account_with_drive_can_be_chosen(client, google):
+    _two_accounts(google)
+    for bad in ("mail-only@example.com", "stranger@example.com", ""):
+        got = client.post("/study/drive/account", json={"account": bad})
+        assert got.status_code == 422 and got.json()["detail"] == "invalid"
+    assert client.post("/study/drive/account", json={"account": 5}).status_code == 422
+    assert client.get("/study/drive/status").json()["account"] == "first@example.com"
+
+
+def test_a_chosen_account_that_disconnects_falls_back_and_null_clears(client, google):
+    _two_accounts(google)
+    client.post("/study/drive/account", json={"account": "second@example.com"})
+    del google.accounts["second@example.com"]
+    assert client.get("/study/drive/status").json()["account"] == "first@example.com"
+    _two_accounts(google)
+    assert client.get("/study/drive/status").json()["account"] == "second@example.com"
+    client.post("/study/drive/account", json={"account": None})
+    assert client.get("/study/drive/status").json()["account"] == "first@example.com"
 
 
 # --- listing -------------------------------------------------------------------------

@@ -185,6 +185,7 @@ class SessionStore:
         self._db.commit()
         self._lock = threading.Lock()
         self._clear_guard = threading.Lock()   # one clear_old_text at a time
+        self._expire_stale_send_blocks()
 
     # --- one-time rebuild ---------------------------------------------------
     def old_text_cleared(self) -> bool:
@@ -869,6 +870,28 @@ class SessionStore:
                 self._db.rollback()
                 raise
         return bool(changed)
+
+    # An unproven text held its chat until the user attested. Builds before the
+    # Not Delivered receipt left a text Messages had marked failed in that state
+    # for good, so the chat stayed blocked. After this long the hold is lifted
+    # for send_message only; nothing is resent, and the claim stays consumed.
+    STALE_SEND_BLOCK_SECONDS = 24 * 3600
+
+    def _expire_stale_send_blocks(self) -> int:
+        """Lift old send_message holds (idempotent; runs when the store opens)."""
+        try:
+            with self._lock:
+                changed = self._db.execute(
+                    "UPDATE workflows SET status='completed', "
+                    "state_json=json_set(state_json,'$.status','expired'), updated_at=? "
+                    "WHERE kind='model_led_effect' AND status IN ('running','uncertain') "
+                    "AND json_extract(state_json,'$.tool')='send_message' AND updated_at<?",
+                    (time.time(), time.time() - self.STALE_SEND_BLOCK_SECONDS)).rowcount
+                self._db.commit()
+            return int(changed)
+        except sqlite3.OperationalError:
+            # Read-only inspection process: the owning service applies it.
+            return 0
 
     def resolve_model_effects(self, sid: str, effect_id: str | None = None) -> int:
         """User attests they checked the destination of unverified model effects.

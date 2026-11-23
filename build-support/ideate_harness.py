@@ -278,6 +278,15 @@ def _thin_node(source: Path, dest: Path, runner=None) -> None:
     dest.chmod(0o755)
 
 
+def _count_package_licenses(pi: Path) -> int:
+    count = 0
+    for path in (pi / "node_modules").rglob("*"):
+        if path.is_file() and not path.is_symlink() and path.name.upper().split(".")[0] in (
+                "LICENSE", "LICENCE", "COPYING", "NOTICE"):
+            count += 1
+    return count
+
+
 def stage(bundle: Path, source: Path, node: Path | None = None, *, release: bool = False,
           lock: dict | None = None) -> dict:
     """Copy the pruned Pi release and Node into the bundle; return the build-info record."""
@@ -322,6 +331,7 @@ def stage(bundle: Path, source: Path, node: Path | None = None, *, release: bool
         raise HarnessError("The Pi harness or Node does not match build-support/ideate-harness.lock.json")
     record = {"harness": "pi", "version": version, "manifest_sha256": digest, "entries": entries,
               "node_version": nversion, "node_sha256": node_sha, "node_license": node_license_state,
+              "package_licenses": _count_package_licenses(target / "pi"),
               "pinned": pinned, "path": BUNDLE_DIR}
     (target / "HARNESS.json").write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
     return record
@@ -351,6 +361,21 @@ def validate(bundle: Path, record) -> None:
     if not (target / "LICENSES" / "Pi-MIT.txt").is_file() or not (
             (target / "LICENSES" / "Node-LICENSE").is_file() or (target / "LICENSES" / "Node-NOTICE.txt").is_file()):
         raise HarnessError("Bundled Ideate harness is missing its licence texts")
+    state = record.get("node_license")
+    if state == "copied":
+        node_text = target / "LICENSES" / "Node-LICENSE"
+        if not node_text.is_file() or not node_text.read_text(errors="replace").strip():
+            raise HarnessError("Bundled Node's LICENSE is missing or empty")
+    elif state == "reference":
+        if not (target / "LICENSES" / "Node-NOTICE.txt").is_file():
+            raise HarnessError("Bundled Node has neither its LICENSE nor a licence notice")
+    else:
+        raise HarnessError("Bundled Ideate harness does not record how Node's licence is carried")
+    if not (target / "pi" / "package.json").is_file():
+        raise HarnessError("Bundled Pi has no package.json to name its licence")
+    # The npm packages' own licence files are counted at staging; losing one is a failure.
+    if record.get("package_licenses") != _count_package_licenses(target / "pi"):
+        raise HarnessError("Bundled npm package licence files differ from those recorded at staging")
     root = target.resolve()
     for path in target.rglob("*"):
         if path.is_symlink():

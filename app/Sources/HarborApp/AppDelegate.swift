@@ -146,6 +146,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // which only tracks bar-vs-expanded WHILE docked.
     private var notchDocked = true
     private var calendarReader: CalendarReader?
+    /// Day's blocks written to the calendar the person chose, when they said yes (DayCalendarWriter).
+    private var dayCalendarSync: AnyCancellable?
     private var remindersWriter: RemindersWriter?
     private var mailReader: MailReader?
     private var mailMemoryReader: MailMemoryReader?
@@ -299,6 +301,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             terminateWithoutShutdown()
             return
         }
+        // One-time fresh start for this release (FreshStart): settings back to a first run,
+        // everything moved to a backup first. Before the service starts and before any setting
+        // is read; it never throws and records that it ran before touching anything.
+        #if !HARBOR_NOTCH_QA
+        if FreshStart.run().ran {
+            // The model read Debug Mode before the defaults were cleared.
+            if model.debugMode { model.debugMode = false }
+        }
+        #endif
         // A committed /resetharbor (its marker is on disk): this app's part runs once
         // per marker, before any setting is read, so this launch is a first run.
         var resetPending = false
@@ -2383,6 +2394,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if calendarReader == nil {
             calendarReader = CalendarReader()
             calendarReader?.start()
+            DayCalendarWriter.shared.didWrite = { [weak self] in self?.calendarReader?.sync() }
+            dayCalendarSync = DayCalendarWriter.shared.attach(to: todayModel)
         }
         if mailReader == nil {
             mailReader = MailReader()

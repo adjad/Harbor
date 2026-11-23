@@ -21,5 +21,6 @@ swiftc -parse-as-library -swift-version 5 -target "$(uname -m)-apple-macosx14.0"
     "${sources[@]}" \
     "$project_root/tests/FirstRunSetupChecks.swift" \
     "$project_root/tests/HarborResetChecks.swift" \
+    "$project_root/tests/FreshStartChecks.swift" \
     -lsqlite3 -o "$scratch/first-run-checks"
 "$scratch/first-run-checks"

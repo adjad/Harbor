@@ -1,7 +1,7 @@
 """The fake Swift app's other half: consumes GET /assistant/events (SSE) from
 the sandbox backend and acts on it exactly like app/Sources/HarborApp's
 OverlayModel.handleAssistantEvent + OutboundSender would — mutating the
-sandbox world and, for the seven actions the backend actually waits on,
+sandbox world and, for the actions the backend actually waits on (RESULT_ACTIONS),
 POSTing the result back to /assistant/action_result.
 
 Pinned against source (service/main.py, service/assistant/outbox.py,
@@ -24,7 +24,8 @@ from sandbox import inject
 from sandbox.world import World
 
 RESULT_ACTIONS = {"send_message", "send_email", "reply_to_email", "draft_email",
-                  "draft_message", "mark_email_read", "archive_email", "prepare_email_reply"}
+                  "draft_message", "mark_email_read", "archive_email", "prepare_email_reply",
+                  "forward_email"}
 FIRE_AND_FORGET = {"create_calendar_event", "delete_calendar_event", "cancel_calendar_event",
                    "create_apple_reminder", "delete_apple_reminder", "sync_emails_now"}
 NOTIFY_ONLY = {"reminder", "scheduled_send_result", "scheduled_send_missed",
@@ -314,6 +315,43 @@ class OutboundConsumer:
             return {"email_headers", "email_raw"}
         await self.world.mutate(_do)
         return True, ""
+
+    async def _h_forward_email(self, ev: dict):
+        """As OutboundSender.forwardEmail: find the inbox message, forward it with
+        any note above the original, and answer with the receipt Mail's script
+        returns only after Mail accepted the send."""
+        message_id = str(ev.get("message_id") or "")
+        to = [str(a) for a in (ev.get("to") or []) if str(a).strip()]
+        note = str(ev.get("body") or "")
+        if not to:
+            return False, "forwardEmail needs at least one recipient", {}
+        original = next((e for e in self.world.state["emails"].values()
+                         if e["message_id"] == message_id and e["mailbox"] == "inbox"), None)
+        if original is None:
+            return False, ("couldn't find that message in the inbox — it may "
+                           "have been moved or is older than the synced window"), {}
+        identity = self.world.state["persona"]["identity_emails"]
+        sender = next((a for a in original["to"] + original["cc"] if a in identity),
+                      identity[0] if identity else "me@sandbox.harbor.test")
+        subject = original["subject"] if original["subject"].lower().startswith("fwd:") \
+            else "Fwd: " + original["subject"]
+        quoted = ("Begin forwarded message:\n\nFrom: " + original["from_addr"] + "\nSubject: "
+                  + original["subject"] + "\n\n" + original["body"])
+
+        async def _do(state: dict) -> set[str]:
+            eid = self.world.new_id("e")
+            state["emails"][eid] = {
+                "id": eid, "message_id": f"<{self.world.new_id('sent')}@sandbox.harbor.test>",
+                "account": original["account"], "ts_off": self.world.rel_ts(),
+                "from_name": "Me", "from_addr": sender, "to": to, "cc": [],
+                "subject": subject, "body": (note + "\n\n" + quoted) if note else quoted,
+                "unread": False, "mailbox": "sent", "deep": False, "in_reply_to": None,
+                "forwarded_from": message_id,
+            }
+            return set()
+        await self.world.mutate(_do)
+        return True, "", {"forward": {"message_id": message_id, "account": original["account"],
+                                      "from": sender, "to": to, "subject": subject}}
 
     # --- fire-and-forget ---------------------------------------------------
 

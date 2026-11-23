@@ -610,23 +610,30 @@ def test_the_cancel_card_shows_the_handle_once(monkeypatch):
     assert f"To: Ian ({PHONE})\n" in action_tools._cancel_scheduled_preview({"id": "fixture-id"})
 
 
-async def test_a_forward_receipt_names_the_matched_contact(contacts, app_bridge, monkeypatch):
-    # The bridge path, for when the Apple Mail forward is switched on.
-    monkeypatch.setattr(action_tools, "APPLE_MAIL_FORWARD_READY", True)
+async def test_a_forward_receipt_names_the_matched_contact(contacts, monkeypatch):
+    sent: list[tuple[str, dict]] = []
+
+    async def request(op, payload, **kwargs):
+        sent.append((op, payload))
+        # Mail's receipt names the email and the addresses it went to.
+        return {"ok": True, "status": "succeeded",
+                "forward": {"message_id": "<m1@example.com>", "account": "Work", "from": "me@example.com",
+                            "to": [BRIAN.upper(), "other.fixture@example.com"], "subject": "Fwd: Plans"}}
+    monkeypatch.setattr(action_tools, "app_request", request)
     receipt = await action_tools.forward_email("<m1@example.com>", "Ian, other.fixture@example.com")
     assert receipt == f"Forwarded to Brian Chen ({BRIAN}), other.fixture@example.com."
-    assert app_bridge[0][1]["to"] == [BRIAN, "other.fixture@example.com"]
+    assert sent[0][1]["to"] == [BRIAN, "other.fixture@example.com"]
 
 
-async def test_a_held_back_forward_says_nothing_was_sent_and_asks_nothing_of_the_app(contacts, app_bridge):
-    from service.tools.registry import REGISTRY, not_sent_receipt
-    assert action_tools.APPLE_MAIL_FORWARD_READY is False
+async def test_a_forward_without_mails_receipt_is_never_reported_forwarded(contacts, app_bridge):
+    from service.tools.registry import REGISTRY, classify_tool_outcome
     result = await action_tools.forward_email("<m1@example.com>", "Ian")
-    assert not app_bridge and not_sent_receipt(REGISTRY["forward_email"], result)
-    assert "NOT sent" in result and "new email" in result.question
-    # A recipient that cannot be resolved is still reported first.
+    assert app_bridge and classify_tool_outcome("forward_email", result).status == "unknown"
+    assert not str(result).startswith("Forwarded")
+    # A recipient that cannot be resolved is still reported first, before the app.
+    before = len(app_bridge)
     missing = await action_tools.forward_email("<m1@example.com>", "Nobody Atall")
-    assert not app_bridge and "new email" not in getattr(missing, "question", "")
+    assert len(app_bridge) == before and not str(missing).startswith("Forwarded")
 
 
 # ---- Through the real loop: the approved card is the one that names them ----
@@ -832,8 +839,7 @@ async def test_a_mac_with_no_sms_account_says_the_text_was_not_sent(contacts, mo
 
 
 # ---- What the person reads after a text (owner's request, 2026-11-15) ----
-# TEMPORARY: a text Messages marked Not Delivered shows only "Passed to Messages."
-# The model's history keeps the failure. Replace with the owner's wording.
+# A text Messages marked Not Delivered shows "Not delivered". The model's history keeps the full failure.
 
 def _delivery_turn(chat, extra):
     chat.bridge = lambda op, payload: {"ok": True, "status": "succeeded", **extra}
@@ -843,16 +849,16 @@ def _delivery_turn(chat, extra):
     return _text(chat.request("text phone only that I'm on my way", chat.sid))
 
 
-def test_a_text_messages_marked_not_delivered_shows_only_passed_to_messages(chat):
+def test_a_text_messages_marked_not_delivered_shows_not_delivered(chat):
     shown = _delivery_turn(chat, {"delivery": "failed", "delivery_service": "iMessage", "delivery_error": 22})
-    assert shown == action_tools.QUIET_NOT_DELIVERED == "Passed to Messages."
-    assert "5550100123" not in shown and "Sent" not in shown and "error" not in shown.lower()
+    assert shown == action_tools.QUIET_NOT_DELIVERED == "Not delivered"
+    assert "5550100123" not in shown and "Sent" not in shown
     assert len(chat.dispatched) == 1                              # sent once, never retried
     # The chat history the model reads next turn still says it failed.
     stored = chat.store.turns_from(chat.sid, 0)[-1]
     assert stored["role"] == "assistant"
     assert "Not Delivered" in stored["content"] and "did not return a verified success" in stored["content"]
-    assert chat.store.display_artifact(chat.sid, immediate=True).text == "Passed to Messages."
+    assert chat.store.display_artifact(chat.sid, immediate=True).text == "Not delivered"
 
 
 def test_a_text_messages_did_not_mark_failed_keeps_its_receipt(chat):
@@ -864,7 +870,7 @@ def test_a_text_messages_did_not_mark_failed_keeps_its_receipt(chat):
         assert "Not Delivered" not in stored and action_tools.QUIET_NOT_DELIVERED not in stored
 
 
-async def test_the_draft_card_shows_only_passed_to_messages_and_audits_the_failure(contacts, monkeypatch):
+async def test_the_draft_card_shows_not_delivered_and_audits_the_failure(contacts, monkeypatch):
     audited = []
     import importlib
     audit_module = importlib.import_module("service.safety.audit")
@@ -874,7 +880,7 @@ async def test_the_draft_card_shows_only_passed_to_messages_and_audits_the_failu
         return {"ok": True, "status": "succeeded", "delivery": "failed", "delivery_service": "iMessage"}
     monkeypatch.setattr(action_tools, "app_request", bridge)
     answer = await main.assistant_send_message_draft({"to": "+15550109999", "text": "Hi"})
-    assert answer == {"ok": False, "result": "Passed to Messages."}
+    assert answer == {"ok": False, "result": "Not delivered"}
     assert "Not Delivered" in audited[-1]["result"] and audited[-1]["ok"] is False
 
 
@@ -887,16 +893,15 @@ def test_the_stored_failure_text_goes_through_the_credential_scrub(chat, monkeyp
     assert chat.store.turns_from(chat.sid, 0)[-1]["content"].endswith(" [scrubbed]")
 
 
-def test_the_draft_cards_show_the_quiet_line_neutral_with_no_tick():
+def test_the_draft_cards_show_not_delivered_in_the_failure_style():
     from pathlib import Path
     root = Path(__file__).resolve().parents[1] / "app/Sources/HarborApp"
     client = (root / "HarborClient.swift").read_text(encoding="utf-8")
     assert f'static let quietNotDelivered = "{action_tools.QUIET_NOT_DELIVERED}"' in client
     notch = (root / "OverlayView.swift").read_text(encoding="utf-8")
     window = (root / "Chat/ChatViews.swift").read_text(encoding="utf-8")
-    assert "|| draft.status == HarborClient.quietNotDelivered)\n" in notch
+    assert "quietNotDelivered" not in notch and "quietNotDelivered" not in window
     assert "? Theme.textSecondary : Theme.bad)" in notch
-    assert "|| draft.status == HarborClient.quietNotDelivered\n" in window
     assert "? ChatTheme.text2 : ChatTheme.danger)" in window
     # The tick and "Message sent" still need ok, which the quiet answer never has.
     assert 'Image(systemName: draft.sent ? "checkmark.circle.fill" : "bubble.left")' in notch

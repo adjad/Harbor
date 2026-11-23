@@ -44,14 +44,25 @@ def test_not_found_text_matches_the_sandbox_mirror():
     assert declared in re.sub(r'"\s*\n\s*"', "", mirror)
 
 
-def test_forward_stays_held_back_until_it_is_checked_in_mail():
-    # The old lookup is kept for forward alone, so a forward still stops before
-    # Mail composes anything. Switch forward to the working lookup only after a
-    # real forward (with and without a note) has been checked in Mail, and
-    # update this test with it.
-    assert SENDER.count("unverifiedForwardLookup(") == 2        # its definition and one caller
-    assert "unverifiedForwardLookup(messageId)" in _function(SENDER, "forwardEmail")
-    assert "MailActionScript.findInboxMessage" not in _function(SENDER, "forwardEmail")
+def test_forward_finds_its_message_the_way_triage_does_and_checks_before_send():
+    # The old forward lookup asked for `inbox of acct`, which Mail's dictionary
+    # does not have, so a forward never found its message. It is gone.
+    assert "unverifiedForwardLookup" not in SENDER and "inbox of acct" not in SCRIPTS
+    script = _function(SCRIPTS, "forwardEmail")
+    assert script.index('set mbx to mailbox "INBOX" of acct') < script.index('set mbx to mailbox "Inbox" of acct')
+    assert script.index('error "\\(messageNotFound)"') < script.index("set fwd to forward theMsg")
+    guard = 'if (send) is not true then error "\\(sendNotAccepted)"'
+    for check in ("set visible of fwd to true", "set originalContent to (content of fwd)",
+                  "\\(forwardLostOriginal)", "\\(forwardRecipientsChanged)", "\\(forwardIdentityChanged)",
+                  "close fwd saving no", "set receipt to {"):
+        assert script.index(check) < script.index(guard), check
+    assert script.index(guard) < script.index("return receipt")
+    body = _function(SENDER, "forwardEmail")
+    assert "MailActionScript.forwardEmail(messageID: messageId, to: to, note: body)" in body
+    assert "MailActionScript.decodeForward(out)" in body
+    assert 'extra: ["forward": receipt]' in body
+    # Only a decoded receipt is a success.
+    assert body.index("decodeForward") < body.index("ok: true")
 
 
 def test_send_and_forward_treat_a_false_answer_from_mail_as_a_failure():
@@ -81,7 +92,7 @@ def test_only_the_automation_refusal_carries_the_fixed_code():
     from service.assistant import outbox
     assert f'code == -1743 ? ["refusal": "{outbox._AUTOMATION_DENIED}"] : [:]' in SENDER
     assert SENDER.count('"refusal"') == 1
-    for name in ("sendEmail", "sendMessage", "run", "runReply"):
+    for name in ("sendEmail", "sendMessage", "run", "runReply", "forwardEmail"):
         body = _function(SENDER, name)
         assert "extra: refusal(code)" in body, name
         assert "NSAppleScript.errorNumber] as? Int ?? 0" in body, name

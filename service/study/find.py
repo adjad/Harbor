@@ -596,6 +596,7 @@ async def add(store, course: dict, items: list[dict]) -> dict:
         added_ids.append(summary["id"])
         if read_kind:
             store.set_deck_status(summary["id"], "reading")
+            _reading.add(summary["id"])
             to_read.append((summary["id"], got["file_id"], read_kind))
     if added_ids:
         schedule(store, course, added_ids, to_read)
@@ -610,6 +611,22 @@ async def add(store, course: dict, items: list[dict]) -> dict:
 _pending: list[tuple] = []
 _running = False
 _tasks: set = set()
+_reading: set[str] = set()      # sources a worker is, or is about to be, reading
+
+
+STALE_READ = "Harbor stopped reading this deck. Try again."
+
+
+def reconcile(store) -> int:
+    """A source left "reading" with no worker for it (a cancelled run, a lost queue) shows
+    "failed" so the app stops saying "Reading slides…" and offers Try again. Returns how many."""
+    fixed = 0
+    for source in store.sources():
+        if source.get("deck_status") == "reading" and source["id"] not in _reading:
+            store.set_deck_status(source["id"], "failed")
+            store.set_deck_error(source["id"], STALE_READ)
+            fixed += 1
+    return fixed
 
 
 def _spawn(coro) -> None:
@@ -647,6 +664,13 @@ async def work(store, course: dict, source_ids: list[str], to_read: list[tuple[s
         except Exception:  # noqa: BLE001
             log.info("Study find: page reading failed")
             store.set_deck_status(source_id, "failed")
+        except BaseException:      # cancelled: never leave the rest "reading"
+            for sid, _f, _k in to_read:
+                _reading.discard(sid)
+            reconcile(store)
+            raise
+        finally:
+            _reading.discard(source_id)
     try:
         await label(store, course, source_ids)
     except Exception:  # noqa: BLE001 — labels are optional; failure leaves them null

@@ -659,6 +659,8 @@ from service.assistant.email_reply_api import router as email_reply_router
 app.include_router(email_reply_router)
 from service.assistant.hours_api import router as hours_router
 app.include_router(hours_router)
+from service.assistant.ask_suggestions import router as ask_suggestions_router
+app.include_router(ask_suggestions_router)
 from service.proactive.api import router as proactive_router
 app.include_router(proactive_router)
 from service.study.api import router as study_router
@@ -4189,6 +4191,13 @@ async def assistant_sync_calendar(body: dict[str, Any]) -> dict[str, Any]:
         assistant_scheduler.record_sync(source, 0, diagnostics=diagnostics)
         return {"ok": True, "synced": 0}
     events = body.get("events") or []
+    if source == "calendar":
+        # The events Harbor wrote for Day's blocks are not meetings: Day shows the block itself.
+        # The app lists them apart; one that still arrives marked is dropped here.
+        from service.assistant import harbor_events
+        if "harbor_events" in body:
+            harbor_events.record(body.get("harbor_events"))
+        events = [e for e in events if isinstance(e, dict) and not harbor_events.is_marked(e)]
     items = []
     for e in events:
         if e.get("when_ts") is None:

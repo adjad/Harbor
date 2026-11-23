@@ -101,11 +101,17 @@ extension StudyFindTarget {
     static func canvasLinks(for course: StudyCourse, in state: StudyState) -> [String] {
         guard course.url.flatMap(courseRef) == nil else { return [] }
         let known = Set(state.courses.compactMap { $0.url.flatMap(courseRef)?.host })
-        return state.assignments(in: course).compactMap(\.url).filter { raw in
+        var links = state.assignments(in: course).compactMap(\.url).filter { raw in
             guard let host = courseRef(raw)?.host else { return false }
             return known.contains(host) || host.hasSuffix(".instructure.com")
                 || host.split(separator: ".").contains("canvas")
         }
+        // No link of its own: the course number is in its id and the school's
+        // Canvas site is the one its other courses already name.
+        if links.isEmpty, let derived = derivedCourseURL(courseID: course.id, knownHosts: Array(known)) {
+            links.append(derived)
+        }
+        return links
     }
 }
 

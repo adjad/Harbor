@@ -1210,3 +1210,20 @@ def test_day_correction_ignores_each_inference_kind_by_stable_pattern_id(ignored
     result = run(windows=[busy("busy", start=at(14), end=at(16)), away(start=at(18), end=at(19))],
         ignored_windows=[ignored])
     assert [b["pattern_id"] for b in result["proposed_plan"]["blocks"] if b["kind"] in ("behavior", "behavior_away")] == [remaining]
+
+
+def test_a_due_reminder_already_planned_as_a_task_is_one_plan_block():
+    # The Day tab draws the reminder once, as that plan block (NotchDay.build drops the
+    # all-day due row); the service must send exactly one block for it, never a second
+    # suggested block, while the attention items that name it stay for Needs you.
+    s = state()
+    s["tasks"] = [authored_task(30, id="renew", title="Streaming plan renews", due_ts=at(23, 59))]
+    rows = [dict(id="r1", title="Streaming plan renews", due_ts=at(23, 59), all_day=True)]
+    plan = assess(DAY, ZONE, s, evidence(reminders=rows), now=NOW)["proposed_plan"]
+    named = [b for b in plan["blocks"] if b["title"] == "Streaming plan renews"]
+    assert [(b["kind"], b.get("task_id")) for b in named] == [("task", "renew")]
+    assert not any(b["kind"] == "suggestion" and b.get("evidence_id") for b in plan["blocks"]
+                   if b["title"] == "Streaming plan renews")
+    attention = assess(DAY, ZONE, s, evidence(reminders=rows), now=NOW)["attention"]
+    # The reminder and the task's own twin are both attention items; the day shows them as the one block.
+    assert sorted(a["source"] for a in attention if a["title"] == "Streaming plan renews") == ["reminders", "harbor"]

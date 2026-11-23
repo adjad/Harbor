@@ -275,48 +275,6 @@ enum OutboundSender {
              extra: parse?(out.stringValue ?? "") ?? [:])
     }
 
-    // Locates a message by its RFC Message-ID across every account's inbox.
-    // Mail has no "message whose message id is X" lookup that spans accounts,
-    // so this walks them. `message id` is the only stable handle — index
-    // position shifts every time mail arrives (see MailReader.rawScript).
-    // Mark read, flag and archive use MailActionScript.findInboxMessage, which
-    // names the inbox the way MailReader does.
-    //
-    // FORWARD ONLY, and held back on purpose. `inbox of acct` is not in Mail's
-    // dictionary for an account, so this lookup finds nothing and a forward
-    // stops before Mail composes anything. The forward script below has never
-    // sent a real email: it reads the new message's content before setting
-    // it, which the reply script found can come back empty, so a note could go
-    // out without the original under it. Move forwardEmail to
-    // MailActionScript.findInboxMessage only after a forward to the owner's
-    // own address, with and without a note, has been checked in Mail.
-    private static func unverifiedForwardLookup(_ messageId: String, account: String = "") -> String {
-        let accountList = account.isEmpty
-            ? "accounts"
-            : "(every account whose name is \"\(escape(account))\")"
-        return """
-            set theMsg to missing value
-            set theAcct to ""
-            repeat with acct in \(accountList)
-                if theMsg is missing value then
-                    try
-                        repeat with mbx in {inbox of acct}
-                            try
-                                set hits to (every message of mbx whose message id is "\(escape(messageId))")
-                                if (count of hits) > 0 then
-                                    set theMsg to item 1 of hits
-                                    set theAcct to (name of acct)
-                                    exit repeat
-                                end if
-                            end try
-                        end repeat
-                    end try
-                end if
-            end repeat
-            if theMsg is missing value then error "couldn't find that message in the inbox — it may have been moved or is older than the synced window"
-        """
-    }
-
     static func prepareEmailReply(actionId: String, messageId: String, body: String,
                                   replyAll: Bool, account: String, accountID: String = "") {
         runReply(actionId: actionId, messageId: messageId, body: body,
@@ -513,9 +471,30 @@ enum OutboundSender {
             return
         }
         DispatchQueue.global(qos: .userInitiated).async {
-            let script = MailActionScript.forwardEmail(
-                lookup: unverifiedForwardLookup(messageId), to: to, note: body)
-            run(actionId: actionId, app: "Mail", script: script)
+            // MailActionScript.forwardEmail checks the forward (original kept,
+            // note above it, recipients, sending address) before `send`, and
+            // returns its receipt only after Mail answers true to `send`.
+            let source = MailActionScript.forwardEmail(messageID: messageId, to: to, note: body)
+            guard let script = NSAppleScript(source: source) else {
+                post(actionId: actionId, ok: false, error: "couldn't build the Mail script")
+                return
+            }
+            var err: NSDictionary?
+            let out = script.executeAndReturnError(&err)
+            if let err {
+                let code = err[NSAppleScript.errorNumber] as? Int ?? 0
+                let reason = code == -1743
+                    ? "Mail Automation access isn't granted — allow it in System Settings › Privacy & Security › Automation"
+                    : (err[NSAppleScript.errorMessage] as? String ?? "Mail refused the forward")
+                post(actionId: actionId, ok: false, error: reason, extra: refusal(code))
+                return
+            }
+            guard let receipt = MailActionScript.decodeForward(out) else {
+                post(actionId: actionId, ok: false,
+                     error: "Forward outcome unknown: Mail returned no readable receipt. Do not retry automatically.")
+                return
+            }
+            post(actionId: actionId, ok: true, error: "", extra: ["forward": receipt])
         }
     }
 

@@ -755,6 +755,12 @@ func studyBlockCalendarChecks(_ check: (Bool, String) -> Void) {
           && ledger.show(block(start: now, added: false), now: now) == .none, "a block already started offers nothing")
     check(ledger.show(block(id: "block:x", added: false), now: now) == .none
           && ledger.show(block(added: false, kind: "task"), now: now) == .none, "only study-block: rows of kind study")
+    // Day calendar sync on: the old Add to calendar is hidden (a tap would make a second event); Undo stays.
+    check(ledger.show(block(added: false), now: now, calendarSync: true) == .none
+          && ledger.show(block(added: false), now: now, calendarSync: false) == .add(busy: false, error: nil),
+          "with Day calendar sync on, no Add to calendar")
+    check(ledger.show(block(added: true, source: "ev1"), now: now, calendarSync: true) == .added(undo: true, busy: false, error: nil),
+          "an earlier add keeps its line and Undo with sync on")
     check(ledger.show(block(added: true, source: "ev1"), now: now) == .added(undo: true, busy: false, error: nil)
           && ledger.show(block(added: true), now: now) == .added(undo: false, busy: false, error: nil),
           "added: Undo only with an event_source_id")
@@ -1015,6 +1021,7 @@ func dayTodoChecks(_ check: (Bool, String) -> Void, dayStart: Double, now: Doubl
     check(DayTimeline.todoKey("Go to Trader Joe's!") == DayTimeline.todoKey("go to trader joes"), "titles compare loosely")
     check(DayTimeline.isTimed(at(9), dayStart: dayStart, dayEnd: dayEnd) && !DayTimeline.isTimed(dayStart, dayStart: dayStart, dayEnd: dayEnd)
           && !DayTimeline.isTimed(dayEnd - 59, dayStart: dayStart, dayEnd: dayEnd), "timed versus date-only")
+    briefTodoChecks(check, dayStart: dayStart, dayEnd: dayEnd, now: now, clock: clock, dayClock: dayClock)
     firstDayChecks(check, dayStart: dayStart, dayEnd: dayEnd, now: now, clock: clock, dayClock: dayClock)
 }
 
@@ -1469,3 +1476,99 @@ func weekRouteChecks(_ check: (Bool, String) -> Void) {
     check(!DayWeek.fullRow(noWeek), "without the week (pending, failed, 404): compact")
 }
 
+
+/// The Brief's to-do list takes only task-like things from Day, once each, and a
+/// reminder Day already scheduled is drawn as that block alone (invented data).
+func briefTodoChecks(_ check: (Bool, String) -> Void, dayStart: Double, dayEnd: Double, now: Double,
+                     clock: (Double) -> String, dayClock: (Double) -> String) {
+    let hour = 3600.0
+    func at(_ h: Double) -> Double { dayStart + h * hour }
+
+    // Day: a calendar event, a study block, a suggested review block, a plan block and a held time.
+    let blocks = [
+        DayBlockInput(id: "standup", title: "Team standup", start: at(14), end: at(14.5), kind: "calendar"),
+        DayBlockInput(id: "study", title: "Study: STAT 101", start: at(15), end: at(16), kind: "study"),
+        DayBlockInput(id: "rev", title: "Review 8 emails", start: at(16), end: at(16.5), kind: "suggestion", evidenceID: "m1"),
+        DayBlockInput(id: "hold", title: "Possible time away", start: at(17), end: at(18), kind: "behavior_away", patternID: "p"),
+        DayBlockInput(id: "task:tv", title: "Streaming plan renews", start: at(11.5), end: at(12), kind: "task", taskID: "tv"),
+    ]
+    let needs = [
+        DayNeedInput(id: "reminders:a1", title: "Streaming plan renews", source: "reminders", due: at(23.98), allDay: true),
+        DayNeedInput(id: "reminders:a2", title: "Pay the library fine", source: "reminders", due: at(17)),
+        DayNeedInput(id: "reminders:a3", title: "Return Priya's charger", source: "reminders", due: dayStart - 30 * hour),
+        DayNeedInput(id: "reminders:a4", title: "Renew passport", source: "reminders", due: at(23.98), allDay: true),
+        DayNeedInput(id: "reminders:a5", title: "Next week's form", source: "reminders", due: dayEnd + 50 * hour),
+        DayNeedInput(id: "reminders:a6", title: "Team standup", source: "calendar", due: at(14)),
+        DayNeedInput(id: "mail:b1", title: "Lease notice from Sam", source: "mail", due: at(20)),
+        DayNeedInput(id: "m1", title: "Quarterly notes", source: "mail", due: at(21)),
+        DayNeedInput(id: "study:c1", title: "STAT 101 problem set", source: "study", due: at(22)),
+        DayNeedInput(id: "reminders:a7", title: "Nothing.", source: "reminders", due: at(19)),
+    ]
+    let unscheduled = [(id: "u1", title: "Call Sam back", reason: "Needs 45 min; the largest gap is 30 min"),
+                       (id: "u2", title: "Reply to Priya about the ride", reason: "No gap"),
+                       (id: "u3", title: "nothing", reason: "")]
+    let listed = ["Reply to Priya about the ride"]
+    func tasks(_ unscheduled: [(id: String, title: String, reason: String)] = unscheduled, needs: [DayNeedInput] = needs,
+               blocks: [DayBlockInput] = blocks, listed: [String] = listed, isToday: Bool = true) -> [DayTimeline.BriefTask] {
+        DayTimeline.briefTasks(unscheduled: unscheduled, needs: needs, blocks: blocks, listed: listed, now: now,
+                               dayStart: dayStart, dayEnd: dayEnd, isToday: isToday, clock: clock, dayClock: dayClock)
+    }
+    let rows = tasks()
+    check(rows.map(\.id) == ["task:u1", "need:reminders:a3", "need:reminders:a2", "need:reminders:a4"],
+          "still-to-fit tasks, then due and overdue reminders by time: \(rows.map(\.id))")
+    check(!rows.contains { ["Team standup", "Study: STAT 101", "Review 8 emails", "Possible time away", "Quarterly notes",
+                            "Lease notice from Sam", "STAT 101 problem set", "Nothing."].contains($0.title) },
+          "no event, study block, suggested block, hold, mail, school work or placeholder: \(rows.map(\.title))")
+    check(!rows.contains { $0.title == "Streaming plan renews" }, "a reminder already scheduled as a plan block is not a to-do too")
+    check(!rows.contains { $0.title == "Reply to Priya about the ride" }, "what the list already shows isn't added again")
+    check(rows.first?.note.hasPrefix("No gap long enough") == true && rows.first?.taskID == "u1" && rows.first?.needID == nil,
+          "a task keeps why it didn't fit and the planner id its check completes")
+    check(rows[1].dueLabel.hasPrefix("Overdue since") && rows[2].dueLabel == "Due " + clock(at(17)) && rows[3].dueLabel == "Today"
+          && rows[2].needID == "reminders:a2",
+          "due lines: \(rows.map(\.dueLabel))")
+    check(Set(rows.map { DayTimeline.todoKey($0.title) }).count == rows.count, "each item once")
+    check(tasks(listed: ["pay the library fine!"]).filter { $0.title == "Pay the library fine" }.isEmpty,
+          "a reminder the list shows (any case or punctuation) isn't repeated")
+    // Once in the Brief: what its Needs you section shows (by id, or by title) isn't a to-do as well.
+    let shownByID = DayTimeline.briefTasks(unscheduled: unscheduled, needs: needs, blocks: blocks, listed: listed,
+                                           inNeedsYou: [(id: "reminders:a2", text: "Something else")], now: now,
+                                           dayStart: dayStart, dayEnd: dayEnd, isToday: true, clock: clock, dayClock: dayClock)
+    check(!shownByID.contains { $0.needID == "reminders:a2" } && shownByID.contains { $0.needID == "reminders:a4" },
+          "a reminder Needs you shows (same id) isn't in the to-dos: \(shownByID.map(\.id))")
+    let shownByTitle = DayTimeline.briefTasks(unscheduled: unscheduled, needs: needs, blocks: blocks, listed: listed,
+                                              inNeedsYou: [(id: "x", text: "pay the Library fine."), (id: "y", text: "Call Sam back")],
+                                              now: now, dayStart: dayStart, dayEnd: dayEnd, isToday: true, clock: clock,
+                                              dayClock: dayClock)
+    check(shownByTitle.map(\.id) == ["need:reminders:a3", "need:reminders:a4"],
+          "a title Needs you shows (any case or punctuation) isn't repeated, task or reminder: \(shownByTitle.map(\.id))")
+    check(tasks(isToday: false).isEmpty, "another day has no to-do list from Day")
+    let twice = tasks(unscheduled + [(id: "u9", title: "call sam back", reason: "")])
+    check(twice.filter { DayTimeline.todoKey($0.title) == "callsamback" }.count == 1, "a planner task repeated by title is listed once")
+
+    // Done in the Brief is done in Day: a check-off completes the same planner task (or the same
+    // Needs you item) Day's own Done does, and once it is done neither list holds it.
+    check(rows[0].id == "task:" + (rows[0].taskID ?? "") && rows[1].id == "need:" + (rows[1].needID ?? ""),
+          "a row names the planner task or Needs you item that Day's Done completes")
+    let afterTask = tasks(unscheduled.filter { $0.id != "u1" })
+    let afterNeed = tasks(needs: needs.filter { $0.id != "reminders:a2" })
+    check(!afterTask.contains { $0.taskID == "u1" } && !afterNeed.contains { $0.needID == "reminders:a2" },
+          "a finished task or reminder leaves the list")
+    let fit = DayTimeline.stillToFit(todos: [], unscheduled: unscheduled, blocks: blocks, needs: needs, now: now,
+                                     dayStart: dayStart, dayEnd: dayEnd, isToday: true, dayClock: dayClock)
+    check(fit.first { $0.id == "task:u1" }?.taskID == "u1", "Day's Still to fit row carries the same planner id")
+
+    // The duplicate: "Streaming plan renews" is a plan block and a reminder due today.
+    let plain = DayTimeline.build(blocks: blocks, allDay: [], needs: needs, caught: [], now: now, dayStart: dayStart,
+                                  dayEnd: dayEnd, workStart: at(9), workEnd: at(18), isToday: true, clock: clock,
+                                  dayClock: dayClock)
+    let renews = plain.items.filter { $0.title == "Streaming plan renews" }
+    check(renews.count == 1 && renews[0].style == .task, "a due reminder Day scheduled as a plan block is drawn once, as the block: \(renews.map(\.id))")
+    check(plain.items.contains { $0.title == "Renew passport" && $0.style == .needsYou },
+          "a due reminder with no block still draws as due")
+    let overdueTwin = DayTimeline.build(
+        blocks: [DayBlockInput(id: "task:cg", title: "Return Priya's charger", start: at(15), end: at(15.5), kind: "task", taskID: "cg")],
+        allDay: [], needs: [needs[2]], caught: [], now: now, dayStart: dayStart, dayEnd: dayEnd, workStart: at(9),
+        workEnd: at(18), isToday: true, clock: clock, dayClock: dayClock)
+    check(overdueTwin.items.filter { $0.title == "Return Priya's charger" }.map(\.style) == [.task],
+          "an overdue reminder that is a plan block is drawn once too")
+}

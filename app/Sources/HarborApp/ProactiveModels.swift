@@ -475,6 +475,11 @@ struct ProactiveTodo: Decodable, Equatable, Identifiable {
     var fingerprint = ""
     /// A dated reminder Mark done can complete in Reminders.
     var canComplete = false
+    /// Set for a row the Brief took from Day (DayTimeline.briefTasks), which the
+    /// engine never sent: a planner task its check completes (TodayModel.edit),
+    /// or a Needs you reminder its Mark done completes. Never decoded.
+    var planTaskID: String? = nil
+    var needID: String? = nil
 
     private enum Keys: String, CodingKey {
         case id, title, source, account, who, quote, due_ts, due_label, kind, done, card_id, fingerprint, can_complete
@@ -505,11 +510,26 @@ struct ProactiveTodo: Decodable, Equatable, Identifiable {
     }
 
     /// Its trailing × (NeedsYouActionsModel): Clear for every to-do, Mark done
-    /// only for an open dated reminder.
+    /// only for an open dated reminder. A Day reminder answers on the Needs you
+    /// route (the one Day's own Done uses) under its own id.
     var actionRow: NeedsYouRow {
-        NeedsYouRow(id: id, label: nil, text: title, overdue: false,
+        NeedsYouRow(id: needID ?? id, label: nil, text: title, overdue: false,
                     fingerprint: fingerprint.isEmpty ? nil : fingerprint,
-                    canComplete: canComplete && !done && source == "reminders", route: NeedsYouRow.todoRoute)
+                    canComplete: canComplete && !done && source == "reminders",
+                    route: needID == nil ? NeedsYouRow.todoRoute : NeedsYouRow.needsYouRoute)
+    }
+
+    /// A row for what Day holds that the to-do list doesn't (DayTimeline.briefTasks).
+    /// `fingerprint` and `canComplete` come from the workspace's Needs you item
+    /// of the same id, when it lists one.
+    init(day task: DayTimeline.BriefTask, fingerprint: String = "", canComplete: Bool = false) {
+        self.init(id: task.id, title: task.title, source: task.needID == nil ? "harbor" : "reminders",
+                  dueTs: task.due, dueLabel: task.dueLabel, kind: task.needID == nil ? "task" : "")
+        who = task.note
+        planTaskID = task.taskID
+        needID = task.needID
+        self.fingerprint = fingerprint
+        self.canComplete = canComplete
     }
 
     /// Who it is from as a row shows it ("Sam in a group of 3 (…)", not
@@ -521,8 +541,8 @@ struct ProactiveTodo: Decodable, Equatable, Identifiable {
         DayTodoInput(id: id, title: title, source: source, who: shownWho, due: dueTs, dueLabel: dueLabel, kind: kind, done: done)
     }
 
-    /// A calendar event is already on the Day; anything else can be added to it.
-    var canAddToDay: Bool { source != "calendar" }
+    /// A calendar event is already on the Day, and a row taken from Day is on it; anything else can be added to it.
+    var canAddToDay: Bool { source != "calendar" && planTaskID == nil && needID == nil }
 }
 
 /// One mail thread or text conversation, summarized.

@@ -246,22 +246,130 @@ enum MailActionScript {
         """
     }
 
-    /// Forwards the message `lookup` leaves in `theMsg`, with an optional note
-    /// above the original. `lookup` is a block such as `findInboxMessage`.
-    static func forwardEmail(lookup: String, to: [String], note: String) -> String {
-        let recipients = recipientLines("to", to).joined(separator: "\n")
-        let prependNote = note.isEmpty ? ""
-            : "set content to \"\(escape(note))\" & return & return & content"
+    /// Raised before `send` when Mail's forward lost or never loaded the
+    /// original email. Nothing is sent; the window is closed unsaved.
+    static let forwardLostOriginal = "Mail did not keep the original email in the forward. Nothing sent."
+    /// Raised before `send` when the forward's recipients are not exactly the approved ones.
+    static let forwardRecipientsChanged = "Mail changed the forward's recipients. Nothing sent."
+    /// Raised before `send` when Mail picked a sending address outside the account that holds the email.
+    static let forwardIdentityChanged = "Mail selected a sending identity outside the email's account. Nothing sent."
+
+    /// The fields of the receipt a forward script returns after Mail accepted
+    /// the send, in order. service/tools/action_tools.py reads it.
+    static let forwardFields = ["message_id", "account", "from", "to", "subject"]
+
+    /// Forwards one inbox message, found by its RFC Message-ID, to `to`, with
+    /// an optional note above the original.
+    ///
+    /// The lessons of the reply script apply: the compose window is made
+    /// visible and given a moment before its content is read, because Mail can
+    /// hand back an empty body otherwise. A forward whose original is empty, or
+    /// whose note replaced the original instead of sitting above it, is closed
+    /// unsaved before `send`, so a note can never go out alone. The recipients
+    /// and the sending address are read back and checked before `send`. Only
+    /// after Mail answers true to `send` does the script return its receipt
+    /// (`forwardFields`); anything else is an error.
+    static func forwardEmail(messageID: String, account: String = "", to: [String], note: String) -> String {
+        let accountList = account.isEmpty
+            ? "accounts"
+            : "(every account whose name is \"\(escape(account))\")"
+        let wanted = "\"\(escape(messageID))\""
+        let recipients = recipientLines("to", to).map { "            " + $0 }.joined(separator: "\n")
+        let approved = "{" + to.map { "\"\(escape($0))\"" }.joined(separator: ", ") + "}"
+        let content = note.isEmpty ? "" : """
+                set desiredNote to "\(escape(note))"
+                set content of fwd to desiredNote & return & return & originalContent
+                set renderedContent to (content of fwd) as text
+                if (length of renderedContent) < ((length of desiredNote) + (length of originalContent)) then error "\(forwardLostOriginal)"
+                if not my exactReplyValue(text 1 thru (length of desiredNote) of renderedContent, desiredNote) then error "\(forwardLostOriginal)"
+        """
         return """
+        \(MailReplyScript.exactValueHandler)
         tell application "Mail"
-        \(lookup)
+            set theMsg to missing value
+            set theAcct to ""
+            set sourceAddresses to {}
+            repeat with acct in \(accountList)
+                if theMsg is missing value then
+                    try
+                        try
+                            set mbx to mailbox "INBOX" of acct
+                            set hits to (every message of mbx whose message id is \(wanted))
+                        on error
+                            set mbx to mailbox "Inbox" of acct
+                            set hits to (every message of mbx whose message id is \(wanted))
+                        end try
+                        if (count of hits) > 0 then
+                            set theMsg to item 1 of hits
+                            set theAcct to (name of acct)
+                            set sourceAddresses to email addresses of acct
+                        end if
+                    end try
+                end if
+            end repeat
+            if theMsg is missing value then error "\(messageNotFound)"
+            if not my exactReplyValue((message id of theMsg) as text, \(wanted)) then error "\(messageNotFound)"
             set fwd to forward theMsg with opening window
-            tell fwd
+            try
+                -- As with a reply: a visible window, then a moment, before
+                -- Mail's content getter returns the forwarded original.
+                set visible of fwd to true
+                delay 1
+                set originalContent to (content of fwd) as text
+                if (length of originalContent) is 0 then error "\(forwardLostOriginal)"
+                tell fwd
         \(recipients)
-        \(prependNote)
+                end tell
+        \(content)
+                set fromAddress to extract address from (sender of fwd)
+                ignoring case
+                    if fromAddress is not in sourceAddresses then error "\(forwardIdentityChanged)"
+                end ignoring
+                set toAddresses to address of every to recipient of fwd
+                set approvedAddresses to \(approved)
+                if (count of toAddresses) is not (count of approvedAddresses) then error "\(forwardRecipientsChanged)"
+                ignoring case
+                    repeat with wantedAddress in approvedAddresses
+                        if (contents of wantedAddress) is not in toAddresses then error "\(forwardRecipientsChanged)"
+                    end repeat
+                end ignoring
+                set receipt to {(message id of theMsg) as text, theAcct as text, fromAddress as text, toAddresses, (subject of fwd) as text}
+            on error problem number code
+                try
+                    close fwd saving no
+                end try
+                error problem number code
+            end try
+            tell fwd
                 if (send) is not true then error "\(sendNotAccepted)"
             end tell
+            return receipt
         end tell
         """
+    }
+
+    /// The receipt a forward script returned, or nil when it is not exactly
+    /// `forwardFields` (the backend then reports the outcome as unknown).
+    static func decodeForward(_ result: NSAppleEventDescriptor) -> [String: Any]? {
+        guard result.descriptorType == NSAppleEventDescriptor.list().descriptorType,
+              result.numberOfItems == forwardFields.count else { return nil }
+        var receipt: [String: Any] = [:]
+        for (index, field) in forwardFields.enumerated() {
+            guard let item = result.atIndex(index + 1) else { return nil }
+            if field == "to" {
+                guard item.descriptorType == NSAppleEventDescriptor.list().descriptorType,
+                      item.numberOfItems > 0 else { return nil }
+                var addresses: [String] = []
+                for i in 1...item.numberOfItems {
+                    guard let value = item.atIndex(i)?.stringValue else { return nil }
+                    addresses.append(value)
+                }
+                receipt[field] = addresses
+            } else {
+                guard let value = item.stringValue else { return nil }
+                receipt[field] = value
+            }
+        }
+        return receipt
     }
 }

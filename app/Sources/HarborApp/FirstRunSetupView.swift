@@ -742,16 +742,15 @@ final class FirstRunPermissions: ObservableObject {
         /// step open.
         var isExtra: Bool { self == .screenRecording || self == .accessibility }
         static let core = allCases.filter { !$0.isExtra }
-        /// The two the setup window asks about: Calendar and Reminders, what Brief and Day
-        /// are built on. Every other one is asked when a task first needs it: Mail & Notes
-        /// Automation from Brief's "Allow Harbor to read Mail" row (BriefAccessRows), Full Disk
-        /// Access from Brief and Day's "See your texts" row, Messages at the first
-        /// text you approve (OutboundSender.sendMessage), Contacts from the Brief's row
-        /// once your texts show numbers (SourceAccess.contacts), Notifications when Harbor
-        /// first has an alert for you (Notifications.deliver), the microphone at the
-        /// first voice ask, Screen Recording and Accessibility at the first look at your
-        /// screen, Study read or Smart Search. Settings › Privacy still lists them all.
-        static let setup: [Item] = [.calendar, .reminders]
+        /// The three the setup window asks about: Calendar and Reminders, what Brief and Day
+        /// are built on, and Contacts, so names show instead of numbers. Full Disk Access and
+        /// the two Automation rows come on the last page, "Get more from Harbor"
+        /// (OnboardingAccessPage), all optional. Every other one is asked when a task first
+        /// needs it: Messages at the first text you approve (OutboundSender.sendMessage),
+        /// Notifications when Harbor first has an alert for you (Notifications.deliver), the
+        /// microphone at the first voice ask, Screen Recording and Accessibility at the first
+        /// look at your screen, Study read or Smart Search. Settings › Privacy lists them all.
+        static let setup: [Item] = [.calendar, .reminders, .contacts]
         var id: String { rawValue }
     }
     enum State: Equatable { case checking, notAsked, allowed, notAllowed, notOnThisMac }
@@ -1531,6 +1530,7 @@ struct FirstRunSetupView: View {
     @StateObject private var permissions = FirstRunPermissions()
     @StateObject private var launchAtLogin = LaunchAtLogin()
     @ObservedObject private var notices = NotchSetupNotices.shared
+    @ObservedObject private var askSuggestions = AskSuggestions.shared
     @ObservedObject private var display = DisplayGeometry.shared
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var step: Step
@@ -1550,10 +1550,12 @@ struct FirstRunSetupView: View {
     /// The one automatic test once Harbor is ready (it also loads the model).
     @State private var testedOnce = false
     @State private var showAdvanced = false
-    /// The Permissions step's optional Screen Recording and Accessibility rows.
-    /// Open again after one was asked for (Screen Recording's quit and reopen
-    /// comes back here), so the row's answer is in view.
-        || UserDefaults.standard.bool(forKey: Permissions.accessibilityPromptedKey)
+    /// The calendar card (OnboardingCalendarSyncCard): the choice, the calendars and the last refusal.
+    @State private var calendarSyncOn = DayCalendarSyncSettings.isEnabled()
+    @State private var calendarSyncDeclined = false
+    @State private var calendarSyncChoices: [DayCalendarChoice] = []
+    @State private var calendarSyncSelection = ""
+    @State private var calendarSyncMessage: String?
     var openDetailedSetup: () -> Void
     /// Closes the window and opens the notch on Ask; with a prompt, Ask's box
     /// holds it, unsent.
@@ -1641,6 +1643,7 @@ struct FirstRunSetupView: View {
                     case .knowYou: knowYouStep
                     case .customize: OnboardingCustomizeStep()
                     case .tour: tourStep
+                    case .access: accessStep
                     }
                 }
                 .padding(.horizontal, 28).padding(.vertical, 24)
@@ -1690,7 +1693,7 @@ struct FirstRunSetupView: View {
             if !qaFixture { launchAtLogin.read() }
             // One read up front: the last step's prompts follow what is allowed.
             Task { await permissions.refresh() }
-            if step == .permissions { permissions.start() }
+            if step == .permissions || step == .access { permissions.start() }
             if !qaFixture { Task { await knowYou.load() } }
             knowYou.onClose = { _ in
                 aboutYouDecided()
@@ -1699,7 +1702,7 @@ struct FirstRunSetupView: View {
         }
         .onReceive(permissions.$states) { states in if !states.isEmpty { permissionsChanged(states) } }
         .onChange(of: step) { _, next in
-            if next == .permissions { permissions.start() } else { permissions.stop() }
+            if next == .permissions || next == .access { permissions.start() } else { permissions.stop() }
             if next == .permissions, !qaFixture { launchAtLogin.read() }
             if next == .tour { Task { await permissions.refresh() } }
             OnboardingTimeline.record("step \(next)")
@@ -1798,6 +1801,7 @@ struct FirstRunSetupView: View {
         case .knowYou: return knowYouFinished
         case .customize: return WildcardTabs.wasChosen()
         case .tour: return false
+        case .access: return permissions.state(.fullDiskAccess) == .allowed
         }
     }
 
@@ -1914,6 +1918,13 @@ struct FirstRunSetupView: View {
                         .keyboardShortcut(.defaultAction)
                 }
             case .tour:
+                Button("Back") { go(step.previous) }.buttonStyle(FirstRunButtonStyle())
+                tourModelStatus
+                Spacer(minLength: 6)
+                Button("Continue") { go(step.next) }
+                    .buttonStyle(FirstRunButtonStyle(primary: true))
+                    .keyboardShortcut(.defaultAction)
+            case .access:
                 Button("Back") { go(step.previous) }.buttonStyle(FirstRunButtonStyle())
                 tourModelStatus
                 Spacer(minLength: 6)
@@ -2313,20 +2324,97 @@ struct FirstRunSetupView: View {
                           detail: FirstRunPermissions.eventKitDetail(
                               .calendar, base: "Your meetings and events, for your day plan.",
                               state: permissions.state(.calendar), unanswered: permissions.unanswered[.calendar] == true))
+            if OnboardingCalendarSyncCard.isShown(calendarAllowed: permissions.state(.calendar) == .allowed) {
+                calendarSyncCard
+            }
             permissionRow(.reminders, icon: "checklist", title: "Reminders",
                           detail: FirstRunPermissions.eventKitDetail(
                               .reminders, base: "What's due, and the reminders Harbor sets for you.",
                               state: permissions.state(.reminders), unanswered: permissions.unanswered[.reminders] == true))
+            permissionRow(.contacts, icon: "person.crop.circle", title: "Contacts",
+                          detail: "So the people in your mail and texts show by name, not number.")
             launchAtLoginRow
             Text("Skipped one? Open Harbor's Settings and choose Permissions… under Privacy, any time. "
-                 + "The rest are asked when a task needs them: Mail when Brief first reads your mail, "
-                 + "Full Disk Access when you want your texts, Messages when you first send a text, "
-                 + "Contacts when your texts show numbers instead of names, Notifications when Harbor first has "
-                 + "an alert for you, the microphone when you first ask by voice, and Screen Recording or "
+                 + "Full Disk Access comes on the last page. The rest are asked when a task needs them: "
+                 + "Messages when you first send a text, Notifications when Harbor first has an alert for you, "
+                 + "the microphone when you first ask by voice, and Screen Recording or "
                  + "\(PrivacyNames.accessibilityWithFormerName) when you first ask about your screen or read "
                  + "school pages in Study.")
                 .font(.system(size: 12)).foregroundStyle(Theme.textMuted).padding(.top, 8)
                 .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    // MARK: The calendar card
+
+    /// Asked once, right under Calendar once it is allowed: whether what Harbor plans for the
+    /// person goes on their calendar. Off until Yes (OnboardingCalendarSyncCard).
+    private var calendarSyncCard: some View {
+        let phase = OnboardingCalendarSyncCard.phase(enabled: calendarSyncOn, declined: calendarSyncDeclined)
+        return VStack(alignment: .leading, spacing: 0) {
+            OnboardingCard(icon: OnboardingCalendarSyncCard.icon, title: OnboardingCalendarSyncCard.title,
+                           detail: OnboardingCalendarSyncCard.detail) {
+                HStack(spacing: 8) {
+                    switch phase {
+                    case .asking:
+                        Button(OnboardingCalendarSyncCard.notNowTitle) {
+                            calendarSyncDeclined = true
+                            calendarSyncMessage = nil
+                            DayCalendarSyncSettings.set(enabled: false, calendarID: nil)
+                        }
+                        .buttonStyle(FirstRunButtonStyle())
+                        Button(OnboardingCalendarSyncCard.yesTitle) { answerCalendarSyncYes() }
+                            .buttonStyle(FirstRunButtonStyle(primary: true))
+                    case .on:
+                        Label(OnboardingCalendarSyncCard.onLabel, systemImage: "checkmark")
+                            .font(.system(size: 12)).foregroundStyle(Color.green.opacity(0.85))
+                    case .off:
+                        Text(OnboardingCalendarSyncCard.offLabel).font(.system(size: 11.5)).foregroundStyle(Theme.textMuted)
+                        Button(OnboardingCalendarSyncCard.turnOnTitle) { answerCalendarSyncYes() }
+                            .buttonStyle(FirstRunButtonStyle())
+                    }
+                }
+            }
+            if phase != .off, !calendarSyncChoices.isEmpty {
+                HStack(spacing: 8) {
+                    Text(OnboardingCalendarSyncCard.pickerLabel).font(.system(size: 12)).foregroundStyle(Theme.textMuted)
+                    DayCalendarPickerMenu(choices: calendarSyncChoices, selection: Binding(
+                        get: { calendarSyncSelection },
+                        set: { id in
+                            calendarSyncSelection = id
+                            if calendarSyncOn { DayCalendarSyncSettings.set(enabled: true, calendarID: id) }
+                        }))
+                }
+                .padding(.leading, 14).padding(.bottom, 9)
+            }
+            if let message = calendarSyncMessage {
+                Text(message).font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true).padding(.leading, 14).padding(.bottom, 9)
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .task { loadCalendarSyncChoices() }
+    }
+
+    private func loadCalendarSyncChoices() {
+        calendarSyncChoices = DayCalendarWriter.choices()
+        calendarSyncSelection = DayCalendarChoices.selection(calendarSyncChoices, stored: DayCalendarSyncSettings.calendarID()) ?? ""
+    }
+
+    /// Yes: needs full Calendar access and a calendar that can be added to. Either missing, the card
+    /// says so and stays off.
+    private func answerCalendarSyncYes() {
+        Task { @MainActor in
+            let access = await DayCalendarWriter.ensureFullAccess()
+            calendarSyncChoices = DayCalendarWriter.choices()
+            let decision = OnboardingCalendarSyncCard.yes(hasFullAccess: access, choices: calendarSyncChoices,
+                                                          selected: calendarSyncSelection.isEmpty ? nil : calendarSyncSelection)
+            calendarSyncMessage = OnboardingCalendarSyncCard.message(for: decision)
+            guard case .enable(let id) = decision else { return }
+            calendarSyncSelection = id
+            calendarSyncOn = true
+            calendarSyncDeclined = false
+            DayCalendarSyncSettings.set(enabled: true, calendarID: id)
         }
     }
 
@@ -2411,6 +2499,95 @@ struct FirstRunSetupView: View {
         }
     }
 
+    // MARK: Last step: Get more from Harbor
+
+    /// Full Disk Access first and largest, with a mark that turns on by itself once
+    /// it is granted (the Permissions poll, started when this step opens), then the
+    /// two optional Automation rows. Nothing here is needed to finish.
+    /// The person's own prompts once the service has some, else the general ones. Pure.
+    nonisolated static func tryPrompts(personal: [String]?, general: [String]) -> [String] {
+        guard let personal, !personal.isEmpty else { return general }
+        return Array(personal.prefix(4))
+    }
+
+    private var accessStep: some View {
+        let fda = permissions.state(.fullDiskAccess)
+        return VStack(alignment: .leading, spacing: 0) {
+            OnboardingHeading(title: OnboardingAccessPage.title, subtitle: OnboardingAccessPage.subtitle)
+            ForEach(OnboardingAccessPage.order, id: \.self) { row in
+                if row == .fullDiskAccess {
+                    OnboardingCard(icon: "externaldrive.badge.checkmark", title: row.title, detail: row.detail) {
+                        if fda == .allowed {
+                            Label(OnboardingAccessPage.grantedLabel, systemImage: "checkmark.circle.fill")
+                                .font(.system(size: 12.5, weight: .medium)).foregroundStyle(Color.green.opacity(0.85))
+                        } else if fda == .notOnThisMac {
+                            Text("Not needed").font(.system(size: 12)).foregroundStyle(Theme.textMuted)
+                        } else {
+                            Button(OnboardingAccessPage.openSettingsTitle) { Task { await permissions.request(.fullDiskAccess) } }
+                                .buttonStyle(FirstRunButtonStyle(primary: true))
+                                .accessibilityLabel("Open System Settings for Full Disk Access")
+                        }
+                    }
+                    .accessibilityElement(children: .contain)
+                    .accessibilityValue(fda == .allowed ? OnboardingAccessPage.grantedLabel : OnboardingAccessPage.notGrantedLabel)
+                    if fda != .allowed && fda != .notOnThisMac {
+                        Text(FirstRunPermissions.fullDiskAccessRelaunchNote)
+                            .font(.system(size: 12)).foregroundStyle(Theme.textMuted)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.bottom, 14).padding(.horizontal, 4)
+                    }
+                    Text(OnboardingAccessPage.optionalHeading).font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(Theme.textSecondary).padding(.top, 6).padding(.bottom, 8)
+                } else {
+                    let item: FirstRunPermissions.Item = row == .messagesAutomation ? .messages : .mail
+                    permissionRow(item, icon: row == .messagesAutomation ? "message" : "envelope",
+                                  title: row.title, detail: row.detail)
+                }
+            }
+            // Last thing setup shows, so a click ends setup with nothing skipped (2026-11-23).
+            // Until Harbor can answer, a prompt would only leave a question it can't
+            // send, and it must not end setup either.
+            let canAnswer = setup.status?.canAnswer == true
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Try asking").font(.system(size: 13, weight: .medium))
+                Text(canAnswer ? "Click one to open Ask with it typed in. Press Return to send it."
+                               : "These work once the model is ready.")
+                    .font(.system(size: 11.5)).foregroundStyle(Theme.textMuted)
+                ForEach(Self.tryPrompts(personal: askSuggestions.prompts, general: OnboardingPrompts.prompts(live)), id: \.self) { prompt in
+                    Button {
+                        guard canAnswer else { return }
+                        OnboardingTimeline.record("try asking")
+                        finish(prompt)
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: "text.cursor").accessibilityHidden(true)
+                            Text("“\(prompt)”")
+                            Spacer(minLength: 0)
+                        }
+                        .font(.system(size: 12.5)).foregroundStyle(Theme.textPrimary)
+                        .padding(.horizontal, 12).padding(.vertical, 8)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.04)))
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.hairline))
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!canAnswer)
+                    .opacity(canAnswer ? 1 : 0.5)
+                    .help(canAnswer ? "Opens Ask with this typed in, ready to send" : "Works once the model is ready")
+                    .accessibilityLabel("Try asking: \(prompt)")
+                    .accessibilityHint(canAnswer ? "Opens Ask with this typed in. It isn't sent until you press Return."
+                                                 : "Works once the model is ready.")
+                }
+            }
+            .padding(.bottom, 14)
+            Text(OnboardingAccessPage.footnote)
+                .font(.system(size: 12)).foregroundStyle(Theme.textMuted).padding(.top, 4)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        // The person's own prompts are built from what Harbor has read so far (AskSuggestionsStore).
+        .task { if !qaFixture { await askSuggestions.refresh() } }
+    }
+
     // MARK: Step 4: Getting to know you
 
     @ViewBuilder private var knowYouStep: some View {
@@ -2463,11 +2640,6 @@ struct FirstRunSetupView: View {
                                detail: Self.helpLine(title: item.title, line: item.line,
                                                      voiceKeyRegistered: voiceKeyRegistered)) { EmptyView() }
             }
-            // The one question setup asks about acting without being asked (ActForMe.swift). It shows
-            // once the service can answer; unanswered, the Brief asks it once instead.
-            if !qaFixture {
-                ActForMeAskCard(place: .setup).padding(.top, 8)
-            }
             OnboardingHeading(title: "Harbor lives at the top of your screen",
                               subtitle: "No window to find. It's always one gesture away.")
                 .padding(.top, 12)
@@ -2487,41 +2659,6 @@ struct FirstRunSetupView: View {
             Text("Open, it has \(Self.tabCountWord(Self.tabLines.count)) tabs").font(.system(size: 13, weight: .medium)).padding(.top, 6).padding(.bottom, 8)
             OpenNotchIllustration(tabs: Self.tabLines)
                 .padding(.bottom, 14)
-            // Until Harbor can answer, a prompt would only leave a question it can't
-            // send, and it must not end setup either.
-            let canAnswer = setup.status?.canAnswer == true
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Try asking").font(.system(size: 13, weight: .medium))
-                Text(canAnswer ? "Click one to open Ask with it typed in. Press Return to send it."
-                               : "These work once the model is ready.")
-                    .font(.system(size: 11.5)).foregroundStyle(Theme.textMuted)
-                ForEach(OnboardingPrompts.prompts(live), id: \.self) { prompt in
-                    Button {
-                        guard canAnswer else { return }
-                        OnboardingTimeline.record("try asking")
-                        finish(prompt)
-                    } label: {
-                        HStack(spacing: 8) {
-                            Image(systemName: "text.cursor").accessibilityHidden(true)
-                            Text("“\(prompt)”")
-                            Spacer(minLength: 0)
-                        }
-                        .font(.system(size: 12.5)).foregroundStyle(Theme.textPrimary)
-                        .padding(.horizontal, 12).padding(.vertical, 8)
-                        .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.04)))
-                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.hairline))
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(!canAnswer)
-                    .opacity(canAnswer ? 1 : 0.5)
-                    .help(canAnswer ? "Opens Ask with this typed in, ready to send" : "Works once the model is ready")
-                    .accessibilityLabel("Try asking: \(prompt)")
-                    .accessibilityHint(canAnswer ? "Opens Ask with this typed in. It isn't sent until you press Return."
-                                                 : "Works once the model is ready.")
-                }
-            }
-            .padding(.bottom, 14)
         }
     }
 

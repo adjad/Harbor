@@ -753,8 +753,11 @@ def _google_still_connected(home: Path) -> bool:
     except (OSError, ValueError):
         return False
     accounts = doc.get("accounts") if isinstance(doc, dict) else None
-    return isinstance(accounts, dict) and any(isinstance(v, dict) and v.get("refresh_token")
-                                              for v in accounts.values())
+    # A token is in the file, or in the login Keychain with the file's marker
+    # (gmail_source.TOKEN_STORE_KEY).
+    return isinstance(accounts, dict) and any(
+        isinstance(v, dict) and (v.get("refresh_token") or v.get("refresh_token_store") == "keychain")
+        for v in accounts.values())
 
 
 GOOGLE_NOT_REVOKED = "Google access was not revoked; remove Harbor at myaccount.google.com/permissions."
@@ -1048,12 +1051,13 @@ async def _disconnect_google(problems: list[dict]) -> int:
     try:
         result = await asyncio.wait_for(gmail_source.disconnect(""), timeout=30)
     except Exception:  # noqa: BLE001 — the files below still go
-        problems.append({"part": "google", "detail": "Google sign-out didn't finish. Harbor's copies of the tokens "
-                                                     "are deleted with its files, but Google may still list Harbor "
-                                                     "as connected (myaccount.google.com/permissions)."})
+        problems.append({"part": "google", "detail": "Google sign-out didn't finish. Google may still list Harbor "
+                                                     "as connected (myaccount.google.com/permissions), and a sign-in "
+                                                     "may be left in Keychain Access under com.harbor.google."})
         return accounts
     revoked = (result or {}).get("revoked") or {}
-    offline = sum(1 for v in revoked.values() if v == "offline")
+    # "unreadable": its Keychain item couldn't be read, so Google was never asked.
+    offline = sum(1 for v in revoked.values() if v in ("offline", "unreadable"))
     if offline:
         problems.append({"part": "google_revoke",
                          "detail": f"Couldn't reach Google to revoke {offline} sign-in"

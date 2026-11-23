@@ -79,6 +79,13 @@ class Act(BaseModel):
     only_new: bool = False
 
 
+class ActKind(BaseModel):
+    """The inline question after a tapped action: yes to one kind (service/proactive/acting.py KIND_KEYS)."""
+    model_config = ConfigDict(extra="forbid", strict=True)
+    kind: str = Field(pattern=r"^[a-z_]{1,20}$")
+    enabled: bool = True
+
+
 def _act_state() -> dict:
     """What the switch shows: the gate (service/proactive/acting.py) and what Harbor did lately."""
     import time
@@ -137,6 +144,31 @@ async def set_act(request: Request):
             raise HTTPException(409, "Harbor couldn't save your yes (~/.moe/act_for_me.json). Until it can, "
                                      "Harbor does nothing on its own.") from exc
         # An off that went wrong somewhere but is in fact off is a success.
+    return _act_state()
+
+
+@router.put("/act/kind")
+async def set_act_kind(request: Request):
+    """Yes (or "Not now") to ONE kind of thing Harbor could do on its own, asked right after the person
+    tapped such an action. A yes needs the Harbor app itself (the same proof as the master switch)
+    and turns on only that kind. "Not now" (`enabled: false`) turns nothing off and nothing on: it
+    only holds that kind's question for a week. The master switch still stops everything."""
+    body = await _body(request, ActKind)
+    from service.proactive import acting
+    if body.kind not in acting.KIND_KEYS:
+        raise HTTPException(422, "Unknown kind.")
+    if body.enabled:
+        _require_app(request)
+        try:
+            acting.set_kind(body.kind)
+        except Exception as exc:  # noqa: BLE001 — the reply says what is true now
+            raise HTTPException(409, "Harbor couldn't save your yes (~/.moe/act_for_me.json). Until it can, "
+                                     "Harbor does nothing on its own.") from exc
+    else:
+        try:
+            acting.mark_kind_aside(body.kind)
+        except Exception:  # noqa: BLE001 — it will simply be asked once more
+            pass
     return _act_state()
 
 

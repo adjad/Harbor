@@ -1529,14 +1529,23 @@ async def email_triage(message_id: str, action: str) -> str:
     return receipt
 
 
-# The app's forward script is held back on purpose (OutboundSender.swift,
-# unverifiedForwardLookup): its lookup finds no message, so Mail composes
-# nothing and the app can only report an unconfirmed result. That held the
-# whole chat ("An earlier action in this chat may not have finished") for a
-# send that never began. Until a real forward has been checked in Mail, the
-# tool says plainly that nothing was sent. Set True together with the app-side
-# change, after a real forward has been checked by hand in Mail.
-APPLE_MAIL_FORWARD_READY = False
+# The app forwards through Mail (MailActionScript.forwardEmail): it checks the
+# forward before `send` (the original is kept with any note above it, the
+# recipients are the approved ones, the sending address belongs to the email's
+# account) and returns a receipt only after Mail answers true to `send`. The
+# tool says "Forwarded" only when that receipt names this email and exactly
+# the approved recipients; anything less is an unknown outcome, never a send.
+def _forward_confirmed(receipt, message_id: str, recipients: list[str]) -> bool:
+    if not isinstance(receipt, dict):
+        return False
+    sent_to = receipt.get("to")
+    if not (isinstance(sent_to, list) and sent_to and all(isinstance(a, str) for a in sent_to)):
+        return False
+    source = receipt.get("message_id")
+    if not isinstance(source, str) or source.strip().lower() != message_id.strip().lower():
+        return False
+    return (sorted(a.strip().lower() for a in sent_to)
+            == sorted(r.strip().lower() for r in recipients))
 
 
 @register(
@@ -1574,15 +1583,6 @@ async def forward_email(message_id: str, to: str, note: str = "") -> str:
         if problem:
             return problem
         resolved.append(handle)
-    if not APPLE_MAIL_FORWARD_READY:
-        # Returned before the app is asked for anything: proof nothing was sent,
-        # so the chat is not held for an unconfirmed send.
-        return _not_sent(
-            "(the forward was NOT sent: this build cannot forward an email through Apple Mail yet. "
-            "Nothing was sent and nothing changed. Offer to send the email's text as a new email "
-            "with send_email instead, and do not call forward_email again in this chat.)",
-            question="I can't forward an email through Mail yet, so nothing was sent. "
-                     "Want me to send its text as a new email instead?")
     note = note or ""
     if _unreviewed():  # as send_email: an approved note goes out as its card showed it
         note = _degarble(note)
@@ -1597,6 +1597,11 @@ async def forward_email(message_id: str, to: str, note: str = "") -> str:
                 "Forward outcome unknown — sending was not confirmed. Check Mail before trying again; do not retry automatically.",
                 operation="forward_email", action_id=res.get("action_id") or "")
         return _not_sent(f"(the forward was NOT sent: {res.get('error') or 'unknown error'})")
+    if not _forward_confirmed(res.get("forward"), message_id, resolved):
+        from service.tools.registry import _OutboundUnknownResult
+        return _OutboundUnknownResult(
+            "Forward outcome unknown — Mail did not confirm this forward. Check Mail before trying again; do not retry automatically.",
+            operation="forward_email", action_id=res.get("action_id") or "")
     return f"Forwarded to {', '.join(_named(r) for r in resolved)}."
 
 
@@ -1608,13 +1613,12 @@ MESSAGE_HANDED_OVER_PREFIX = "Handed to Messages for "
 MESSAGE_HANDED_OVER_LINE = "Handed to Messages; delivery isn't confirmed yet."
 MESSAGE_HANDED_OVER = ("Delivery isn't confirmed yet, so don't tell the user it was sent or "
                        "delivered; say it was handed to Messages and delivery isn't confirmed.")
-# TEMPORARY, at the owner's request on 2026-11-15 ("just remove the error message
-# for now - I will add something else later"): a text Messages marked Not
-# Delivered shows the person only QUIET_NOT_DELIVERED. The model, the audit log
-# and the debug export still get the full failure below, nothing is retried, and
-# no reply says Sent. Replace this visible line with the owner's wording.
+# A text Messages marked Not Delivered (its own delivery/error fields) shows the
+# person only QUIET_NOT_DELIVERED, in the failure style. The model, the audit log
+# and the debug export get the full failure below, nothing is retried, and no
+# reply says Sent. (The name is historical: the line is no longer quiet.)
 NOT_DELIVERED_TEXT = "Messages shows it as Not Delivered."
-QUIET_NOT_DELIVERED = "Passed to Messages."
+QUIET_NOT_DELIVERED = "Not delivered"
 
 
 def quiet_not_delivered(result) -> bool:

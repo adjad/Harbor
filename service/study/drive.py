@@ -23,6 +23,7 @@ from datetime import datetime
 import httpx
 
 from service import gmail_source
+from service.study.store import study_exists, study_store
 
 log = logging.getLogger(__name__)
 
@@ -82,29 +83,59 @@ def _missing(message: str = NO_DRIVE) -> DriveError:
 
 # --- the account ------------------------------------------------------------------
 
+def _preferred() -> str | None:
+    """The account the student chose in Study, or None (then the first one is used)."""
+    try:
+        if not study_exists():
+            return None
+        chosen = study_store().meta("drive_account")
+    except Exception:  # noqa: BLE001 — a store problem never blocks Drive
+        return None
+    return chosen if isinstance(chosen, str) and chosen else None
+
+
+def _with_drive() -> list[tuple[str, dict]]:
+    return [(email, item) for email, item in gmail_source.connected_accounts().items()
+            if DRIVE_SCOPE in gmail_source.granted_scopes(email, item)]
+
+
 def _account() -> tuple[str | None, bool]:
     """(account, has Drive) for the Study tab.
 
-    Study has no account picker and runs outside any bound_account() context, so there is
-    no "currently bound" account to reuse. It takes the first connected account (the order
-    the user connected them, so the choice is stable) whose sign-in granted drive.readonly,
-    preferring one whose sign-in has not expired. With no such account it reports the first
-    connected account without Drive, so the message can say "reconnect" rather than "connect".
+    Study runs outside any bound_account() context. It uses the account the student chose
+    (Study's picker) while that account is still connected with drive.readonly; otherwise the
+    first connected account (the order the user connected them, so the choice is stable)
+    whose sign-in granted drive.readonly, preferring one whose sign-in has not expired. With
+    no such account it reports the first connected account without Drive, so the message can
+    say "reconnect" rather than "connect".
     """
     accounts = gmail_source.connected_accounts()
     with_drive = [(email, item) for email, item in accounts.items()
                   if DRIVE_SCOPE in gmail_source.granted_scopes(email, item)]
     if with_drive:
+        chosen = _preferred()
+        if chosen and any(email == chosen for email, _ in with_drive):
+            return chosen, True
         live = [email for email, item in with_drive if not item.get("auth_expired")]
         return (live or [with_drive[0][0]])[0], True
     return (next(iter(accounts), None), False)
 
 
+def choose_account(email: str | None) -> dict:
+    """Remember which connected Google account Study reads Drive with (None goes back to the
+    automatic choice). Only a connected account with Drive can be chosen."""
+    if email is not None and not any(e == email for e, _ in _with_drive()):
+        raise DriveError(422, "invalid", "Harbor can't use that Google account for Drive. Pick one from the list.")
+    study_store().set_meta("drive_account", email)
+    return status()
+
+
 def status() -> dict:
     account, drive = _account()
+    accounts = [email for email, _ in _with_drive()]
     if account is None:
-        return {"connected": False, "drive": False, "account": None, "message": NOT_CONNECTED}
-    return {"connected": True, "drive": drive, "account": account,
+        return {"connected": False, "drive": False, "account": None, "accounts": [], "message": NOT_CONNECTED}
+    return {"connected": True, "drive": drive, "account": account, "accounts": accounts,
             "message": None if drive else NO_DRIVE}
 
 

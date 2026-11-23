@@ -109,17 +109,76 @@ enum MailReplyScriptChecks {
                 "Missing CC recipient")
         require(plainSend.contains("subject:\"A \\\"quoted\\\" subject\", content:\"Line one\\nLine two \\\\ end\""),
                 "Subject and body must be escaped into single literals")
-        let forwardWithNote = MailActionScript.forwardEmail(lookup: lookup, to: ["first@example.com"], note: "For you")
-        let forwardBare = MailActionScript.forwardEmail(lookup: lookup, to: ["first@example.com"], note: "")
+        let forwardWithNote = MailActionScript.forwardEmail(messageID: "<fixture@example.com>",
+            to: ["first@example.com"], note: "For you")
+        let forwardBare = MailActionScript.forwardEmail(messageID: "<fixture@example.com>",
+            to: ["first@example.com", "second@example.com"], note: "")
+        func at(_ script: String, _ text: String) -> String.Index {
+            guard let range = script.range(of: text) else { fatalError("Missing forward contract: \(text)") }
+            return range.lowerBound
+        }
         for forward in [forwardWithNote, forwardBare] {
             require(forward.contains(sendGuard) && !hasBareSend(forward), "A forward ignores Mail's false result")
-            require(forward.range(of: "tell fwd")!.lowerBound < forward.range(of: sendGuard)!.lowerBound,
+            require(forward.range(of: "tell fwd", options: .backwards)!.lowerBound < at(forward, sendGuard),
                     "Send must resolve against the forwarded message")
-            require(forward.range(of: MailActionScript.messageNotFound)!.lowerBound <
-                    forward.range(of: "forward theMsg")!.lowerBound, "A forward must find its message first")
+            require(at(forward, MailActionScript.messageNotFound) < at(forward, "forward theMsg"),
+                    "A forward must find its message first")
+            require(!forward.contains("inbox of acct"), "An account has no inbox property; the lookup would find nothing")
+            require(at(forward, "mailbox \"INBOX\" of acct") < at(forward, "mailbox \"Inbox\" of acct"),
+                    "The forward lookup names the inbox the way the reader does")
+            // Visible and given a moment before the original is read.
+            require(at(forward, "set visible of fwd to true") < at(forward, "delay 1"), "Forward window is not made visible first")
+            require(at(forward, "delay 1") < at(forward, "set originalContent to (content of fwd)"),
+                    "The original is read before Mail loaded it")
+            require(forward.contains("if (length of originalContent) is 0 then error \"\(MailActionScript.forwardLostOriginal)\""),
+                    "An empty forward must stop before send")
+            // Every check comes before send, and a failure closes the window unsaved.
+            for check in ["sender of fwd", "address of every to recipient of fwd",
+                          MailActionScript.forwardRecipientsChanged, MailActionScript.forwardIdentityChanged,
+                          "set receipt to {"] {
+                require(at(forward, check) < at(forward, sendGuard), "Checked after send: \(check)")
+            }
+            require(at(forward, "close fwd saving no") < at(forward, sendGuard), "A failed check leaves the forward open")
+            require(at(forward, sendGuard) < at(forward, "return receipt"), "A receipt is returned before Mail accepted the send")
         }
-        require(forwardWithNote.contains("set content to \"For you\" & return & return & content"), "Missing forward note")
-        require(!forwardBare.contains("set content to"), "A forward without a note must leave the content alone")
+        require(forwardWithNote.contains("set desiredNote to \"For you\""), "Missing forward note")
+        require(at(forwardWithNote, "set content of fwd to desiredNote & return & return & originalContent") <
+                at(forwardWithNote, "exactReplyValue(text 1 thru (length of desiredNote) of renderedContent, desiredNote)"),
+                "The note is not checked above the original")
+        require(forwardWithNote.contains("((length of desiredNote) + (length of originalContent))"),
+                "A note that replaced the original would be sent alone")
+        require(!forwardBare.contains("set content of fwd"), "A forward without a note must leave the content alone")
+        require(forwardBare.contains("set approvedAddresses to {\"first@example.com\", \"second@example.com\"}"),
+                "The approved recipients are not checked")
+        let escapedForward = MailActionScript.forwardEmail(messageID: "a\"b\\c", account: "Work \"two\"",
+            to: ["x\"y@example.com"], note: "Line one\nLine \"two\"")
+        require(escapedForward.contains("message id is \"a\\\"b\\\\c\""), "Forward Message-ID must be escaped")
+        require(escapedForward.contains("repeat with acct in (every account whose name is \"Work \\\"two\\\"\")"),
+                "A pinned forward must search only the named account")
+        require(escapedForward.contains("set desiredNote to \"Line one\\nLine \\\"two\\\"\""), "Forward note must be escaped")
+        // Receipt decode: exactly the five fields, with the recipients as a list.
+        let receipt = NSAppleEventDescriptor.list()
+        let receiptValues: [Any] = ["<fixture@example.com>", "Work", "me@example.com",
+                                    ["first@example.com"], "Fwd: A subject"]
+        for (index, value) in receiptValues.enumerated() {
+            if let list = value as? [String] {
+                let item = NSAppleEventDescriptor.list()
+                for (i, address) in list.enumerated() { item.insert(.init(string: address), at: i + 1) }
+                receipt.insert(item, at: index + 1)
+            } else {
+                receipt.insert(.init(string: value as! String), at: index + 1)
+            }
+        }
+        let decodedForward = MailActionScript.decodeForward(receipt)!
+        require(decodedForward["to"] as? [String] == ["first@example.com"], "Forward recipients decode failed")
+        require(decodedForward["message_id"] as? String == "<fixture@example.com>", "Forward Message-ID decode failed")
+        let short = NSAppleEventDescriptor.list()
+        short.insert(.init(string: "<fixture@example.com>"), at: 1)
+        require(MailActionScript.decodeForward(short) == nil, "A partial receipt must not decode")
+        require(MailActionScript.decodeForward(.init(string: "ok")) == nil, "A bare answer must not decode")
+        var compileError: NSDictionary?
+        require(NSAppleScript(source: escapedForward)!.compileAndReturnError(&compileError),
+                "Escaped forward script failed to compile: \(compileError ?? [:])")
         for source in [plainSend, forwardWithNote, forwardBare] {
             var error: NSDictionary?
             require(NSAppleScript(source: source)!.compileAndReturnError(&error),

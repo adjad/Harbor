@@ -484,6 +484,11 @@ func studySourceChecks(_ check: (Bool, String) -> Void, now: Date, calendar: Cal
 
     let status = decode(StudyDriveStatus.self, #"{"connected": true, "drive": true, "account": "a@b.edu"}"#)
     check(status?.blocker == nil && status?.account == "a@b.edu", "a connected Drive has no blocker")
+    check(status?.accounts == [], "an older service without accounts decodes to none")
+    let two = decode(StudyDriveStatus.self, #"{"connected": true, "drive": true, "account": "a@b.edu", "accounts": ["a@b.edu", "", "c@d.edu"]}"#)
+    check(two?.accounts == ["a@b.edu", "c@d.edu"], "the Drive accounts decode, blanks dropped")
+    check(decode(StudyDriveStatus.self, #"{"connected": true, "drive": true, "accounts": "x"}"#)?.accounts == [],
+          "wrongly typed accounts fall back to none")
     check(decode(StudyDriveStatus.self, "{}")?.blocker == StudyText.driveNotConnected, "no Google: not connected")
     check(decode(StudyDriveStatus.self, #"{"connected": true, "drive": false}"#)?.blocker == StudyText.driveNeedsScope,
           "Google without Drive says so")

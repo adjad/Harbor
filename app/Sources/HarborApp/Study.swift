@@ -1084,9 +1084,11 @@ struct StudyDriveStatus: Decodable, Equatable {
     let connected: Bool
     let drive: Bool
     let account: String?
+    /// Every connected Google account that allowed Drive (the picker shows with two or more).
+    let accounts: [String]
     let message: String?
 
-    enum CodingKeys: String, CodingKey { case connected, drive, account, message }
+    enum CodingKeys: String, CodingKey { case connected, drive, account, accounts, message }
 
     /// Why Drive can't be listed, or nil when it can.
     var blocker: String? {
@@ -1104,6 +1106,7 @@ extension StudyDriveStatus {
         connected = c.studyBool(.connected)
         drive = c.studyBool(.drive)
         account = c.studyOptionalString(.account)
+        accounts = ((try? c.decodeIfPresent([String].self, forKey: .accounts)) ?? nil)?.filter { !$0.isEmpty } ?? []
         message = c.studyOptionalString(.message)
     }
 }

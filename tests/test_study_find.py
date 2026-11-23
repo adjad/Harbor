@@ -844,3 +844,44 @@ def test_a_later_refused_copy_of_an_item_wins_over_an_innocent_first():
     items = find.resolve([{"url": url, "title": "Week 4 reading", "type": "Page"},
                           {"url": url, "title": "Take the quiz", "type": "Quiz"}], course=C, sources=[])
     assert [(i["via"], i.get("reason")) for i in items] == [("none", "quiz")]
+
+
+# --- a deck never stays "reading" ---------------------------------------------------
+
+def _stale_source(store, sid="src_stale", status="reading"):
+    store.save_source({"id": sid, "course_id": COURSE["id"], "kind": "slides", "title": "Week 1",
+                       "url": f"https://docs.google.com/presentation/d/{sid}/edit", "text": "x"})
+    sid = next(s["id"] for s in store.sources() if sid in (s.get("url") or ""))
+    store.set_deck_status(sid, status)
+    return sid
+
+
+def test_reconcile_fails_stale_reading_and_keeps_live_reads(google, monkeypatch):
+    store = google.store
+    store.upsert_courses([COURSE])
+    stale = _stale_source(store, "src_stale")
+    live = _stale_source(store, "src_live")
+    ready = _stale_source(store, "src_ready", "ready")
+    monkeypatch.setattr(find, "_reading", {live})
+    assert find.reconcile(store) == 1
+    by_id = {s["id"]: s for s in store.sources()}
+    assert by_id[stale]["deck_status"] == "failed"
+    assert by_id[stale]["deck_error"] == find.STALE_READ
+    assert by_id[live]["deck_status"] == "reading"
+    assert by_id[ready]["deck_status"] == "ready"
+    assert find.reconcile(store) == 0
+
+
+def test_a_cancelled_worker_leaves_no_deck_reading(google, monkeypatch):
+    store = google.store
+    store.upsert_courses([COURSE])
+    first, second = _stale_source(store, "src_a"), _stale_source(store, "src_b")
+    monkeypatch.setattr(find, "_reading", {first, second})
+
+    async def cancelled(*a, **kw):
+        raise asyncio.CancelledError()
+    monkeypatch.setattr(deck, "read_source", cancelled)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(find.work(store, COURSE, [first, second], [(first, "f1", "slides"), (second, "f2", "slides")]))
+    assert {s["deck_status"] for s in store.sources()} == {"failed"}
+    assert find._reading == set()

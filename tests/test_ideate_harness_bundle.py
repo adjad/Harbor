@@ -241,3 +241,23 @@ def test_package_manager_config_and_env_files_are_left_out():
         assert h.pruned(P("node_modules/x") / name, False), name
     assert not h.pruned(P("node_modules/x/environment.js"), False)
     assert not hasattr(h, "is_harness_target")
+
+
+def test_validate_fails_when_node_or_package_licences_go_missing(tmp_path, source):
+    bundle, record = staged(tmp_path, source)
+    assert record["node_license"] == "copied" and record["package_licenses"] >= 1
+    target = bundle / h.BUNDLE_DIR
+    h.validate(bundle, record)
+    package_licence = target / "pi/node_modules/foo/LICENSE"
+    package_licence.unlink()
+    with pytest.raises(h.HarnessError, match="licence"):
+        h.validate(bundle, record)
+    package_licence.write_text("MIT foo")
+    node_licence = target / "LICENSES/Node-LICENSE"
+    node_licence.write_text("")
+    with pytest.raises(h.HarnessError, match="Node's LICENSE"):
+        h.validate(bundle, record)
+    node_licence.unlink()
+    (target / "LICENSES/Node-NOTICE.txt").write_text("notice")   # a notice cannot stand in for a copied LICENSE
+    with pytest.raises(h.HarnessError, match="Node's LICENSE"):
+        h.validate(bundle, record)

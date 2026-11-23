@@ -162,6 +162,8 @@ struct DayFitRow: Equatable, Identifiable {
     let symbol: String
     /// Set for a to-do, so the row can check it off or add it to the day.
     var todoID: String? = nil
+    /// Set for a task the planner couldn't place, so the row can check it off.
+    var taskID: String? = nil
 }
 
 /// One "Caught for you" record from the attention runner.
@@ -847,8 +849,12 @@ struct DayTimeline: Equatable {
         }
 
         // A reminder that already has a suggested block is drawn once, as the suggestion.
+        // The same goes for one already on the day as your own plan block (a
+        // reminder Harbor scheduled): that block is where it is, so it isn't also a due row.
         let suggested = Set(blocks.compactMap { $0.kind == "suggestion" ? $0.evidenceID : nil })
-        for need in needs where need.source != "calendar" && !isJunk(need.title) && !suggested.contains(need.id) {
+        let planned = plannedTitles(blocks)
+        for need in needs where need.source != "calendar" && !isJunk(need.title) && !suggested.contains(need.id)
+            && !planned.contains(todoKey(need.title)) {
             guard let due = need.due else { continue }
             if isToday && due < now {
                 let start = max(earliest, now)
@@ -1009,7 +1015,7 @@ struct DayTimeline: Equatable {
         for task in unscheduled where !isJunk(task.title) && !seen.contains(todoKey(task.title)) {
             seen.insert(todoKey(task.title))
             rows.append(DayFitRow(id: "task:" + task.id, title: task.title, detail: plainReason(task.reason).capitalizedFirst,
-                                  symbol: sourceSymbol("harbor")))
+                                  symbol: sourceSymbol("harbor"), taskID: task.id))
         }
         for todo in todos where !todo.done && todo.source != "calendar" && !isJunk(todo.title)
             && !seen.contains(todoKey(todo.title)) {
@@ -1034,17 +1040,91 @@ struct DayTimeline: Equatable {
         return rows
     }
 
+    /// The titles of the day's own plan blocks (a task Harbor or the person put on
+    /// the clock), in todoKey spelling. A reminder with one of these titles is
+    /// drawn as that block, once.
+    static func plannedTitles(_ blocks: [DayBlockInput]) -> Set<String> {
+        Set(blocks.filter { $0.taskID != nil && !isJunk($0.title) }.map { todoKey($0.title) })
+    }
+
     /// The overdue reminders the agenda lists by name. Past `maxOverdueShown` the rest
     /// fold into one "N more overdue" row, so those keep their place in Still to fit.
     private static func drawnOverdue(_ needs: [DayNeedInput], blocks: [DayBlockInput], now: Double,
                                      isToday: Bool) -> [DayNeedInput] {
         guard isToday else { return [] }
         let suggested = Set(blocks.compactMap { $0.kind == "suggestion" ? $0.evidenceID : nil })
+        let planned = plannedTitles(blocks)
         let overdue = needs.filter { need in
             need.source != "calendar" && !isJunk(need.title) && !suggested.contains(need.id)
+                && !planned.contains(todoKey(need.title))
                 && (need.due.map { $0 < now } ?? false)
         }
         return overdue.count > maxOverdueShown ? Array(overdue.prefix(maxOverdueShown - 1)) : overdue
+    }
+
+    // MARK: The Brief's to-do list
+
+    /// One task-like thing Day holds that the Brief's to-do list adds to the
+    /// to-dos it already lists: a task the planner couldn't place (Still to
+    /// fit) or a reminder that is due today or overdue.
+    struct BriefTask: Equatable, Identifiable {
+        /// "task:<planner id>" or "need:<needs id>".
+        let id: String
+        let title: String
+        /// Its due line as the Brief's to-dos phrase it ("Today", "Overdue since Fri"), or "".
+        let dueLabel: String
+        /// What a task row says under its title (why it didn't fit), or "".
+        let note: String
+        let due: Double?
+        /// The planner task it checks off (TodayModel.edit), or the Needs you item (Mark done).
+        var taskID: String? = nil
+        var needID: String? = nil
+    }
+
+    /// What Day adds to the Brief's to-do list, each once and only task-like:
+    /// the planner's still-to-fit tasks and the reminders due by today's end
+    /// (or overdue), never calendar events, study blocks, suggested or held
+    /// time blocks, mail or texts. `listed` is every title the Brief's to-do
+    /// list already shows (the proactive to-dos): anything with one of them is
+    /// left out. A reminder Day already placed as a plan block, or suggested a
+    /// block for, is that block, not a to-do. `inNeedsYou` is what the Brief's Needs
+    /// you section already shows (by id or title): an item shows once in the Brief.
+    static func briefTasks(unscheduled: [(id: String, title: String, reason: String)], needs: [DayNeedInput],
+                           blocks: [DayBlockInput], listed: [String],
+                           inNeedsYou: [(id: String, text: String)] = [], now: Double, dayStart: Double, dayEnd: Double,
+                           isToday: Bool, clock: (Double) -> String, dayClock: (Double) -> String) -> [BriefTask] {
+        guard isToday else { return [] }
+        let needsIDs = Set(inNeedsYou.map(\.id))
+        var seen = Set(listed.map(todoKey) + inNeedsYou.map { todoKey($0.text) })
+        var rows: [BriefTask] = []
+        let placed = Set(blocks.map { todoKey($0.title) })
+        for task in unscheduled where !isJunk(task.title) && !seen.contains(todoKey(task.title))
+            && !placed.contains(todoKey(task.title)) {
+            seen.insert(todoKey(task.title))
+            rows.append(BriefTask(id: "task:" + task.id, title: task.title, dueLabel: "",
+                                  note: plainReason(task.reason).capitalizedFirst, due: nil, taskID: task.id))
+        }
+        let suggested = Set(blocks.compactMap { $0.kind == "suggestion" ? $0.evidenceID : nil })
+        let planned = plannedTitles(blocks)
+        let due = needs.filter { need in
+            need.source == "reminders" && !isJunk(need.title) && !suggested.contains(need.id)
+                && !planned.contains(todoKey(need.title)) && !needsIDs.contains(need.id)
+                && (need.due.map { $0 < dayEnd } ?? false)
+        }.sorted { ($0.due ?? 0, $0.id) < ($1.due ?? 0, $1.id) }
+        for need in due where !seen.contains(todoKey(need.title)) {
+            guard let at = need.due else { continue }
+            seen.insert(todoKey(need.title))
+            let label: String
+            if at < now {
+                label = "Overdue since " + (need.allDay ? overdueDay(at, dayStart: dayStart, dayClock: dayClock)
+                                                          : overdueLabel(at, dayStart: dayStart, clock: clock, dayClock: dayClock))
+            } else {
+                label = need.allDay ? "Today" : "Due " + clock(at)
+            }
+            rows.append(BriefTask(id: "need:" + need.id, title: need.title, dueLabel: label, note: "", due: at,
+                                  needID: need.id))
+        }
+        return rows
     }
 
     // MARK: Agenda
@@ -2763,7 +2843,16 @@ enum StudyBlockCalendar {
 
         func phase(_ id: String) -> Phase { phases[id] ?? .idle }
 
-        func show(_ block: Block, now: Double) -> Show {
+        /// `calendarSync`: Day calendar sync is on, so it puts the block on the calendar
+        /// itself and the old Add to calendar is hidden (a tap would make a second
+        /// event). An added block keeps its line and Undo.
+        func show(_ block: Block, now: Double, calendarSync: Bool = false) -> Show {
+            let shown = showIgnoringSync(block, now: now)
+            if calendarSync, case .add = shown { return .none }
+            return shown
+        }
+
+        private func showIgnoringSync(_ block: Block, now: Double) -> Show {
             guard block.kind == "study", block.id.hasPrefix(StudyBlockCalendar.idPrefix),
                   let added = block.added else { return .none }
             let canAct = !routeMissing

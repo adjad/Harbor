@@ -10,6 +10,8 @@ struct OverlayView: View {
     @ObservedObject var todayModel: TodayModel
     // The app's one SettingsLoader, shared with the Harbor window's Settings.
     @ObservedObject var settings: SettingsLoader
+    // The person's own starter questions, read from the service each time Ask opens empty.
+    @ObservedObject private var askSuggestions = AskSuggestions.shared
     // The app's one setup model, shared with Settings › Models › Setup.
     @ObservedObject var setup: SetupGuideModel
     var onClose: () -> Void
@@ -1191,8 +1193,10 @@ struct OverlayView: View {
         }
     }
 
-    // Starter questions a fresh install can answer, two to a row so four fit
-    // the panel's width, under a greeting once the person has told Harbor their name.
+    // The person's own questions (AskSuggestionsStore: built from their calendar, mail and
+    // notes), two to a row under a greeting once they have told Harbor their name. Nothing
+    // shows until the service answers; when it has none the general starters stay, so a
+    // fresh install still has questions it can answer.
     private var suggestionsRow: some View {
         VStack(alignment: .leading, spacing: 6) {
             if let greeting = AskStarters.greeting(name: model.starterName) {
@@ -1200,14 +1204,17 @@ struct OverlayView: View {
             }
             LazyVGrid(columns: [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)],
                       alignment: .leading, spacing: 8) {
-                ForEach(model.suggestions, id: \.self) { s in
+                ForEach(AskSuggestionPrompts.shown(personal: askSuggestions.prompts, general: model.suggestions),
+                        id: \.self) { s in
                     Button { model.pick(s) } label: {
-                        Text(s).lineLimit(1).truncationMode(.tail)
+                        Text(s).lineLimit(2).multilineTextAlignment(.leading)
+                            .fixedSize(horizontal: false, vertical: true)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, 12).padding(.vertical, 6)
-                            .background(Capsule().fill(Theme.chipFill))
-                            .overlay(Capsule().stroke(Theme.chipStroke, lineWidth: 1))
-                            .contentShape(Capsule())
+                            .padding(.horizontal, 12).padding(.vertical, 7)
+                            .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Theme.chipFill))
+                            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                .stroke(Theme.chipStroke, lineWidth: 1))
+                            .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                     }
                     .buttonStyle(.plain)
                     .font(.harbor(.body)).foregroundStyle(Theme.textSecondary)
@@ -1215,6 +1222,8 @@ struct OverlayView: View {
                 }
             }
         }
+        // Each time Ask opens empty (or a new chat empties it): read what is cached now.
+        .task { await askSuggestions.refresh() }
     }
 
     // A light row of the starters not yet asked in this chat, under the last reply.
@@ -1339,8 +1348,7 @@ struct OverlayView: View {
             if !draft.status.isEmpty {
                 Text(draft.status)
                     .font(.harbor(.footnote))
-                    .foregroundStyle((draft.sent || draft.isSending
-                                      || draft.status == HarborClient.quietNotDelivered)
+                    .foregroundStyle((draft.sent || draft.isSending)
                                      ? Theme.textSecondary : Theme.bad)
             }
             if !draft.sent {

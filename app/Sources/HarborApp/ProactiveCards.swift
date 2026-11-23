@@ -68,6 +68,9 @@ final class ProactiveActions: ObservableObject {
     @Published var openDrafts: Set<String> = []
     /// Cards the service confirmed fired or dismissed; gone until it stops sending them.
     @Published var hidden: Set<String> = []
+    /// Cards whose tapped action Harbor could do on its own, with the one short question shown on
+    /// them (ActForConsent). The card stays, done, until the question is answered.
+    @Published var consentAsk: [String: ActForConsent.Kind] = [:]
     @Published var dismissing: Set<String> = []
     @Published var cardErrors: [String: String] = [:]
     @Published var todoBusy: Set<String> = []
@@ -206,6 +209,11 @@ final class ProactiveActions: ObservableObject {
             let handedBack = !outcome.handoff.isEmpty || !outcome.url.isEmpty
             fires[card.id] = .done(outcome.message.isEmpty ? (handedBack ? "Opened to finish" : "Done") : outcome.message)
             guard !handedBack else { return }
+            // An action Harbor could do by itself next time: ask once, on this card, before it goes.
+            if let kind = await ActForConsent.kindToAsk(method: action.method, title: card.title) {
+                withAnimation(.easeOut(duration: 0.2)) { consentAsk[card.id] = kind }
+                return
+            }
             try? await Task.sleep(for: .milliseconds(1400))
             withAnimation(.easeOut(duration: 0.2)) { _ = hidden.insert(card.id) }
             openDrafts.remove(card.id)
@@ -222,6 +230,20 @@ final class ProactiveActions: ObservableObject {
             fires[card.id] = .unconfirmed(ProactiveOutcome.unconfirmedLine(method: action.method))
             await today.refresh(afterMutation: true)
         }
+    }
+
+    /// The answer to the inline question: Yes turns on only that kind, Not now holds the question for
+    /// a week. Either way the card goes on its way, as it would have without the question.
+    func answerConsent(_ card: ProactiveCard, yes: Bool, today: TodayModel) async {
+        guard let kind = consentAsk[card.id] else { return }
+        let problem = await ActForMeModel.shared.setKind(kind.rawValue, on: yes)
+        // A yes that could not be saved keeps the question, with the reason, so it can be tried again.
+        if yes, problem != nil { return }
+        withAnimation(.easeOut(duration: 0.2)) { _ = consentAsk.removeValue(forKey: card.id) }
+        try? await Task.sleep(for: .milliseconds(yes ? 900 : 200))
+        withAnimation(.easeOut(duration: 0.2)) { _ = hidden.insert(card.id) }
+        openDrafts.remove(card.id)
+        await today.refresh(afterMutation: true)
     }
 
     func dismiss(_ card: ProactiveCard, today: TodayModel) async {
@@ -243,6 +265,22 @@ final class ProactiveActions: ObservableObject {
     /// Check a to-do off (or back on).
     func toggleDone(_ todo: ProactiveTodo, today: TodayModel) async {
         await changeTodo(todo, body: ["done": !isDone(todo)], today: today) { [self] in todoDone[todo.id] = !isDone(todo) }
+    }
+
+    /// Check off a task the planner couldn't place, the way Day's own task list
+    /// does (PATCH status done). Day's Still to fit and the Brief's to-dos both
+    /// call this, so one check-off shows in both once the plan refreshes. `key`
+    /// is the row's id ("task:<id>").
+    func completePlanTask(_ taskID: String, key: String, today: TodayModel) async {
+        guard !todoBusy.contains(key), let task = today.currentPlan?.tasks.first(where: { $0.id == taskID }) else { return }
+        todoBusy.insert(key)
+        defer { todoBusy.remove(key) }
+        if await today.edit(task, values: ["status": "done"]) {
+            todoErrors[key] = nil
+            todoDone[key] = true
+        } else {
+            todoErrors[key] = "That didn't save."
+        }
     }
 
     func addToDay(_ todo: ProactiveTodo, today: TodayModel) async {
@@ -448,10 +486,9 @@ struct ProactiveBriefSection: View {
         }
     }
 
-    /// The sources Harbor couldn't read, then the two zones.
+    /// The two zones. Sources Harbor can't read are one "Finish setup" row (BriefAccessRows.swift).
     private func zones(_ shown: ProactiveState) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            if !unread.isEmpty { accessRows(unread) }
             zonePair(shown)
         }
     }
@@ -480,35 +517,6 @@ struct ProactiveBriefSection: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(BriefPlate.heading(spoken, count: count))
         .accessibilityAddTraits(.isHeader)
-    }
-
-    // MARK: Sources Harbor couldn't read
-
-    /// One quiet row per source Harbor couldn't read: what's wrong, and the
-    /// setting that fixes it (Full Disk Access for texts, Calendars, …).
-    private func accessRows(_ rows: [SourceAccess]) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            ForEach(rows, id: \.source) { access in
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Image(systemName: DayTimeline.sourceSymbol(access.source)).font(.harbor(size: 10.5))
-                        .foregroundStyle(Theme.textMuted).frame(width: 15)
-                    Text(access.headline).font(.harbor(size: 12.5)).foregroundStyle(Theme.textSecondary)
-                        .lineLimit(2).fixedSize(horizontal: false, vertical: true)
-                        .help(access.detail)
-                    Spacer(minLength: 6)
-                    // fixLink: a Google account to reconnect opens Harbor's own Settings.
-                    if let fix = access.fixLink, let url = URL(string: fix.url) {
-                        NotchChrome.small(Permissions.fixLabel(fix)) {
-                            if fix == BriefDetail.googleSettings { BriefFix.open(fix) } else { Permissions.openFix(url) }
-                        }
-                        .help(access.detail)
-                    }
-                }
-                .accessibilityElement(children: .combine)
-            }
-        }
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("Sources Harbor can't read yet")
     }
 
     // MARK: Accounts
@@ -708,8 +716,9 @@ struct ProactiveBriefSection: View {
         }
     }
 
-    /// Nothing ready: one line, with Analyze now beside it; "Let Harbor act for
-    /// me" under it while it is asking or off, its log while it is on.
+    /// Nothing ready: one line, with Analyze now beside it; its log under it while
+    /// "Let Harbor act for me" is on. Nothing about it while it is off: the question
+    /// comes later, on the card of an action Harbor could have done itself.
     private var readyEmpty: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -722,11 +731,7 @@ struct ProactiveBriefSection: View {
                 accountMenu
                 analyzeControl
             }
-            if let state = actingState, state.enabled {
-                if actions.showActingLog { actingLog(state) }
-            } else {
-                ActForMeBriefRow()
-            }
+            if let state = actingState, state.enabled, actions.showActingLog { actingLog(state) }
         }
         .padding(.vertical, 2)
     }
@@ -754,15 +759,14 @@ struct ProactiveBriefSection: View {
         return "Nothing to get ahead of in what Harbor could read."
     }
 
-    /// "Let Harbor act for me" at READY FOR YOU's foot: the question until it is
-    /// answered and one line while it is off (ActForMeBriefRow, as before);
-    /// while it is on, the box. What Harbor did shows with its own Undo either way.
+    /// "Let Harbor act for me" at READY FOR YOU's foot: while it is on, the box.
+    /// While it is off, nothing but what Harbor did, with its own Undo either way.
+    /// The question is never here (see ActForConsent: it is asked on the tapped card).
     @ViewBuilder private func actingArea(_ did: [ProactiveCard]) -> some View {
         if let state = actingState, state.enabled {
             actingBox(state, did: did)
-        } else {
-            ActForMeBriefRow()
-            if !did.isEmpty { actingAdded(did) }
+        } else if !did.isEmpty {
+            actingAdded(did)
         }
     }
 
@@ -1063,6 +1067,7 @@ struct ProactiveBriefSection: View {
                 cardRowAction(card)
                 cardDismiss(card)
             }
+            if let kind = actions.consentAsk[card.id] { consentLine(card, kind).padding(.leading, tagColumn + 10) }
             if case .failed(let reason) = state {
                 Text(reason).font(.harbor(size: 11)).foregroundStyle(Theme.bad)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1072,6 +1077,14 @@ struct ProactiveBriefSection: View {
                 Text(error).font(.harbor(size: 11)).foregroundStyle(Theme.bad).padding(.leading, tagColumn + 10)
             }
         }
+    }
+
+    /// The one inline question after a tapped action Harbor could do on its own (ActForConsent).
+    private func consentLine(_ card: ProactiveCard, _ kind: ActForConsent.Kind) -> some View {
+        ActForConsentLine(kind: kind) { yes in
+            Task { await actions.answerConsent(card, yes: yes, today: today); model.onResize() }
+        }
+        .padding(.top, 2)
     }
 
     /// A row's own button, small: the same fire as its large card's button.
@@ -1325,6 +1338,7 @@ struct ProactiveBriefSection: View {
                 if action?.sendsDraft == true && !isDone(fire) { sendsOnTap }
             }
             .padding(.top, 3)
+            if let kind = actions.consentAsk[card.id] { consentLine(card, kind) }
             if case .failed(let reason) = fire {
                 Text(reason).font(.harbor(size: 11)).foregroundStyle(Theme.bad)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1660,7 +1674,11 @@ struct ProactiveBriefSection: View {
     /// Open to-dos, most urgent first, none just cleared and none that only
     /// restates an event the calendar line names (ProactiveState.plate).
     private func listTodos(_ shown: ProactiveState) -> [ProactiveTodo] {
-        let todos = shown.todos.filter { !itemActions.isHidden($0.actionRow) }
+        // What the Needs you section above already shows isn't also a to-do.
+        let inNeedsYou = needsYouShown
+        let nameKeys = Set(inNeedsYou.map { DayTimeline.todoKey($0.text) })
+        let todos = shown.todos.filter { !itemActions.isHidden($0.actionRow) && !nameKeys.contains(DayTimeline.todoKey($0.title)) }
+            + dayTodos(besides: shown.todos).filter { !itemActions.isHidden($0.actionRow) }
         let bounds = today.dayInterval
         let tomorrow = schoolCalendar.date(byAdding: .day, value: 1, to: bounds.end) ?? bounds.end.addingTimeInterval(86_400)
         let items: [PlateItem] = ProactiveState.plate(todos: todos, school: [], isDone: { actions.isDone($0) },
@@ -1671,6 +1689,36 @@ struct ProactiveBriefSection: View {
         return items.compactMap { item -> ProactiveTodo? in
             if case .todo(let todo) = item { return todo }
             return nil
+        }
+    }
+
+    /// What Day holds that the engine's to-dos don't: tasks the planner couldn't
+    /// place and reminders due today or overdue (DayTimeline.briefTasks). A
+    /// reminder only comes if Needs you can mark it done, so its check works.
+    private var needsYouShown: [(id: String, text: String)] {
+        guard today.isShowingCurrentDay else { return [] }
+        return (today.currentPlan?.workspace?.needs_you?.items ?? []).map { (id: $0.id, text: $0.text) }
+    }
+
+    private func dayTodos(besides listed: [ProactiveTodo]) -> [ProactiveTodo] {
+        guard today.isShowingCurrentDay, let plan = today.currentPlan else { return [] }
+        let bounds = today.dayInterval
+        let blocks = plan.displayBlocks.map {
+            DayBlockInput(id: $0.id, title: $0.title, start: $0.start, end: $0.end, kind: $0.kind,
+                          taskID: $0.task_id, evidenceID: $0.evidence_id)
+        }
+        let completable: [String: DailyNeedsYou.Item] = Dictionary(
+            (plan.workspace?.needs_you?.items ?? []).filter { $0.can_complete == true && !($0.fingerprint ?? "").isEmpty }
+                .map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let tasks = DayTimeline.briefTasks(
+            unscheduled: plan.displayUnscheduled.map { (id: $0.task_id, title: $0.title, reason: $0.reason) },
+            needs: plan.dayNeeds.filter { completable[$0.id] != nil }, blocks: blocks, listed: listed.map(\.title), inNeedsYou: needsYouShown,
+            now: today.now.timeIntervalSince1970, dayStart: bounds.start.timeIntervalSince1970,
+            dayEnd: bounds.end.timeIntervalSince1970, isToday: true, clock: today.clock,
+            dayClock: { NotchChrome.dayClock($0, zone: today.timezone, locale: today.clockLocale) })
+        return tasks.map { task in
+            let item = task.needID.flatMap { completable[$0] }
+            return ProactiveTodo(day: task, fingerprint: item?.fingerprint ?? "", canComplete: item != nil)
         }
     }
 
@@ -1832,7 +1880,7 @@ struct ProactiveBriefSection: View {
     /// that keep their places from row to row.
     private func todoRow(_ todo: ProactiveTodo) -> some View {
         let done = actions.isDone(todo)
-        let busy = actions.todoBusy.contains(todo.id)
+        let busy = actions.todoBusy.contains(todo.id) || (todo.needID != nil && itemActions.busy[todo.actionRow.id] != nil)
         return VStack(alignment: .leading, spacing: 2) {
             HStack(alignment: .center, spacing: 8) {
                 checkButton(todo, done: done, busy: busy)
@@ -1843,7 +1891,7 @@ struct ProactiveBriefSection: View {
             if let error = actions.todoErrors[todo.id] {
                 Text(error).font(.harbor(size: 11)).foregroundStyle(Theme.bad).padding(.leading, Self.listInset)
             }
-            if let failure = itemActions.failures[todo.id] {
+            if let failure = itemActions.failures[todo.actionRow.id] {
                 Text(failure).font(.harbor(size: 11)).foregroundStyle(Theme.textSecondary)
                     .fixedSize(horizontal: false, vertical: true).padding(.leading, Self.listInset)
             }
@@ -1851,8 +1899,20 @@ struct ProactiveBriefSection: View {
         .accessibilityElement(children: .contain)
     }
 
+    /// The check: an engine to-do through the engine; a planner task through
+    /// Day's own task edit; a Day reminder through Needs you's Mark done.
+    private func check(_ todo: ProactiveTodo) async {
+        if let taskID = todo.planTaskID {
+            await actions.completePlanTask(taskID, key: todo.id, today: today)
+        } else if todo.needID != nil {
+            if await itemActions.perform(.markDone, on: todo.actionRow) { await today.refresh(afterMutation: true) }
+        } else {
+            await actions.toggleDone(todo, today: today)
+        }
+    }
+
     private func checkButton(_ todo: ProactiveTodo, done: Bool, busy: Bool) -> some View {
-        Button { Task { await actions.toggleDone(todo, today: today) } } label: {
+        Button { Task { await check(todo) } } label: {
             Image(systemName: done ? "checkmark.circle.fill" : "circle")
                 .font(.harbor(size: 15, weight: .light))
                 .foregroundStyle(done ? Theme.textSecondary : Theme.textPrimary.opacity(0.85))

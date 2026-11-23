@@ -734,3 +734,79 @@ def test_attach_names_the_guide_from_the_real_store(tmp_path, monkeypatch):
     assert d["id"] == "canvas:105:hw5" and d["day"] == "today"
     assert d["url"] == "https://canvas.example.edu/courses/105/assignments/5005"
     assert d["material"] == {"id": "m_hw5", "kind": "guide", "scope": "assignment", "title": "Homework 5 guide"}
+
+
+# ---------------------------------------------------------------- same-minute collision, double booking
+
+def _two_item_store(tmp_path):
+    store_mod = pytest.importorskip("service.study.store")
+    store = store_mod.StudyStore(tmp_path / "study" / "study.db")
+    store.upsert_courses([{"id": "canvas:9", "name": "Statistics", "code": "STAT 101", "grade": None,
+                           "score": None, "url": None, "source": "canvas", "sample": False}])
+    row = {"course_id": "canvas:9", "kind": "assignment", "due_ts": at(23, 59), "all_day": False,
+           "points": 20.0, "score": None, "status": "upcoming", "details": "", "url": None,
+           "source": "canvas", "sample": False}
+    store.upsert_assignments([row | {"id": "canvas:9:aa", "title": "HW2"},
+                              row | {"id": "canvas:9:bb", "title": "HW3"}])
+    return store
+
+
+def test_a_new_study_block_never_starts_where_a_booked_one_sits(tmp_path, monkeypatch):
+    """The booked block's calendar copy may be missing from the Day lists (Harbor's own events can be left
+    out on read); the booking record alone keeps a second block off its minute."""
+    from service.study import blocks_api
+    store = _two_item_store(tmp_path)
+    now = at(9)
+    first = plan.study_blocks(store.assignments(), [], now=now, timezone=TZ, day=DAY)[0]
+    store.set_meta(blocks_api.META, {first["id"]: {"source_id": "ev1", "title": first["title"],
+                                                   "start": first["start"], "end": first["end"], "day": DAY,
+                                                   "timezone": TZ, "at": now}})
+    monkeypatch.setattr(blocks_api, "_calendar_state", lambda day, tz: (None, {}))
+    monkeypatch.setattr(day_hook, "store_path", lambda: tmp_path / "study" / "study.db")
+    monkeypatch.setattr(day_hook, "study_store", lambda: store)
+    result = snapshot(now)
+    day_hook.attach(result, now=now, timezone=TZ)
+    study = [b for b in result["blocks"] if b["kind"] == "study"]
+    assert len(study) == 2
+    assert len({round(b["start"] / 60) for b in study}) == 2          # never the same minute
+    for a, b in zip(study, study[1:]):
+        assert a["end"] <= b["start"]
+
+
+def test_a_moved_and_reissued_event_is_not_gone():
+    from service.study import blocks_api
+    record = {"source_id": "ev-old", "title": "Study: HW2", "start": at(18), "end": at(18, 45), "day": DAY,
+              "timezone": TZ, "at": at(9)}
+    status = {"available": True, "syncing": False, "last_sync": at(12)}
+    now = at(12, 1)
+    moved = {"ev-new": (at(19), at(19, 45), "Study: HW2")}      # Calendar moved it and gave it a new id
+    assert blocks_api.gone(record, status, moved, now) is False
+    deleted = {"ev-x": (at(19), at(19, 45), "Dentist")}
+    assert blocks_api.gone(record, status, deleted, now) is True
+    assert blocks_api.gone(record, status, {}, now) is True
+
+
+def test_a_block_booked_under_another_id_is_not_booked_twice(tmp_path, monkeypatch):
+    import asyncio
+    from service.study import blocks_api
+    store = _two_item_store(tmp_path)
+    store.set_meta(blocks_api.META, {"study-block:canvas:9:old": {
+        "source_id": "ev1", "title": "Study: HW2", "start": at(18), "end": at(18, 45), "day": DAY,
+        "timezone": TZ, "at": at(9)}})
+    monkeypatch.setattr(blocks_api, "study_store", lambda: store)
+    monkeypatch.setattr(blocks_api, "study_exists", lambda: True)
+    block = {"id": "study-block:canvas:9:aa", "title": "Study: HW2", "start": at(19), "end": at(19, 45),
+             "kind": "study", "added": False}
+    monkeypatch.setattr(blocks_api, "_snapshot", lambda day, tz: {"blocks": [block]})
+    created = []
+
+    async def create(plan_):
+        created.append(plan_)
+        return {"ok": True, "status": "succeeded", "source_id": "ev2"}
+    monkeypatch.setattr(blocks_api, "_create", create)
+
+    class Req:
+        async def json(self):
+            return {"day": DAY, "timezone": TZ}
+    got = asyncio.run(blocks_api.add_block("study-block:canvas:9:aa", Req()))
+    assert got["ok"] is True and got["source_id"] == "ev1" and created == []

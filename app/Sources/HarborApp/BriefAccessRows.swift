@@ -1,29 +1,30 @@
 import AppKit
 import SwiftUI
 
-/// The quiet rows Brief and Day show for access Setup no longer asks for. Setup asks
-/// for Calendar and Reminders only; the rest is asked when a task needs it:
+/// The one setup row Brief (and, before onboarding is done, Day) can show. Setup asks
+/// for Calendar and Reminders; the rest is asked at the moment a task needs it, and
+/// lives in Settings. Until onboarding is finished, every source Harbor can't read yet
+/// is folded into ONE row, "Finish setup · 3", that opens the notch permission page
+/// (the whole list). It names no source twice, has no per-source Allow button, and is
+/// gone once onboarding is finished (`onboardingDone`).
 ///
-///   - "Allow Harbor to read Mail": Mail & Notes Automation, asked only by this row's
-///     button (the same request Setup's Mail row ran, `request(.mail)` on FirstRunPermissions),
-///     never by a timer or in the background. Shown while Automation is undecided, Mail
-///     is on this Mac, Google isn't covering mail and the Envelope Index can't be read.
-///   - "See your texts": Full Disk Access, when Messages' history can't be opened.
-///   - "See your mail and notes when they're closed": Full Disk Access again, for
-///     Mail and Notes while those apps are closed and their stores can't be opened.
+/// What counts as missing:
+///   - Mail & Notes Automation, undecided while Mail is on this Mac, Google isn't
+///     covering mail and the Envelope Index can't be read (mail);
+///   - Full Disk Access, when Messages' history can't be opened (texts), or Mail and
+///     Notes while those apps are closed and their stores can't be opened;
+///   - the plan's own unread Calendar, Reminders, mail and texts, when the service named
+///     a permission as the reason, and Contacts when macOS turned it down.
+/// A source is never missing when the live probe (AccessProbe) says that store reads, or
+/// can't say.
 ///
-/// Texts and closed apps open the notch permission page focused on Full Disk Access
-/// (Permissions.openFix, the link every Brief and Day fix uses). A row is never shown
-/// when the live probe (AccessProbe) says that store reads, or can't say. Each row can
-/// be put away for the rest of the day.
-///
-/// `decide` and the day-key helpers are pure (tests/FirstRunSetupChecks.swift); the
-/// model reads the facts, the view draws them.
+/// After onboarding Day keeps one quiet line, only when Calendar or Reminders (its own
+/// data) can't be read; Brief keeps none. `decide`, `finishRow` and `dayLine` are pure
+/// (tests/FirstRunSetupChecks.swift); the model reads the facts, the view draws them.
 enum BriefAccessRows {
-    enum Row: String, CaseIterable, Equatable {
-        case allowMail = "allow-mail"
-        case seeTexts = "see-texts"
-        case seeClosed = "see-closed"
+    /// A source that can be missing, counted once however many places report it.
+    enum Source: String, CaseIterable, Equatable {
+        case calendar, reminders, mail, texts, notes, contacts
     }
 
     /// What the rows are decided from.
@@ -45,10 +46,15 @@ enum BriefAccessRows {
         /// Mail and/or Notes, closed and unreadable, in the order Mail, Notes.
         var closed: [AccessProbe.Store] = []
 
-        var rows: [Row] {
-            (allowMail ? [Row.allowMail] : []) + (seeTexts ? [.seeTexts] : []) + (closed.isEmpty ? [] : [.seeClosed])
+        /// The sources these facts say are missing.
+        var sources: Set<Source> {
+            var out: Set<Source> = []
+            if allowMail { out.insert(.mail) }
+            if seeTexts { out.insert(.texts) }
+            for store in closed { out.insert(store == .mail ? .mail : .notes) }
+            return out
         }
-        var isEmpty: Bool { rows.isEmpty }
+        var isEmpty: Bool { sources.isEmpty }
     }
 
     /// The stores macOS refused, from one probe. `.on` and `.unknown` refuse none.
@@ -64,7 +70,7 @@ enum BriefAccessRows {
         }
     }
 
-    /// Which rows show right now. Pure.
+    /// Which sources the probe and Automation say are missing right now. Pure.
     static func decide(_ f: Facts) -> Shown {
         var shown = Shown()
         let indexReadable = f.outcomes[.mail] == .readable
@@ -76,81 +82,88 @@ enum BriefAccessRows {
         return shown
     }
 
-    static let allowMailTitle = "Allow Harbor to read Mail"
-    static let allowMailHelp = "Harbor asks macOS once, to read your mail and notes while those apps are open."
-    static let seeTextsTitle = "See your texts"
-    static let seeTextsHelp = "Harbor needs Full Disk Access to read your Messages."
+    // MARK: The plan's own unread sources
 
-    /// "See your mail and notes when they're closed". Pure.
-    static func closedTitle(_ stores: [AccessProbe.Store]) -> String {
-        switch (stores.contains(.mail), stores.contains(.notes)) {
-        case (true, true): return "See your mail and notes when they're closed"
-        case (true, false): return "See your mail when Mail is closed"
-        case (false, true): return "See your notes when Notes is closed"
-        case (false, false): return ""
+    /// Reasons that a person fixes with a permission (SourceAccess.blocked). Anything else
+    /// (no accounts, a Google sign-in, a transient read) is not a setup row.
+    static let permissionBlocks: Set<String> = [
+        "calendar_access", "reminders_access", "full_disk_access", "mail_automation",
+        "mail_closed", "notes_closed", "contacts_access",
+    ]
+
+    /// The missing sources among the plan's unread ones, by the permission the service named.
+    /// Pure.
+    static func missing(_ unread: [SourceAccess]) -> Set<Source> {
+        var out: Set<Source> = []
+        for access in unread where !access.readable && access.state == .unavailable {
+            guard let blocked = access.blocked, permissionBlocks.contains(blocked) else { continue }
+            switch access.source {
+            case "calendar": out.insert(.calendar)
+            case "reminders": out.insert(.reminders)
+            case "email", "mail": out.insert(.mail)
+            case "messages", "texts": out.insert(.texts)
+            case "notes": out.insert(.notes)
+            case "contacts": out.insert(.contacts)
+            default: break
+            }
         }
-    }
-
-    static let closedHelp = "Harbor needs Full Disk Access to read these while their apps are closed."
-
-    static func title(_ row: Row, closed: [AccessProbe.Store] = []) -> String {
-        switch row {
-        case .allowMail: return allowMailTitle
-        case .seeTexts: return seeTextsTitle
-        case .seeClosed: return closedTitle(closed)
-        }
-    }
-
-    static func symbol(_ row: Row) -> String {
-        switch row {
-        case .allowMail: return "envelope"
-        case .seeTexts: return "message"
-        case .seeClosed: return "internaldrive"
-        }
-    }
-
-    // MARK: Put away for the day
-
-    static func dismissKey(_ row: Row) -> String { "harbor.briefAccess.dismissed." + row.rawValue }
-
-    /// "2026-11-21", in the person's calendar.
-    static func dayKey(_ date: Date, calendar: Calendar = .current) -> String {
-        let parts = calendar.dateComponents([.year, .month, .day], from: date)
-        return String(format: "%04d-%02d-%02d", parts.year ?? 0, parts.month ?? 0, parts.day ?? 0)
-    }
-
-    /// A row put away on `stored`'s day stays away that day only. Pure.
-    static func isDismissed(stored: String?, today: String) -> Bool { stored == today }
-
-    /// Rows that remain after the ones put away today. Pure.
-    static func visible(_ shown: Shown, dismissed: Set<Row>) -> Shown {
-        var out = shown
-        if dismissed.contains(.allowMail) { out.allowMail = false }
-        if dismissed.contains(.seeTexts) { out.seeTexts = false }
-        if dismissed.contains(.seeClosed) { out.closed = [] }
         return out
+    }
+
+    // MARK: The row
+
+    /// The one row: how many distinct sources are still missing.
+    struct Finish: Equatable {
+        let sources: [Source]
+        var count: Int { sources.count }
+        var title: String { "Finish setup · \(count)" }
+    }
+
+    static let finishHelp = "Harbor can't see some of your things yet. Open the permissions page to turn them on."
+    static let finishSymbol = "lock.shield"
+
+    /// Onboarding is finished (or never started, as for someone who upgraded): the flag
+    /// FirstRunSetup keeps (`harbor.firstRun.done`, with `harbor.firstRun.started`). Pure.
+    static func onboardingDone(_ flag: (String) -> Bool = { UserDefaults.standard.bool(forKey: $0) }) -> Bool {
+        !FirstRunSetup.isUnfinished(flag)
+    }
+
+    /// The Brief's row: nil once onboarding is done, and nil when nothing is missing; else
+    /// one row naming each missing source once. Pure.
+    static func finishRow(_ shown: Shown, planMissing: Set<Source>, onboardingDone: Bool) -> Finish? {
+        guard !onboardingDone else { return nil }
+        let all = shown.sources.union(planMissing)
+        guard !all.isEmpty else { return nil }
+        return Finish(sources: Source.allCases.filter(all.contains))
+    }
+
+    /// Day after onboarding: one quiet line only for Calendar or Reminders, Day's own
+    /// data; nothing else is Day's to say. Before onboarding is done the Finish setup row
+    /// speaks for everything, so Day adds no line. Pure.
+    static func dayLine(planMissing: Set<Source>, onboardingDone: Bool) -> [Source] {
+        guard onboardingDone else { return [] }
+        return [Source.calendar, .reminders].filter(planMissing.contains)
+    }
+
+    /// The row's button: the notch permission page, the whole list.
+    @MainActor static func openPermissionPage() {
+        NotificationCenter.default.post(name: .harborOpenPermissionPage, object: nil)
     }
 }
 
-/// Reads the facts and runs the one request. Nothing here asks macOS on its own: the
-/// only ask is `allowMail()`, from the row's button.
+/// Reads the facts. Nothing here asks macOS: the row only opens the permission page.
 @MainActor
 final class BriefAccessRowsModel: ObservableObject {
     static let shared = BriefAccessRowsModel()
 
     @Published private(set) var shown = BriefAccessRows.Shown()
-    @Published private(set) var asking = false
-    /// The Setup window's own object, so the request is the very one its Mail row ran.
-    private let permissions = FirstRunPermissions()
     private var live = true
-    private var dismissed: Set<BriefAccessRows.Row> = []
-    private var raw = BriefAccessRows.Shown()
     private var generation = 0
 
     init() {}
 
     #if HARBOR_NOTCH_QA
-    /// A fixed set of rows for a render: reads nothing from this Mac.
+    /// A fixed set of facts for a render: reads nothing from this Mac.
     static func qaFixture(_ shown: BriefAccessRows.Shown) -> BriefAccessRowsModel {
         let model = BriefAccessRowsModel()
         model.live = false
@@ -159,10 +172,14 @@ final class BriefAccessRowsModel: ObservableObject {
     }
     #endif
 
+    /// Whether the row may show at all (a render's fixture shows it).
+    var onboardingDone: Bool { live ? BriefAccessRows.onboardingDone() : false }
+
     /// Reads the facts again. Cheap: the probe's answer is already kept, the Automation
-    /// read is `ask: false`, and Gmail is checked only when it could change a row.
+    /// read is `ask: false`, and Gmail is checked only when it could change the answer.
+    /// Does nothing once onboarding is done: no row will show.
     func refresh(now: Date = Date()) async {
-        guard live else { return }
+        guard live, !BriefAccessRows.onboardingDone() else { return }
         generation += 1
         let mine = generation
         let monitor = AccessProbeMonitor.shared
@@ -175,53 +192,14 @@ final class BriefAccessRowsModel: ObservableObject {
         // Mail & Notes Automation: .notAsked is "no answer yet". Reads only.
         let automation = await Task.detached { FirstRunPermissions.automationStateNow(ask: false) }.value
         facts.automationUndecided = automation == .notAsked
-        // Google only matters when it would hide a mail row.
+        // Google only matters when it would hide a mail entry.
         let mailMatters = facts.automationUndecided || BriefAccessRows.unreadable(facts.probe, facts.outcomes).contains(.mail)
         if mailMatters {
             facts.gmailCovers = MailRecache.gmailCovers(await Self.gmailAccounts(), now: now)
         }
         guard mine == generation else { return }
-        raw = BriefAccessRows.decide(facts)
-        loadDismissed(now: now)
-        publish()
-    }
-
-    private func loadDismissed(now: Date) {
-        let today = BriefAccessRows.dayKey(now)
-        dismissed = Set(BriefAccessRows.Row.allCases.filter {
-            BriefAccessRows.isDismissed(stored: UserDefaults.standard.string(forKey: BriefAccessRows.dismissKey($0)), today: today)
-        })
-    }
-
-    private func publish() {
-        let next = BriefAccessRows.visible(raw, dismissed: dismissed)
+        let next = BriefAccessRows.decide(facts)
         if next != shown { shown = next }
-    }
-
-    /// Put a row away until tomorrow.
-    func dismiss(_ row: BriefAccessRows.Row, now: Date = Date()) {
-        UserDefaults.standard.set(BriefAccessRows.dayKey(now), forKey: BriefAccessRows.dismissKey(row))
-        dismissed.insert(row)
-        publish()
-    }
-
-    /// The row's button: the same Mail & Notes Automation request Setup's row made.
-    func allowMail() {
-        guard live, !asking else { return }
-        asking = true
-        Task {
-            await permissions.request(.mail)
-            // request() tucked the notch away for macOS's question: bring it back.
-            Permissions.stepBack()
-            asking = false
-            await refresh()
-        }
-    }
-
-    /// Texts, and Mail and Notes while closed: the notch permission page, on Full Disk Access.
-    func openFullDiskAccess() {
-        guard live, let url = URL(string: BriefDetail.fullDiskAccess.url) else { return }
-        Permissions.openFix(url)
     }
 
     private static func gmailAccounts() async -> [MailRecache.GmailAccount] {
@@ -237,18 +215,24 @@ final class BriefAccessRowsModel: ObservableObject {
     }
 }
 
-/// The rows, one line each, in Brief's and Day's access-row style.
+/// The one row, in Brief's and Day's access-row style. `planMissing` is what the plan
+/// says it can't read (BriefAccessRows.missing), so a source named there and by the
+/// probe is counted once.
 struct BriefAccessRowsView: View {
     @ObservedObject private var model: BriefAccessRowsModel
     @ObservedObject private var probe = AccessProbeMonitor.shared
+    private let planMissing: Set<BriefAccessRows.Source>
 
-    init(model: BriefAccessRowsModel? = nil) {
+    init(model: BriefAccessRowsModel? = nil, planMissing: Set<BriefAccessRows.Source> = []) {
         self.model = model ?? BriefAccessRowsModel.shared
+        self.planMissing = planMissing
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            ForEach(model.shown.rows, id: \.rawValue) { row in line(row) }
+        Group {
+            if let row = BriefAccessRows.finishRow(model.shown, planMissing: planMissing, onboardingDone: model.onboardingDone) {
+                line(row)
+            }
         }
         .task { await model.refresh() }
         .onChange(of: probe.reading) { _, _ in Task { await model.refresh() } }
@@ -257,39 +241,21 @@ struct BriefAccessRowsView: View {
         }
     }
 
-    private func line(_ row: BriefAccessRows.Row) -> some View {
-        let title = BriefAccessRows.title(row, closed: model.shown.closed)
-        return HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Image(systemName: BriefAccessRows.symbol(row)).font(.harbor(size: 10.5))
-                .foregroundStyle(Theme.textMuted).frame(width: 15)
-            Text(title).font(.harbor(size: 12.5)).foregroundStyle(Theme.textSecondary)
-                .lineLimit(1).truncationMode(.tail)
-                .help(help(row))
-            Spacer(minLength: 6)
-            if row == .allowMail {
-                if model.asking {
-                    ProgressView().controlSize(.small)
-                } else {
-                    NotchChrome.small(Permissions.allowLabel) { model.allowMail() }.help(help(row))
-                }
-            } else {
-                NotchChrome.small(Permissions.allowLabel) { model.openFullDiskAccess() }.help(help(row))
+    private func line(_ row: BriefAccessRows.Finish) -> some View {
+        Button { BriefAccessRows.openPermissionPage() } label: {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: BriefAccessRows.finishSymbol).font(.harbor(size: 10.5))
+                    .foregroundStyle(Theme.textMuted).frame(width: 15)
+                Text(row.title).font(.harbor(size: 12.5)).foregroundStyle(Theme.textSecondary)
+                    .lineLimit(1).truncationMode(.tail)
+                Spacer(minLength: 6)
+                Image(systemName: "chevron.right").font(.harbor(size: 9, weight: .medium)).foregroundStyle(Theme.textMuted)
             }
-            Button { model.dismiss(row) } label: {
-                Image(systemName: "xmark").font(.harbor(size: 9, weight: .medium)).foregroundStyle(Theme.textMuted)
-            }
-            .buttonStyle(.plain)
-            .help("Hide until tomorrow")
-            .accessibilityLabel("Hide \(title) until tomorrow")
+            .contentShape(Rectangle())
         }
-        .accessibilityElement(children: .contain)
-    }
-
-    private func help(_ row: BriefAccessRows.Row) -> String {
-        switch row {
-        case .allowMail: return BriefAccessRows.allowMailHelp
-        case .seeTexts: return BriefAccessRows.seeTextsHelp
-        case .seeClosed: return BriefAccessRows.closedHelp
-        }
+        .buttonStyle(.plain)
+        .help(BriefAccessRows.finishHelp)
+        .accessibilityLabel(row.title)
+        .accessibilityHint("Opens the permissions page")
     }
 }

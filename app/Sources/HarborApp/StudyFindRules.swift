@@ -27,6 +27,21 @@ struct StudyFindTarget: Equatable, Sendable {
         return (parts.host, segments[1])
     }
 
+    /// A course Harbor saved without its address (`canvas:<n>`, the id Study gives
+    /// a course whose number it read from a Canvas link) lives on the same
+    /// Canvas site as the courses whose addresses it does hold, when they all
+    /// name ONE host. Returns that course's address, else nil (two sites, none
+    /// known, or an id that isn't a Canvas course number).
+    static func derivedCourseURL(courseID: String, knownHosts: [String]) -> String? {
+        let prefix = "canvas:"
+        guard courseID.hasPrefix(prefix) else { return nil }
+        let number = String(courseID.dropFirst(prefix.count))
+        guard !number.isEmpty, number.count <= 18, isDigits(number) else { return nil }
+        let hosts = Set(knownHosts.map { $0.lowercased() })
+        guard hosts.count == 1, let host = hosts.first, !host.isEmpty else { return nil }
+        return "https://\(host)/courses/\(number)"
+    }
+
     init(host: String, canvasID: String, courseID: String) {
         self.host = host.lowercased()
         self.canvasID = canvasID

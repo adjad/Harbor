@@ -350,6 +350,10 @@ def _agenda_item(item: dict, *, now: float | None = None,
              _agenda_clock(when, now))
     location = _agenda_text(item.get("location"))
     suffix = f" · {location}" if location else ""
+    if item.get("source") == "day":
+        # Day's own block or due item (service/assistant/day_agenda.py), in time order with the calendar.
+        from service.assistant import day_agenda
+        suffix += f" · {day_agenda.note(item)}"
     if _is_harbor_only(item):
         suffix += " [Harbor-only; Apple status unverified]"
     continued = ""
@@ -391,7 +395,7 @@ def _format_forward_agenda(items: list[dict], *, now: float, window_label: str,
         bucket = days.setdefault(day, {"events": [], "reminders": []})
         # A merged row may carry both calendar and reminder provenance. Keep
         # it visible once; each Harbor-only item is clearly marked on its line.
-        bucket["events" if "calendar" in _schedule_sources(item) else "reminders"].append(item)
+        bucket["events" if _schedule_sources(item) & {"calendar", "day"} else "reminders"].append(item)
 
     blocks: list[str] = []
     for day, bucket in days.items():
@@ -405,7 +409,8 @@ def _format_forward_agenda(items: list[dict], *, now: float, window_label: str,
             lines.extend(_agenda_item(item, now=now, display_day_start=display_day_start)
                          for item in bucket["reminders"])
         blocks.append("\n".join(lines))
-    calendar_count = sum("calendar" in _schedule_sources(item) for item in items)
+    # Day's planned blocks are on the schedule beside the calendar's events, so they count with them.
+    calendar_count = sum(bool(_schedule_sources(item) & {"calendar", "day"}) for item in items)
     reminder_count = sum(bool(_schedule_sources(item) & {"manual", "reminders"})
                          for item in items)
     counts = [_agenda_count(calendar_count, "event")]
@@ -620,12 +625,24 @@ async def get_upcoming(days: int = 7, account: str | None = None,
     if reminders_pending and "reminders" not in unavailable_ids:
         reminder_note = ("\nHarbor has not received a current Reminders read yet, so Apple "
                          "Reminders items are not shown here. Try again in a moment.")
+    # The Day tab and the calendar are one schedule: Day's planned blocks (study time, kept
+    # tasks, suggested time) and what is due that day join the calendar's events, in time
+    # order and each once. Read whether or not the calendar sync is on. Not for another
+    # account's calendar, nor a question about one event's end time.
+    if boundary != "end" and not account:
+        from service.assistant import day_agenda
+        day_rows = await day_agenda.rows((start if today_period else forward_start) if period else now,
+                                         end, now=now)
+        if query:
+            day_rows = _match_schedule_query(day_rows, query)
+        items = day_agenda.merge(items, day_rows)
     # `upcoming()` normally makes this redundant, but the tool must not
     # describe a just-elapsed entry as "upcoming" when a source returns one.
     items = _collapse_schedule_rows(
         [item for item in items
          if float(item.get("when_ts") or 0) >= now
-         or ((period or boundary == "end") and item.get("source") == "calendar")])
+         or ((period or boundary == "end") and item.get("source") in ("calendar", "day")
+             and (item.get("kind") != "due" or item.get("source") == "calendar"))])
     # Dated to-dos the Brief read from mail, texts and notes (a family lunch
     # on Saturday, a homework due time) are not calendar rows, but a day or
     # week answer without them is wrong. calendar_only keeps them too: the

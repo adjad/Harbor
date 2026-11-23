@@ -110,6 +110,9 @@ struct NotchBriefView: View {
         // Brief opened: a stale mail cache is read now (MailReader; with Google off it may open Mail
         // hidden, MailRecache), so Brief isn't left with no mail just because Gmail is off.
         .onAppear { NotificationCenter.default.post(name: MailReader.briefOpened, object: nil) }
+        // The Brief is always today, whatever day Day is showing (Day gets its day back).
+        .onAppear { pinToToday() }
+        .onChange(of: today.followsToday) { _, _ in pinToToday() }
         .task(id: today.isShowingCurrentDay && composedBrief == nil) {
             guard today.isShowingCurrentDay, composedBrief == nil else { return }
             while !Task.isCancelled {
@@ -144,8 +147,8 @@ struct NotchBriefView: View {
                     // needs you (cards, mail and texts) and what is on your plate
                     // (calendar, school work, to-dos, found in mail), side by side
                     // when wide enough. It replaces the tiles and the Top 3.
-                    if let contacts = BriefFix.contactsAccess() { accessRow(contacts) }
-                    if today.isShowingCurrentDay { BriefAccessRowsView() }
+                    // One "Finish setup" row until onboarding is done, then none.
+                    BriefAccessRowsView(planMissing: Self.setupMissing(proactive.unreadSources(Self.coverage(plan))))
                     // Back after a long absence: the cards below are from
                     // before, and the refreshed ones replace them on their own.
                     if proactive.updating && !proactive.isWorking { ProcessingRow(label: Self.updatingLabel) }
@@ -166,7 +169,7 @@ struct NotchBriefView: View {
                 } else {
                     let brief = BriefContent(plan: plan, today: today, composed: composedToday)
                     lede(brief.lede)
-                    underLede(brief)
+                    underLede(brief, plan)
                     legacy(plan, brief)
                 }
             } else if today.error.isEmpty {
@@ -182,6 +185,10 @@ struct NotchBriefView: View {
         }
     }
 
+    private func pinToToday() {
+        if BriefFollowsToday.pin(today) { Task { await today.refresh() } }
+    }
+
     static let updatingLabel = "Updating your Brief…"
 
     /// The loading row's words: Harbor starting up on a cold launch, then a
@@ -194,6 +201,13 @@ struct NotchBriefView: View {
     /// Reminders from the plan's own health, the rest from source_coverage.
     static func coverage(_ plan: TodayPlan) -> [SourceAccess] {
         ["calendar", "reminders", "email", "messages"].compactMap { plan.access($0) }
+    }
+
+    /// What the Finish setup row counts from the plan: the unread sources a permission fixes,
+    /// and Contacts when macOS turned it down. Empty once onboarding is done.
+    static func setupMissing(_ unread: [SourceAccess]) -> Set<BriefAccessRows.Source> {
+        guard !BriefAccessRows.onboardingDone() else { return [] }
+        return BriefAccessRows.missing(unread + [BriefFix.contactsAccess()].compactMap { $0 })
     }
 
     /// The tallest an opened row (to-dos, mail and texts) gets before it scrolls.
@@ -286,12 +300,11 @@ struct NotchBriefView: View {
         footerChips(plan)
     }
 
-    /// Right under the sentence, in both layouts: Contacts when macOS turned it
-    /// down, what Harbor does and when (first launch day), and what it is keeping
+    /// Right under the sentence, in both layouts: the one Finish setup row (until
+    /// onboarding is done), what Harbor does and when (first launch day), and what it is keeping
     /// in mind (the day's goal among it).
-    @ViewBuilder private func underLede(_ brief: BriefContent) -> some View {
-        if today.isShowingCurrentDay, let contacts = BriefFix.contactsAccess() { accessRow(contacts) }
-        if today.isShowingCurrentDay { BriefAccessRowsView() }
+    @ViewBuilder private func underLede(_ brief: BriefContent, _ plan: TodayPlan) -> some View {
+        BriefAccessRowsView(planMissing: Self.setupMissing(Self.coverage(plan).filter { plan.unreadSources.contains($0.source) }))
         if !brief.intro.isEmpty { introLines(brief.intro) }
         if !brief.summary.isEmpty { goalLines(brief.summary) }
     }
@@ -531,24 +544,6 @@ struct NotchBriefView: View {
         .accessibilityLabel("How Harbor works")
     }
 
-    /// One source Harbor can't read and the setting that fixes it, as the
-    /// proactive Brief's and the Day tab's rows show theirs.
-    private func accessRow(_ access: SourceAccess) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Image(systemName: access.symbol).font(.harbor(size: 10.5))
-                .foregroundStyle(Theme.textMuted).frame(width: 15)
-            Text(access.headline).font(.harbor(size: 12.5)).foregroundStyle(Theme.textSecondary)
-                .lineLimit(2).fixedSize(horizontal: false, vertical: true)
-                .help(access.detail)
-            Spacer(minLength: 6)
-            if let fix = access.fixLink {
-                NotchChrome.small(Permissions.fixLabel(fix)) { BriefFix.open(fix) }
-                    .help(access.detail)
-            }
-        }
-        .accessibilityElement(children: .combine)
-    }
-
     /// The tab's one row style: a mono label column, then the text. A row
     /// without a label keeps the column, so every list's text lines up. A Needs
     /// you row adds its trailing × (Clear, and Mark done for a reminder).
@@ -638,13 +633,6 @@ struct NotchBriefView: View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text(today.selectedDate, format: .dateTime.weekday(.wide).month(.abbreviated).day())
                 .font(.harbor(size: 18, weight: .semibold)).foregroundStyle(Theme.textPrimary)
-            if !today.followsToday {
-                NotchChrome.chip("Back to today", icon: "calendar", help: "Show today instead of the day picked in the planner") {
-                    today.returnToToday()
-                    Task { await today.refresh() }
-                }
-                .disabled(today.busy)
-            }
             Spacer()
             if let updated = updatedAt {
                 Text("Updated " + updated.formatted(date: .omitted, time: .shortened))
@@ -976,4 +964,31 @@ struct NeedsYouRowControls: View {
             if confirmed { await onConfirmed() }
         }
     }
+}
+
+/// The Brief is always today. Day's day picker moves the shared TodayModel to another
+/// day; opening the Brief puts it back on today and remembers the day Day was showing,
+/// so Day shows that day again when it opens (restore).
+@MainActor
+enum BriefFollowsToday {
+    private(set) static var dayToRestore: Date?
+
+    /// Moves the model back to today when it shows another day. True when it did.
+    static func pin(_ today: TodayModel) -> Bool {
+        guard !today.followsToday else { return false }
+        dayToRestore = today.selectedDate
+        today.returnToToday()
+        return true
+    }
+
+    /// Day opened: the day it was showing before the Brief took over. True when it moved.
+    static func restore(_ today: TodayModel) -> Bool {
+        guard let date = dayToRestore else { return false }
+        dayToRestore = nil
+        today.selectDate(date)
+        return true
+    }
+
+    /// Checks reset the memory.
+    static func forget() { dayToRestore = nil }
 }

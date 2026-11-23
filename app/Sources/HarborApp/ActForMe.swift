@@ -5,6 +5,8 @@ import SwiftUI
 // arrive after it; off stops everything at once. What Harbor does once it is on is the
 // service's own list (`does`), shown word for word, so no screen can claim more than is
 // built. Harbor never sends anything by itself. Unknown state shows "Check", never a guess.
+// The yes can also come one kind at a time, right after the person taps something Harbor could
+// have done itself (ActForConsent below): one short question on that card, never a card of its own.
 
 struct ActForMe: Equatable {
     struct Done: Equatable, Identifiable {
@@ -33,6 +35,14 @@ struct ActForMe: Equatable {
     /// How many things Harbor did in the last day.
     let today: Int
     let recent: [Done]
+    /// Per kind (add, hold, follow_up): is it on, and may its inline question be shown now
+    /// ("Not now" holds it for a week; the service decides, never the app).
+    let kinds: [String: Kind]
+
+    struct Kind: Equatable {
+        let on: Bool
+        let ask: Bool
+    }
 
     static let title = "Let Harbor act for me"
 
@@ -48,6 +58,12 @@ struct ActForMe: Equatable {
         new = (json["new"] as? [String] ?? []).filter { !$0.isEmpty }
         note = json["note"] as? String ?? ""
         today = max(0, json["today"] as? Int ?? 0)
+        var kinds: [String: Kind] = [:]
+        for (name, value) in json["kinds"] as? [String: Any] ?? [:] {
+            guard let row = value as? [String: Any] else { continue }
+            kinds[name] = Kind(on: row["on"] as? Bool ?? false, ask: row["ask"] as? Bool ?? false)
+        }
+        self.kinds = kinds
         recent = (json["recent"] as? [[String: Any]] ?? []).enumerated().compactMap { index, row in
             guard let title = row["title"] as? String, !title.isEmpty else { return nil }
             return Done(id: index, title: title, who: row["who"] as? String ?? "",
@@ -61,15 +77,13 @@ struct ActForMe: Equatable {
         !enabled ? "Off. Harbor does none of this without your tap."
             : (new.isEmpty ? "On. "
                : (agreed.isEmpty ? "On, but nothing is agreed yet; " : "On for what you agreed to; ")
-                 + "\(new.count == 1 ? "one action waits" : "\(new.count) actions wait") "
-                 + "for your yes (turn this off and on to review them). ")
+                 + "\(new.count == 1 ? "one more action asks" : "\(new.count) more actions ask") "
+                 + "you first, the first time it comes up (or turn this off and on to say yes to all). ")
               + "Harbor shows each thing it does in the Brief as “Harbor did this”, with an Undo. "
               + never
     }
 
-    /// The one line the Brief always shows once the question has been answered.
-    static let briefOff = "Let Harbor act for me is off"
-    static let briefTurnOn = "Turn on"
+    /// The Brief's line while it is on.
     var briefOn: String { "Harbor is acting for you · \(today) today" }
 
     /// The confirmation for the notch row: compact, and explicit that a yes covers only what
@@ -124,6 +138,25 @@ final class ActForMeModel: ObservableObject {
                 await refresh()
             }
             pending = false
+        }
+    }
+
+    /// The inline question after a tapped action: yes to ONE kind (`on`), or "Not now" for it
+    /// (the service holds the question for a week). Returns the problem, if any. The state is
+    /// then read again, so what shows is what is true.
+    func setKind(_ kind: String, on: Bool) async -> String? {
+        guard !pending else { return nil }
+        pending = true
+        problem = nil
+        defer { pending = false }
+        switch await MeetingClient.send("PUT", Self.path + "/kind", body: ["kind": kind, "enabled": on]) {
+        case .ok(let json):
+            state = ActForMe(json)
+            return nil
+        case .refused(let why):
+            problem = why
+            await refresh()
+            return why
         }
     }
 
@@ -307,82 +340,85 @@ struct ActForMeAskCard: View {
     }
 }
 
-/// "Let Harbor act for me" in the Brief, always: the question until it is answered; after
-/// "Not now", one quiet line with Turn on (which opens the same question: the yes is still
-/// the person's own tap); while on, one line with today's count that opens what Harbor did.
-/// Each thing Harbor did also has its own "Harbor did this" card with Undo among the Brief's cards.
-struct ActForMeBriefRow: View {
+/// The question asked at the moment it matters: right after the person taps a card action Harbor
+/// could have done on its own, one short line in that card's own spot. One question per kind,
+/// asked once: a yes turns on only that kind (service: PUT act/kind), "Not now" holds it for a
+/// week, and a kind that is already on never asks. The full list stays in Settings.
+enum ActForConsent {
+    enum Kind: String, Equatable {
+        case add, hold
+        case followUp = "follow_up"
+
+        /// The one short question, no list.
+        var question: String {
+            switch self {
+            case .add: return "Done. Want Harbor to add things like this on its own next time?"
+            case .hold: return "Done. Want Harbor to hold time like this on its own next time?"
+            case .followUp: return "Done. Want Harbor to set reply reminders like this on its own next time?"
+            }
+        }
+    }
+
+    static let yes = "Yes"
+    static let notNow = "Not now"
+    /// Said after Yes, briefly, before the card goes.
+    static let thanks = "On for this. Each one has an Undo."
+
+    /// Which kind a tapped card's action belongs to, or nil for one Harbor never does on its own
+    /// (a reply, a read). Only the card's own method and title decide, never message text beyond
+    /// the title Harbor itself wrote.
+    static func kind(method: String, title: String) -> Kind? {
+        switch method {
+        case "block_time", "add_to_day": return .hold
+        case "calendar_event": return .add
+        case "reminder":
+            return title.lowercased().hasPrefix("reply to ") || title.lowercased().contains("reminder to reply") ? .followUp : .add
+        default: return nil
+        }
+    }
+
+    /// Whether to ask after this tapped card: the service says the kind is off and not put aside.
+    @MainActor static func kindToAsk(method: String, title: String, model: ActForMeModel = .shared) async -> Kind? {
+        guard let kind = kind(method: method, title: title) else { return nil }
+        await model.refresh()
+        guard let row = model.state?.kinds[kind.rawValue], !row.on, row.ask else { return nil }
+        return kind
+    }
+}
+
+/// The inline line itself: the question, Yes, Not now. Used by the large card and the compact row.
+struct ActForConsentLine: View {
+    let kind: ActForConsent.Kind
+    /// The answer: true for Yes. The caller records it and lets the card go.
+    let onAnswer: (Bool) -> Void
     @ObservedObject private var model = ActForMeModel.shared
-    @State private var asking = false
-    @State private var listed = false
 
     var body: some View {
-        if let state = model.state, !state.does.isEmpty {
-            if !state.asked {
-                ActForMeAskCard(place: .brief)
-            } else if !state.enabled {
-                if asking {
-                    ActForMeAskCard(place: .brief, forced: true, onNotNow: { asking = false })
-                } else {
-                    line(ActForMe.briefOff) {
-                        Button(ActForMe.briefTurnOn) { asking = true }
-                            .buttonStyle(.plain)
-                            .font(.harbor(size: 11.5, weight: .medium)).foregroundStyle(Theme.textPrimary)
-                            .padding(.horizontal, 9).padding(.vertical, 3)
-                            .background(Capsule().fill(Theme.chipFill))
-                            .overlay(Capsule().stroke(Theme.chipStroke, lineWidth: 1))
-                            .help("See what Harbor would do on its own, then say yes or not now.")
-                    }
+        VStack(alignment: .leading, spacing: 5) {
+            Text(kind.question)
+                .font(.harbor(size: 12)).foregroundStyle(Theme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 10) {
+                Button { onAnswer(true) } label: {
+                    Text(ActForConsent.yes).font(.harbor(size: 12, weight: .semibold)).foregroundStyle(Color.black)
+                        .padding(.horizontal, 12).padding(.vertical, 4)
+                        .background(Capsule().fill(Color.white.opacity(0.92))).contentShape(Capsule())
                 }
-            } else {
-                VStack(alignment: .leading, spacing: 5) {
-                    Button { listed.toggle() } label: {
-                        line(state.briefOn) {
-                            Image(systemName: listed ? "chevron.up" : "chevron.down")
-                                .font(.harbor(size: 8, weight: .bold)).foregroundStyle(Theme.textMuted)
-                                .accessibilityHidden(true)
-                        }
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .help("What Harbor did lately. Each one also has its own card with an Undo.")
-                    .accessibilityLabel(state.briefOn)
-                    .accessibilityHint(listed ? "Hides what Harbor did" : "Shows what Harbor did")
-                    if listed { done(state) }
+                .buttonStyle(.plain)
+                .help("Harbor will do this kind of thing on its own, with an Undo. It never sends, replies, deletes or pays.")
+                Button { onAnswer(false) } label: {
+                    Text(ActForConsent.notNow).font(.harbor(size: 12, weight: .medium)).foregroundStyle(Theme.textSecondary)
+                        .padding(.horizontal, 8).padding(.vertical, 4).contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
+                .help("Harbor keeps asking before it does this. It won't ask again for a week.")
+            }
+            .disabled(model.pending)
+            if let problem = model.problem {
+                Text(problem).font(.harbor(size: 11)).foregroundStyle(Theme.bad).fixedSize(horizontal: false, vertical: true)
             }
         }
-    }
-
-    private func line<Trailing: View>(_ text: String, @ViewBuilder trailing: () -> Trailing) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(text).font(.harbor(size: 12)).foregroundStyle(Theme.textSecondary)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 4)
-            trailing()
-        }
-    }
-
-    @ViewBuilder private func done(_ state: ActForMe) -> some View {
-        if state.recent.isEmpty {
-            Text("Nothing yet. When Harbor does something, it shows here and as a card with an Undo.")
-                .font(.harbor(size: 11.5)).foregroundStyle(Theme.textMuted)
-                .fixedSize(horizontal: false, vertical: true)
-        } else {
-            ForEach(state.recent.prefix(5)) { item in
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Image(systemName: !item.check.isEmpty ? "questionmark" : item.undone ? "arrow.uturn.backward" : "checkmark")
-                        .font(.harbor(size: 8, weight: .bold)).foregroundStyle(Theme.textMuted)
-                        .accessibilityHidden(true)
-                    Text(!item.check.isEmpty ? "May have added “\(item.title)”: check \(item.check)"
-                         : item.title + (item.undone ? " (undone)" : ""))
-                        .font(.harbor(size: 11.5)).foregroundStyle(Theme.textSecondary).lineLimit(2)
-                    Spacer(minLength: 4)
-                    Text(Date(timeIntervalSince1970: item.at), style: .relative)
-                        .font(.harbor(size: 10.5)).foregroundStyle(Theme.textMuted).monospacedDigit()
-                }
-                .accessibilityElement(children: .combine)
-            }
-        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(kind.question)
     }
 }

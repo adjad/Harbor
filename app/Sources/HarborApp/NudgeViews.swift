@@ -203,8 +203,15 @@ struct BehaviorNudge: Identifiable, Equatable {
 struct NudgeStack: View {
     @ObservedObject var model: OverlayModel
 
+    /// A suggestion waits while an approval card does: stacked above it, the
+    /// suggestion pushed the card below the visible part of the chat. The
+    /// suggestions are kept, and show once the card is answered.
+    static func shows(nudgeCount: Int, approvalWaiting: Bool) -> Bool {
+        nudgeCount > 0 && !approvalWaiting
+    }
+
     var body: some View {
-        if !model.nudges.isEmpty {
+        if Self.shows(nudgeCount: model.nudges.count, approvalWaiting: model.pending != nil) {
             VStack(alignment: .leading, spacing: 8) {
                 ForEach(model.nudges) { nudge in
                     NudgeCard(nudge: nudge,

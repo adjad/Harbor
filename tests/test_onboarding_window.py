@@ -39,7 +39,7 @@ def _body(text: str, signature: str) -> str:
 
 def test_prompts_only_follow_a_click():
     """A prompt may only come from the setup window's row button
-    (FirstRunPermissions.request), ContactsReader's guarded request, which
+    (FirstRunPermissions.request), the calendar sync's Yes (DayCalendarWriter.ensureFullAccess), ContactsReader's guarded request, which
     the app starts with mayAsk false, or the first alert Harbor has for you
     (Notifications.allowedAskingFirstTime, the one place Notifications is asked)."""
     hits = {}
@@ -47,7 +47,13 @@ def test_prompts_only_follow_a_click():
         for match in PROMPTING.finditer(text):
             hits.setdefault(name, []).append(text.count("\n", 0, match.start()) + 1)
     assert set(hits) == {"FirstRunSetupView.swift", "ContactsReader.swift", "VoiceInput.swift",
-                         "Permissions.swift", "PageReader.swift", "Notifications.swift"}, hits
+                         "Permissions.swift", "PageReader.swift", "Notifications.swift",
+                         "DayCalendarWriter.swift"}, hits
+    # The calendar sync asks for full Calendar access only when the person says Yes: the setup
+    # card's Yes and Settings' switch are the only callers.
+    callers = {name for name, text in _sources().items() if "DayCalendarWriter.ensureFullAccess()" in text}
+    assert callers == {"FirstRunSetupView.swift", "DayCalendarSettingsRow.swift"}, callers
+    assert "requestFullAccessToEvents" in _sources()["DayCalendarWriter.swift"]
     notes = _sources()["Notifications.swift"]
     asking = _body(notes, "static func allowedAskingFirstTime() async -> Bool")
     # Two requests exist: the first one (provisional, so macOS shows no question) and
@@ -209,7 +215,10 @@ def test_fix_links_say_where_they_go():
     """Every Brief/Day fix link opens through openFix and is labelled by fixLabel."""
     for name in ("NotchBriefView.swift", "NotchDayView.swift", "ProactiveCards.swift"):
         text = _sources()[name]
-        assert "Permissions.openFix(url)" in text and "Permissions.fixLabel" in text, name
+        # 2026-11-23: the Brief's per-source rows became one "Finish setup" row, so a file may
+        # offer no fix link at all; any it still offers go through openFix and fixLabel.
+        if "openFix(" in text:
+            assert "Permissions.openFix(url)" in text and "Permissions.fixLabel" in text, name
         assert "fix.label)" not in text, name
 
 
@@ -246,7 +255,8 @@ def test_nothing_the_notch_opens_lands_under_it():
     # Any window of Harbor's taking the keyboard, unless it is raised above the panel.
     assert "self?.stepAside(forKey: window)" in app
     # Every link reaches the page through openFix, the Brief's and the Ask's alike.
-    for name in ("OverlayView.swift", "Chat/ChatViews.swift", "NotchDayView.swift", "ProactiveCards.swift"):
+    # (ProactiveCards no longer draws access rows: the Brief has one "Finish setup" row.)
+    for name in ("OverlayView.swift", "Chat/ChatViews.swift", "NotchDayView.swift"):
         assert "Permissions.openFix(url)" in sources[name], name
     assert "harborOpenPermissions" not in sources["OverlayModel.swift"]
     # The setup window stays where setup and Settings › Privacy use it.
@@ -364,8 +374,9 @@ def test_messages_has_its_own_permission_row():
     step = _body(setup, "private var permissionsStep: some View")
     # A title is a literal, or PrivacyNames for a permission macOS renamed.
     rows = re.findall(r'permissionRow\(\.(\w+), icon: "[^"]+", title: "?([^",]+)"?,', step)
-    assert rows == [("calendar", "Calendar"), ("reminders", "Reminders")], rows
-    assert "static let setup: [Item] = [.calendar, .reminders]" in setup
+    # 2026-11-23: setup asks the three basics; Full Disk Access is the last page (OnboardingAccess).
+    assert rows == [("calendar", "Calendar"), ("reminders", "Reminders"), ("contacts", "Contacts")], rows
+    assert "static let setup: [Item] = [.calendar, .reminders, .contacts]" in setup
     assert "permissionRow(.mail" not in step and "permissionRow(.fullDiskAccess" not in step
     sender = _sources()["OutboundSender.swift"]
     send = _body(sender, "static func sendMessage(actionId: String, to given: String, text: String)")
@@ -405,9 +416,9 @@ def test_messages_has_its_own_permission_row():
     assert "AXIsProcessTrustedWithOptions" not in setup and "CGRequestScreenCaptureAccess" not in setup
     footnote = step[step.index('Text("Skipped one?'):]
     assert "microphone" in footnote and "asked for later" not in footnote
-    for asked_at_use in ("The rest are asked when a task needs them", "Mail when Brief first reads your mail",
-                         "Full Disk Access when you want your texts", "Messages when you first send a text", "Contacts when your texts show numbers",
-                         "Notifications when Harbor first has", "Screen Recording"):
+    # 2026-11-23: Contacts is a setup row and Full Disk Access (Mail, Messages, Notes) is the last page.
+    for asked_at_use in ("The rest are asked when a task needs them", "Full Disk Access comes on the last page",
+                         "Messages when you first send a text", "Notifications when Harbor first has", "Screen Recording"):
         assert asked_at_use in footnote, asked_at_use
     # Nothing else in the step: the rest are asked when a task needs them, and
     # only the setup rows count toward "still off".
@@ -532,8 +543,11 @@ def test_try_asking_waits_for_a_model_that_can_answer():
     """A prompt clicked before Harbor can answer used to finish setup and leave an
     unsendable question in Ask."""
     setup = _sources()["FirstRunSetupView.swift"]
-    tour = _body(setup, "private var tourStep: some View")
+    # 2026-11-23: Try asking moved to the last page, so a click ends setup with nothing skipped.
+    tour = _body(setup, "private var accessStep: some View")
+    assert "Try asking" not in _body(setup, "private var tourStep: some View")
     assert "let canAnswer = setup.status?.canAnswer == true" in tour
+    assert "Self.tryPrompts(personal: askSuggestions.prompts" in tour
     assert tour.index("guard canAnswer else { return }") < tour.index("finish(prompt)")
     assert ".disabled(!canAnswer)" in tour and "These work once the model is ready." in tour
 
@@ -762,15 +776,15 @@ def test_waiting_out_the_download_keeps_people_close():
     tour = _body(sources["FirstRunSetupView.swift"], "private var tourStep: some View")
     assert tour.index("tourDownload") < tour.index("OnboardingTourView()") < tour.index("Self.helpsYourDay")
     sample = sources["OnboardingTour.swift"]
+    mockups = sources["OnboardingMockups.swift"]
     # Sample cards only: nothing reads data, asks the service, or acts.
-    for call in ("HarborClient", "URLSession", "NotificationCenter", "NSWorkspace", "UserDefaults"):
-        assert call not in sample, call
+    for text in (sample, mockups):
+        for call in ("HarborClient", "URLSession", "NotificationCenter", "NSWorkspace", "UserDefaults"):
+            assert call not in text, call
     assert 'OnboardingPill(text: "Example")' in sample
-    # Each sample card carries its own mark (Release Auditor, 98bba9ab).
-    helper = _body(sample, "private func sample<Content: View>(")
-    assert "OnboardingTour.cardMark" in helper and "dash:" in helper
-    for card in ("private var brief: some View", "private var day: some View", "private var ask: some View"):
-        assert _body(sample, card).lstrip("{ \n").startswith("sample {"), card
+    # Each mockup sits in a frame that carries its own mark and takes no clicks (Release Auditor, 98bba9ab).
+    frame = mockups[mockups.index("struct OnboardingNotchFrame"):]
+    assert "OnboardingTour.cardMark" in frame and ".allowsHitTesting(false)" in frame
     assert "polling: setupModel.isShown" in status
 
 
@@ -849,24 +863,21 @@ def test_the_permission_page_stays_open_under_a_question():
 
 
 def test_brief_and_day_ask_for_what_setup_no_longer_does():
-    """Setup asks for Calendar and Reminders only. Mail & Notes Automation is asked by one
-    button on Brief's "Allow Harbor to read Mail" row (the request Setup's row used), never by
-    a timer; Full Disk Access is a quiet row that opens the notch permission page."""
+    """Setup asks for Calendar and Reminders only. Brief shows at most ONE row, "Finish setup",
+    until onboarding is done and none after; it opens the notch permission page and has no
+    per-source Allow button. Nothing here asks macOS: no request, no timer."""
     rows = _sources()["BriefAccessRows.swift"]
     model = rows[rows.index("final class BriefAccessRowsModel"):]
-    # The one ask: FirstRunPermissions.request(.mail), only from the button's method.
-    assert model.count("permissions.request(.mail)") == 1
-    assert "permissions.request(.mail)" in _body(model, "func allowMail()")
-    assert "ask: false" in model and "ask: true" not in model
+    assert "request(" not in rows and "ask: false" in model and "ask: true" not in model
     assert not PROMPTING.search(rows)
     assert "Timer" not in rows and "Task.sleep" not in rows
-    # Full Disk Access opens the notch page through the same link every fix uses.
-    assert "Permissions.openFix(url)" in _body(model, "func openFullDiskAccess()")
-    assert "BriefDetail.fullDiskAccess.url" in _body(model, "func openFullDiskAccess()")
-    # Mounted in Brief (both layouts) and Day, on the current day.
+    # The row opens the notch permission page (the whole list) and keys off the onboarding flag.
+    assert ".harborOpenPermissionPage" in _body(rows, "static func openPermissionPage()")
+    assert "!FirstRunSetup.isUnfinished(flag)" in rows
+    # Mounted once in each Brief layout and in Day, on the current day; no per-source rows beside it.
     brief = _sources()["NotchBriefView.swift"]
-    assert brief.count("BriefAccessRowsView()") == 2
-    assert "BriefAccessRowsView()" in _sources()["NotchDayView.swift"]
+    assert brief.count("BriefAccessRowsView(") == 2 and "accessRow(" not in brief
+    assert "BriefAccessRowsView(" in _sources()["NotchDayView.swift"]
     # Setup's step no longer lists them.
     step = _body(_sources()["FirstRunSetupView.swift"], "private var permissionsStep: some View")
     assert "Mail & Notes" not in step and "Full Disk Access\"" not in step

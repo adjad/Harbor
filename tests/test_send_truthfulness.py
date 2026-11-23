@@ -62,7 +62,7 @@ async def test_a_messages_error_with_no_way_to_read_the_store_is_unknown_and_not
 
 
 def test_not_delivered_wording_is_untouched():
-    assert action_tools.QUIET_NOT_DELIVERED == "Passed to Messages."
+    assert action_tools.QUIET_NOT_DELIVERED == "Not delivered"
     assert action_tools.NOT_DELIVERED_TEXT == "Messages shows it as Not Delivered."
 
 

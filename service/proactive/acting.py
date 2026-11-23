@@ -62,6 +62,17 @@ ASKED_FILE = "act_for_me_asked.json"   # "Not now", beside it; see _notes_path()
 DAY_S = 86400
 SHOWN_S = 3 * DAY_S                    # how long a "Harbor did this" card stays
 KINDS = ("calendar", "reminder", "hold", "follow_up", "draft")
+# The things a person can say yes to ONE AT A TIME, at the moment it matters (the inline question
+# after they tapped something Harbor could have done itself). Each names the ACTIONS keys its yes
+# covers. The master switch stays the whole gate: off clears every kind at once, and a yes saved
+# before this existed (covers named every action) means every kind is on. A kind's yes writes
+# only its own keys; nothing else turns on.
+KIND_KEYS: dict[str, tuple[str, ...]] = {
+    "add": ("add", "add_more"),
+    "hold": ("hold",),
+    "follow_up": ("follow_up",),
+}
+KIND_ASIDE_S = 7 * DAY_S               # "Not now" for a kind: not asked again for at least a week
 # Statuses that may have changed something, so they count as done today and block a repeat.
 LANDED = ("added", "undone", "unknown", "undo_unknown")
 
@@ -381,8 +392,82 @@ def mark_asked() -> None:
         aside = _aside(setting, notes)
         if (notes.get("asked") is True or setting.get("asked") is True) and all(key in aside for key in waiting):
             return
+        written = {"asked": True, "aside": sorted(set(aside) | set(waiting))}
+        if kinds := _kind_aside(notes):
+            written["kind_aside"] = kinds            # "Not now" per kind survives the master's own
+        paths.private_write_bytes(_notes_path(), json.dumps(written).encode("utf-8"))
+
+
+def _kind_aside(notes: dict[str, Any]) -> dict[str, float]:
+    """When each kind's question was put aside ("Not now"), from the notes file only."""
+    found = notes.get("kind_aside")
+    if not isinstance(found, dict):
+        return {}
+    return {k: n for k, v in found.items() if k in KIND_KEYS and (n := _num(v)) is not None}
+
+
+def kind_on(kind: str) -> bool:
+    """The person's yes names every action of this kind (and the gate is on)."""
+    return kind in KIND_KEYS and all(enabled(key) for key in KIND_KEYS[kind])
+
+
+def should_ask(kind: str, *, now: float | None = None) -> bool:
+    """The inline question for this kind may be shown: it is off, and "Not now" was not said
+    within the last week. A kind that is on is never asked about."""
+    if kind not in KIND_KEYS or kind_on(kind):
+        return False
+    said = _kind_aside(_notes()).get(kind)
+    current = time.time() if now is None else float(now)
+    return said is None or current - said >= KIND_ASIDE_S
+
+
+def mark_kind_aside(kind: str, *, now: float | None = None) -> None:
+    """"Not now" to one kind's question. Like mark_asked it writes only the notes file, never the
+    gate's: it can only stop a question being shown, never turn anything on or move a time."""
+    import json
+    from service import paths
+    if kind not in KIND_KEYS:
+        raise ValueError("unknown kind")
+    with _lock:
+        notes = _notes()
+        aside = _kind_aside(notes)
+        aside[kind] = time.time() if now is None else float(now)
         paths.private_write_bytes(_notes_path(), json.dumps(
-            {"asked": True, "aside": sorted(set(aside) | set(waiting))}).encode("utf-8"))
+            {**{k: v for k, v in notes.items() if k not in ("kind_aside",)}, "kind_aside": aside}).encode("utf-8"))
+
+
+def set_kind(kind: str, *, now: float | None = None) -> dict[str, Any]:
+    """The person's yes to ONE kind of thing ("Want Harbor to hold time like this on its own?").
+
+    Turns on only that kind's actions. When the gate is off this is the first yes, and it names
+    only this kind; when it is on, the kinds already agreed keep their recorded times (a write
+    still moves every time forward to now, see `set_enabled`) and every other kind stays off.
+    A yes that changes nothing writes nothing. Failures follow `set_enabled`: a yes that cannot
+    be saved leaves the gate off (or the older file removed) and raises."""
+    global _revoked
+    if kind not in KIND_KEYS:
+        raise ValueError("unknown kind")
+    stamp = time.time() if now is None else float(now)
+    with _lock:
+        try:
+            before = _setting() if enabled() else {}
+            had = _covers(before)
+            if before and all(key in had for key in KIND_KEYS[kind]):
+                return state()
+            first = _num(before.get("enabled_at")) if before else stamp
+            covers = dict(had)
+            for key in KIND_KEYS[kind]:
+                covers.setdefault(key, stamp)
+            _write({"enabled": True, "enabled_at": first, "asked": True, "covers": covers})
+        except Exception:
+            if not _unlink():
+                _revoked = True
+            audit("act_for_me.setting", enabled=False, saved=False, kind=kind)
+            raise
+        else:
+            _revoked = False
+    audit("act_for_me.setting", enabled=True, saved=True, kind=kind)
+    return state()
 
 
 def state() -> dict[str, Any]:
@@ -393,7 +478,10 @@ def state() -> dict[str, Any]:
             # on, what the person HAS agreed to and what is new since: Harbor does only the former.
             "does": list(DOES), "never": NEVER, "scope": SCOPE,
             "agreed": [ACTIONS[k] for k in ACTIONS if on and k not in waiting],
-            "new": [ACTIONS[k] for k in waiting]}
+            "new": [ACTIONS[k] for k in waiting],
+            # Per kind, for the inline question after a tapped action: whether it is on, and
+            # whether asking is allowed now ("Not now" holds it for a week).
+            "kinds": {k: {"on": kind_on(k), "ask": should_ask(k)} for k in KIND_KEYS}}
 
 
 def audit(event: str, **fields) -> None:

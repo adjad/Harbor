@@ -4134,6 +4134,8 @@ def _decide(category: str, args: dict, tool: str | None = None) -> Decision:
     if category in _ALWAYS_CONFIRM_CALENDAR:
         if read_only():
             return Decision(Tier.DENY, f"view-only mode: {category} is disabled")
+        if tool == "clear_reminders":
+            return Decision(Tier.CONFIRM, "changes your Reminders — always confirmed")
         return Decision(Tier.CONFIRM,
                         "changes your calendar — always confirmed")
 

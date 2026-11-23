@@ -138,7 +138,11 @@ def gone(record: dict, status: dict | None, events: dict, now: float) -> bool:
         return False
     if str(record.get("source_id")) in events:
         return False
-    return not any(_same(found, record) for found in events.values())
+    # Calendar can move an event and re-issue it under a new identifier. The booking's stable identity
+    # is its exact title that day: an event still carrying it is the same booking, moved, not gone.
+    title = str(record.get("title") or "").strip()
+    return not any(_same(found, record) or (title and str(found[2]).strip() == title)
+                   for found in events.values())
 
 
 def edited(record: dict, events: dict) -> bool:
@@ -188,6 +192,13 @@ async def add_block(block_id: str, request: Request):
             _audit("study_block_calendar_add", tool="add_calendar_event", block=block_id, ok=False, status="gone")
             return _fail("blocked", GONE)
         start, end = float(block["start"]), float(block["end"])
+        # The same study block under another id (its twin folded away, or Calendar moved and re-issued
+        # its event) is already booked: its title that day is its identity, so it is never booked twice.
+        title = str(block.get("title") or "Study").strip()[:200]
+        for other_id, other in records().items():
+            if (isinstance(other, dict) and other.get("day") == body.day and other_id != block_id
+                    and str(other.get("title") or "").strip() == title and other.get("source_id")):
+                return {"ok": True, "status": "succeeded", "block_id": other_id, "source_id": other["source_id"]}
         plan = {"capture_key": _key(block_id, body.day), "source_id": f"study:{block_id}",
                 "title": str(block.get("title") or "Study").strip()[:200], "day": body.day,
                 "timezone": body.timezone, "start_ts": start, "duration_min": max(1, round((end - start) / 60)),

@@ -40,6 +40,8 @@ struct NotchDayView: View {
     // To-dos the proactive engine found (ProactiveCards.swift): check-offs and
     // Add to Day are shared with the Brief.
     @ObservedObject private var proactive = ProactiveActions.shared
+    // Mark done for a reminder Needs you can complete: the Brief's own model.
+    @ObservedObject private var needActions: NeedsYouActionsModel = NotchBriefView.needsYouActions
     // "Add to calendar" on study blocks: where each add stands this session.
     @ObservedObject private var studyAdds = StudyBlockAdds.shared
 
@@ -176,6 +178,8 @@ struct NotchDayView: View {
         .animation(Theme.Motion.panel(reduceMotion: reduceMotion), value: showing)
         .environment(\.timeZone, today.timezone)
         .modifier(DayRefreshLoop(model: model, today: today))
+        // The Brief always shows today and moved the model there; Day shows the day it had.
+        .onAppear { if BriefFollowsToday.restore(today) { Task { await today.refresh() } } }
         // A change anywhere (a sync, an answer from another place) refreshes the
         // stale-reminder questions now instead of at the next minute.
         .onReceive(NotificationCenter.default.publisher(for: .harborAssistantChanged)) { _ in
@@ -383,12 +387,10 @@ struct NotchDayView: View {
         .accessibilityLabel("\(ask.title), \(ask.detail)")
     }
 
-    /// Calendar and Reminders when Harbor can't read them, and Contacts when macOS
-    /// turned it down (on today): why, and the setting that fixes it. Nothing
-    /// for a source that is fine.
+    /// Calendar and Reminders when Harbor can't read them: why, and the setting that
+    /// fixes it. Nothing for a source that is fine.
     private func unreadAccess(_ plan: TodayPlan) -> [SourceAccess] {
         ["calendar", "reminders"].compactMap { plan.access($0) }.filter { !$0.readable }
-            + [today.isShowingCurrentDay ? BriefFix.contactsAccess() : nil].compactMap { $0 }
     }
 
     private func accessRow(_ access: SourceAccess) -> some View {
@@ -401,7 +403,7 @@ struct NotchDayView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 6)
-            // Day's rows are System Settings pages (Calendars, Reminders, Contacts).
+            // Day's row is a System Settings page (Reminders).
             if let fix = access.fixLink, let url = URL(string: fix.url) {
                 NotchChrome.small(Permissions.fixLabel(fix)) { Permissions.openFix(url) }
             }
@@ -429,10 +431,18 @@ struct NotchDayView: View {
             let timeline = timeline(plan)
             // Calendar's own row would repeat the summary, which says it when
             // Harbor can't read the calendar, with the same Allow… beside it.
-            let unread = unreadAccess(plan).filter { $0.source != "calendar" }
+            // Until onboarding is done: the one Finish setup row, counting each missing
+            // source once (Contacts too). After: one quiet line, only when Calendar or
+            // Reminders can't be read (BriefAccessRows.dayLine).
+            let done = BriefAccessRows.onboardingDone()
+            let allUnread = unreadAccess(plan)
+            let quiet = BriefAccessRows.dayLine(planMissing: BriefAccessRows.missing(allUnread), onboardingDone: done).map(\.rawValue)
+            let unread = allUnread.filter { $0.source != "calendar" && quiet.contains($0.source) }
+            let setupMissing: Set<BriefAccessRows.Source> = done || !today.isShowingCurrentDay ? []
+                : BriefAccessRows.missing(allUnread + [BriefFix.contactsAccess()].compactMap { $0 })
             Group {
                 ForEach(unread, id: \.source) { accessRow($0) }
-                if today.isShowingCurrentDay { BriefAccessRowsView() }
+                if today.isShowingCurrentDay { BriefAccessRowsView(planMissing: setupMissing) }
                 summaryRow(plan, timeline: timeline, calendar: plan.calendarState)
             }
             .disabled(today.planIsStale)
@@ -815,6 +825,15 @@ struct NotchDayView: View {
                     NotchChrome.small("Done") { Task { await proactive.toggleDone(todo, today: today) } }
                         .help("Check it off")
                         .accessibilityLabel("Check off \(todo.title)")
+                }
+            } else if let taskID = row.taskID {
+                // A task the planner couldn't place: the same check-off the Brief's to-dos use.
+                if proactive.todoBusy.contains(row.id) {
+                    ProgressView().controlSize(.small)
+                } else {
+                    NotchChrome.small("Done") { Task { await proactive.completePlanTask(taskID, key: row.id, today: today) } }
+                        .help("Check it off")
+                        .accessibilityLabel("Check off \(row.title)")
                 }
             }
         }
@@ -1494,7 +1513,8 @@ struct NotchDayView: View {
     private func calendarShow(_ item: DayItem) -> StudyBlockCalendar.Show {
         guard item.kind == "study", let id = item.blockID,
               let block = plan?.displayBlocks.first(where: { $0.id == id }) else { return .none }
-        return studyAdds.ledger.show(block.calendarAddFacts, now: today.now.timeIntervalSince1970)
+        return studyAdds.ledger.show(block.calendarAddFacts, now: today.now.timeIntervalSince1970,
+                                     calendarSync: DayCalendarSyncSettings.isEnabled())
     }
 
     /// The one extra line under a study block: what went wrong, or that it's added.
@@ -1585,6 +1605,18 @@ struct NotchDayView: View {
                     }
                 } else if let need = need(for: item), !planned(need) {
                     NotchChrome.small("Plan time") { planTime(item) }.disabled(today.busy)
+                }
+                // A reminder Needs you can complete: the Brief's Mark done, the same answer.
+                if item.todoID == nil, let row = markDoneRow(item) {
+                    if needActions.busy[row.id] != nil {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        NotchChrome.small("Done") {
+                            Task { if await needActions.perform(.markDone, on: row) { await today.refresh(afterMutation: true) } }
+                        }
+                        .help("Check it off in Reminders")
+                        .accessibilityLabel("Check off \(item.title)")
+                    }
                 }
                 if let reminder = cancellableReminder(item) {
                     NotchChrome.small("Cancel") {
@@ -1714,6 +1746,17 @@ struct NotchDayView: View {
 
     private func task(for item: DayItem) -> TodayTask? {
         item.taskID.flatMap { id in plan?.tasks.first { $0.id == id } }
+    }
+
+    /// The Needs you row Done completes for a reminder's row: the workspace's own
+    /// item of that id, when Needs you lists it as completable.
+    private func markDoneRow(_ item: DayItem) -> NeedsYouRow? {
+        guard let id = item.needID,
+              let entry = plan?.workspace?.needs_you?.items.first(where: { $0.id == id && $0.can_complete == true }),
+              let fingerprint = entry.fingerprint, !fingerprint.isEmpty else { return nil }
+        let row = NeedsYouRow(id: id, label: nil, text: item.title, overdue: item.style == .overdue,
+                              fingerprint: fingerprint, canComplete: true)
+        return needActions.actions(for: row).contains(.markDone) && !needActions.isHidden(row) ? row : nil
     }
 
     private func need(for item: DayItem) -> DailyAttentionItem? {

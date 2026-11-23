@@ -23,6 +23,8 @@ Rules:
 - Google rows are marked `calendar_writable=False`: Harbor's Cancel/Move go
   through EventKit, which cannot reach a Google-only event.
 - Event descriptions are never read or stored (untrusted text, and not needed).
+- An event Harbor wrote for a Day block (service/assistant/harbor_events.py) is dropped, by the title
+  and start the app reported, since this reader can't see its marker.
 - A fetch that finishes after the account was disconnected or reconnected is
   discarded (gmail_source.bound_account fencing), so an erase stays erased.
 - Fetched every CALENDAR_EVERY seconds from gmail_source.run(), and right after
@@ -380,6 +382,9 @@ def store_events(account: str, items: list[dict], store=None) -> int:
     prefix = _prefix(account)
     now = time.time()
     written = 0
+    # An event Harbor wrote for a Day block reaches this account's calendar too; Day shows the block.
+    from service.assistant import harbor_events
+    items = harbor_events.without_recorded(items)
     with store.transaction() as db:
         native = {_dupe_key(r["title"], r["when_ts"]) for r in db.execute(
             "SELECT title, when_ts FROM commitments WHERE source='calendar' AND status='active' "
@@ -461,6 +466,8 @@ def merge_native_items(items: list[dict], store=None) -> list[dict]:
         print(f"[google_calendar] merge skipped: {type(exc).__name__}", flush=True)
         return native
     keys = {_dupe_key(it.get("title"), it.get("when_ts")) for it in native}
+    from service.assistant import harbor_events
+    google = harbor_events.without_recorded(google)
     return native + [it for it in google if _dupe_key(it["title"], it["when_ts"]) not in keys]
 
 

@@ -47,8 +47,14 @@ Disconnecting an account also erases everything Harbor derived from it: its
 mail caches, its Google Calendar events, the mail overviews written from the
 combined inbox, and its proactive cards/to-dos (`erase_account_data`).
 
-The refresh token lives in ~/.moe/gmail.json (0600), same trust model as the
-other personal caches under ~/.moe.
+Each account's refresh token lives in the login Keychain
+(service/config/google_tokens.py); ~/.moe/gmail.json (0600) holds the rest and
+marks the account `refresh_token_store: "keychain"`. A token written by an
+older build is moved there once, and leaves the file only after Keychain reads
+it back. When Keychain is unavailable the token stays in the file, as before,
+and the next save or launch tries again. (The Workspace server's per-account
+credential files, google_workspace.CREDENTIALS_DIR, still hold a copy: the
+server reads only files.)
 """
 from __future__ import annotations
 
@@ -207,29 +213,159 @@ def invalidate_behavior_history(reason="invalidated") -> None:
 
 # --- config / token -----------------------------------------------------------
 
+# gmail.json marks an account whose refresh token is in the login Keychain
+# (service/config/google_tokens.py) instead of the file.
+TOKEN_STORE_KEY = "refresh_token_store"
+KEYCHAIN = "keychain"
+
+
+def _token_slots(data: dict) -> list[tuple[dict, str]]:
+    """(entry, address) for every account entry gmail.json can hold a token in:
+    each of `accounts`, or the single-account form's top level."""
+    accounts = data.get("accounts")
+    if isinstance(accounts, dict):
+        return [(item, str(email).strip().lower()) for email, item in accounts.items()
+                if isinstance(item, dict) and str(email).strip()]
+    if data.get("email"):
+        return [(data, str(data["email"]).strip().lower())]
+    return []
+
+
+def _read_file() -> dict:
+    try:
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001 — absent/corrupt means "not connected"
+        return {}
+
+
+def _write_file(data: dict) -> None:
+    MOE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG_PATH.with_suffix(".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(data, handle)
+        handle.flush()
+        os.fsync(handle.fileno())
+    tmp.replace(CONFIG_PATH)
+
+
+def _keychain_emails(data: dict) -> set[str]:
+    return {email for item, email in _token_slots(data) if item.get(TOKEN_STORE_KEY) == KEYCHAIN}
+
+
+def _move_tokens_to_keychain(raw: dict) -> None:
+    """The one-time move of tokens still in gmail.json (older builds, or a save
+    while Keychain was unavailable). Each token is written to Keychain and read
+    back; only a confirmed one leaves the file, and the file is rewritten only
+    after that. A token Keychain didn't confirm stays in the file for the next
+    try. Called with _history_config_lock held."""
+    from service.config import google_tokens
+    pending = [(item, email) for item, email in _token_slots(raw) if item.get("refresh_token")]
+    if not pending or not google_tokens.may_move():
+        return
+    moved = False
+    for item, email in pending:
+        if google_tokens.store(email, str(item["refresh_token"])):
+            item.pop("refresh_token", None)
+            item[TOKEN_STORE_KEY] = KEYCHAIN
+            moved = True
+    if moved:
+        try:
+            _write_file(raw)
+        except OSError as exc:
+            # The file still holds every token, and Keychain holds a copy: nothing lost.
+            print(f"[gmail] could not rewrite gmail.json after the Keychain move: {type(exc).__name__}",
+                  flush=True)
+
+
 @mutating
 def load_config() -> dict:
+    """gmail.json, with each account's refresh token filled in from Keychain.
+
+    A token still in the file wins (it is the newest: it is only there when
+    Keychain did not confirm it) and is moved to Keychain. An account whose
+    Keychain item can't be read right now has no refresh_token here, so it
+    reads as not connected until a later read succeeds; _save_config keeps
+    its entry, so it is never dropped."""
+    from service.config import google_tokens
     with _history_config_lock:
-        try:
-            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-            data = data if isinstance(data, dict) else {}
-        except Exception:  # noqa: BLE001 — absent/corrupt means "not connected"
-            data = {}
+        raw = _read_file()
+        data = json.loads(json.dumps(raw))
+        for item, email in _token_slots(data):
+            marked = item.pop(TOKEN_STORE_KEY, None) == KEYCHAIN
+            if marked and not item.get("refresh_token"):
+                token = google_tokens.read(email)
+                if token:
+                    item["refresh_token"] = token
+        _move_tokens_to_keychain(raw)
         _observe_history_config(data)
         return data
 
 
+def token_storage() -> str:
+    """Where the connected accounts' refresh tokens are: "keychain", "file"
+    (Keychain unavailable, so the 0600 file), "mixed", or "" with none."""
+    with _history_config_lock:
+        raw = _read_file()
+    places = {KEYCHAIN if item.get(TOKEN_STORE_KEY) == KEYCHAIN and not item.get("refresh_token")
+              else "file" for item, _ in _token_slots(raw)
+              if item.get("refresh_token") or item.get(TOKEN_STORE_KEY) == KEYCHAIN}
+    return places.pop() if len(places) == 1 else "mixed" if places else ""
+
+
 @mutating
-def _save_config(cfg: dict) -> None:
+def _save_config(cfg: dict, *, forget: set[str] | frozenset[str] = frozenset()) -> None:
+    """Write gmail.json from `cfg`, with refresh tokens in Keychain.
+
+    Each token goes to Keychain first and leaves the file only once it reads
+    back exactly (google_tokens.store); otherwise it is written to the file,
+    0600, as the fallback. An account the file keeps in Keychain is never
+    dropped by a save that lacks it (its Keychain item may just have been
+    unreadable when the caller loaded): only `forget` (a disconnect) removes
+    it, and its Keychain item is deleted after the file no longer names it."""
+    from service.config import google_tokens
+    forget = {email.strip().lower() for email in forget}
     with _history_config_lock:
         _withdraw_history_configuration()
-        MOE_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = CONFIG_PATH.with_suffix(".tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(cfg, handle)
-        tmp.replace(CONFIG_PATH)
+        old = _read_file()
+        out = json.loads(json.dumps(cfg))
+        old_marked = _keychain_emails(old)
+        present = set()
+        moving = []
+        for item, email in _token_slots(out):
+            present.add(email)
+            item.pop(TOKEN_STORE_KEY, None)
+            token = item.get("refresh_token")
+            if token:
+                if google_tokens.cached(email) == str(token):
+                    item.pop("refresh_token", None)
+                    item[TOKEN_STORE_KEY] = KEYCHAIN
+                else:
+                    moving.append((item, email, str(token)))
+            elif email in old_marked and email not in forget:
+                item[TOKEN_STORE_KEY] = KEYCHAIN
+        keep = [(item, email) for item, email in _token_slots(old)
+                if email in old_marked - present - forget]
+        if keep:
+            accounts = out.get("accounts")
+            if not isinstance(accounts, dict):
+                accounts = out["accounts"] = {}
+            for item, email in keep:
+                accounts[email] = {k: v for k, v in item.items() if k != "accounts"}
+        if moving:
+            # A new token reaches the file before Keychain: if anything fails
+            # after this, the file holds the newest token, and the file wins.
+            _write_file(out)
+            for item, email, token in moving:
+                if google_tokens.store(email, token):
+                    item.pop("refresh_token", None)
+                    item[TOKEN_STORE_KEY] = KEYCHAIN
+        _write_file(out)
+        for email in forget & old_marked:
+            if not google_tokens.delete(email):
+                print("[gmail] could not remove a disconnected account's Keychain item", flush=True)
         _observe_history_config(cfg)
 
 
@@ -388,7 +524,9 @@ def status() -> dict:
             "authorizing": _pending_flow is not None, "authorization": dict(_authorization),
             # Accounts whose next sign-in also asks for the Workspace scopes.
             "workspace_consent": [r["email"] for r in rows if r["workspace"] and not r["workspace_full"]],
-            "mail_accounts": E.native_email_accounts(), "workspace": workspace}
+            "mail_accounts": E.native_email_accounts(), "workspace": workspace,
+            # "keychain", or "file" while Keychain was unavailable (never the token itself).
+            "token_storage": token_storage()}
 
 
 # The one status line per account. Brief's sync (mail, calendar) and the
@@ -1685,8 +1823,18 @@ async def disconnect(account: str = "") -> dict:
         cfg = load_config()
         accounts = connected_accounts(cfg)
         removed = {email: item for email, item in accounts.items() if not account or email == account.lower()}
-        for email in removed:
-            accounts.pop(email)
+        # An account whose Keychain item can't be read right now is missing from
+        # `accounts` but still in the file. Disconnecting it by name, or
+        # disconnecting everything, removes it too (its data is erased; its
+        # token can't be revoked without reading it). Any other such account is
+        # kept, so the file is deleted only when no account is left in it.
+        with _history_config_lock:
+            marked = _keychain_emails(_read_file())
+        wanted = marked if not account else {account.strip().lower()} & marked
+        unreadable = wanted - set(removed)
+        forget = set(removed) | unreadable
+        for email in forget:
+            accounts.pop(email, None)
             _epochs[email] = _epochs.get(email, 0) + 1
             _access.pop(email, None)
             _last.pop(email, None)
@@ -1697,24 +1845,29 @@ async def disconnect(account: str = "") -> dict:
                 if key[0] == email:
                     _meta.pop(key, None)
             _forget_auth(email)
-        if accounts or cfg.get("client_id"):
+        if accounts or cfg.get("client_id") or (marked - forget):
             # The user's own OAuth client stays after the last account goes, so
             # "Connect Google" in the notch still works after an erase. It holds
             # no account data and no token.
             _save_config({"client_id": cfg.get("client_id", ""), "client_secret": cfg.get("client_secret", ""),
-                          "accounts": accounts})
+                          "accounts": accounts}, forget=forget)
         else:
+            from service.config import google_tokens
             with _history_config_lock:
                 CONFIG_PATH.unlink(missing_ok=True)
                 _observe_history_config({})
+                for email in forget:
+                    if not google_tokens.delete(email):
+                        print("[gmail] could not remove a disconnected account's Keychain item", flush=True)
         E.configure_external_accounts(accounts)
-    erased = {email: erase_account_data(email, attachment_text=False) for email in removed}
+    erased = {email: erase_account_data(email, attachment_text=False) for email in sorted(forget)}
     for email, parts in erased.items():     # the store may wait up to 30 s for a lock: off the event loop
         parts["attachment_text"] = await asyncio.to_thread(_erase_attachment_text, email)
     # Revocation is best effort: the local disconnect already succeeded. Each
     # account says whether Google confirmed it ("revoked"), refused the token
     # ("rejected", e.g. already revoked) or could not be reached ("offline").
-    revoked: dict[str, str] = {}
+    # "unreadable": its Keychain item couldn't be read, so Google wasn't asked.
+    revoked: dict[str, str] = {email: "unreadable" for email in unreadable}
     for email, item in removed.items():
         try:
             async with httpx.AsyncClient(timeout=5) as http:
@@ -1725,7 +1878,7 @@ async def disconnect(account: str = "") -> dict:
             revoked[email] = "offline"
     complete = all(value == "erased" or value.startswith("erased ")
                    for parts in erased.values() for value in parts.values())
-    return {"removed": sorted(removed), "erased": erased, "complete": complete, "revoked": revoked}
+    return {"removed": sorted(forget), "erased": erased, "complete": complete, "revoked": revoked}
 
 
 def _erase_attachment_text(account: str) -> str:

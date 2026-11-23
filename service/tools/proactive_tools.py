@@ -26,7 +26,7 @@ from service.tools.registry import register
 
 MAX_CHARS = 1500
 _SOURCE = {"mail": "email", "messages": "text", "calendar": "calendar",
-           "reminders": "reminder", "notes": "note"}
+           "reminders": "reminder", "notes": "note", "day": "Harbor's plan"}
 
 
 def _clean(value, limit: int = 110) -> str:
@@ -323,10 +323,10 @@ def render_day_plan(snap: dict, *, now: float, tz: str, day: str | date = "today
         ts = t.get("due_ts")
         return ts is not None and datetime.fromtimestamp(ts, zone).date() == target
 
-    timed = sorted((t for t in todos if on_target(t) and (t.get("source") != "calendar" or t["due_ts"] >= now - 3600)),
+    timed = sorted((t for t in todos if on_target(t) and (t.get("source") not in ("calendar", "day") or t["due_ts"] >= now - 3600)),
                    key=lambda t: (not _timed(t), t["due_ts"]))
     overdue = [t for t in _overdue(todos, now, zone, today) if not on_target(t)]
-    later = [t for t in todos if t not in timed and t not in overdue and t.get("source") != "calendar"
+    later = [t for t in todos if t not in timed and t not in overdue and t.get("source") not in ("calendar", "day")
              and not (tomorrow and t.get("due_ts") is not None and t["due_ts"] >= now - 3600
                       and today <= datetime.fromtimestamp(t["due_ts"], zone).date() < target)]
     waiting = [t for t in snap.get("threads") or [] if t.get("needs_reply")]
@@ -353,7 +353,7 @@ def render_day_plan(snap: dict, *, now: float, tz: str, day: str | date = "today
             if len(items) > cap:
                 lines.append(f"- …and {len(items) - cap} more")
 
-    section(f"Time-bound {word}:", timed, lambda t: _due_line(t, zone), 5)
+    section(f"Time-bound {word}:", timed, lambda t: _due_line(t, zone), 8)
     section("Overdue:", overdue, _overdue_line, 3)
     section("Waiting on a reply from you:", waiting, _waiting_line, 3)
     section("Suggested next steps:", cards, _card_line, 3)
@@ -451,6 +451,47 @@ def _store_schedule(start: float, end: float, now: float) -> dict:
     return {"calendar": calendar, "reminders": reminders}
 
 
+def _day_todos(rows: list[dict]) -> list[dict]:
+    """Day's rows (service/assistant/day_agenda.py) as snapshot to-dos, so they sort and print
+    with the calendar's events."""
+    todos = []
+    for row in rows:
+        end = row.get("end_ts")
+        until = ("until " + datetime.fromtimestamp(end).strftime("%-I:%M %p").lstrip("0").lower()
+                 if isinstance(end, (int, float)) and not isinstance(end, bool) else "")
+        why = {"suggested": "suggested time, not kept yet" + (", " + until if until else ""),
+               "planned": until, "due": "due"}.get(row.get("state"), "")
+        todos.append({"id": row["id"], "title": row["title"], "source": "day", "due_ts": row["when_ts"],
+                      "due_label": "", "done": False, "timed": not row.get("all_day"), "why": why})
+    return todos
+
+
+async def with_day_rows(snap: dict, start: float, end: float, now: float, tz: str) -> dict:
+    """The snapshot plus Day's planned blocks and due items in [start, end), each once: a
+    calendar to-do that is the block (same title and start) gives way to it. Never fatal."""
+    try:
+        from service.assistant import day_agenda
+        rows = await day_agenda.rows(start, end, now=now, tz=tz)
+    except Exception:  # noqa: BLE001 - Day's plan never costs the plan the Brief has
+        return snap
+    if not rows:
+        return snap
+    key = day_agenda._key
+    blocks = {key(r["title"], r["when_ts"]) for r in rows if r["kind"] == "block"}
+    todos = [t for t in snap.get("todos") or []
+             if not (t.get("source") == "calendar" and key(t.get("title"), t.get("due_ts")) in blocks)]
+    have = {key(t.get("title"), t.get("due_ts")) for t in todos}
+    titles = {k[0] for k in have}
+    fresh = []
+    for row in rows:
+        k = key(row["title"], row["when_ts"])
+        if k in have or (row["kind"] == "due" and k[0] in titles):
+            continue
+        have.add(k)
+        fresh.append(row)
+    return {**snap, "todos": todos + _day_todos(fresh)}
+
+
 @register(
     "get_my_day_plan",
     "The user's plan for a day or a week, from Harbor's Brief: calendar events and "
@@ -500,9 +541,15 @@ async def get_my_day_plan(day: str = "today") -> str:
             return "(error: that time has passed; use get_past_events for it)"
         if end - start > 26 * 3600:
             snap = snapshot(now=now, schedule_fn=lambda _now, _tz: _range_schedule(start, end, _now, _tz))
+            snap = await with_day_rows(snap, max(start, now - 86400), end, now, tz)
             return render_range_plan(snap, now=now, tz=tz, start=start, end=end, label=label)
         if target > today + timedelta(days=1):
             snap = snapshot(now=now, schedule_fn=lambda _now, _tz: _range_schedule(start, end, _now, _tz))
+            snap = await with_day_rows(snap, start, end, now, tz)
             return render_day_plan(snap, now=now, tz=tz, day=target)
         word = "today" if target == today else "tomorrow"
-    return render_day_plan(snapshot(now=now), now=now, tz=tz, day=word)
+    zone = ZoneInfo(tz)
+    first = datetime.combine(datetime.fromtimestamp(now, zone).date() + timedelta(days=1 if word == "tomorrow" else 0),
+                             datetime.min.time(), zone)
+    snap = await with_day_rows(snapshot(now=now), first.timestamp(), (first + timedelta(days=1)).timestamp(), now, tz)
+    return render_day_plan(snap, now=now, tz=tz, day=word)

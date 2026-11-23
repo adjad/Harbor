@@ -177,7 +177,19 @@ final class CalendarReader {
         let pred = store.predicateForEvents(withStart: start, end: end, calendars: nil)
         let events = store.events(matching: pred)
         // Declined and cancelled events are not on the person's day.
-        let kept = events.filter(CalendarReader.keeps)
+        let counted = events.filter(CalendarReader.keeps)
+        // Events Harbor wrote itself (Day's blocks, DayCalendarWriter) are the same blocks
+        // Day already shows, so they are never read back as meetings: set apart here and
+        // reported by id, so the service can drop a second copy that reaches it another way.
+        let kept = counted.filter { !CalendarReader.isHarborOwn($0) }
+        let ownEvents: [[String: Any]] = counted.compactMap { ev in
+            guard let id = DayCalendarMarker.blockID(url: ev.url?.absoluteString, notes: ev.notes),
+                  let start = ev.startDate else { return nil }
+            var row: [String: Any] = ["block_id": id, "title": RemindersWriter.syncedTitle(ev.title),
+                                      "when_ts": start.timeIntervalSince1970]
+            if let end = ev.endDate { row["end_ts"] = end.timeIntervalSince1970 }
+            return row
+        }
 
         let payload: [[String: Any]] = kept.compactMap { ev in
             guard let sd = ev.startDate else { return nil }
@@ -239,7 +251,8 @@ final class CalendarReader {
             "calendar_count": cals.count,
             "calendars": cals.map { $0.title },
             "events_found": events.count,
-            "events_declined_or_cancelled": events.count - kept.count,
+            "events_declined_or_cancelled": events.count - counted.count,
+            "harbor_events": ownEvents,
             "event_ids": payload.map { "\($0["title"] ?? "") | \($0["source_id"] ?? "")" },
         ]
         return (events: payload, diagnostics: diagnostics)
@@ -275,7 +288,7 @@ final class CalendarReader {
                         guard first.timeIntervalSince1970 < end && last.timeIntervalSince1970 > start else { continue }
                         // A declined or cancelled event didn't happen to the person;
                         // learning from it would teach habits they don't have.
-                        guard Self.keeps(ev) else { continue }
+                        guard Self.keeps(ev), !Self.isHarborOwn(ev) else { continue }
                         guard let row = Self.historyEventRow(id: id, title: ev.title ?? "(untitled)",
                             start: first.timeIntervalSince1970, end: last.timeIntervalSince1970,
                             allDay: ev.isAllDay, calendar: ev.calendar?.title ?? "") else { return (nil,"invalid_record") }
@@ -301,6 +314,11 @@ final class CalendarReader {
                 CalendarEventPolicy.Attendee(isCurrentUser: $0.isCurrentUser,
                                              declined: $0.participantStatus == .declined)
             })
+    }
+
+    /// Whether Harbor wrote this event itself (DayCalendarMarker): by its link or its notes line.
+    static func isHarborOwn(_ ev: EKEvent) -> Bool {
+        DayCalendarMarker.isOwn(url: ev.url?.absoluteString, notes: ev.notes)
     }
 
     static func historyEventRow(id: String, title: String, start: Double, end: Double,
@@ -508,9 +526,72 @@ final class CalendarReader {
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // Harbor's own Day events are listed apart from the meetings (readSnapshot).
+        var diagnostics = diagnostics
+        let own = (diagnostics.removeValue(forKey: "harbor_events") as? [[String: Any]]) ?? []
         req.httpBody = try? JSONSerialization.data(withJSONObject: ["events": events,
-                                                                    "diagnostics": diagnostics])
+                                                                    "diagnostics": diagnostics,
+                                                                    "harbor_events": own])
         URLSession.shared.dataTask(with: req).resume()
+    }
+}
+
+/// How Harbor marks the calendar events it writes for Day's blocks, and how every
+/// reader recognises them. Pure rules, checked by tests/CalendarReaderChecks.swift.
+///
+/// Rules:
+/// - IMPORTANT: an event is Harbor's own when its link starts "harbor-day://block/" or a
+///   line of its notes holds that link. The link is set on the event, and the same
+///   link is written into the notes, because a calendar that syncs through an account
+///   (Google) can keep the notes and drop the link.
+/// - IMPORTANT: the block id follows the prefix, percent-encoded, and is the only key
+///   a sync matches on. An event with neither marker is never touched.
+/// - IMPORTANT: every calendar read (CalendarReader, the service's ingestion) leaves
+///   marked events out of the meetings, since Day already shows the block.
+enum DayCalendarMarker {
+    static let urlPrefix = "harbor-day://block/"
+    static let notesLead = "Added by Harbor: "
+
+    private static let unreserved: CharacterSet = {
+        var set = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+        set.insert(charactersIn: "-._~")
+        return set
+    }()
+
+    /// The link for a block, the event's URL.
+    static func url(forBlock id: String) -> String {
+        urlPrefix + (id.addingPercentEncoding(withAllowedCharacters: unreserved) ?? id)
+    }
+
+    /// The notes line for a block.
+    static func notesLine(forBlock id: String) -> String { notesLead + url(forBlock: id) }
+
+    /// The block id a marker names, from the event's URL first, else a notes line.
+    static func blockID(url: String?, notes: String?) -> String? {
+        if let url, let id = id(in: url, anchoredAtStart: true) { return id }
+        if let notes, let id = id(in: notes, anchoredAtStart: false) { return id }
+        return nil
+    }
+
+    static func isOwn(url: String?, notes: String?) -> Bool { blockID(url: url, notes: notes) != nil }
+
+    /// Notes for a written event: the marker line, then whatever the person added.
+    static func notes(forBlock id: String, keeping existing: String?) -> String {
+        let line = notesLine(forBlock: id)
+        let rest = (existing ?? "").split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { !$0.contains(urlPrefix) }.joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return rest.isEmpty ? line : line + "\n" + rest
+    }
+
+    private static func id(in text: String, anchoredAtStart: Bool) -> String? {
+        guard let found = text.range(of: urlPrefix) else { return nil }
+        if anchoredAtStart && found.lowerBound != text.startIndex { return nil }
+        let tail = text[found.upperBound...]
+        let token = tail.prefix { !$0.isWhitespace }
+        guard !token.isEmpty, let decoded = String(token).removingPercentEncoding, !decoded.isEmpty,
+              decoded.count <= 400 else { return nil }
+        return decoded
     }
 }
 

@@ -144,6 +144,8 @@ PROFILE_TESTS = {
         "tests/test_corpus_reasoning_export.py",
         "tests/test_gmail_source.py",
         "tests/test_google_workspace.py",
+        # Google refresh tokens moved to a stand-in Keychain; invented tokens only.
+        "tests/test_google_tokens_keychain.py",
         "tests/test_linked_documents.py",
         "tests/test_mail_history_wire.py",
         "tests/test_message_attribution.py",
@@ -175,6 +177,8 @@ PROFILE_TESTS = {
     },
     "outbound": {
         "tests/test_action_tools_sanitize.py",
+        # Forward through the sandbox Mail app behind the real outbox; never real Mail.
+        "tests/test_mail_forward.py",
         "tests/test_event_move.py",
         "tests/test_cancel_reaches_mac_apps.py",
         "tests/test_outbound_content_provenance.py",
@@ -407,6 +411,7 @@ ADDITIONAL_FULL_TESTS = {
     "tests/test_final_ask_card_and_referents.py",
     "tests/test_ask_typed_reminder.py",
     "tests/test_send_truthfulness.py",
+    "tests/test_known_msgs_ask_fixes.py",
     "tests/test_inline_terminal_confirm.py",
     "tests/test_final_ask_web_wordings.py",
     "tests/test_final_web_ownership.py",
@@ -463,6 +468,9 @@ ADDITIONAL_FULL_TESTS = {
     # Toolbench fake-world receipts and seeded facts against the real outcome
     # classifier; temp HARBOR_HOME, no model, network, Mac apps or tool execution.
     "tests/test_toolbench_world.py",
+    # Ask's suggested prompts: invented cached calendar, reminders, mail and notes, with the
+    # real tools answering each prompt; temp HARBOR_HOME and store, no model, network or Mac apps.
+    "tests/test_ask_suggestions.py",
     # Planner eval --dry-run in a temp HOME/HARBOR_HOME: builds menus, no model, oMLX or tool execution.
     "tests/test_eval_planner_dry_run.py",
     # Inert bounded attestation store; supplied facts and manual interleavings only.
@@ -509,6 +517,10 @@ ADDITIONAL_FULL_TESTS = {
     # store, fixture calendars, fake behavior engine; no model, source or network.
     "tests/test_schedule_brief_items.py",
     "tests/test_brief_in_schedule_tools.py",
+    # Day's blocks beside the calendar in Ask's day reads, and Harbor's own calendar events never
+    # shown as meetings (sync route, Google reader): invented plan, stubbed store, scratch HARBOR_HOME.
+    "tests/test_day_blocks_in_ask.py",
+    "tests/test_harbor_calendar_marker.py",
     # Reply-draft reads and day-plan corrections: regex and registry checks only.
     "tests/test_reply_draft_reads.py",
     # Ask quality: code-failure fixes, tool-pair descriptions, the Harbor self-reference
@@ -963,6 +975,7 @@ _NATIVE_GATE_DEPENDENCIES = {
     "native/reminders-policy-contract": "native/reminders-policy-compile",
     "native/reminder-action-ledger-contract": "native/reminder-action-ledger-compile",
     "native/calendar-move-contract": "native/calendar-move-compile",
+    "native/day-calendar-sync-contract": "native/day-calendar-sync-compile",
     "native/checkin-cancel-contract": "native/checkin-cancel-compile",
     "native/privacy-relaunch-contract": "native/privacy-relaunch-compile",
     "native/chat-logic-contract": "native/chat-logic-compile",
@@ -1263,6 +1276,7 @@ def _native_gates(build_dir: Path) -> list[tuple[str, list[str]]]:
     prompt_queue = str(build_dir / "prompt-queue")
     agent_send = str(build_dir / "agent-send")
     notch_command = str(build_dir / "notch-command")
+    ask_suggestions = str(build_dir / "ask-suggestions")
     screen_look = str(build_dir / "screen-look")
     read_aloud_voice = str(build_dir / "read-aloud-voice")
     study_find = str(build_dir / "study-find")
@@ -1282,6 +1296,7 @@ def _native_gates(build_dir: Path) -> list[tuple[str, list[str]]]:
     reminders_policy = str(build_dir / "reminders-policy")
     reminder_action_ledger = str(build_dir / "reminder-action-ledger")
     calendar_move = str(build_dir / "calendar-move")
+    day_calendar_sync = str(build_dir / "day-calendar-sync")
     checkin_cancel = str(build_dir / "checkin-cancel")
     privacy_relaunch = str(build_dir / "privacy-relaunch")
     settings_response = str(build_dir / "settings-response")
@@ -1413,6 +1428,18 @@ def _native_gates(build_dir: Path) -> list[tuple[str, list[str]]]:
             ],
         ),
         ("native/notch-command-contract", [notch_command]),
+        (
+            "native/ask-suggestions-compile",
+            [
+                TRUSTED_SWIFTC, "-parse-as-library", "-swift-version", "5",
+                "-module-cache-path", module_cache,
+                "app/Sources/HarborApp/AskSuggestionsStore.swift", "app/Sources/HarborApp/HarborClient.swift",
+                "app/Sources/HarborApp/AgentSend.swift", "app/Sources/HarborApp/AskAccess.swift",
+                "app/Sources/HarborApp/NotchCommand.swift",
+                "tests/AskSuggestionsChecks.swift", "-o", ask_suggestions,
+            ],
+        ),
+        ("native/ask-suggestions-contract", [ask_suggestions]),
         (
             "native/ideate-compile",
             [
@@ -1644,6 +1671,17 @@ def _native_gates(build_dir: Path) -> list[tuple[str, list[str]]]:
             ],
         ),
         ("native/calendar-move-contract", [calendar_move]),
+        (
+            "native/day-calendar-sync-compile",
+            [
+                TRUSTED_SWIFTC, "-parse-as-library", "-swift-version", "5",
+                "-module-cache-path", module_cache,
+                "app/Sources/HarborApp/DayCalendarSync.swift",
+                "app/Sources/HarborApp/OnboardingCalendarSync.swift",
+                "tests/DayCalendarSyncChecks.swift", "-o", day_calendar_sync,
+            ],
+        ),
+        ("native/day-calendar-sync-contract", [day_calendar_sync]),
         (
             "native/checkin-cancel-compile",
             [

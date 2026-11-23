@@ -363,6 +363,30 @@ struct ProactiveChecks {
                                    todayEnd: day0 + 86400, tomorrowEnd: day0 + 2 * 86400).count == 3,
               "with nothing named, every event stays")
 
+        // Day's own task-like items in the Brief's to-do list: a planner task and a Needs you reminder.
+        let fitTask = DayTimeline.BriefTask(id: "task:u1", title: "Call Sam back", dueLabel: "", note: "No gap long enough",
+                                            due: nil, taskID: "u1")
+        let dueTask = DayTimeline.BriefTask(id: "need:reminders:a2", title: "Pay the library fine", dueLabel: "Due 5 PM",
+                                            note: "", due: noon + 3600, needID: "reminders:a2")
+        let dayTask = ProactiveTodo(day: fitTask)
+        let dayDue = ProactiveTodo(day: dueTask, fingerprint: "bbbbbbbbbbbbbbbbbbbbbbbb", canComplete: true)
+        check(dayTask.planTaskID == "u1" && dayTask.needID == nil && dayTask.who == "No gap long enough" && !dayTask.canAddToDay,
+              "a planner task keeps its id for the check-off and why it didn't fit")
+        check(dayTask.actionRow.actions.isEmpty, "a planner task has no Clear or Mark done of its own (no engine id)")
+        check(dayDue.needID == "reminders:a2" && dayDue.dueLabel == "Due 5 PM" && dayDue.dueTs == noon + 3600 && dayDue.source == "reminders",
+              "a due reminder keeps its due line")
+        check(dayDue.actionRow.route == NeedsYouRow.needsYouRoute && dayDue.actionRow.id == "reminders:a2"
+              && dayDue.actionRow.actions == [.clear, .markDone],
+              "Mark done answers on the Needs you route under the reminder's own id: \(dayDue.actionRow.actions)")
+        check(ProactiveTodo(id: "engine", title: "x", source: "reminders").actionRow.route == NeedsYouRow.todoRoute,
+              "an engine to-do still answers on the to-do route")
+        let mixed = ProactiveState.plate(todos: [ProactiveTodo(id: "e1", title: "Reply to Dana", source: "mail", dueLabel: "This week"),
+                                                 dayDue, dayTask],
+                                         school: [], isDone: { _ in false }, now: noon, dayStart: day0,
+                                         todayEnd: day0 + 86400, tomorrowEnd: day0 + 2 * 86400)
+        check(Set(mixed.map(\.id)) == ["todo:e1", "todo:need:reminders:a2", "todo:task:u1"] && mixed.count == 3,
+              "Day's items sit in the one list with the engine's: \(mixed.map(\.id))")
+
         print("Proactive checks: \(count) passed")
     }
 }

@@ -26,14 +26,6 @@ ARGS = {
 
 
 @pytest.fixture(autouse=True)
-def forward_bridge_path(monkeypatch):
-    # These pin the app-bridge receipts of all four sends. The Apple Mail
-    # forward is held back as shipped (tests/test_send_recipient_preflight.py),
-    # so its bridge path is switched on here.
-    monkeypatch.setattr(A, "APPLE_MAIL_FORWARD_READY", True)
-
-
-@pytest.fixture(autouse=True)
 def isolated_effects(monkeypatch):
     def forbidden(*args, **kwargs):
         raise AssertionError("No network, native process, or personal source in outbound fixtures")
@@ -72,7 +64,11 @@ class Sink:
         if self.mode == "timeout":
             return event
         result = {
-            "success": {"ok": True, "accepted": True, "reply": ENVELOPE},
+            # A forward's receipt names the email and the addresses Mail sent it to.
+            "success": {"ok": True, "accepted": True, "reply": ENVELOPE,
+                        "forward": {"message_id": ARGS["forward_email"]["message_id"], "account": "Work",
+                                    "from": "me@example.invalid", "to": [ARGS["forward_email"]["to"]],
+                                    "subject": "Fwd: Fixture"}},
             "generic_false": {"ok": False, "error": "synthetic native failure"},
             "explicit_unknown": {"ok": False, "status": "unknown", "error": "lost receipt"},
             "forged_preflight": {"ok": False, "status": "not_attempted", "dispatch_started": False,

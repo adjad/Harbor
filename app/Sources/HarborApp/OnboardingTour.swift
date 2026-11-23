@@ -28,7 +28,10 @@ enum OnboardingTour {
     /// On every sample card, not only the header.
     static let cardMark = "EXAMPLE"
 
-    // The examples, kept here so the copy can be checked.
+    // The examples, kept here so the copy can be checked. Invented names and times.
+    static let briefHeroTitle = "Study for STAT 101 midterm"
+    static let briefHeroBody = "You're free 2\u{2013}3 PM after Lab. I can hold that hour."
+    static let briefHeroButton = "Block 2\u{2013}3 PM?"
     static let briefMeta = "NEW · MAIL"
     static let briefTitle = "Reply to Sam about Friday's dinner"
     static let briefBody = "Sam asked if 7 still works. I wrote a short yes for you to read first."
@@ -39,8 +42,8 @@ enum OnboardingTour {
         ("Due 5 PM", "Send the budget draft"),
         ("Anytime", "Call the dentist"),
     ]
-    static let askQuestion = "What did Sam say about Friday?"
-    static let askAnswer = "Sam asked whether dinner at 7 still works, and said they'll book the table once you say yes."
+    static let askQuestion = "What's due this week?"
+    static let askAnswer = "Your budget draft is due Thursday at 5 PM, and the STAT 101 problem set is due Friday morning."
 }
 
 struct OnboardingTourView: View {
@@ -62,9 +65,9 @@ struct OnboardingTourView: View {
                 .fixedSize(horizontal: false, vertical: true)
             Group {
                 switch page {
-                case 0: brief
-                case 1: day
-                default: ask
+                case 0: OnboardingBriefMock()
+                case 1: OnboardingDayMock()
+                default: OnboardingAskMock()
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -102,61 +105,5 @@ struct OnboardingTourView: View {
         .accessibilityElement()
         .accessibilityLabel("Page")
         .accessibilityValue(OnboardingTour.position(page))
-    }
-
-    /// Notch-dark, the way the open notch draws its cards, with a dashed edge and
-    /// its own "Example" mark, so no card can pass for the person's real mail or day.
-    private func sample<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 6, content: content)
-            .padding(12)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(RoundedRectangle(cornerRadius: 12).fill(Color.black.opacity(0.55)))
-            .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Theme.hairline, style: StrokeStyle(lineWidth: 1, dash: [4, 3])))
-            .overlay(alignment: .topTrailing) {
-                Text(OnboardingTour.cardMark).font(.system(size: 9.5, weight: .semibold)).tracking(0.6)
-                    .foregroundStyle(Theme.textMuted)
-                    .padding(.horizontal, 6).padding(.vertical, 2)
-                    .background(Capsule().fill(Theme.chipFill))
-                    .padding(8)
-            }
-    }
-
-    private var brief: some View {
-        sample {
-            Text(OnboardingTour.briefMeta).font(.system(size: 10.5, weight: .medium, design: .monospaced))
-                .foregroundStyle(Theme.textMuted)
-            Text(OnboardingTour.briefTitle).font(.system(size: 14, weight: .semibold))
-            Text(OnboardingTour.briefBody).font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
-                .fixedSize(horizontal: false, vertical: true)
-            Text(OnboardingTour.briefButton).font(.system(size: 12, weight: .medium)).foregroundStyle(.black)
-                .padding(.horizontal, 12).padding(.vertical, 5)
-                .background(Capsule().fill(Color.white.opacity(0.9)))
-                .padding(.top, 2)
-        }
-    }
-
-    private var day: some View {
-        sample {
-            ForEach(OnboardingTour.dayRows, id: \.title) { row in
-                HStack(alignment: .firstTextBaseline, spacing: 10) {
-                    Text(row.time).font(.system(size: 11.5).monospacedDigit()).foregroundStyle(Theme.textMuted)
-                        .frame(width: 64, alignment: .leading)
-                    Text(row.title).font(.system(size: 12.5))
-                }
-            }
-        }
-    }
-
-    private var ask: some View {
-        sample {
-            HStack {
-                Spacer(minLength: 40)
-                Text(OnboardingTour.askQuestion).font(.system(size: 12.5))
-                    .padding(.horizontal, 10).padding(.vertical, 6)
-                    .background(RoundedRectangle(cornerRadius: 10).fill(Theme.chipFill))
-            }
-            Text(OnboardingTour.askAnswer).font(.system(size: 12.5)).foregroundStyle(Theme.textSecondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
     }
 }

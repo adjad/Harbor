@@ -459,6 +459,7 @@ struct StudyDrivePicker: View {
     var body: some View {
         StudyChrome.card(padding: 10) {
             topRow
+            if study.driveAccounts.count > 1 { accountRow }
             if !state.courses.isEmpty { courseRow }
             if let notice = study.driveNotice {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
@@ -514,6 +515,27 @@ struct StudyDrivePicker: View {
             .overlay(RoundedRectangle(cornerRadius: 8)
                 .stroke(searching ? Color.white.opacity(0.35) : Theme.chipStroke, lineWidth: 1))
             NotchChrome.iconButton("xmark", help: "Close Google Drive") { study.closeDrive() }
+        }
+    }
+
+    /// Which Google account Drive is read with; only with two or more that allowed Drive.
+    private var accountRow: some View {
+        HStack(alignment: .center, spacing: 8) {
+            Text("Account".uppercased())
+                .font(.harbor(size: 9.5, design: .monospaced)).tracking(0.6).foregroundStyle(Theme.textMuted)
+                .fixedSize()
+            Menu {
+                ForEach(study.driveAccounts, id: \.self) { email in
+                    Button(email) { Task { await study.chooseDriveAccount(email) } }
+                }
+            } label: {
+                Text(study.driveAccount ?? "Choose an account")
+                    .font(.harbor(size: 12)).foregroundStyle(Theme.textPrimary)
+                    .lineLimit(1).truncationMode(.middle)
+            }
+            .menuStyle(.borderlessButton).fixedSize()
+            .accessibilityLabel("Google account for Drive")
+            Spacer(minLength: 0)
         }
     }
 

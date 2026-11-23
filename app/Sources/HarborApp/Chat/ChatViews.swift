@@ -1028,7 +1028,6 @@ struct ChatDraftCard: View {
             if !draft.status.isEmpty {
                 Text(draft.status).font(.harbor(.footnote, on: .window))
                     .foregroundStyle(draft.sent || draft.isSending
-                                     || draft.status == HarborClient.quietNotDelivered
                                      ? ChatTheme.text2 : ChatTheme.danger)
                     .padding(.horizontal, 14).padding(.bottom, 10)
             }
