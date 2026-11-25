@@ -128,6 +128,23 @@ def test_after_it_times_out_nothing_reopens_it_until_the_next_wake(store):
     assert W._window is not None and W._window["reason"] == "wake"
 
 
+def test_a_wake_during_an_open_window_opens_a_fresh_one(store):
+    """Auditor note 1: the Mac slept through an open window; on the wake the old
+    one (reads from before the night) was kept. A fresh one replaces it."""
+    W.tick(now=NOW, store=store)                                   # launch, 9 h gap
+    old = W._window
+    assert old is not None and old["reason"] == "launch"
+    wake = NOW + 30 + 8 * HOUR
+    W.tick(now=NOW + 30, store=store)
+    W.tick(now=wake, store=store)
+    assert W._window is not None and W._window is not old
+    assert W._window["reason"] == "wake" and W._window["started"] == NOW + 30 + 2 * W.TICK_S
+    # An ordinary tick afterwards keeps the new one.
+    new = W._window
+    W.tick(now=wake + 30, store=store)
+    assert W._window is new
+
+
 def test_reads_right_after_a_wake_count_even_before_the_window_opens(store):
     W.tick(now=NOW, store=store)                          # launch
     W._reset_for_tests(); W._launch_checked = True
@@ -296,8 +313,46 @@ def test_the_cycle_may_skip_its_gap_at_most_once_per_interval(store):
     start = W._window["opened_mono"]
     W._cache = (time.monotonic(), {"building": True, "building_for": ["drafts"], "late": []})
     assert W.wants_cycle(mono=start) is True
+    W.spend_warm(mono=start)                                    # the cycle started on it
     assert W.wants_cycle(mono=start + 30) is False
     assert W.wants_cycle(mono=start + W.WARM_EVERY_S + 1) is True
+
+
+def test_asking_for_the_early_slot_does_not_use_it(store):
+    """Auditor note 3: wants_cycle used the slot before the cycle's other checks,
+    so a tick stood down by them cost the drafts two minutes."""
+    opened()
+    evaluate(NOW + 45, store=store, drafts=lambda after, now: False)
+    start = W._window["opened_mono"]
+    W._cache = (time.monotonic(), {"building": True, "building_for": ["drafts"], "late": []})
+    assert W.wants_cycle(mono=start) is True
+    assert W.wants_cycle(mono=start + 30) is True               # nothing started: still free
+    assert W._window["warm_at"] is None
+
+
+def test_a_tick_stood_down_by_the_build_gap_keeps_the_early_slot(store, monkeypatch):
+    from service import brief_pace
+    monkeypatch.setattr(cycle, "running", lambda: False)
+    monkeypatch.setattr(cycle, "_rerun", None)
+    monkeypatch.setattr(W, "tick", lambda **kw: None)
+    monkeypatch.setattr(cycle, "_stood_down", lambda reason: None)
+    started = []
+    monkeypatch.setattr(cycle.asyncio, "create_task", lambda coro: (started.append(coro), coro.close())[0])
+    monkeypatch.setattr(brief_pace, "automatic_plan", lambda now=None, state=None: "as_is")
+    opened()
+    W._window["after"] = NOW + 60
+    W._cache = (time.monotonic(), {"building": True, "building_for": ["drafts"], "late": []})
+    monkeypatch.setattr(brief_pace, "build_gap_passed", lambda last: False)
+    assert cycle.schedule_tick() is None and started == []
+    assert W._window["warm_at"] is None                         # stood down: the slot is kept
+    monkeypatch.setattr(brief_pace, "build_gap_passed", lambda last: True)
+    monkeypatch.setattr(brief_pace, "may_start", lambda kind: True)
+    monkeypatch.setattr(cycle, "_foreground", lambda: False)
+    from service.assistant.hub import hub
+    monkeypatch.setattr(type(hub), "has_subscribers", property(lambda self: True), raising=False)
+    W._cache = (time.monotonic(), {"building": True, "building_for": ["drafts"], "late": []})
+    cycle.schedule_tick()
+    assert len(started) == 1 and W._window["warm_at"] is not None   # used once it started
 
 
 # --- a stale mail error is not a read (Auditor finding 3) ---------------------------
@@ -330,6 +385,27 @@ def test_a_mail_error_is_never_a_read_and_only_reconnect_skips_the_wait(monkeypa
         "sam@example.invalid": {"headers_at": NOW - 9 * HOUR, "auth_expired": True, "headers_error": "x"},
         "lee@example.invalid": {"headers_at": NOW - 9 * HOUR, "headers_error": offline}})
     assert W._email(NOW, NOW + 5)[0] == "waiting"
+
+
+def test_two_accounts_one_failing_for_now_waits_only_on_the_healthy_one(monkeypatch):
+    """Auditor note 2: with one account offline and the other read, mail waited the
+    full three minutes. Once every account has read or failed, it is in."""
+    from service.tools import email_tools as mail
+    monkeypatch.setattr(mail, "email_sync_state", lambda: "ready")
+    offline = "Google could not be reached; try again when online"
+    monkeypatch.setattr(mail, "_external_accounts", {
+        "sam@example.invalid": {"headers_at": NOW + 2},
+        "lee@example.invalid": {"headers_at": NOW - 9 * HOUR, "headers_error": offline}})
+    assert W._email(NOW, NOW + 5) == ("in", NOW + 2)
+    # The healthy one hasn't read yet: waited for (the failing one isn't).
+    monkeypatch.setattr(mail, "_external_accounts", {
+        "sam@example.invalid": {"headers_at": NOW - 9 * HOUR},
+        "lee@example.invalid": {"headers_at": NOW - 9 * HOUR, "headers_error": offline}})
+    assert W._email(NOW, NOW + 5) == ("waiting", None)
+    # Only failing accounts, none read: still waited for, never "in" on old mail.
+    monkeypatch.setattr(mail, "_external_accounts", {
+        "lee@example.invalid": {"headers_at": NOW - 9 * HOUR, "headers_error": offline}})
+    assert W._email(NOW, NOW + 5) == ("waiting", None)
 
 
 def test_an_offline_mail_account_at_wake_keeps_the_drafts_waiting(store, monkeypatch):

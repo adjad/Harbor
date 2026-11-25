@@ -1314,6 +1314,18 @@ def _remote_background_paused() -> bool:
         return False
 
 
+def _spend_warm(warm: bool) -> None:
+    """A cycle starts on the Brief's early slot (brief_warmup.wants_cycle):
+    only now, after every check passed, is the slot used."""
+    if not warm:
+        return
+    try:
+        from service.proactive import brief_warmup
+        brief_warmup.spend_warm()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def schedule_tick() -> asyncio.Task | None:
     """Single-flight background tick for the scheduler loop; never awaited there."""
     global _task, _rerun
@@ -1379,6 +1391,7 @@ def schedule_tick() -> asyncio.Task | None:
         if not hub.has_subscribers:
             _stood_down("the app isn't connected to the event stream")
             return None
+        _spend_warm(warm)
         _task = asyncio.create_task(_light_tick())
         return _task
     last_build = state.get("build_at")
@@ -1402,6 +1415,7 @@ def schedule_tick() -> asyncio.Task | None:
             return None
     except Exception:  # noqa: BLE001
         pass
+    _spend_warm(warm)
     _task = asyncio.create_task(_build_tick() if plan == "build" else _return_tick() if catch_up
                                 else _idle_tick() if refresh else _tick())
     return _task

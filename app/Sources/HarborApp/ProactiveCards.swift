@@ -1738,7 +1738,8 @@ struct ProactiveBriefSection: View {
     private func calendarLine(todosEmpty: String?) -> some View {
         let calendarUnread = unread.contains { $0.source == "calendar" }
         let upcoming: [String] = events.map { today.clock($0.start) + " " + $0.title }
-        let calendarBuilding = proactive.building && proactive.buildingFor.contains("calendar")
+        let calendarBuilding = BriefBuilding.calendarPending(building: proactive.building,
+                                                             buildingFor: proactive.buildingFor, late: proactive.late)
         let dayLine: String = BriefPlate.calendarLine(upcoming: upcoming, allDay: allDayEvents,
                                                       earlierToday: endedEvents, calendarUnread: calendarUnread,
                                                       calendarBuilding: calendarBuilding)

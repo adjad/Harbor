@@ -854,6 +854,12 @@ enum BriefBuilding {
         return names.isEmpty ? nil : "Waiting for " + joined(names)
     }
 
+    /// Calendar isn't in: still waited for, or late (silent, or missing after
+    /// the timeout). The calendar line then never says the day is empty.
+    static func calendarPending(building: Bool, buildingFor: [String], late: [String]) -> Bool {
+        (building && buildingFor.contains("calendar")) || late.contains("calendar")
+    }
+
     /// After the timeout: what is shown, and what didn't come in.
     static func lateLine(_ ids: [String]) -> String? {
         let names = names(ids)

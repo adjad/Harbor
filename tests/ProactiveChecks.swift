@@ -414,6 +414,14 @@ struct ProactiveChecks {
               == "9 AM Lab", "what is known still shows while building")
         check(BriefPlate.calendarLine(upcoming: [], allDay: [], earlierToday: 0, calendarUnread: false)
               == "Nothing on your calendar today", "once Calendar is in, the plain line")
+        check(BriefBuilding.calendarPending(building: false, buildingFor: [], late: ["calendar", "drafts"]),
+              "after the timeout a late Calendar is still pending: no empty-calendar line beside the late line")
+        check(BriefBuilding.calendarPending(building: true, buildingFor: ["email"], late: ["calendar"]),
+              "a silent Calendar while building is pending")
+        check(BriefBuilding.calendarPending(building: true, buildingFor: ["calendar"], late: []),
+              "a Calendar still waited for is pending")
+        check(!BriefBuilding.calendarPending(building: false, buildingFor: ["calendar"], late: ["email"]),
+              "Calendar in, only Mail late: the plain calendar line")
 
         print("Proactive checks: \(count) passed")
     }

@@ -28,7 +28,8 @@ The thresholds (written down here, as asked):
 
 ONCE PER GAP. A window opens only at a launch or a wake, never on a notch
 open, an unpark or any later read: after one completes or times out, none
-opens again until the next launch or wake. None opens when the automatic cycle
+opens again until the next launch or wake. A wake while one is still open (the
+Mac slept through it) replaces it with a fresh one. None opens when the automatic cycle
 is paused (a remote model without parity, cycle._remote_background_paused):
 the drafts could never come in.
 
@@ -51,7 +52,9 @@ after the gap ended counts:
   is in as well: that is terminal.
 - email: every connected Google account fetched its headers after the gap
   ended. An error is never a read. A temporary one (offline, timed out) is
-  waited for like any fetch still owed. An account whose sign-in stops mail
+  waited for like any fetch still owed, but only while no other account has
+  read: once every account has read or failed, only the healthy ones are
+  waited on. An account whose sign-in stops mail
   (cycle._unread_reason says "reconnect": expired, refused, no Gmail scope)
   can't come in by waiting: it isn't waited for, and the Brief names it
   "reconnect" (honest(), mail_unread_by) rather than late. With none
@@ -173,7 +176,7 @@ def _email(started: float, now: float) -> tuple[str, float | None]:
         return "terminal", None
     accounts = dict(getattr(mail, "_external_accounts", {}) or {})
     if accounts:
-        stamps, lagging, failing = [], False, 0
+        stamps, lagging, failing, erroring = [], False, 0, 0
         for address, item in accounts.items():
             stamp = _stamp((item or {}).get("headers_at"))
             if stamp is not None and stamp >= started:
@@ -185,10 +188,18 @@ def _email(started: float, now: float) -> tuple[str, float | None]:
                 # mail_unread_by). Not waited for, and not counted as read.
                 failing += 1
                 continue
-            # No fetch since the gap ended, or a temporary failure (offline, timed
-            # out): it may come in any minute, so it is waited for, and named
-            # late if it stays silent. An error is never a read.
-            lagging = True
+            if (item or {}).get("headers_error"):
+                # A temporary failure (offline, timed out). An error is never a read.
+                erroring += 1
+                continue
+            lagging = True   # healthy, no fetch since the gap ended yet: waited for
+        if erroring and not stamps and not lagging:
+            # No account has read since the gap ended and the rest failed for now:
+            # it may come in any minute, so wait (named late if it stays silent).
+            # Never "in" on last night's mail.
+            return "waiting", None
+        # Every account has read or failed: only the healthy ones are waited on;
+        # one failing for now doesn't hold the Brief (honest() names it).
         if not stamps and not lagging and failing:
             return "terminal", None  # every account needs reconnecting: named "reconnect", not waited for
         # One account read and another hasn't yet: waiting, but reporting (not silent).
@@ -261,15 +272,20 @@ def _read(source: str, window: dict, now: float, readers: dict) -> tuple[str, fl
 
 
 def begin(reason: str, *, now: float | None = None, readers=None, read_from: float | None = None,
-          store=None) -> bool:
-    """Open a window, once for this launch or wake (one already open is kept).
-    Reads count from ``read_from`` (when the gap ended; default now). The wait
-    set leaves out what is terminal now. True when one is open."""
+          store=None, fresh: bool = False) -> bool:
+    """Open a window, once for this launch or wake. One already open is kept,
+    unless ``fresh`` (a wake: the Mac slept through it, so its reads and its
+    deadline are from before the gap and a new one replaces it). Reads count
+    from ``read_from`` (when the gap ended; default now). The wait set leaves
+    out what is terminal now. True when one is open."""
     global _window, _late, _cache
     now = time.time() if now is None else now
     read_from = now if read_from is None or not read_from <= now else float(read_from)
-    if _window is not None:
+    if _window is not None and not fresh:
         return True
+    if _window is not None:
+        _log(f"a {reason} during the open window ({_window['reason']}): building again")
+        _window, _cache = None, None
     if _cycle_paused():
         _log(f"not building ({reason}): the automatic cycle is paused")
         return False
@@ -305,7 +321,8 @@ def tick(*, now: float | None = None, store=None) -> None:
         elif previous is not None and now - previous >= SLEEP_GAP_S \
                 and _stamp(_store_state(store).get("as_of")) is not None:
             # Asleep until at least two ticks after the last one: reads from then count.
-            begin("wake", now=now, read_from=min(now, previous + 2 * TICK_S), store=store)
+            # A window still open from before the sleep is replaced (begin's fresh).
+            begin("wake", now=now, read_from=min(now, previous + 2 * TICK_S), store=store, fresh=True)
         _evaluate(now, store)
     except Exception:  # noqa: BLE001 — the Brief shows as it did before
         pass
@@ -436,7 +453,8 @@ def defers_cycle(now: float | None = None) -> bool:
 def wants_cycle(now: float | None = None, mono: float | None = None) -> bool:
     """Mail and messages are in and the drafts aren't: the next cycle tick may
     run before its usual gap, at most once per WARM_EVERY_S (the chat and turn
-    rules still hold)."""
+    rules still hold). Asking doesn't use the slot: spend_warm() does, once the
+    cycle's other checks passed and it starts."""
     v = view(now)
     waiting = v["building_for"]
     if not (v["building"] and "drafts" in waiting and "email" not in waiting and "messages" not in waiting):
@@ -445,10 +463,14 @@ def wants_cycle(now: float | None = None, mono: float | None = None) -> bool:
     if window is None:
         return False
     mono = time.monotonic() if mono is None else mono
-    if window["warm_at"] is not None and mono - window["warm_at"] < WARM_EVERY_S:
-        return False
-    window["warm_at"] = mono
-    return True
+    return window["warm_at"] is None or mono - window["warm_at"] >= WARM_EVERY_S
+
+
+def spend_warm(mono: float | None = None) -> None:
+    """The cycle started on wants_cycle's early slot: the next is WARM_EVERY_S away."""
+    window = _window
+    if window is not None:
+        window["warm_at"] = time.monotonic() if mono is None else mono
 
 
 def holds_scheduled_work(now: float | None = None) -> bool:
