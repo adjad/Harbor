@@ -1318,19 +1318,21 @@ def schedule_tick() -> asyncio.Task | None:
     """Single-flight background tick for the scheduler loop; never awaited there."""
     global _task, _rerun
     from service.assistant.hub import hub
-    warm = False
+    warm = defer = False
     try:
         # A launch or wake after a long gap opens the Brief's building window
-        # (brief_warmup): it owes the catch-up, and a cycle with the fresh mail
-        # and texts may run before its usual gap.
+        # (brief_warmup): it owes the catch-up, the automatic cycle waits for
+        # the fresh mail and texts (a build on last night's caches would use up
+        # the build gap), and then one may run before its usual gap.
         from service.proactive import brief_warmup
         brief_warmup.tick()
         if brief_warmup.building():
             from service.proactive import return_refresh
             return_refresh.arm("building")
-            warm = brief_warmup.wants_cycle()
+            defer = brief_warmup.defers_cycle()
+            warm = not defer and brief_warmup.wants_cycle()
     except Exception:  # noqa: BLE001 — the Brief builds on its usual cadence
-        warm = False
+        warm = defer = False
     if running():
         return None
     if handled.due():
@@ -1345,6 +1347,11 @@ def schedule_tick() -> asyncio.Task | None:
         analyze(request.get("account"))
         return _task
     if _remote_background_paused():
+        return None
+    if defer:
+        # At most until mail and texts are in or silent (brief_warmup.SILENT_S),
+        # and never past its timeout. "Analyze now" never comes through here.
+        _stood_down("the Brief is waiting for fresh mail and texts")
         return None
     try:
         from service.proactive import return_refresh

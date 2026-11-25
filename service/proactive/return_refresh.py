@@ -114,18 +114,9 @@ def arm(reason: str, *, now: float | None = None, store=None) -> bool:
     global _armed, _opened_at
     now = time.time() if now is None else now
     try:
-        state = _store(store).state()
-        stale = is_stale(now, state)
+        stale = is_stale(now, _store(store).state())
     except Exception:  # noqa: BLE001 — an unreadable store owes nothing
         return False
-    if reason in ("launch", "opened", "unparked"):
-        try:
-            # Back after a long gap: the Brief says it is still building until
-            # its sources are in, and goes first (brief_warmup).
-            from service.proactive import brief_warmup
-            brief_warmup.consider(reason, now=now, state=state)
-        except Exception:  # noqa: BLE001 — the catch-up below still runs
-            pass
     if not stale:
         return _armed is not None
     if _armed is None:
