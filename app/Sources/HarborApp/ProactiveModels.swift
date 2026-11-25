@@ -50,6 +50,14 @@ struct ProactiveState: Decodable, Equatable {
     /// model coming back after Save memory, the notch opening on an old Brief;
     /// service/proactive/return_refresh.py), so what shows is from before.
     var updating = false
+    /// Back after a long gap (a night, a day away), the Brief's sources are
+    /// still coming in (service/proactive/brief_warmup.py): what shows is
+    /// partial, and no row may give an all-clear yet.
+    var building = false
+    /// The sources not in yet: "email", "messages", "calendar", "reminders", "day", "drafts".
+    var buildingFor: [String] = []
+    /// Past the wait's timeout, the sources that still haven't come in.
+    var late: [String] = []
 
     struct Stats: Decodable, Equatable {
         var read: Int = 0
@@ -117,7 +125,7 @@ struct ProactiveState: Decodable, Equatable {
         self.threads = threads
     }
 
-    private enum Keys: String, CodingKey { case state, as_of, progress, accounts, summary, cards, todos, threads, lede, stats, owner, reason, unread, mail_read_by, mail_unread_by, mail_unread_reasons, updating }
+    private enum Keys: String, CodingKey { case state, as_of, progress, accounts, summary, cards, todos, threads, lede, stats, owner, reason, unread, mail_read_by, mail_unread_by, mail_unread_reasons, updating, building, building_for, late }
     private enum OwnerKeys: String, CodingKey { case id, label }
     private enum StatsKeys: String, CodingKey { case read, found, drafted, filtered, as_of }
 
@@ -146,6 +154,9 @@ struct ProactiveState: Decodable, Equatable {
         }
         summary = c.lenientString(.summary) ?? ""
         updating = c.lenient(.updating, Bool.self) ?? false
+        building = c.lenient(.building, Bool.self) ?? false
+        buildingFor = c.lenient(.building_for, LossyList<String>.self)?.items.filter { !$0.isEmpty } ?? []
+        late = c.lenient(.late, LossyList<String>.self)?.items.filter { !$0.isEmpty } ?? []
         cards = c.lenient(.cards, LossyList<ProactiveCard>.self)?.items.filter { !$0.id.isEmpty } ?? []
         todos = c.lenient(.todos, LossyList<ProactiveTodo>.self)?.items.filter { !$0.id.isEmpty && !$0.title.isEmpty } ?? []
         threads = c.lenient(.threads, LossyList<ProactiveThread>.self)?.items.filter { !$0.id.isEmpty } ?? []
@@ -804,5 +815,49 @@ extension ProactiveState {
             let message = thread.replyRef["message_id"] ?? ""
             return message.isEmpty || !messages.contains(message)
         }
+    }
+}
+
+
+/// The Brief while it is still building after a long gap, and after its wait
+/// timed out (service/proactive/brief_warmup.py). Pure, for the checks.
+enum BriefBuilding {
+    static let label = "Brief is still building…"
+    /// A zone or list with nothing in it yet: never "nothing needs you".
+    static let emptyLine = "Still building · this fills in as your sources come in."
+
+    /// Each source's name, in the order given; Day is left out beside Calendar
+    /// or Reminders (it plans from them), and unknown ids are dropped.
+    static func names(_ ids: [String]) -> [String] {
+        let labels: [String: String] = ["email": "Mail", "messages": "Messages", "calendar": "Calendar",
+                                        "reminders": "Reminders", "day": "Day", "drafts": "Drafts"]
+        let planned = ids.contains("calendar") || ids.contains("reminders")
+        var seen = Set<String>()
+        return ids.compactMap { id in
+            guard let name = labels[id], !(id == "day" && planned), seen.insert(id).inserted else { return nil }
+            return name
+        }
+    }
+
+    static func joined(_ names: [String]) -> String {
+        switch names.count {
+        case 0: return ""
+        case 1: return names[0]
+        case 2: return names[0] + " and " + names[1]
+        default: return names.dropLast().joined(separator: ", ") + " and " + names[names.count - 1]
+        }
+    }
+
+    /// The row's tooltip while building: "Waiting for Mail and Messages".
+    static func waitingLine(_ ids: [String]) -> String? {
+        let names = names(ids)
+        return names.isEmpty ? nil : "Waiting for " + joined(names)
+    }
+
+    /// After the timeout: what is shown, and what didn't come in.
+    static func lateLine(_ ids: [String]) -> String? {
+        let names = names(ids)
+        guard !names.isEmpty else { return nil }
+        return "Showing what's here · " + joined(names) + (names.count == 1 ? " hasn't" : " haven't") + " come in yet"
     }
 }

@@ -387,6 +387,34 @@ struct ProactiveChecks {
         check(Set(mixed.map(\.id)) == ["todo:e1", "todo:need:reminders:a2", "todo:task:u1"] && mixed.count == 3,
               "Day's items sit in the one list with the engine's: \(mixed.map(\.id))")
 
+        // Back after a long gap: the Brief says it is still building (service/proactive/brief_warmup.py).
+        let buildingJSON = #"{"state":"ready","as_of":1700000000,"building":true,"building_for":["email","calendar","day","drafts",""],"late":[]}"#
+        let building = try! JSONDecoder().decode(ProactiveState.self, from: Data(buildingJSON.utf8))
+        check(building.building && building.buildingFor == ["email", "calendar", "day", "drafts"] && building.late.isEmpty,
+              "building and its sources decode (blank ids dropped): \(building.buildingFor)")
+        let plain = try! JSONDecoder().decode(ProactiveState.self, from: Data(#"{"state":"ready","as_of":1700000000}"#.utf8))
+        check(!plain.building && plain.buildingFor.isEmpty && plain.late.isEmpty, "an older service: not building")
+        check(BriefBuilding.label == "Brief is still building…", "the building row's words")
+        check(BriefBuilding.names(["email", "calendar", "day", "drafts"]) == ["Mail", "Calendar", "Drafts"],
+              "Day is left out beside Calendar, which it plans from")
+        check(BriefBuilding.names(["day", "bogus"]) == ["Day"], "Day alone is named; unknown ids are dropped")
+        check(BriefBuilding.waitingLine(["email", "messages"]) == "Waiting for Mail and Messages", "the waiting tooltip")
+        check(BriefBuilding.waitingLine([]) == nil, "nothing waited for: no tooltip")
+        check(BriefBuilding.lateLine(["messages"]) == "Showing what's here · Messages hasn't come in yet",
+              "after the timeout, the one late source is named")
+        check(BriefBuilding.lateLine(["email", "reminders", "day", "drafts"])
+              == "Showing what's here · Mail, Reminders and Drafts haven't come in yet",
+              "several late sources: \(BriefBuilding.lateLine(["email", "reminders", "day", "drafts"]) ?? "")")
+        check(BriefBuilding.lateLine([]) == nil, "nothing late: no line")
+        check(!BriefBuilding.emptyLine.lowercased().contains("nothing") && BriefBuilding.emptyLine.contains("building"),
+              "the empty line while building is never an all-clear")
+        check(BriefPlate.calendarLine(upcoming: [], allDay: [], earlierToday: 0, calendarUnread: false, calendarBuilding: true)
+              == "Calendar is still coming in", "no \"nothing on your calendar\" while Calendar is coming in")
+        check(BriefPlate.calendarLine(upcoming: ["9 AM Lab"], allDay: [], earlierToday: 0, calendarUnread: false, calendarBuilding: true)
+              == "9 AM Lab", "what is known still shows while building")
+        check(BriefPlate.calendarLine(upcoming: [], allDay: [], earlierToday: 0, calendarUnread: false)
+              == "Nothing on your calendar today", "once Calendar is in, the plain line")
+
         print("Proactive checks: \(count) passed")
     }
 }

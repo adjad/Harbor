@@ -948,7 +948,10 @@ enum BriefPlate {
     /// Day"), at most three; with none left, "Nothing left on your calendar
     /// today" when something was on it earlier, else "Nothing on your
     /// calendar today". Never "else": nothing is listed above it.
-    static func calendarLine(upcoming: [String], allDay: [String], earlierToday: Int, calendarUnread: Bool) -> String {
+    static func calendarLine(upcoming: [String], allDay: [String], earlierToday: Int, calendarUnread: Bool,
+                             calendarBuilding: Bool = false) -> String {
+        // Back after a long gap and Calendar not in yet: no "nothing on your calendar".
+        if calendarBuilding && upcoming.isEmpty && allDay.isEmpty { return "Calendar is still coming in" }
         if calendarUnread && upcoming.isEmpty && allDay.isEmpty { return "Harbor can't see your calendar yet" }
         let named: [String] = allDay.map { "All day: " + $0 } + upcoming
         if !named.isEmpty { return named.prefix(3).joined(separator: " · ") }

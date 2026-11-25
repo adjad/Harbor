@@ -334,7 +334,8 @@ final class ProactiveActions: ObservableObject {
     /// Whether the Brief should poll: the engine is working, or Analyze now
     /// was just tapped and it hasn't started yet.
     func shouldPoll(_ state: ProactiveState, now: Date = Date()) -> Bool {
-        state.isWorking || analyzePending(now: now)
+        // Building after a long gap: follow it until the full Brief swaps in.
+        state.isWorking || state.building || analyzePending(now: now)
     }
 
     /// The engine took the request (it reports working), or it has stayed
@@ -740,6 +741,7 @@ struct ProactiveBriefSection: View {
     /// while it is reading or couldn't, the reason (never an all-clear for a
     /// source it couldn't read).
     private var readyEmptyLine: String {
+        if proactive.building { return BriefBuilding.emptyLine }
         guard unread.isEmpty, !proactive.isUnavailable, !proactive.hasReadNothing,
               let stats = proactive.stats, stats.read > 0 else { return needsYouEmptyLine }
         let at: String = (stats.asOf ?? proactive.asOf).map { today.clock($0) } ?? ""
@@ -751,6 +753,7 @@ struct ProactiveBriefSection: View {
     /// couldn't, or an all-clear only for what it could read.
     private var needsYouEmptyLine: String {
         if proactive.isWorking { return "Cards land here as Harbor reads." }
+        if proactive.building { return BriefBuilding.emptyLine }
         if proactive.isUnavailable || proactive.hasReadNothing {
             let reason = proactive.reason.trimmingCharacters(in: .whitespacesAndNewlines)
             return reason.isEmpty ? "Not caught up yet. Tap ✦ to read your mail and texts." : reason
@@ -1637,7 +1640,8 @@ struct ProactiveBriefSection: View {
         return VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline, spacing: 14) {
                 zoneTitle("YOUR LISTS", spoken: "Your lists", count: 0, lit: false).fixedSize()
-                calendarLine(todosEmpty: todos.isEmpty ? shown.todoLine(unread: unread) : nil)
+                // Still building: no "no to-dos" until Reminders is in.
+                calendarLine(todosEmpty: todos.isEmpty && !proactive.building ? shown.todoLine(unread: unread) : nil)
             }
             .frame(minHeight: Self.controlsHeaderHeight)
             listColumns(todos: todos, threads: threads)
@@ -1734,8 +1738,10 @@ struct ProactiveBriefSection: View {
     private func calendarLine(todosEmpty: String?) -> some View {
         let calendarUnread = unread.contains { $0.source == "calendar" }
         let upcoming: [String] = events.map { today.clock($0.start) + " " + $0.title }
+        let calendarBuilding = proactive.building && proactive.buildingFor.contains("calendar")
         let dayLine: String = BriefPlate.calendarLine(upcoming: upcoming, allDay: allDayEvents,
-                                                      earlierToday: endedEvents, calendarUnread: calendarUnread)
+                                                      earlierToday: endedEvents, calendarUnread: calendarUnread,
+                                                      calendarBuilding: calendarBuilding)
         let quiet: Bool = events.isEmpty && allDayEvents.isEmpty
         let line: String = todosEmpty.map { dayLine + " · " + $0 } ?? dayLine
         return Button { model.tab = .day } label: {

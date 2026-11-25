@@ -114,9 +114,18 @@ def arm(reason: str, *, now: float | None = None, store=None) -> bool:
     global _armed, _opened_at
     now = time.time() if now is None else now
     try:
-        stale = is_stale(now, _store(store).state())
+        state = _store(store).state()
+        stale = is_stale(now, state)
     except Exception:  # noqa: BLE001 — an unreadable store owes nothing
         return False
+    if reason in ("launch", "opened", "unparked"):
+        try:
+            # Back after a long gap: the Brief says it is still building until
+            # its sources are in, and goes first (brief_warmup).
+            from service.proactive import brief_warmup
+            brief_warmup.consider(reason, now=now, state=state)
+        except Exception:  # noqa: BLE001 — the catch-up below still runs
+            pass
     if not stale:
         return _armed is not None
     if _armed is None:
@@ -263,8 +272,16 @@ async def run(*, now: float | None = None, store=None, cycle, gists, ready=None,
         _log("no longer owed: the Brief was caught up meanwhile")
         return "fresh"
     since = (arrived or _arrived)(now)
-    if since < SETTLE_S:
-        _retry_at = now + (SETTLE_S - since)
+    settle = SETTLE_S
+    try:
+        # While the Brief is building after a long gap it goes first: a shorter
+        # settle (a turn still stops it at once).
+        from service.proactive import brief_warmup
+        settle = brief_warmup.settle_s(SETTLE_S)
+    except Exception:  # noqa: BLE001
+        pass
+    if since < settle:
+        _retry_at = now + (settle - since)
         return "settling"
     if not await (ready or _model_ready)():
         _retry_at = now + WAIT_S

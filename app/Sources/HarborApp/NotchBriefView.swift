@@ -121,6 +121,9 @@ struct NotchBriefView: View {
             }
         }
         .onChange(of: buildingFirstBrief) { _, _ in model.onResize() }
+        // The full Brief replaces the building one with a short fade, not a jump.
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.35), value: plan?.workspace?.proactive?.building ?? false)
+        .onChange(of: plan?.workspace?.proactive?.building ?? false) { _, _ in model.onResize() }
     }
 
     /// The first launch day's first summary is on its way and none is on screen.
@@ -151,7 +154,18 @@ struct NotchBriefView: View {
                     BriefAccessRowsView(planMissing: Self.setupMissing(proactive.unreadSources(Self.coverage(plan))))
                     // Back after a long absence: the cards below are from
                     // before, and the refreshed ones replace them on their own.
-                    if proactive.updating && !proactive.isWorking { ProcessingRow(label: Self.updatingLabel) }
+                    // Back after a night or a day away: the sources are still coming in, so
+                    // what shows is partial and says so; then the full Brief swaps in. Past
+                    // the wait's timeout, what is shown and what didn't come in.
+                    if proactive.building {
+                        ProcessingRow(label: BriefBuilding.label)
+                            .help(BriefBuilding.waitingLine(proactive.buildingFor) ?? BriefBuilding.label)
+                            .transition(.opacity)
+                    } else if let late = BriefBuilding.lateLine(proactive.late) {
+                        Text(late).font(.harbor(size: 12)).foregroundStyle(Theme.textMuted)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .transition(.opacity)
+                    } else if proactive.updating && !proactive.isWorking { ProcessingRow(label: Self.updatingLabel) }
                     ProactiveBriefSection(proactive: proactive, model: model, today: today, actions: actions,
                                           events: restOfToday(plan),
                                           allDayEvents: allDayToday(plan), endedEvents: endedToday(plan),

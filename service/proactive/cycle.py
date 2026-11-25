@@ -1318,6 +1318,19 @@ def schedule_tick() -> asyncio.Task | None:
     """Single-flight background tick for the scheduler loop; never awaited there."""
     global _task, _rerun
     from service.assistant.hub import hub
+    warm = False
+    try:
+        # A launch or wake after a long gap opens the Brief's building window
+        # (brief_warmup): it owes the catch-up, and a cycle with the fresh mail
+        # and texts may run before its usual gap.
+        from service.proactive import brief_warmup
+        brief_warmup.tick()
+        if brief_warmup.building():
+            from service.proactive import return_refresh
+            return_refresh.arm("building")
+            warm = brief_warmup.wants_cycle()
+    except Exception:  # noqa: BLE001 — the Brief builds on its usual cadence
+        warm = False
     if running():
         return None
     if handled.due():
@@ -1351,7 +1364,7 @@ def schedule_tick() -> asyncio.Task | None:
         refresh = catch_up = False      # by day the scheduled builds cover both
     if plan == "light":
         # No model call, so no chat rule: only never during a turn, and not unasked.
-        if time.time() < _next_tick_at:
+        if time.time() < _next_tick_at and not warm:
             return None
         if _foreground():
             _stood_down("a turn is in progress")
@@ -1362,7 +1375,7 @@ def schedule_tick() -> asyncio.Task | None:
         _task = asyncio.create_task(_light_tick())
         return _task
     last_build = state.get("build_at")
-    if not refresh and not catch_up and time.time() < _next_tick_at:
+    if not refresh and not catch_up and not warm and time.time() < _next_tick_at:
         return None
     if not brief_pace.build_gap_passed(last_build):
         # Whatever is due stays due: this catch-up, refresh or tick runs as one
@@ -1664,7 +1677,7 @@ def snapshot(*, account: str | None = None, now: float | None = None, tz: str | 
                         for c in shown],
               "todos": [_public(t) for t in todos], "threads": [{k: v for k, v in t.items() if k != "asks"} for t in threads],
               "lede": _lede(cards, todos, summary, now, tz), "stats": _stats(state, cards, todos, account),
-              "updating": _updating()}
+              "updating": _updating(), **_building()}
     if view_state == "unavailable":
         result["reason"] = "Harbor hasn't read your mail and texts yet. Tap Analyze now."
     # Why a waiting person did or didn't get a card ("you answered last",
@@ -1673,6 +1686,17 @@ def snapshot(*, account: str | None = None, now: float | None = None, tz: str | 
     if _status.get("error"):
         result["error"] = _status["error"]
     return result
+
+
+def _building() -> dict:
+    """After a long gap: ``building`` until every source the Brief reads is in,
+    ``building_for`` (what isn't yet) and, past the timeout, ``late``
+    (service/proactive/brief_warmup.py)."""
+    try:
+        from service.proactive import brief_warmup
+        return brief_warmup.view()
+    except Exception:  # noqa: BLE001
+        return {"building": False, "building_for": [], "late": []}
 
 
 def _updating() -> bool:

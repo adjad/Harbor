@@ -997,7 +997,7 @@ def _demo_hold() -> bool:
     """Demo mode (service/stage_mode.py) holds this scheduled tick only. The proactive
     cycle's own calls (refresh_all, refresh_changed, _resident_reply) never ask this."""
     from service import stage_mode
-    return stage_mode.holds_background()
+    return stage_mode.holds_background(brief_work=True)   # the gists are the Brief: never held for it
 
 
 def _scheduled_abort() -> bool:

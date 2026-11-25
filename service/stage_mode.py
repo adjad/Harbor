@@ -41,10 +41,23 @@ def active(now: float | None = None) -> bool:
     return (time.monotonic() if now is None else now) - since < MAX_S
 
 
-def holds_background() -> bool:
+def holds_background(*, brief_work: bool = False) -> bool:
     """Heavy scheduled model work (mail memory, digests, summaries, memory extraction) waits
-    while this is True. NOT for the proactive cycle or anything the person just asked for."""
-    return active()
+    while this is True. NOT for the proactive cycle or anything the person just asked for.
+
+    Also True for a few minutes after a launch or wake after a long gap, while the Brief
+    builds (service/proactive/brief_warmup.py), so the Brief's reads and model calls go
+    first. The Brief's own scheduled work passes ``brief_work=True`` and waits only for
+    Demo mode. That hold never outlasts brief_warmup.GIVE_UP_S, and a turn still wins."""
+    if active():
+        return True
+    if brief_work:
+        return False
+    try:
+        from service.proactive import brief_warmup
+        return brief_warmup.holds_scheduled_work()
+    except Exception:  # noqa: BLE001 — unknown: nothing is held for the Brief
+        return False
 
 
 def remaining_s(now: float | None = None) -> float:
