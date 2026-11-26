@@ -18,7 +18,8 @@ IMPORTANT rules:
   long chat can't starve a cold start. The slot is global: at most one Brief call
   goes beside Ask per MAX_WAIT_S, however many are waiting. A caller that only
   waits (the cycle between items, fair=False) never takes it: past the cap it is
-  told CAPPED and yields.
+  told CAPPED and yields. The slot counts only when a call runs: a caller that
+  took it and then stood down gives it back (release_fair).
 - Waiting changes no status. The caller's "updating" stays as it is; a wait is
   never a failure.
 """
@@ -38,8 +39,10 @@ RESUMED = "resumed"    # waited, and Ask went idle
 FAIR = "fair"          # waited MAX_WAIT_S and took the fairness slot: goes beside Ask
 CAPPED = "capped"      # waited MAX_WAIT_S, fair=False: did not take the slot
 
-# When the fairness slot was last taken (monotonic), for the one-per-window rule.
+# When the fairness slot was last taken (monotonic), for the one-per-window rule,
+# and what it was before that take, for release_fair.
 _last_fair: float | None = None
+_fair_before: float | None = None
 # Indirections so tests can drive the gate on a virtual clock.
 _clock = time.monotonic
 _sleep = asyncio.sleep
@@ -61,7 +64,7 @@ def _log(text: str) -> None:
 async def wait_for_ask(what: str = "brief", *, fair: bool = True, clock=None, sleep=None) -> str:
     """Wait until Ask is idle. CLEAR, RESUMED, FAIR (took the global fairness slot)
     or, with fair=False, CAPPED after MAX_WAIT_S."""
-    global _last_fair
+    global _last_fair, _fair_before
     clock, sleep = clock or _clock, sleep or _sleep
     start = clock()
     if not ask_busy(start):
@@ -79,6 +82,20 @@ async def wait_for_ask(what: str = "brief", *, fair: bool = True, clock=None, sl
             _log(f"{what} waited {now - start:.0f} s, the fairness cap: it yields")
             return CAPPED
         if _last_fair is None or now - _last_fair >= MAX_WAIT_S:
-            _last_fair = now
+            _fair_before, _last_fair = _last_fair, now
             _log(f"{what} call waited {now - start:.0f} s, the fairness cap: it goes beside Ask")
             return FAIR
+
+
+def fair_taken() -> float | None:
+    """When the slot was last taken: read right after wait_for_ask returned FAIR."""
+    return _last_fair
+
+
+def release_fair(taken: float | None) -> None:
+    """The caller took the slot at `taken` but no call ran: give the slot back. A no-op
+    once someone else has taken it since."""
+    global _last_fair
+    if taken is not None and _last_fair == taken:
+        _last_fair = _fair_before
+        _log("no call ran: the fairness slot is free again")

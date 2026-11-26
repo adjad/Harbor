@@ -518,6 +518,27 @@ def _unreviewed() -> bool:
     return not _CONTENT_REVIEWED.get()
 
 
+# Each send this turn's tools confirmed went out, in words ("the text to Sam").
+# Noted before any later await, so a Stop that lands after the send (in the Brief
+# bookkeeping, or before the result is shown) still lets the turn say it was sent
+# instead of leaving it looking unfinished, which invites a second send. The
+# turn starts its own list (begin_verified_sends); without one nothing is kept.
+_VERIFIED_SENDS: ContextVar[list | None] = ContextVar("harbor_verified_sends", default=None)
+
+
+def begin_verified_sends() -> list[str]:
+    """Start this turn's record of confirmed sends and return it."""
+    sends: list[str] = []
+    _VERIFIED_SENDS.set(sends)
+    return sends
+
+
+def _note_verified_send(what: str) -> None:
+    sends = _VERIFIED_SENDS.get()
+    if sends is not None:
+        sends.append(what)
+
+
 # The small on-device agent model (LFM2.5) sometimes over-escapes when it
 # writes tool-call JSON by hand: it emits a literal backslash-n instead of an
 # actual newline, and backslash-quote instead of a bare quote (JSON doesn't
@@ -1362,6 +1383,7 @@ async def reply_to_email(message_id: str, body: str, reply_all: bool = False,
         return _OutboundUnknownResult(
             "Reply outcome unknown — the bridge did not confirm the approved reply. Check Mail before trying again; do not retry automatically.",
             operation="reply_to_email", action_id=res.get("action_id") or "")
+    _note_verified_send("the email reply to " + (", ".join(expected["to"]) or "the sender"))
     await _answered_in_brief("mail", message_id=expected["message_id"], account=expected["account"],
                        subject=expected["subject"], to=list(expected["to"]) + list(expected["cc"]))
     return make_receipt(expected)
@@ -1754,6 +1776,7 @@ async def send_message(to: str, text: str, confirmed_self_send: bool = False,
                    "failed message and choose Send as Text Message." if by_imessage else "")
                 + " Check Messages before trying again; do not retry automatically.")
     if delivery in ("delivered", "sent"):
+        _note_verified_send(f"the text to {display}")
         await _answered_in_brief("text", handle=to)
     if delivery == "delivered":
         return f"Message sent to {display}. Messages shows it as delivered."

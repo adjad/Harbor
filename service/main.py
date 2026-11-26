@@ -2866,6 +2866,8 @@ async def agent(body: dict[str, Any]):
         # True once this request's assistant reply is stored: a stop after that point (the client
         # closing at `done`, then the summary) finished a turn; it is not an unfinished one.
         assistant_reply_stored = False
+        from service.tools.action_tools import begin_verified_sends
+        verified_sends = begin_verified_sends()
 
         def settle_unfinished(message: str) -> None:
             """Leave durable state honest when a turn stops without finishing.
@@ -2924,6 +2926,24 @@ async def agent(body: dict[str, Any]):
                 pass
             if assistant_reply_stored:
                 return   # the real reply is already stored; never follow it with a failure note
+            if verified_sends:
+                # A send the tool confirmed went out before the stop: say it was sent,
+                # so neither the person nor the model sends it a second time.
+                sent = "; ".join(dict.fromkeys(verified_sends))
+                try:
+                    if task_turn and task_turn.plan.intent in {"email.reply", "email.send", "message.send"}:
+                        uncertain_send = False   # the task's own send is the confirmed one
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    store.add_turn(sid, "assistant",
+                                   f"(Sent: {sent}. It went out before this request stopped — "
+                                   f"{message} Don't send it again."
+                                   + (" Another send was also attempted; its outcome is unknown. "
+                                      "Check before requesting another send.)" if uncertain_send else ")"))
+                except Exception:  # noqa: BLE001
+                    pass
+                return
             try:
                 store.add_turn(sid, "assistant",
                                f"(This request could not be completed — {message} "

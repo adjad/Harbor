@@ -144,7 +144,7 @@ def test_simulation_wrapper_compile_lists_are_used(tmp_path: Path) -> None:
     (["service/safety/policy.py"], "shared QA, safety or packaging infrastructure"),
     (["scripts/package_app.sh"], "shared QA, safety or packaging infrastructure"),
     (["service/orphan.py"], "no gate covers it"),
-    (["README.md"], "no gate covers it"),
+    (["README.md"], "non-code file"),
     (["service/removed.py"], "deleted or renamed"),
     ([], "no changed paths"),
 ])
@@ -156,6 +156,38 @@ def test_unsure_changes_fall_back_to_every_gate(tmp_path: Path, changed, why) ->
     assert selection.native_names == ["native/clock-compile", "native/clock-contract",
                                       "native/panel-contract", "native/widget-rules-compile",
                                       "native/widget-rules-contract"]
+
+
+def test_fallback_summary_names_the_set_and_says_it_is_no_release_run(tmp_path: Path) -> None:
+    text = "\n".join(qa_affected.describe(_select(tmp_path, ["conftest.py"])))
+    assert "NOT a release gate" in text
+    assert "every gate this runner selects for the full profile" in text
+    assert "not a release run" in text
+    assert "FULL gate set" not in text
+
+
+def test_a_module_conftest_imports_runs_every_gate(tmp_path: Path) -> None:
+    # tests/conftest.py imports service.middle in a fixture; middle imports leaf at module level.
+    # service.hub only reaches leaf through its own function body, which is not followed.
+    files = {**BASE, "tests/conftest.py": "def fixture():\n    from service import middle, hub\n"}
+    tracked = _tree(tmp_path, files)
+    for path in ("service/middle.py", "service/leaf.py", "service/hub.py"):
+        selection = qa_affected.select(_qa(tmp_path, tracked, [path]), "main")
+        assert selection.full_fallback, path
+        assert "imported by conftest" in selection.fallback_reasons[0]
+    files["tests/conftest.py"] = "def fixture():\n    from service import hub\n"
+    tracked = _tree(tmp_path, files)
+    selection = qa_affected.select(_qa(tmp_path, tracked, ["service/leaf.py"]), "main")
+    assert not selection.full_fallback
+
+
+def test_a_data_file_runs_every_gate_even_when_a_test_names_it(tmp_path: Path) -> None:
+    files = {**BASE, "service/data/rules.json": "{}\n",
+             "tests/test_rules.py": "PATH = 'service/data/rules.json'\n"}
+    tracked = _tree(tmp_path, files)
+    selection = qa_affected.select(_qa(tmp_path, tracked, ["service/data/rules.json"]), "main")
+    assert selection.full_fallback
+    assert "non-code file" in selection.fallback_reasons[0]
 
 
 def test_runner_manifest_lines_alone_do_not_force_the_full_set(tmp_path: Path) -> None:
@@ -245,7 +277,7 @@ def test_changed_since_refuses_profile_and_the_build_wrapper(monkeypatch) -> Non
         simqa.main()
 
 
-def test_affected_report_is_marked_and_rejected_as_release_evidence(monkeypatch, tmp_path) -> None:
+def test_affected_report_is_marked_and_rejected_as_release_evidence(monkeypatch, tmp_path, capsys) -> None:
     expected = "e" * 40
     report = tmp_path / "report.json"
     selection = qa_affected.Selection(
@@ -267,6 +299,11 @@ def test_affected_report_is_marked_and_rejected_as_release_evidence(monkeypatch,
                                       "--changed-since", "main", "--report", str(report)])
     assert simqa.main() == 0
     assert ran == [(["tests/test_one.py"], False)]
+    out = capsys.readouterr().out
+    summary = json.loads(out[out.index("{\n"):out.index("\n}\n") + 2])
+    assert summary["profiles"] == ["affected"]
+    assert summary["release_gate"] is False
+    assert "NOT a release gate" in summary["notice"]
     payload = json.loads(report.read_text(encoding="utf-8"))
     assert payload["profiles"] == ["affected"]
     assert payload["selection"]["release_gate"] is False

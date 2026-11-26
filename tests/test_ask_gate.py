@@ -70,10 +70,17 @@ def vrun(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def quiet_ask(monkeypatch):
+    """Every test starts with Ask idle and ends without leaving timing state behind."""
+    from service import stage_mode
     monkeypatch.setattr(idle, "_foreground_turns", 0)
     monkeypatch.setattr(idle, "_last_turn", None)
     monkeypatch.setattr(ask_gate, "_last_fair", None)
+    monkeypatch.setattr(ask_gate, "_fair_before", None)
     monkeypatch.setattr(G, "_last_standdown", "")
+    yield
+    stage_mode.set_active(False)
+    idle._foreground_turns, idle._last_turn = 0, None
+    ask_gate._last_fair = ask_gate._fair_before = None
 
 
 async def _after(delay, fn):
@@ -295,6 +302,45 @@ def test_the_fairness_slot_never_passes_demo_modes_hold(monkeypatch, model, vrun
         assert vrun(main()) is None and engine.sent == []
     finally:
         stage_mode.set_active(False)
+    assert ask_gate._last_fair is None, "no call ran, so the slot is free again"
+
+
+def test_a_slot_given_back_goes_to_the_next_call(monkeypatch, model, vrun):
+    engine = use(monkeypatch, SerialEngine())
+    loaded = [[], ["fast"]]                    # the first caller finds the model gone
+
+    async def loaded_models():
+        return loaded.pop(0)
+    engine.loaded_models = loaded_models
+
+    async def main():
+        idle.begin_foreground()               # a long Ask: both callers wait out the cap
+        try:
+            return await asyncio.gather(G._resident_reply("s", "m", idle.foreground_busy),
+                                        G._resident_reply("s", "m", idle.foreground_busy))
+        finally:
+            idle.end_foreground()
+    assert sorted(vrun(main()), key=str) == [None, "ok"]
+    assert engine.sent[0] - 1000.0 < ask_gate.MAX_WAIT_S + 1, \
+        "the caller that stood down gave the slot back: the other went in the same window"
+
+
+def test_a_turn_ending_mid_check_never_cancels_a_scheduled_call(monkeypatch, model, vrun):
+    engine = use(monkeypatch, SerialEngine(brief=(0.3, 5.0)))
+
+    def abort():                               # the turn ends right after abort() reads it
+        busy = idle.foreground_busy()
+        if busy:
+            idle.end_foreground()
+        return busy
+
+    async def main():
+        call = asyncio.ensure_future(G._resident_reply("s", "m", abort))
+        await asyncio.sleep(1.0)
+        idle.begin_foreground()               # Ask starts mid-call
+        return await call
+    assert vrun(main()) == "ok"
+    assert engine.cancelled == 0 and engine.finished == 1
 
 
 def test_remote_inference_never_waits(monkeypatch, model):

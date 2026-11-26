@@ -157,12 +157,12 @@ def _latest_day(when: str, anchor: date) -> date | None:
     return anchor + timedelta(days=ahead + (7 if words[0] == "next" else 0))
 
 
-def passed_date(title: object, anchor_ts: object, now: float) -> PassedDate | None:
+def passed_date(title: object, anchor_ts: object, now: float, tz: str | None = None) -> PassedDate | None:
     """The day named in a title whose event is over, or None. ``anchor_ts`` is the item's
     due time, or when it was written if it has no due time. A source with neither passes
     ``now``, which leaves a weekday or "tomorrow" ahead and so never matches. The event's
     own day still counts as ahead, and so does a second date in the title that hasn't
-    come yet."""
+    come yet. Days are read in `tz` (the Brief's zone) when given, else the Mac's."""
     anchor_ts = valid_created_ts(anchor_ts)
     if not isinstance(title, str) or anchor_ts is None:
         return None
@@ -170,8 +170,9 @@ def passed_date(title: object, anchor_ts: object, now: float) -> PassedDate | No
     found = next(filter(None, (pattern.search(text) for pattern in _MENTIONS)), None)
     if found is None or _STILL_OPEN.search(text):
         return None
-    anchor = datetime.fromtimestamp(anchor_ts).date()
-    today = datetime.fromtimestamp(now).date()
+    zone = _zone(tz)
+    anchor = datetime.fromtimestamp(anchor_ts, zone).date()
+    today = datetime.fromtimestamp(now, zone).date()
     named = " ".join(found.group("when").split()).rstrip(".")
     on = _latest_day(named, anchor) or _title_date(named, anchor)
     if on is None or on >= today:
@@ -181,6 +182,17 @@ def passed_date(title: object, anchor_ts: object, now: float) -> PassedDate | No
         if other_on is None or other_on >= today:
             return None
     return PassedDate(on, named[0].upper() + named[1:] if named[0].isalpha() else named)
+
+
+def _zone(tz: str | None):
+    """The named zone, or None (the Mac's) when there is none or it can't be read."""
+    if not tz:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(tz)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def valid_created_ts(value: object) -> float | None:

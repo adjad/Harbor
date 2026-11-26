@@ -721,9 +721,10 @@ async def _resident_reply(system: str, material: str, abort, *,
     nothing else but keep-warm models or another app's model on the user's oMLX.app.
     A call waits for Ask before it starts (service/proactive/ask_gate.py). One that is
     running when a turn starts finishes: Ask goes first at the next call boundary.
-    A stop that isn't a turn (Demo mode) still cancels it within 0.5 s.
+    A stop that isn't a turn (Demo mode) still cancels it, within 0.5 s (within the
+    2 s grace plus 0.5 s if a turn just ended).
     """
-    from service import idle, memory_saver
+    from service import memory_saver
     from service.assistant.brief import _c
     from service.config import role_to_model, thinking_kwargs
     from service.inference.remote_policy import remote_only_profile
@@ -746,46 +747,55 @@ async def _resident_reply(system: str, material: str, abort, *,
     # Before residency is read: a turn may change what is loaded.
     from service.proactive import ask_gate
     slot = ask_gate.CLEAR if remote else await ask_gate.wait_for_ask()
-    if remote:
-        # Remote inference: there is no local residency to protect, so the only
-        # stand-down is a user's turn.
-        loaded, warm = {model}, set()
-    else:
-        try:
-            loaded = set(await client.loaded_models())
-        except _UNREACHABLE as exc:
-            _stood_down(f"the engine isn't reachable ({type(exc).__name__})")
+    # The fairness slot counts only when a call runs: a stand-down below gives it back.
+    taken = ask_gate.fair_taken() if slot == ask_gate.FAIR else None
+    request = None
+    try:
+        if remote:
+            # Remote inference: there is no local residency to protect, so the only
+            # stand-down is a user's turn.
+            loaded, warm = {model}, set()
+        else:
+            try:
+                loaded = set(await client.loaded_models())
+            except _UNREACHABLE as exc:
+                _stood_down(f"the engine isn't reachable ({type(exc).__name__})")
+                return None
+            try:
+                warm = set(client.keep_warm())
+            except Exception:  # noqa: BLE001 — unknown keep-warm set: assume nothing extra is allowed
+                warm = set()
+        if model not in loaded:
+            _stood_down(f"the fast model ({model}) isn't loaded; loaded: {sorted(loaded) or 'nothing'}")
             return None
-        try:
-            warm = set(client.keep_warm())
-        except Exception:  # noqa: BLE001 — unknown keep-warm set: assume nothing extra is allowed
-            warm = set()
-    if model not in loaded:
-        _stood_down(f"the fast model ({model}) isn't loaded; loaded: {sorted(loaded) or 'nothing'}")
-        return None
-    others = loaded - warm - {model} - memory_saver.other_apps_models(client)
-    if others:
-        _stood_down(f"another model is resident: {sorted(others)}")
-        return None
-    # The fairness slot goes beside a turn, never past Demo mode's hold.
-    if abort() and (slot != ask_gate.FAIR or _demo_hold()):
-        _stood_down("a turn is in progress")
-        return None
-    budget = tokens[0] if _thinking_off(model) else tokens[1]
-    from service.inference.remote_policy import cloud_output_budget
-    budget = cloud_output_budget(budget)        # room for a cloud model's reasoning
-    from service.inference.power_tier import BRIEF, power_tier
-    with power_tier(BRIEF):
-        request = asyncio.ensure_future(client.chat(
-            model, [{"role": "system", "content": system}, {"role": "user", "content": material}],
-            max_tokens=budget, temperature=0, **thinking_kwargs(model, on=False)))
+        others = loaded - warm - {model} - memory_saver.other_apps_models(client)
+        if others:
+            _stood_down(f"another model is resident: {sorted(others)}")
+            return None
+        # The fairness slot goes beside a turn, never past Demo mode's hold.
+        if abort() and (slot != ask_gate.FAIR or _demo_hold()):
+            _stood_down("a turn is in progress")
+            return None
+        budget = tokens[0] if _thinking_off(model) else tokens[1]
+        from service.inference.remote_policy import cloud_output_budget
+        budget = cloud_output_budget(budget)        # room for a cloud model's reasoning
+        from service.inference.power_tier import BRIEF, power_tier
+        with power_tier(BRIEF):
+            request = asyncio.ensure_future(client.chat(
+                model, [{"role": "system", "content": system}, {"role": "user", "content": material}],
+                max_tokens=budget, temperature=0, **thinking_kwargs(model, on=False)))
+    finally:
+        if request is None:
+            ask_gate.release_fair(taken)
     deadline = time.monotonic() + _TIMEOUT_S
     try:
         while not request.done():
-            # A turn never cancels a running call (ask_gate). A stop that isn't a turn
-            # (Demo mode turned on, for the scheduled tick) still does, so Demo mode's
-            # hold isn't stretched by a call of up to _TIMEOUT_S.
-            if abort() and not idle.foreground_busy():
+            # A turn never cancels a running call (ask_gate), nor does one that just
+            # ended: ask_busy() holds through the grace, so a turn ending between the
+            # two reads can't look like a stop. A stop that isn't a turn (Demo mode
+            # turned on, for the scheduled tick) still cancels it, so Demo mode's hold
+            # isn't stretched by a call of up to _TIMEOUT_S.
+            if abort() and not ask_gate.ask_busy():
                 request.cancel()
                 _stood_down("stopped during the call (not a turn)")
                 return None
@@ -1012,8 +1022,8 @@ def _demo_hold() -> bool:
 
 def _scheduled_abort() -> bool:
     """The scheduled tick's abort: a turn, or Demo mode turned on. Before the call
-    both stand it down. During it only Demo mode cancels it (at the next 0.5 s check);
-    a turn lets it finish (service/proactive/ask_gate.py)."""
+    both stand it down. During it only Demo mode cancels it (at the next 0.5 s check,
+    after the gate's grace if a turn just ended); a turn lets it finish (service/proactive/ask_gate.py)."""
     from service import idle
     return idle.foreground_busy() or _demo_hold()
 

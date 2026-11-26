@@ -9,9 +9,14 @@ Selection always fails safe toward running more:
 
 * shared infrastructure (conftest, build-support, this selector, the runner
   outside its manifest lists, safety/policy modules, packaging and signing
-  scripts, test dependencies) selects the full gate set;
-* a deleted or renamed path selects the full gate set;
-* a changed path that no gate covers selects the full gate set;
+  scripts, test dependencies) selects every gate;
+* a module conftest imports, directly or transitively, selects every gate;
+* a changed file that is not Python, shell or Swift (data, docs) selects every gate;
+* a deleted or renamed path selects every gate;
+* a changed path that no gate covers selects every gate;
+
+"Every gate" is every test module and native gate of the runner's full profile,
+run outside the build pipeline, so even that is not a release run.
 * otherwise a gate is selected when its inputs are reachable from a changed
   path through module-level Python imports, a test's own imports, an exact
   mention of the path or dotted module name anywhere, a test or shell script
@@ -71,6 +76,9 @@ _MANIFEST_LINE = re.compile(
 _MANIFEST_ENTRY = re.compile(r'"(tests/[A-Za-z0-9_./-]+\.py)"')
 _TOKEN = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*")
 _INDEXED_SUFFIXES = {".py", ".sh"}
+# Files whose users are traced (imports, compile lists, script mentions);
+# any other changed file selects every gate.
+_CODE_SUFFIXES = {".py", ".sh", ".swift"}
 _FOLDER_SCAN = re.compile(r"\brglob\b|\bglob\b|os\.walk|\biterdir\b|\bfind\b|\bls-files\b|\*\.[A-Za-z]+")
 _BARE_IMPORT_ROOTS = {"scripts", "build-support", "tests"}
 
@@ -225,6 +233,8 @@ class RepoGraph:
         self.lazy_importers: dict[str, set[str]] = {}
         self.scans_folders: set[str] = set()
         self.mentions: dict[str, set[str]] = {}
+        self.eager_imports: dict[str, set[str]] = {}
+        self.lazy_imports: dict[str, set[str]] = {}
         indexed = [path for path in tracked
                    if PurePosixPath(path).suffix in _INDEXED_SUFFIXES and (root / path).is_file()]
         for path in indexed:
@@ -252,6 +262,8 @@ class RepoGraph:
                                    and id(node) not in skip)
                 self._mention(path, _tokens(strings))
                 eager, lazy = self._imports(path, tree)
+                self.eager_imports[path] = eager
+                self.lazy_imports[path] = lazy
                 for target in eager:
                     self.importers.setdefault(target, set()).add(path)
                 for target in lazy:
@@ -302,6 +314,24 @@ class RepoGraph:
         eager.discard(path)
         lazy.discard(path)
         return eager, lazy - eager
+
+    def imported_by(self, starts: list[str]) -> set[str]:
+        """Every file ``starts`` import, directly or transitively.
+
+        All of the starts' own imports count, in function bodies too (fixtures
+        run them); beyond that only module-level imports, the same limit as
+        selection (product lazy imports reach hubs like service.config).
+        """
+        seen: set[str] = set()
+        for start in starts:
+            seen |= self.eager_imports.get(start, set()) | self.lazy_imports.get(start, set())
+        frontier = list(seen)
+        while frontier:
+            for target in self.eager_imports.get(frontier.pop(), set()):
+                if target not in seen:
+                    seen.add(target)
+                    frontier.append(target)
+        return seen - set(starts)
 
     def users(self, path: str) -> set[str]:
         if _is_test_module(path) or path == RUNNER or is_full_trigger(path):
@@ -424,6 +454,10 @@ def select(qa, ref: str) -> Selection:
     tracked_set = set(tracked)
     inputs = {name: _gate_inputs(command, root, tracked_set) for name, command in all_native}
 
+    graph = RepoGraph(root, tracked)
+    # Whatever conftest imports runs inside every test session.
+    conftest_imports = graph.imported_by(
+        [path for path in tracked if PurePosixPath(path).name == "conftest.py"])
     fallback: list[str] = []
     if not changed:
         fallback.append("no changed paths since the ref: nothing to map, so run everything")
@@ -441,13 +475,16 @@ def select(qa, ref: str) -> Selection:
             fallback.append(f"{path}: shared QA, safety or packaging infrastructure")
         elif not (root / path).is_file():
             fallback.append(f"{path}: deleted or renamed")
+        elif path in conftest_imports:
+            fallback.append(f"{path}: imported by conftest, so every test session loads it")
+        elif PurePosixPath(path).suffix not in _CODE_SUFFIXES:
+            fallback.append(f"{path}: data or other non-code file; its readers can't be traced fully")
         else:
             to_map.append(path)
 
     reasons: dict[str, list[str]] = {}
     unmapped: list[str] = []
     if not fallback:
-        graph = RepoGraph(root, tracked)
         full_set = set(full_tests)
         for path in sorted(manifest_tests):
             if path in full_set:
@@ -476,7 +513,7 @@ def select(qa, ref: str) -> Selection:
     if fallback:
         tests = list(full_tests)
         native_names = list(native_order)
-        reasons = {"*": ["full gate set: " + item for item in fallback]}
+        reasons = {"*": ["every gate: " + item for item in fallback]}
     else:
         chosen = set(reasons)
         # Keep each compile/contract pair together so a contract never runs stale.
@@ -506,8 +543,9 @@ def describe(selection: Selection) -> list[str]:
     lines = [NOT_A_RELEASE_GATE,
              f"Changed since {selection.ref} ({selection.ref_sha[:12]}): {len(selection.changed)} paths"]
     if selection.full_fallback:
-        lines.append(f"Running the FULL gate set ({len(selection.tests)} modules + "
-                     f"{len(selection.native_names)} native gates) because:")
+        lines.append(f"Running every gate this runner selects for the full profile "
+                     f"({len(selection.tests)} modules + {len(selection.native_names)} native gates, "
+                     f"outside the build pipeline, so still not a release run) because:")
         lines.extend("  " + reason for reason in selection.fallback_reasons)
         return lines
     lines.append(f"Selected {len(selection.tests)} modules + {len(selection.native_names)} native gates:")

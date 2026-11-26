@@ -252,7 +252,7 @@ def without_passed_events(todos: dict[str, dict], now: float, tz: str | None = N
     from service.assistant.stale_reminders import passed_date
     return {key: todo for key, todo in todos.items()
             if todo.get("source") in ("calendar", "reminders")
-            or not (passed_date(todo.get("title"), todo.get("due_ts") or now, now) or _event_day_passed(todo, now, tz))}
+            or not (passed_date(todo.get("title"), todo.get("due_ts") or now, now, tz) or _event_day_passed(todo, now, tz))}
 
 
 def _event_day_passed(todo: dict, now: float, tz: str | None = None) -> bool:

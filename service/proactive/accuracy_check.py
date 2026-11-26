@@ -60,11 +60,13 @@ EXIT_NO_ACCESS = 3
 # Fixed vocabularies: nothing outside these ever reaches the report.
 VERDICTS = ("correct", "false_positive", "unverifiable", "unchecked")
 REASONS = {
-    "correct": ("open", "done_shown", "deadline_ahead", "task_after_reply"),
+    # overdue_work: a dated to-do (not an event) whose day has passed. The Brief keeps late
+    # work on purpose, and asks Keep/Delete about overdue reminders, so it is correct.
+    "correct": ("open", "done_shown", "deadline_ahead", "task_after_reply", "overdue_work"),
     # read_fyi: read and over a day old (the Brief drops these only when it knows the read state);
     # read_fyi_recent: read, under a day old, kept by design (cycle.read_fyi_expired).
-    "false_positive": ("replied", "read_fyi", "read_fyi_recent", "archived", "deleted", "past_event",
-                       "past_date"),
+    # past_event: an event card, held slot or event to-do that is already over.
+    "false_positive": ("replied", "read_fyi", "read_fyi_recent", "archived", "deleted", "past_event"),
     "unverifiable": ("not_found", "ambiguous", "no_reference", "source_unavailable"),
     "unchecked": ("no_ground_truth",),
 }
@@ -218,8 +220,17 @@ def _attention(thread: dict, now: float) -> str:
     return "fyi"
 
 
+# Fingerprints that are the item's id alone ("reminder:<id>", cycle.py), not "<ref>:<ask>".
+_ID_ONLY_PREFIXES = ("calendar", "reminder", "block")
+
+
 def _ref_of_fingerprint(fp) -> str:
-    return str(fp).rpartition(":")[0] if isinstance(fp, str) and ":" in fp else ""
+    if not isinstance(fp, str) or ":" not in fp:
+        return ""
+    head, _, rest = fp.partition(":")
+    if head in _ID_ONLY_PREFIXES and rest:
+        return fp
+    return fp.rpartition(":")[0]
 
 
 def _decision_set(decisions: dict, key: str) -> set[str]:
@@ -639,7 +650,9 @@ def classify(item: dict, *, now: float, mail: MailTruth | None, texts: TextTruth
     if item.get("done"):
         return verdict("correct", "done_shown")
     if item["kind"] == "todo" and item.get("due_ts") is not None and item["due_ts"] < _local_midnight(now):
-        return verdict("false_positive", "past_date")
+        if item.get("todo_kind") == "event":
+            return verdict("false_positive", "past_event")
+        return verdict("correct", "overdue_work")
     for end in (item.get("event_end"), item.get("slot_end")):
         if end is not None and end < now:
             return verdict("false_positive", "past_event")

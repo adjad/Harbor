@@ -1001,6 +1001,8 @@ ADDITIONAL_FULL_TESTS = {
     "tests/test_brief_handled_drafts.py",
     # Brief accuracy check: invented Brief state and invented Mail/Messages databases in tmp_path.
     "tests/test_brief_accuracy_check.py",
+    # A Stop after a confirmed send leaves the turn saying it was sent: faked agent and bridge.
+    "tests/test_stop_after_verified_send.py",
 }
 # Integrated runtime contracts are mandatory; missing files fail selection.
 MINI_RUNTIME_INTEGRATION_TESTS = {
@@ -2139,9 +2141,14 @@ def main() -> int:
         report["selection"] = selection.report()
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps({key: report[key] for key in (
+    summary = {key: report[key] for key in (
         "status", "candidate_sha", "sha_stable", "worktree_clean", "totals"
-    )}, indent=2))
+    )}
+    if selection is not None:
+        # A changed-only summary must never read like a release verdict.
+        summary = {"profiles": profiles, "release_gate": False,
+                   "notice": _affected_module().NOT_A_RELEASE_GATE, **summary}
+    print(json.dumps(summary, indent=2))
     if selection is not None:
         print(_affected_module().NOT_A_RELEASE_GATE, flush=True)
     return 0 if ok else 1

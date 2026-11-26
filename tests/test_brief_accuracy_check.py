@@ -253,8 +253,44 @@ def test_view_filters_dates_cards_and_todos(world):
          {"dismissed": {"card:gone": NOW - 10}, "done": {"todo:done": {"at": NOW - 60}}})
     got = by_reason(ac.run(world["paths"], now=NOW))
     assert got == {("card", "false_positive", "replied"): 1, ("card", "correct", "task_after_reply"): 1,
-                   ("card", "false_positive", "past_event"): 1, ("todo", "false_positive", "past_date"): 1,
+                   ("card", "false_positive", "past_event"): 1, ("todo", "correct", "overdue_work"): 1,
                    ("todo", "correct", "done_shown"): 1, ("todo", "unchecked", "no_ground_truth"): 1}
+
+
+def test_late_work_is_correct_and_a_passed_event_todo_is_not(world):
+    todos = [
+        {"id": "todo:late", "title": "x", "source": "mail", "kind": "task", "done": False,
+         "due_ts": NOW - 2 * DAY, "fingerprints": ["mail:form:h1"]},
+        {"id": "todo:rem", "title": "x", "source": "reminders", "kind": "reminder", "done": False,
+         "due_ts": NOW - DAY, "fingerprints": ["reminder:r1"]},
+        {"id": "todo:event", "title": "x", "source": "calendar", "kind": "event", "done": False,
+         "due_ts": NOW - 2 * DAY, "fingerprints": ["calendar:e1"]},
+        {"id": "todo:today", "title": "x", "source": "reminders", "kind": "reminder", "done": False,
+         "due_ts": NOW - 60, "fingerprints": ["reminder:r2"]},
+    ]
+    save(world["brief"], {"todos": todos})
+    report = ac.run(world["paths"], now=NOW)
+    got = by_reason(report)
+    assert got[("todo", "correct", "overdue_work")] == 2
+    assert got[("todo", "false_positive", "past_event")] == 1
+    assert "past_date" not in {r for v in ac.REASONS.values() for r in v}
+    assert report["counts"]["todo"]["correct"]["overdue_work"] == 2
+
+
+def test_reminder_todos_keep_their_own_ref_and_hash(world):
+    assert ac._ref_of_fingerprint("reminder:r1") == "reminder:r1"
+    assert ac._ref_of_fingerprint("calendar:e1") == "calendar:e1"
+    assert ac._ref_of_fingerprint("block:b1") == "block:b1"
+    assert ac._ref_of_fingerprint("mail:form:h1") == "mail:form"
+    assert ac._ref_of_fingerprint("reminder") == ""
+    todos = [{"id": f"todo:{n}", "title": "x", "source": "reminders", "kind": "reminder", "done": False,
+              "due_ts": NOW + DAY, "fingerprints": [f"reminder:r{n}"]} for n in range(3)]
+    save(world["brief"], {"todos": todos})
+    salt = ac.Hasher()
+    hashes = [row["item"] for row in ac.run(world["paths"], now=NOW, hasher=salt)["items"]]
+    assert len(hashes) == 3 and len(set(hashes)) == 3
+    again = [row["item"] for row in ac.run(world["paths"], now=NOW, hasher=ac.Hasher())["items"]]
+    assert set(again).isdisjoint(hashes)             # a new salt per run: nothing carries across
 
 
 def test_false_negatives_are_open_direct_questions_without_a_row(world):

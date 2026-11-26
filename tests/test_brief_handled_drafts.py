@@ -275,3 +275,33 @@ def test_an_event_day_is_judged_in_the_briefs_time_zone(tz, kept):
     now = datetime(2026, 11, 25, 0, 30, tzinfo=timezone.utc).timestamp()
     todos = {"dinner": {"title": "Dinner with Sam", "source": "messages", "due_ts": due}}
     assert ("dinner" in without_passed_events(todos, now, tz)) is kept
+
+
+# --- Auditor notes on 713083a8 --------------------------------------------------------------
+
+@pytest.fixture
+def mac_in_utc(monkeypatch):
+    """The Mac's own zone is UTC while the Brief's is Los Angeles."""
+    import time
+    monkeypatch.setenv("TZ", "UTC")
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
+
+
+@pytest.mark.parametrize("tz, kept", [("UTC", False), ("America/Los_Angeles", True)])
+def test_a_title_date_is_read_in_the_briefs_time_zone(mac_in_utc, tz, kept):
+    """Written 2026-11-25 15:00 in Los Angeles, "Dinner tomorrow" is the 26th there.
+    At 17:00 on the 26th in Los Angeles it is already the 27th in UTC: the Brief's
+    zone keeps it for the evening, the Mac's (UTC) would drop it."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from service.assistant.stale_reminders import passed_date
+    from service.proactive.cycle import without_passed_events
+    la = ZoneInfo("America/Los_Angeles")
+    written = datetime(2026, 11, 25, 15, 0, tzinfo=la).timestamp()
+    now = datetime(2026, 11, 26, 17, 0, tzinfo=la).timestamp()
+    assert (passed_date("Dinner tomorrow", written, now, tz) is None) is kept
+    party = {"party": {"title": "Party on 11/26", "source": "notes", "due_ts": None}}
+    assert ("party" in without_passed_events(party, now, tz)) is kept

@@ -364,7 +364,10 @@ def test_a_turn_that_starts_mid_call_lets_it_finish(isolated, monkeypatch, model
     """Never cancelled mid-request (service/proactive/ask_gate.py): Ask goes first at
     the next call boundary, and the finished reply is kept."""
     from service import idle
-    monkeypatch.setattr(idle, "_foreground_turns", 0)
+    from service.proactive import ask_gate
+    monkeypatch.setattr(idle, "_foreground_turns", 0)   # restored after: no timing state left behind
+    monkeypatch.setattr(idle, "_last_turn", None)
+    monkeypatch.setattr(ask_gate, "_last_fair", None)
 
     class Turn(list):                 # the fake engine "starts a turn" mid-call
         def __setitem__(self, index, value):
