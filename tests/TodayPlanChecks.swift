@@ -1006,6 +1006,48 @@ struct TodayPlanChecks {
               "the hold keeps the newest eight days, one per day and zone")
         check(DayPlanHold.fade > 0.2 && DayPlanHold.fade < 0.6, "a held day reads as not live")
     }
+    /// A write that keeps nothing says why, and a good one clears it.
+    @MainActor
+    static func diskCacheWriteChecks() throws {
+        let scratch = ProcessInfo.processInfo.environment["HARBOR_TODAY_SCRATCH"].flatMap { $0.isEmpty ? nil : $0 }
+        let base = scratch.map { URL(fileURLWithPath: $0, isDirectory: true) } ?? FileManager.default.temporaryDirectory
+        let folder = base.appendingPathComponent("harbor-day-write-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer {
+            chmod(folder.path, 0o700)
+            try? FileManager.default.removeItem(at: folder)
+        }
+        let cache = DayPlanDiskCache(url: folder.appendingPathComponent(DayPlanDiskCache.fileName))
+        cache.save(Data("{\"a\":1}".utf8))
+        cache.flush()
+        check((try? Data(contentsOf: cache.url)) == Data("{\"a\":1}".utf8),
+              "A save keeps the reply's bytes (\(DayPlanDiskCache.lastFailureReason() ?? "no failure logged"))")
+        check(DayPlanDiskCache.lastFailureReason() == nil, "A kept plan leaves no failure behind")
+
+        // A missing folder is never created, and says so.
+        let missing = DayPlanDiskCache(url: folder.appendingPathComponent("absent").appendingPathComponent(DayPlanDiskCache.fileName))
+        missing.save(Data("{}".utf8))
+        missing.flush()
+        check(!FileManager.default.fileExists(atPath: missing.url.deletingLastPathComponent().path), "The home is never created")
+        check(DayPlanDiskCache.lastFailureReason()?.contains("missing") == true, "A missing folder is logged")
+
+        // A folder that cannot be written keeps the last plan and logs why.
+        chmod(folder.path, 0o500)
+        cache.save(Data("{\"b\":2}".utf8))
+        cache.flush()
+        chmod(folder.path, 0o700)
+        check((try? Data(contentsOf: cache.url)) == Data("{\"a\":1}".utf8), "The last kept plan stays")
+        check(DayPlanDiskCache.lastFailureReason()?.contains("cannot create") == true, "The refused write is logged")
+
+        // An oversized reply is not kept, and says so.
+        cache.save(Data(count: DayPlanDiskCache.maxBytes + 1))
+        cache.flush()
+        check(DayPlanDiskCache.lastFailureReason()?.contains("over") == true, "An oversized reply is logged")
+        cache.save(Data("{\"c\":3}".utf8))
+        cache.flush()
+        check(DayPlanDiskCache.lastFailureReason() == nil, "A good save clears the failure")
+    }
+
     /// The Day's first open after a launch shows today's plan as the last
     /// launch kept it, never an empty day, while the first read comes in; a
     /// read that brings nothing new is not published again.
@@ -1049,7 +1091,9 @@ struct TodayPlanChecks {
         await first.refresh()
         cache.flush()
         check(first.plan?.blocks.first?.title == "Invented standup", "The read is shown")
-        check(FileManager.default.fileExists(atPath: cache.url.path), "Today's plan is kept on disk")
+        check(FileManager.default.fileExists(atPath: cache.url.path),
+              "Today's plan is kept on disk (\(DayPlanDiskCache.lastFailureReason() ?? "no failure logged"))")
+        check(DayPlanDiskCache.lastFailureReason() == nil, "A kept plan leaves no failure behind")
         let attributes = try FileManager.default.attributesOfItem(atPath: cache.url.path)
         check((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600, "The kept plan is readable by its owner only")
 
@@ -1121,6 +1165,7 @@ struct TodayPlanChecks {
         await reminderCancelChecks()
         try await cacheFirstChecks()
         await dayPlanHoldChecks()
+        try diskCacheWriteChecks()
         try tolerantDecodeChecks()
         try sourceAccessChecks()
         try evidenceLabelChecks()

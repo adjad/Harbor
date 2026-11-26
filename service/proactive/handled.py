@@ -83,16 +83,27 @@ def latest_sent_texts(records, acknowledged: dict[str, float] | None = None) -> 
 
 def answered_refs(seen: dict[str, dict], *, texts: dict[str, float], sent: list[dict]) -> set[str]:
     """Item ids (card source refs) the user answered after their last incoming message."""
-    out = set()
+    return set(answered_times(seen, texts=texts, sent=sent))
+
+
+def answered_times(seen: dict[str, dict], *, texts: dict[str, float], sent: list[dict]) -> dict[str, float]:
+    """answered_refs, each with when the answer went out: the newest text or
+    tapback in the conversation, or the newest sent mail that answers the thread."""
+    out: dict[str, float] = {}
     for ref, entry in seen.items():
         if entry.get("source") == "messages":
-            if texts.get(entry.get("conversation"), float("-inf")) > entry["received_ts"]:
-                out.add(ref)
+            at = texts.get(entry.get("conversation"), float("-inf"))
+            if at > entry["received_ts"]:
+                out[ref] = float(at)
         elif entry.get("source") == "mail" and sent:
-            if sources.answered_by_sent(sent, account=entry.get("account", ""), subject=entry.get("subject", ""),
-                                        message_id=entry.get("message_id", ""), after=entry["received_ts"],
-                                        sender=_bare_address(entry.get("sender"))):
-                out.add(ref)
+            times = [float(row.get("ts") or 0) for row in sent
+                     if sources.answered_by_sent([row], account=entry.get("account", ""),
+                                                 subject=entry.get("subject", ""),
+                                                 message_id=entry.get("message_id", ""),
+                                                 after=entry["received_ts"],
+                                                 sender=_bare_address(entry.get("sender")))]
+            if times:
+                out[ref] = max(times)
     return out
 
 
@@ -154,14 +165,16 @@ def prune_replied(store, now: float | None = None) -> int:
         return len(stale)
 
 
-def _mark_todo_replied(store, todo_id: str, now: float) -> None:
+def _mark_todo_replied(store, todo_id: str, at: float, now: float | None = None) -> None:
+    """Records that the user answered `todo_id`'s thread at `at` (when the answer
+    went out, not when Harbor noticed it)."""
     with store._lock:
         data = store._read("decisions.json")
         if not isinstance(data.get("replied_todos"), dict):
             data["replied_todos"] = {}
-        data["replied_todos"][todo_id] = now
+        data["replied_todos"][todo_id] = at
         store._write("decisions.json")
-    prune_replied(store, now)
+    prune_replied(store, at if now is None else now)
 
 
 def with_replied_labels(snap: dict, store=None, now: float | None = None) -> dict:
@@ -240,12 +253,16 @@ def contacted_records(state: dict, seen: dict[str, dict], sent: list[dict], *, n
     return out
 
 
-def retire(store, *, answered: set[str], sched: dict | None = None, now: float | None = None,
+def retire(store, *, answered: set[str] | dict[str, float], sched: dict | None = None, now: float | None = None,
            contacted: set[str] | None = None) -> dict:
     """Dismiss cards and finish to-dos the user handled; mark their threads
-    answered. Returns what changed, for the log and tests."""
+    answered. `answered` may carry when each answer went out (answered_times):
+    a kept to-do's "you replied <Day>" names that day, and an answer older than
+    REPLIED_KEEP_S gets no label at all. Returns what changed, for the log and tests."""
     contacted = contacted or set()
     now = time.time() if now is None else now
+    answered_at = dict(answered) if isinstance(answered, dict) else {}
+    answered = set(answered)
     state = store.state()
     todos = {t.get("id"): t for t in state.get("todos") or []}
     done_ids = set(store.done_todos(now)) if hasattr(store, "done_todos") else set()
@@ -287,9 +304,14 @@ def retire(store, *, answered: set[str], sched: dict | None = None, now: float |
     if kept:
         already = replied_todos(store, now)
         for todo_id in sorted(kept - done_ids):
-            if todo_id not in already:
-                _mark_todo_replied(store, todo_id, now)
-                marked_todos.append(todo_id)
+            if todo_id in already:
+                continue
+            times = [answered_at[r] for r in _refs(todos.get(todo_id) or {}) if r in answered_at]
+            at = min(max(times), now) if times else now
+            if at < now - REPLIED_KEEP_S:
+                continue                  # answered over a week ago: no "you replied" at all
+            _mark_todo_replied(store, todo_id, at, now)
+            marked_todos.append(todo_id)
     threads = state.get("threads") or []
     marked = [t["id"] for t in threads if t.get("id", "").removeprefix("thread:") in answered and not t.get("replied")]
     if marked:
@@ -349,7 +371,7 @@ def mark_sent_reply(*, kind: str, message_id: str = "", account: str = "", subje
             texts = {chat: now for chat in chats if chat}
         else:
             return {"cards": [], "todos": [], "threads": [], "replied": []}
-        answered = answered_refs(seen, texts=texts, sent=sent)
+        answered = answered_times(seen, texts=texts, sent=sent)
         changed = retire(store, answered=answered, now=now)
         if publish and any(changed.values()):
             from service.assistant.hub import hub
@@ -372,7 +394,7 @@ def sweep(store=None, *, now: float | None = None, texts=None, sent=None, sched=
         texts = latest_sent_texts(sources.text_records())
     if sent is None:
         sent = sources.sent_rows() + sources.cached_native_sent()
-    answered = answered_refs(seen, texts=texts, sent=sent)
+    answered = answered_times(seen, texts=texts, sent=sent)
     contacted = contacted_records(store.state(), seen, sent, now=now)
     return retire(store, answered=answered, sched=sched, now=now, contacted=contacted)
 

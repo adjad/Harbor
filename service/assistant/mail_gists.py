@@ -719,7 +719,8 @@ async def _resident_reply(system: str, material: str, abort, *,
 
     Never loads or evicts: the fast-role model must already be resident, with
     nothing else but keep-warm models or another app's model on the user's oMLX.app.
-    A user's turn that starts before or during the call wins: the request is cancelled.
+    A call waits for Ask before it starts (service/proactive/ask_gate.py). One that is
+    running when a turn starts finishes: Ask goes first at the next call boundary.
     """
     from service import memory_saver
     from service.assistant.brief import _c
@@ -741,6 +742,9 @@ async def _resident_reply(system: str, material: str, abort, *,
         if not remote and getattr(client, "managed", False) is not True:
             _stood_down("the engine isn't this Mac's own; the inbox summary stays on this Mac")
             return None
+    # Before residency is read: a turn may change what is loaded.
+    from service.proactive import ask_gate
+    slot = ask_gate.CLEAR if remote else await ask_gate.wait_for_ask()
     if remote:
         # Remote inference: there is no local residency to protect, so the only
         # stand-down is a user's turn.
@@ -762,7 +766,8 @@ async def _resident_reply(system: str, material: str, abort, *,
     if others:
         _stood_down(f"another model is resident: {sorted(others)}")
         return None
-    if abort():
+    # The fairness slot goes beside a turn, never past Demo mode's hold.
+    if abort() and (slot != ask_gate.FAIR or _demo_hold()):
         _stood_down("a turn is in progress")
         return None
     budget = tokens[0] if _thinking_off(model) else tokens[1]
@@ -776,10 +781,6 @@ async def _resident_reply(system: str, material: str, abort, *,
     deadline = time.monotonic() + _TIMEOUT_S
     try:
         while not request.done():
-            if abort():
-                request.cancel()
-                _stood_down("a turn started during the call")
-                return None
             if time.monotonic() >= deadline:
                 request.cancel()
                 raise TimeoutError(f"gist reply took over {_TIMEOUT_S:.0f}s")
@@ -1002,8 +1003,8 @@ def _demo_hold() -> bool:
 
 
 def _scheduled_abort() -> bool:
-    """The scheduled tick's abort: a turn, or Demo mode turned on mid-call (the request
-    is cancelled at the next 0.5 s check, exactly as for a turn; the gist is due again)."""
+    """The scheduled tick's abort: a turn, or Demo mode turned on. Checked before the
+    call; a call already running finishes (service/proactive/ask_gate.py)."""
     from service import idle
     return idle.foreground_busy() or _demo_hold()
 

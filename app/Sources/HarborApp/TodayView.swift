@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import os
 
 struct TodayTask: Decodable, Identifiable {
     let id: String
@@ -406,18 +407,41 @@ struct DayPlanDiskCache: Sendable {
     }
 
     /// Keeps `data` (a plan reply that decoded) in place of the last one. Never
-    /// creates Harbor's home; a failed write keeps nothing and says nothing.
+    /// creates Harbor's home; a failed write keeps nothing and logs why
+    /// (the "day-plan-cache" log category, and `lastFailureReason()`).
     func save(_ data: Data) {
-        guard data.count <= Self.maxBytes else { return }
         let url = url
         Self.queue.async {
+            guard data.count <= Self.maxBytes else {
+                return Self.failed("not kept: a \(data.count)-byte reply is over \(Self.maxBytes) bytes")
+            }
             let folder = url.deletingLastPathComponent()
-            guard FileManager.default.fileExists(atPath: folder.path) else { return }
+            guard FileManager.default.fileExists(atPath: folder.path) else {
+                return Self.failed("not kept: its folder \(folder.lastPathComponent) is missing")
+            }
             let temporary = folder.appendingPathComponent("." + Self.fileName + ".tmp")
             guard FileManager.default.createFile(atPath: temporary.path, contents: data,
-                                                 attributes: [.posixPermissions: 0o600]) else { return }
-            if rename(temporary.path, url.path) != 0 { try? FileManager.default.removeItem(at: temporary) }
+                                                 attributes: [.posixPermissions: 0o600]) else {
+                return Self.failed("not kept: cannot create \(temporary.lastPathComponent) (\(String(cString: strerror(errno))))")
+            }
+            if rename(temporary.path, url.path) != 0 {
+                let reason = String(cString: strerror(errno))
+                try? FileManager.default.removeItem(at: temporary)
+                return Self.failed("not kept: rename to \(url.lastPathComponent) failed (\(reason))")
+            }
+            Self.lastFailure = nil
         }
+    }
+
+    /// Why the last write kept nothing; nil after one that kept the plan.
+    /// Touched only on the write queue; read it with `lastFailureReason()`.
+    nonisolated(unsafe) private static var lastFailure: String?
+    static func lastFailureReason() -> String? { queue.sync { lastFailure } }
+    private static let log = Logger(subsystem: "com.harbor.assistant", category: "day-plan-cache")
+
+    private static func failed(_ reason: String) {
+        lastFailure = reason
+        log.error("\(reason, privacy: .public)")
     }
 
     /// Waits for writes already asked for (checks only).

@@ -116,7 +116,11 @@ struct AppBugChecks {
 
     static func exportNames() {
         let files = FileManager.default
-        let dir = files.temporaryDirectory.appendingPathComponent("app-bug-export-\(UUID().uuidString)")
+        // Under the gate's own scratch folder (the runner's per-gate TMPDIR; the QA sandbox
+        // denies the system temporary folder), the system one only when run by hand.
+        let scratch = ProcessInfo.processInfo.environment["TMPDIR"].flatMap { $0.hasPrefix("/") ? $0 : nil }
+        let base = scratch.map { URL(fileURLWithPath: $0, isDirectory: true) } ?? files.temporaryDirectory
+        let dir = base.appendingPathComponent("app-bug-export-\(UUID().uuidString)")
         defer { try? files.removeItem(at: dir) }
         check((try? files.createDirectory(at: dir, withIntermediateDirectories: true)) != nil, "a scratch folder")
         let first = ResearchExportName.unused("Rivers", in: dir)

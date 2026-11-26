@@ -141,6 +141,8 @@ class MCPServer:
             )
         except Exception as e:  # noqa: BLE001
             self.error = f"couldn't start: {e}"
+            if self.name == _WORKSPACE_SERVER:
+                await _retire_workspace_credentials()
             return False
 
         self._reader = asyncio.create_task(self._read_loop())
@@ -175,6 +177,8 @@ class MCPServer:
         that's what the finally block is for.
         """
         assert self.proc and self.proc.stdout
+        proc = self.proc
+        stopped_here = False
         try:
             while True:
                 line = await self.proc.stdout.readline()
@@ -196,6 +200,7 @@ class MCPServer:
                     else:
                         fut.set_result(msg.get("result") or {})
         except asyncio.CancelledError:
+            stopped_here = True                # stop() retires the files itself
             raise
         except Exception:  # noqa: BLE001
             pass
@@ -204,8 +209,10 @@ class MCPServer:
                 if not fut.done():
                     fut.set_exception(RuntimeError(f"the {self.name} MCP server stopped"))
             self._pending.clear()
-            if self.name == _WORKSPACE_SERVER and self.proc is not None and self.proc.returncode is not None:
-                # The server died on its own: its sign-in files go with it.
+            if self.name == _WORKSPACE_SERVER and not stopped_here and self.proc is proc:
+                # Its output closed: the server is gone or going, and its sign-in
+                # files go with it, whether or not it has exited yet.
+                await _end_process(proc)
                 await _retire_workspace_credentials()
 
     async def _send(self, payload: dict) -> None:
@@ -256,6 +263,20 @@ class MCPServer:
 
 
 _WORKSPACE_SERVER = "google_workspace"
+
+
+async def _end_process(proc) -> None:
+    """Let a server whose output closed exit; one that lingers is killed."""
+    try:
+        await asyncio.wait_for(proc.wait(), 5)
+        return
+    except asyncio.TimeoutError:
+        pass
+    try:
+        proc.kill()
+        await asyncio.wait_for(proc.wait(), 5)
+    except Exception:  # noqa: BLE001 — gone already, or the next start sweeps
+        pass
 
 
 async def _retire_workspace_credentials() -> None:

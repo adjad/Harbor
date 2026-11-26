@@ -63,11 +63,22 @@ def bundled_compatibility(root: Path | None = None, mac_version: str | None = No
             "unavailable_reason": reason or (None if available else "The built-in engine is not included in this build.")}
 
 
+def _overlay_path() -> Path:
+    """The file the choice is saved to (engine/api.py, via config._save_overlay):
+    config's USER_CONFIG once config is loaded, so the read and the write can never
+    name different files. Not imported here: config imports this module, and MODE is
+    decided while this module is still loading (before config exists)."""
+    import sys
+    config = sys.modules.get("service.config")
+    path = getattr(config, "USER_CONFIG", None)
+    return path if isinstance(path, Path) else MOE_DIR / "config.yaml"
+
+
 def _overlay_selection() -> tuple[bool, str | None]:
     """Whether a selection exists, and its valid value. Never expose raw config."""
     try:
         import yaml
-        doc = yaml.safe_load((MOE_DIR / "config.yaml").read_text())
+        doc = yaml.safe_load(_overlay_path().read_text())
         if doc is None:
             doc = {}
         if not isinstance(doc, dict):

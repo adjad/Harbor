@@ -360,11 +360,13 @@ def test_a_slow_but_successful_reply_is_cached(isolated, monkeypatch, model):
     assert G._load()["inbox"]["gist"] == "Mostly event updates" and G._PATH.exists()
 
 
-def test_a_turn_that_starts_mid_call_cancels_it(isolated, monkeypatch, model):
+def test_a_turn_that_starts_mid_call_lets_it_finish(isolated, monkeypatch, model):
+    """Never cancelled mid-request (service/proactive/ask_gate.py): Ask goes first at
+    the next call boundary, and the finished reply is kept."""
     turn = [False]
-    client = use(monkeypatch, FakeClient(["fast"], delay=1.0, turn=turn))
-    assert asyncio.run(G.refresh(NOW, abort=lambda: turn[0])) is False
-    assert client.cancelled and "inbox" not in G._load() and G._next_call_at == NOW + G._IDLE_GAP_S
+    client = use(monkeypatch, FakeClient(["fast"], delay=0.3, turn=turn))
+    assert asyncio.run(G.refresh(NOW, abort=lambda: turn[0])) is True
+    assert turn[0] and not client.cancelled and G._load()["inbox"]["gist"] == "Mostly school mail"
 
 
 def test_a_cut_off_reply_is_a_failure(isolated, monkeypatch, model):

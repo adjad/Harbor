@@ -223,6 +223,9 @@ PROFILE_TESTS = {
         "tests/test_security_fix_workspace_credentials.py",
         "tests/test_security_fix_keychain_locks.py",
         "tests/test_security_fix_gmail_file_lock.py",
+        "tests/test_security_fix_barrier_keychain.py",
+        "tests/test_security_fix_gmail_transaction.py",
+        "tests/test_security_fix_workspace_adopt.py",
         # The user's access choice survives a restart; boots under tmp_path only.
         "tests/test_access_mode_persistence.py",
         "tests/test_always_confirm_grants.py",
@@ -604,6 +607,8 @@ ADDITIONAL_FULL_TESTS = {
     "tests/test_proactive_return_refresh.py",
     "tests/test_brief_warmup.py",
     "tests/test_brief_pace.py",
+    # Brief's model calls wait for Ask: fake clocks and a fake serial engine, no model.
+    "tests/test_ask_gate.py",
     "tests/test_proactive_mail_recall.py",
     "tests/test_proactive_past_week.py",
     "tests/test_proactive_quality.py",
@@ -990,6 +995,10 @@ ADDITIONAL_FULL_TESTS = {
     "tests/test_raw_mail_state_isolation.py",
     # bug-sweep-2: a test's config overlay does not outlive it (conftest)
     "tests/test_user_config_overlay_isolation.py",
+    # Verified sends answer their Brief thread at once: faked bridges, tmp proactive store, faked hub.
+    "tests/test_brief_handled_drafts.py",
+    # Brief accuracy check: invented Brief state and invented Mail/Messages databases in tmp_path.
+    "tests/test_brief_accuracy_check.py",
 }
 # Integrated runtime contracts are mandatory; missing files fail selection.
 MINI_RUNTIME_INTEGRATION_TESTS = {

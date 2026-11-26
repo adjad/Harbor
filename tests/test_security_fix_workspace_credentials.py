@@ -35,6 +35,7 @@ def store(tmp_path, monkeypatch):
         return len(updates)
 
     monkeypatch.setattr(gmail_source, "adopt_workspace_updates", adopt)
+    monkeypatch.setattr(gmail_source, "named_accounts", lambda: set(accounts))
     monkeypatch.setattr(W, "_server_live", lambda: False)
     return accounts, adopted
 
@@ -75,7 +76,7 @@ def test_what_the_server_changed_is_kept_before_its_files_go(store):
 
 def test_a_start_after_a_crash_sweeps_and_keeps_the_left_over_changes(store):
     accounts, _ = store
-    W.CREDENTIALS_DIR.mkdir(parents=True)
+    W.start_server_credentials()              # an earlier run, which then crashed
     os.chmod(W.CREDENTIALS_DIR, 0o755)
     left = W.CREDENTIALS_DIR / f"{ACCOUNT}.json"
     left.write_text(json.dumps({"refresh_token": "fixture-refresh-left", "scopes": [W.FULL_SCOPE]}))

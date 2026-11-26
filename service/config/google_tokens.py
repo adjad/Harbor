@@ -237,6 +237,22 @@ def read(email: str, want: str | None = None) -> str | None:
         _io_lock.release()
 
 
+def read_later(email: str, want: str | None = None) -> None:
+    """For a caller that may not run `security` itself (the event loop, or one
+    holding the publication barrier or gmail.json's locks): read the account on
+    a worker thread unless its current token is cached already."""
+    email = email.strip().lower()
+    if not _lock.acquire(blocking=False):
+        _read_soon(email, want)
+        return
+    try:
+        if _current(_cache.get(email), want):
+            return
+    finally:
+        _lock.release()
+    _read_soon(email, want)
+
+
 _reading: set[tuple[str, str | None]] = set()
 
 

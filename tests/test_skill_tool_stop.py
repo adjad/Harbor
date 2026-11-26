@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
 import time
 from pathlib import Path
 
@@ -22,12 +23,37 @@ def _alive(pid: int) -> bool:
 
 # A child that hangs with the shell alone: Simulation QA's sandbox refuses to run
 # /bin/sleep, and /dev/fd (process substitution), and macOS's bash 3.2 has no coproc.
-# A builtin loop in a backgrounded subshell (a fork of bash, no exec) runs until it is
-# killed; each test kills it within about a second.
+# A builtin loop in a backgrounded subshell (a fork of bash, no exec), bounded by bash's
+# own $SECONDS so it ends by itself after LOOP_S even if nothing kills it. Each test
+# kills it within about a second; the fixture below kills whatever a failed test left.
+LOOP_S = 30
+
+
 def _script(folder: Path) -> Path:
     (folder / "run.sh").write_text(
-        "#!/bin/bash\n( while :; do :; done ) &\necho $! > child.pid\necho $$ > parent.pid\nwait\n")
+        "#!/bin/bash\n"
+        f"( end=$((SECONDS + {LOOP_S})); while [ $SECONDS -lt $end ]; do :; done ) &\n"
+        "echo $! > child.pid\necho $$ > parent.pid\nwait\n")
     return folder
+
+
+@pytest.fixture(autouse=True)
+def _no_loop_outlives_the_test(tmp_path):
+    yield
+    for name in ("child.pid", "parent.pid"):
+        try:
+            pid = int((tmp_path / name).read_text())
+        except (OSError, ValueError):
+            continue
+        if _alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(pid, os.WNOHANG)       # reaped here only if it is ours; launchd otherwise
+            except ChildProcessError:
+                pass
 
 
 def _wait_for(path: Path) -> int:

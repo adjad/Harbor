@@ -85,7 +85,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 import httpx
 
 from service.paths import MOE_DIR
-from service.publication_authority import Authority, Witness, mutating, revocation
+from service.publication_authority import Authority, Witness, holding_barrier, mutating, revocation
 
 SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
@@ -284,16 +284,27 @@ def _read_file() -> dict:
 # Harbor and Quayside share gmail.json. Each read-modify-write of it (and the
 # replace of its shared temp file) holds this advisory lock, taken after
 # _history_config_lock and never across a Keychain call, so neither app writes
-# from a copy the other has just replaced. A plain read needs no lock: the file
-# only ever changes by an atomic rename.
+# from a copy the other has just replaced. A caller that loads, changes and saves
+# holds it for the whole span (_config_transaction). A plain read needs no lock:
+# the file only ever changes by an atomic rename.
 FILE_LOCK_WAIT_S = 2.0
+_file_lock_held = threading.local()
 
 
 @contextlib.contextmanager
 def _file_lock():
     """Hold gmail.json.lock (0600, never followed through a link). If the other
     app keeps it past FILE_LOCK_WAIT_S, or it can't be opened, go on without it:
-    the write itself is still atomic, it just may overwrite a newer one."""
+    the write itself is still atomic, it just may overwrite a newer one. Nested
+    in the same thread (a save inside _config_transaction) it is already held."""
+    depth = getattr(_file_lock_held, "depth", 0)
+    if depth:
+        _file_lock_held.depth = depth + 1
+        try:
+            yield
+        finally:
+            _file_lock_held.depth = depth
+        return
     fd = None
     try:
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -316,9 +327,11 @@ def _file_lock():
             os.close(fd)
             fd = None
         print(f"[gmail] could not lock gmail.json: {type(exc).__name__}", flush=True)
+    _file_lock_held.depth = 1
     try:
         yield
     finally:
+        _file_lock_held.depth = 0
         if fd is not None:
             try:
                 fcntl.flock(fd, fcntl.LOCK_UN)
@@ -375,10 +388,10 @@ def keychain_sync() -> None:
         idle = not _uses_keychain(_read_file()) and "service.config.google_tokens" not in sys.modules
     if idle:
         return
-    from service.config import google_tokens
-    if google_tokens.on_loop():
+    if _keychain_barred():
         _schedule_keychain_sync()
         return
+    from service.config import google_tokens
     with _sync_lock:
         with _history_config_lock:
             raw = _read_file()
@@ -446,7 +459,74 @@ def _keychain_work_waiting(raw: dict, *, saving: bool = False) -> bool:
                     and any(item.get("refresh_token") for item, _ in _token_slots(raw))))
 
 
+def _keychain_barred() -> bool:
+    """A Keychain call can take 30 s (a locked Keychain asks for the password), so
+    none runs on the event loop, inside the publication barrier (revocation() or
+    publication(): the event loop takes it too), or under _history_config_lock.
+    There a read is started on a worker thread and a write is left to one."""
+    from service.config import google_tokens
+    return (google_tokens.on_loop() or holding_barrier() or _history_config_lock._is_owned()
+            or getattr(_file_lock_held, "depth", 0) > 0)
+
+
+@contextlib.contextmanager
+def _config_transaction():
+    """One load -> change -> save of gmail.json, with gmail.json's lock held from
+    before the load to after the save, so a sign-in the other app (Quayside or Harbor)
+    saves meanwhile waits and then builds on this one instead of being dropped.
+    Keychain is read first, with nothing held; inside, loads use the cache and
+    Keychain writes go to a worker. Order: barrier, config lock, file lock."""
+    _read_tokens()
+    with revocation(), _history_config_lock, _file_lock():
+        yield
+
+
+def _read_tokens() -> dict:
+    """Read every Keychain-marked account's token into google_tokens' cache, with no
+    lock held (or, where that can't be done now, start the read on a worker).
+    Callers that are about to take revocation() call this first, so the load they
+    make inside it finds every token cached. Returns the file it read."""
+    with _history_config_lock:
+        raw = _read_file()
+    if not _uses_keychain(raw):
+        return raw
+    from service.config import google_tokens
+    barred = _keychain_barred()
+    for item, email in _token_slots(raw):
+        if item.get(TOKEN_STORE_KEY) == KEYCHAIN and not item.get("refresh_token"):
+            want = item.get(TOKEN_FINGERPRINT_KEY) or None
+            if barred:
+                google_tokens.read_later(email, want)
+            else:
+                google_tokens.read(email, want)    # cached afterwards
+    return raw
+
+
 @mutating
+def _load_cached() -> tuple[dict, bool, dict]:
+    """gmail.json with each Keychain account's token from the cache only (no
+    Keychain call): (config, Keychain work waiting, the file it was built from)."""
+    with _history_config_lock:
+        raw = _read_file()
+        data = json.loads(json.dumps(raw))
+        if not _uses_keychain(raw):
+            for item, _ in _token_slots(data):
+                item.pop(TOKEN_STORE_KEY, None)
+                item.pop(TOKEN_FINGERPRINT_KEY, None)
+            _observe_history_config(data)
+            return data, False, raw
+        from service.config import google_tokens
+        for item, email in _token_slots(data):
+            marked = item.pop(TOKEN_STORE_KEY, None) == KEYCHAIN
+            want = item.pop(TOKEN_FINGERPRINT_KEY, None) or None
+            if marked and not item.get("refresh_token"):
+                token = google_tokens.cached(email, want)
+                if token:
+                    item["refresh_token"] = token
+        _observe_history_config(data)
+        return data, _keychain_work_waiting(raw), raw
+
+
 def load_config() -> dict:
     """gmail.json, with each account's refresh token filled in from Keychain.
 
@@ -455,38 +535,16 @@ def load_config() -> dict:
     account whose Keychain item can't be read right now has no refresh_token
     here, so it reads as not connected until a later read succeeds;
     _save_config keeps its entry, so it is never dropped. Keychain is read
-    outside _history_config_lock, so a slow read never holds up other callers."""
-    for _attempt in range(3):
-        with _history_config_lock:
-            raw = _read_file()
-            if not _uses_keychain(raw):
-                data = json.loads(json.dumps(raw))
-                for item, _ in _token_slots(data):
-                    item.pop(TOKEN_STORE_KEY, None)
-                    item.pop(TOKEN_FINGERPRINT_KEY, None)
-                _observe_history_config(data)
-                return data
-        from service.config import google_tokens
-        wanted = [(email, item.get(TOKEN_FINGERPRINT_KEY) or None) for item, email in _token_slots(raw)
-                  if item.get(TOKEN_STORE_KEY) == KEYCHAIN and not item.get("refresh_token")]
-        for email, want in wanted:
-            google_tokens.read(email, want)    # cached afterwards
-        with _history_config_lock:
-            if _read_file() != raw and _attempt < 2:
-                continue                       # saved meanwhile: read the new file
-            data = json.loads(json.dumps(raw))
-            for item, email in _token_slots(data):
-                marked = item.pop(TOKEN_STORE_KEY, None) == KEYCHAIN
-                want = item.pop(TOKEN_FINGERPRINT_KEY, None) or None
-                if marked and not item.get("refresh_token"):
-                    token = google_tokens.cached(email, want)
-                    if token:
-                        item["refresh_token"] = token
-            _observe_history_config(data)
-            waiting = _keychain_work_waiting(raw)
-            break
+    first, with no lock held and outside the publication barrier; a load made
+    where it can't be read (the event loop, inside revocation(), under the
+    config lock) uses what is cached and reads the rest on a worker."""
+    for attempt in range(3):
+        read = _read_tokens()
+        data, waiting, used = _load_cached()
+        if used == read or attempt == 2 or _keychain_barred():
+            break                              # else saved meanwhile: read the new file
     if waiting:
-        keychain_sync() if not google_tokens.on_loop() else _schedule_keychain_sync()
+        keychain_sync()                        # on a worker when barred
     return data
 
 
@@ -501,8 +559,16 @@ def token_storage() -> str:
     return places.pop() if len(places) == 1 else "mixed" if places else ""
 
 
-@mutating
 def _save_config(cfg: dict, *, forget: set[str] | frozenset[str] = frozenset()) -> None:
+    """Write gmail.json from `cfg` (_save_locked), then move its tokens to
+    Keychain: inline, or on a worker where no Keychain call may run (inside the
+    publication barrier, on the event loop)."""
+    if _save_locked(cfg, forget=forget):
+        keychain_sync()
+
+
+@mutating
+def _save_locked(cfg: dict, *, forget: set[str] | frozenset[str] = frozenset()) -> bool:
     """Write gmail.json from `cfg`; refresh tokens then move to Keychain.
 
     A token already confirmed in Keychain this run is written as the marker
@@ -524,7 +590,7 @@ def _save_config(cfg: dict, *, forget: set[str] | frozenset[str] = frozenset()) 
             # No Google token anywhere: a plain write, without the Keychain module.
             _write_file(out)
             _observe_history_config(cfg)
-            return
+            return False
         from service.config import google_tokens
         old_marked = _keychain_emails(old)
         present = set()
@@ -568,9 +634,7 @@ def _save_config(cfg: dict, *, forget: set[str] | frozenset[str] = frozenset()) 
         _pending_deletes.update(forget & old_marked)
         _write_file(out)
         _observe_history_config(cfg)
-        waiting = _keychain_work_waiting(out, saving=True)
-    if waiting:
-        keychain_sync() if not google_tokens.on_loop() else _schedule_keychain_sync()
+        return _keychain_work_waiting(out, saving=True)
 
 
 def builtin_client() -> tuple[str, str]:
@@ -641,6 +705,13 @@ def connected_accounts(cfg: dict | None = None) -> dict[str, dict]:
                             "client_secret": cfg.get("client_secret", ""), **item}
             for email, item in accounts.items() if isinstance(item, dict) and
             item.get("refresh_token") and (item.get("client_id") or cfg.get("client_id"))}
+
+
+def named_accounts() -> set[str]:
+    """Every account gmail.json names, connected or not readable right now (no
+    Keychain call)."""
+    with _history_config_lock:
+        return {email for _, email in _token_slots(_read_file())}
 
 
 def is_connected() -> bool:
@@ -892,7 +963,7 @@ def _mark_expired(email: str, snapshot: dict) -> None:
     sign-in in between leaves the account alone. An account already marked
     is not announced again; a reconnect writes a fresh record without it."""
     try:
-        with revocation():
+        with _config_transaction():
             cfg = load_config()
             accounts = connected_accounts(cfg)
             item = accounts.get(email)
@@ -1841,7 +1912,7 @@ async def _finish(client_id, client_secret, code, verifier, redirect, *,
     if generation != _flow_generation:
         return
     email = email.strip().lower()
-    with revocation():
+    with _config_transaction():
         cfg = load_config()
         accounts = connected_accounts(cfg)
         if mail_account_id and any(item.get("mail_account_id") == mail_account_id and other != email
@@ -1959,7 +2030,7 @@ def adopt_workspace_updates(updates: dict[str, dict]) -> int:
     newer refresh token (saved to Keychain like any other) or scopes it added on
     demand. Only for accounts still connected; values are never logged."""
     changed = 0
-    with revocation():
+    with _config_transaction():
         cfg = load_config()
         accounts = connected_accounts(cfg)
         for email, change in updates.items():
@@ -1982,7 +2053,7 @@ def set_workspace(account: str, enabled: bool) -> dict:
     reconnect: Google grants them only at the next sign-in."""
     from service import google_workspace
     account = account.strip().lower()
-    with revocation():
+    with _config_transaction():
         cfg = load_config()
         accounts = connected_accounts(cfg)
         if account not in accounts:
@@ -2081,7 +2152,7 @@ async def disconnect(account: str = "") -> dict:
     # Read every Keychain item off the event loop first, so no account looks
     # unreadable (and gets forgotten unrevoked) only because Keychain was busy.
     await asyncio.to_thread(load_config)
-    with revocation():
+    with _config_transaction():
         invalidate_behavior_history("disconnected")
         _withdraw_history_configuration()
         from service.tools import email_tools as E

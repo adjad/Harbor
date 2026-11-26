@@ -1,15 +1,18 @@
 """Pure interval checks, no native read or collector construction."""
 
-import shutil
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+# The compiler these checks run, and the one they skip without: the same path.
+SWIFTC = "/usr/bin/swiftc"
+
 
 @pytest.mark.skipif(
-    sys.platform != "darwin" or not shutil.which("swiftc"),
+    sys.platform != "darwin" or not os.access(SWIFTC, os.X_OK),
     reason="macOS compiler required",
 )
 def test_native_activity_intervals(tmp_path):
@@ -17,7 +20,7 @@ def test_native_activity_intervals(tmp_path):
     executable = tmp_path / "activity-checks"
     result = subprocess.run(
         [
-            "/usr/bin/swiftc",
+            SWIFTC,
             "-parse-as-library",
             "-swift-version",
             "5",
@@ -42,7 +45,7 @@ def test_native_activity_intervals(tmp_path):
 
 
 @pytest.mark.skipif(
-    sys.platform != "darwin" or not shutil.which("swiftc"),
+    sys.platform != "darwin" or not os.access(SWIFTC, os.X_OK),
     reason="macOS compiler required",
 )
 def test_signal_settings_async_order(tmp_path):
@@ -93,7 +96,7 @@ def test_signal_settings_async_order(tmp_path):
     env["HARBOR_ENGINE_ROOT"] = str(tmp_path / "absent-engine")
     executable = tmp_path / "signal-checks"
     compiled = subprocess.run(
-        ["/usr/bin/swiftc", "-parse-as-library", "-swift-version", "5",
+        [SWIFTC, "-parse-as-library", "-swift-version", "5",
          "-module-cache-path", str(tmp_path / "modules"), str(model),
          str(root / "tests/BehaviorSignalSettingsRegression.swift"), "-o", str(executable)],
         env=env, cwd=tmp_path, capture_output=True, text=True, timeout=120,
@@ -110,7 +113,7 @@ def test_signal_settings_async_order(tmp_path):
 
 
 @pytest.mark.skipif(
-    sys.platform != "darwin" or not shutil.which("swiftc"),
+    sys.platform != "darwin" or not os.access(SWIFTC, os.X_OK),
     reason="macOS compiler required",
 )
 def test_global_learning_settings_confirmation(tmp_path):
@@ -150,7 +153,7 @@ def test_global_learning_settings_confirmation(tmp_path):
     env["HARBOR_ENGINE_ROOT"] = str(tmp_path / "absent-engine")
     executable = tmp_path / "consent-checks"
     compiled = subprocess.run(
-        ["/usr/bin/swiftc", "-parse-as-library", "-swift-version", "5",
+        [SWIFTC, "-parse-as-library", "-swift-version", "5",
          "-module-cache-path", str(tmp_path / "modules"), str(extracted),
          str(root / "tests/BehaviorGlobalSettingsRegression.swift"), "-o", str(executable)],
         env=env, cwd=tmp_path, capture_output=True, text=True, timeout=120,

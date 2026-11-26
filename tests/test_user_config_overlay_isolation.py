@@ -30,3 +30,17 @@ def test_the_next_test_does_not_inherit_it():
     from service.assistant import behavior_runtime
     assert "runtime" in _seen
     assert behavior_runtime._runtime is _seen["runtime"]
+
+
+def test_a_test_saves_an_engine_mode():
+    from service.engine import mode
+    from service.config import _save_overlay
+    _seen["mode"] = mode.configured_mode()
+    _save_overlay({"engine": {"mode": mode.EXTERNAL}})
+    assert mode.configured_mode() == mode.EXTERNAL     # read back from the file it was saved to
+
+
+def test_the_next_test_has_the_engine_mode_it_had_before():
+    from service.engine import mode
+    assert "mode" in _seen
+    assert mode.configured_mode() == _seen["mode"]

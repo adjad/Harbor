@@ -1,15 +1,18 @@
 """Compile/run pure native mapping contracts; never instantiate native readers."""
 
-import shutil
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+# The compiler these checks run, and the one they skip without: the same path.
+SWIFTC = "/usr/bin/swiftc"
+
 
 @pytest.mark.skipif(
-    sys.platform != "darwin" or not shutil.which("swiftc"),
+    sys.platform != "darwin" or not os.access(SWIFTC, os.X_OK),
     reason="macOS Swift compiler required",
 )
 def test_native_history_mapping_contract(tmp_path):
@@ -17,7 +20,7 @@ def test_native_history_mapping_contract(tmp_path):
     executable = tmp_path / "history-contract"
     result = subprocess.run(
         [
-            "/usr/bin/swiftc",
+            SWIFTC,
             "-parse-as-library",
             "-swift-version",
             "5",
@@ -48,7 +51,7 @@ def test_native_history_mapping_contract(tmp_path):
     assert "synthetic behavior history mapping checks passed" in checked.stdout
 
 
-@pytest.mark.skipif(sys.platform != "darwin" or not shutil.which("swiftc"), reason="macOS Swift compiler required")
+@pytest.mark.skipif(sys.platform != "darwin" or not os.access(SWIFTC, os.X_OK), reason="macOS Swift compiler required")
 def test_actual_learned_values_preserve_source_uncertainty(tmp_path):
     import json
     from datetime import datetime
@@ -72,7 +75,7 @@ def test_actual_learned_values_preserve_source_uncertainty(tmp_path):
     wire = tmp_path / "wire.json"
     wire.write_text(json.dumps(rows, allow_nan=False))
     executable = tmp_path / "learned-values"
-    compiled = subprocess.run(["/usr/bin/swiftc", "-parse-as-library", "-swift-version", "5",
+    compiled = subprocess.run([SWIFTC, "-parse-as-library", "-swift-version", "5",
         "-module-cache-path", str(tmp_path / "modules"), str(values),
         "tests/BehaviorLearnedValuesRegression.swift", "-o", str(executable)],
         cwd=root, capture_output=True, text=True, timeout=120)

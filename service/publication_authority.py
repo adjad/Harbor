@@ -45,6 +45,12 @@ def assert_drain_allowed():
         raise PublicationBusy("Cleanup cannot wait inside a caller publication or mutation; retry outside it")
 
 
+def holding_barrier() -> bool:
+    """Whether this thread is inside revocation() or publication(): code that may
+    block for long (a Keychain call) must not run then."""
+    return bool(getattr(_local,"revokers",0)) or getattr(_local,"publisher",None) is not None
+
+
 @contextmanager
 def revocation():
     """Order a supported mutation before taking any inner writer locks.

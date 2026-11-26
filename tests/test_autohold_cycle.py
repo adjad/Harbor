@@ -340,8 +340,8 @@ def test_a_cycle_that_yielded_to_a_turn_holds_nothing(setting, store, holds):
     acting.set_enabled(True, now=NOW - 60)
     calls = {"n": 0}
 
-    def abort():                       # a turn is running when the judge starts, then it ends
-        calls["n"] += 1
-        return calls["n"] == 1
+    def abort():                       # a turn is running when the judge starts and at the
+        calls["n"] += 1                # re-check after the Ask gate, then it ends
+        return calls["n"] <= 2
     assert cycle_once(store, abort=abort)["status"] == "yielded"
     assert holds == [] and store.auto_added() == {} and methods(store) == ["block_time"]

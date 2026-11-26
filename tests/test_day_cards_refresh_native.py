@@ -7,12 +7,15 @@ caller has resumed (the gap that used to leave Day's rows stale for a minute).
 """
 from __future__ import annotations
 
-import shutil
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+# The compiler these checks run, and the one they skip without: the same path.
+SWIFTC = "/usr/bin/swiftc"
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -111,7 +114,7 @@ def test_day_cards_region_is_only_the_coalescing_logic():
     assert "View" not in region.replace("NotchDayView", "")
 
 
-@pytest.mark.skipif(sys.platform != "darwin" or not shutil.which("swiftc"), reason="macOS compiler required")
+@pytest.mark.skipif(sys.platform != "darwin" or not os.access(SWIFTC, os.X_OK), reason="macOS compiler required")
 def test_forced_day_refresh_is_never_dropped(tmp_path):
     (tmp_path / "DayCards.swift").write_text("import Foundation\n" + _day_cards_source())
     (tmp_path / "Harness.swift").write_text(HARNESS)
@@ -121,7 +124,7 @@ def test_forced_day_refresh_is_never_dropped(tmp_path):
         env[key] = str(tmp_path / leaf)
     executable = tmp_path / "day-cards-checks"
     compiled = subprocess.run(
-        ["/usr/bin/swiftc", "-parse-as-library", "-swift-version", "5",
+        [SWIFTC, "-parse-as-library", "-swift-version", "5",
          "-module-cache-path", str(tmp_path / "modules"),
          str(tmp_path / "DayCards.swift"), str(tmp_path / "Harness.swift"), "-o", str(executable)],
         env=env, cwd=tmp_path, capture_output=True, text=True, timeout=180,

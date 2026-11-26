@@ -409,9 +409,50 @@ def credentials_path(email: str) -> Path:
 # account store (whose tokens live in the Keychain), and removed when it stops
 # or its process ends; the next start sweeps any a crash left behind. The server
 # also writes to them (a refreshed token, scopes it added on demand), so before
-# a file goes, what changed is folded back into the account store.
-def _write_credentials(email: str, item: dict) -> None:
+# a file goes, what changed is folded back into the account store, but only
+# when it is newer than what is stored and within what the user allows
+# (_collect_server_changes).
+#
+# Beside the folder, never in it (the server reads the folder), Harbor records the
+# fingerprint (google_tokens.fingerprint, never the token) of the token it wrote
+# for each account: "credentials.written". A file's token is newer only while
+# the stored token is still the one written; after a sign-in since, in either
+# app, the file is stale.
+def _written_path() -> Path:
+    return CREDENTIALS_DIR.with_name(CREDENTIALS_DIR.name + ".written")
+
+
+def _read_written() -> dict[str, str]:
+    data = _read_private(_written_path()) or {}
+    accounts = data.get("accounts")
+    if not isinstance(accounts, dict):
+        return {}
+    return {str(email).lower(): value for email, value in accounts.items() if isinstance(value, str)}
+
+
+def _save_written(written: dict[str, str]) -> None:
+    path = _written_path()
+    if not written:
+        path.unlink(missing_ok=True)
+        return
     _private_dir()
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        json.dump({"accounts": written}, handle)
+    tmp.replace(path)
+
+
+def _write_credentials(email: str, item: dict) -> None:
+    from service.config import google_tokens
+    _private_dir()
+    written = _read_written()
+    written[email] = google_tokens.fingerprint(str(item.get("refresh_token") or ""))
+    _save_written(written)
     path = credentials_path(email)
     tmp = path.with_suffix(".tmp")
     try:
@@ -457,46 +498,80 @@ def _read_private(path: Path) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def _collect_server_changes() -> None:
-    """Fold a newer refresh token or added scopes the server wrote into the account
-    store (and so into the Keychain). Values are compared, never logged."""
+def _collect_server_changes() -> set[str]:
+    """Fold what the server wrote into the account store (and so into the
+    Keychain), only where it is newer and allowed. Values are compared, never
+    logged. A file is discarded (not adopted) when:
+    - Harbor has no record of writing it;
+    - its token differs from the stored one while the stored one is no longer
+      the token Harbor wrote (a newer sign-in since: the file is stale);
+    - it lists a consent scope (Gmail, Calendar, the read-only Workspace ones)
+      the account's current grant lacks: a reconnect unticked it.
+    Scopes outside the consent set (writes the server asked for on demand) are
+    added. Returns the accounts whose file can't be judged yet: gmail.json still
+    names the account but its token can't be read right now (at startup, on the
+    event loop). Their files are kept for a later read instead of discarded."""
     if not CREDENTIALS_DIR.is_dir():
-        return
+        return set()
     from service import gmail_source
+    from service.config import google_tokens
     current = gmail_source.connected_accounts()
+    named = gmail_source.named_accounts()
+    written = _read_written()
+    consent = set(gmail_source.CONSENT_SCOPES) | set(WORKSPACE_SCOPES)
     updates: dict[str, dict] = {}
+    undecided: set[str] = set()
     for path in CREDENTIALS_DIR.glob("*.json"):
         email = path.stem.lower()
         item = current.get(email)
-        data = _read_private(path)
-        if item is None or data is None:
+        base = written.get(email)
+        if item is None:
+            if email in named and base:
+                undecided.add(email)
             continue
-        change: dict = {}
+        data = _read_private(path)
+        if data is None or not base:
+            continue
         token = data.get("refresh_token")
-        if isinstance(token, str) and token and token != item.get("refresh_token"):
+        stored = str(item.get("refresh_token") or "")
+        if not isinstance(token, str) or not token:
+            continue
+        if token != stored and google_tokens.fingerprint(stored) != base:
+            continue                       # a newer sign-in since: stale
+        raw = data.get("scopes")
+        scopes = [s for s in raw if isinstance(s, str)] if isinstance(raw, list) else []
+        granted = gmail_source.granted_scopes(email, item)
+        if any(s in consent and s not in granted for s in scopes):
+            continue                       # broader than the user's current grant
+        change: dict = {}
+        if token != stored:
             change["refresh_token"] = token
-        scopes = data.get("scopes")
-        if isinstance(scopes, list):
-            known = list(item.get("scopes") or [])
-            added = [s for s in scopes if isinstance(s, str) and s not in known]
-            if added:
-                change["scopes"] = known + added
+        added = [s for s in dict.fromkeys(scopes) if s not in granted]
+        if added:
+            change["scopes"] = list(item.get("scopes") or sorted(granted)) + added
         if change:
             updates[email] = change
     if updates:
         gmail_source.adopt_workspace_updates(updates)
+    return undecided
 
 
-def _clear_credentials() -> None:
-    if not CREDENTIALS_DIR.is_dir() or CREDENTIALS_DIR.is_symlink():
-        return
-    for path in CREDENTIALS_DIR.iterdir():
-        if path.is_file() or path.is_symlink():
-            path.unlink(missing_ok=True)
-    try:
-        CREDENTIALS_DIR.rmdir()
-    except OSError:
-        pass
+def _clear_credentials(keep: set[str] | frozenset[str] = frozenset()) -> None:
+    """Remove the server's files, except those of `keep` (not judged yet), and
+    the record of what was written for them."""
+    written = _read_written()
+    if CREDENTIALS_DIR.is_dir() and not CREDENTIALS_DIR.is_symlink():
+        for path in CREDENTIALS_DIR.iterdir():
+            if (path.is_file() or path.is_symlink()) and not (
+                    path.suffix == ".json" and path.stem.lower() in keep and not path.is_symlink()):
+                path.unlink(missing_ok=True)
+        try:
+            CREDENTIALS_DIR.rmdir()
+        except OSError:
+            pass
+    left = {email: value for email, value in written.items() if email in keep}
+    if left != written:
+        _save_written(left)
 
 
 def _server_live() -> bool:
@@ -505,7 +580,8 @@ def _server_live() -> bool:
 
 
 def start_server_credentials() -> None:
-    """Before the server starts: keep what a crashed run changed, sweep its files,
+    """Before the server starts: keep what a crashed run changed (when newer),
+    sweep its files (even one not judged: the server must not get a stale one),
     then write a fresh file for each switched-on account."""
     _collect_server_changes()
     _clear_credentials()
@@ -517,9 +593,9 @@ def start_server_credentials() -> None:
 
 
 def stop_server_credentials() -> None:
-    """After the server stops or dies: keep what it changed, then remove its files."""
-    _collect_server_changes()
-    _clear_credentials()
+    """After the server stops or dies: keep what it changed, then remove its files
+    (one whose token can't be read right now waits for the next sweep)."""
+    _clear_credentials(_collect_server_changes())
 
 
 def sync_credentials(accounts: dict[str, dict], *, refresh: tuple[str, ...] = ()) -> None:
@@ -531,8 +607,7 @@ def sync_credentials(accounts: dict[str, dict], *, refresh: tuple[str, ...] = ()
     it isn't running there are no files at all: what a crashed run left is
     folded back and swept."""
     if not _server_live():
-        _collect_server_changes()
-        _clear_credentials()
+        _clear_credentials(_collect_server_changes())
         return
     wanted = {email.lower(): item for email, item in accounts.items() if item.get("workspace")}
     for email, item in wanted.items():
@@ -542,6 +617,9 @@ def sync_credentials(accounts: dict[str, dict], *, refresh: tuple[str, ...] = ()
         for path in CREDENTIALS_DIR.glob("*.json"):
             if path.stem.lower() not in wanted:
                 path.unlink(missing_ok=True)
+        written = _read_written()
+        if set(written) - set(wanted):
+            _save_written({email: value for email, value in written.items() if email in wanted})
 
 
 def enabled_accounts() -> list[str]:
