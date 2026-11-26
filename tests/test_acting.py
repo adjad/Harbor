@@ -582,11 +582,12 @@ def test_the_gates_file_is_protected_from_the_assistants_own_tools(setting, monk
         for cmd in (f"echo x > {target}", "echo x > ~/.moe/act_for_me.json",
                     "sed -i '' s/false/true/ ~/.moe/act_for_me.json", f"mv /tmp/x {target}"):
             assert policy.decide("shell", {"cmd": cmd}, tool="run_shell").tier.name == expected, (full, view, cmd)
-    # config.yaml, where the gate used to live, IS writable without a card under Full access: why it moved.
+    # config.yaml, where the gate used to live, was writable without a card under Full access (why
+    # it moved). Since the 2026-11-25 pentest fix #1 every file in Harbor's own folder asks too.
     monkeypatch.setattr(policy, "_FULL_ACCESS", True)
     monkeypatch.setattr(policy, "_READ_ONLY", False)
     assert policy.decide("fs_write", {"path": str(MOE_DIR / "config.yaml"), "content": "x"},
-                         tool="write_file").tier.name == "ALLOW"
+                         tool="write_file").tier.name == "CONFIRM"
     monkeypatch.undo()
     assert acting._path() == __import__("service.paths", fromlist=["moe_dir"]).moe_dir() / acting.FILE
 

@@ -273,6 +273,8 @@ def test_schedule_tick_is_single_flight_and_waits_for_quiet(isolated, monkeypatc
 
 
 class FakeClient:
+    managed = True          # Harbor's own engine on this Mac (an unknown client stands down)
+
     def __init__(self, loaded, warm=(), *, delay=0.0, content="Mostly school mail", finish="stop", turn=None):
         self.loaded, self.warm = list(loaded), set(warm)
         self.delay, self.content, self.finish, self.turn = delay, content, finish, turn

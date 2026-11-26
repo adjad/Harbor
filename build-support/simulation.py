@@ -77,13 +77,13 @@ def main():
     def gates(build):
         result = native(build)
         for name, sources, contract in (
-            ("assistant-delivery", ["HarborClient.swift", "AgentSend.swift", "AssistantDelivery.swift"], "AssistantDeliveryChecks.swift"),
+            ("assistant-delivery", ["HarborClient.swift", "ResearchExportName.swift", "AgentSend.swift", "AssistantDelivery.swift"], "AssistantDeliveryChecks.swift"),
             ("node-presentation", ["NodePresentation.swift"], "NodePresentationChecks.swift"),
             ("backend-credentials", ["BackendCredentials.swift"], "BackendCredentialChecks.swift"),
             ("backend-recovery", ["BackendCredentials.swift", "BackendManager.swift", "PortGuard.swift", "BackendOwnership.swift", "BackendTrust.swift"], "BackendRecoveryChecks.swift"),
             ("prompt-queue", ["PromptQueue.swift", "AgentSend.swift"], "PromptQueueChecks.swift"),
             ("google-connect", ["GoogleAccountState.swift"], "GoogleConnectChecks.swift"),
-            ("calendar-reader", ["HarborClient.swift", "AgentSend.swift", "AssistantDelivery.swift", "CalendarReader.swift",
+            ("calendar-reader", ["HarborClient.swift", "ResearchExportName.swift", "AgentSend.swift", "AssistantDelivery.swift", "CalendarReader.swift",
                                  "CalendarMove.swift", "RemindersWriter.swift", "ReminderActionLedger.swift"], "CalendarReaderChecks.swift"),
             ("notes-db", ["NotesDBReader.swift"], "NotesDBReaderChecks.swift"),
             ("onboarding", ["Onboarding.swift"], "OnboardingChecks.swift"),
@@ -92,6 +92,7 @@ def main():
             ("voice-capture", ["VoiceCapture.swift", "Math.swift"], "VoiceCaptureChecks.swift"),
             ("read-aloud-voice-ci", ["ReadAloudVoice.swift"], "ReadAloudVoiceChecks.swift"),
             ("study-find-ci", ["StudyFindRules.swift"], "StudyFindChecks.swift"),
+            ("app-bugs-ci", ["AppBugRules.swift", "ResearchExportName.swift"], "AppBugChecks.swift"),
             ("video-sampler", ["VideoSampler.swift"], "VideoSamplerChecks.swift"),
             ("screen-look-ci", ["ScreenLook.swift"], "ScreenLookChecks.swift"),
             ("media-attachment", ["MediaAttachment.swift", "VideoSampler.swift", "DocumentAttachment.swift"],

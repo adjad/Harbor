@@ -43,17 +43,24 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     from .app import create_app
 
+    link_key = ""
     try:
         host = tailscale.resolve_bind_host(args.host)
-        link_key = gateway_link.ensure_secret()
+        # A new key for every run, removed when it ends (service/gateway_link.py).
+        link_key = gateway_link.start_secret()
         app = create_app(state=state_dir(), backend=args.backend, link_key=link_key,
                          model_dirs=[Path(p) for p in args.model], mac_name=_computer_name())
     except (tailscale.BindError, ValueError, StoreError, OSError) as exc:
+        if link_key:
+            gateway_link.end_secret(link_key)
         return _err(str(exc))
     config = uvicorn.Config(app, host=host, port=args.port, log_level="warning", access_log=False,
                             proxy_headers=False, server_header=False, ws="none")
     print(f"Harbor phone gateway listening on http://{host}:{args.port} -> {args.backend}", flush=True)
-    uvicorn.Server(config).run()
+    try:
+        uvicorn.Server(config).run()
+    finally:
+        gateway_link.end_secret(link_key)
     return 0
 
 

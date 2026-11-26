@@ -521,6 +521,15 @@ enum OutboundSender {
         ]
         payload.merge(extra) { current, _ in current }
         req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
-        URLSession.shared.dataTask(with: req).resume()
+        req.timeoutInterval = 10
+        // Checked and retried (swarm #32): a lost post left the service waiting 45 s and
+        // calling a send that went out unconfirmed. Keyed by action_id, so a repeat is safe.
+        Task.detached(priority: .userInitiated) {
+            let delivered = await ResultPost.deliver {
+                let (_, response) = try await URLSession.shared.data(for: req)
+                return (response as? HTTPURLResponse)?.statusCode ?? 0
+            }
+            if !delivered { NSLog("%@", "Harbor outbound: the result for an action couldn't be posted") }
+        }
     }
 }

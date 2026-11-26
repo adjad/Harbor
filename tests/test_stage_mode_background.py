@@ -149,6 +149,8 @@ def test_mail_memory_call_in_flight_is_cancelled_when_demo_mode_turns_on(walk, m
     cancelled = []
 
     class Client:
+        managed = True      # Harbor's own engine on this Mac
+
         async def loaded_models(self):
             return ["fast-model"]
 

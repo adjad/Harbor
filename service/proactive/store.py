@@ -42,18 +42,38 @@ class ProactiveStore:
     # --- files ---------------------------------------------------------------
 
     def _read(self, name: str) -> dict:
+        """The file's contents, cached. A missing file starts empty. A corrupt one is moved
+        aside first (so it is kept, not overwritten). Any other read failure (a transient
+        OSError) is NOT cached: the caller gets an empty dict, the next call retries, and
+        _write refuses to replace the file with that empty dict."""
         with self._lock:
             if name not in self._cache:
+                path = self.base / name
                 try:
-                    data = json.loads((self.base / name).read_text())
-                    self._cache[name] = data if isinstance(data, dict) else {}
-                except (OSError, ValueError):
-                    self._cache[name] = {}
+                    data = json.loads(path.read_text())
+                except FileNotFoundError:
+                    data = {}
+                except ValueError:
+                    data = None
+                except OSError:
+                    traceback.print_exc()
+                    return {}
+                if not isinstance(data, dict):
+                    try:
+                        path.replace(path.with_name(f"{path.name}.corrupt-{int(time.time())}"))
+                    except OSError:
+                        traceback.print_exc()
+                        return {}
+                    data = {}
+                self._cache[name] = data
             return self._cache[name]
 
     def _write(self, name: str) -> None:
         with self._lock:
             data = self._read(name)
+            if name not in self._cache:
+                print(f"proactive store: {name} could not be read; not overwriting it")
+                return
             try:
                 self.base.mkdir(mode=0o700, parents=True, exist_ok=True)
                 path = self.base / name

@@ -161,23 +161,68 @@ def _entry() -> dict:
     return entry if isinstance(entry, dict) else {}
 
 
+_warm_task: asyncio.Task | None = None
+WARM_TIMEOUT_S = 300
+
+
+async def _stop_proc(proc) -> None:
+    if proc is not None and proc.returncode is None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.shield(proc.wait())
+        except Exception:  # noqa: BLE001
+            pass
+
+
 async def _warm(uvx: str) -> None:
     """The first run of the pinned server downloads its packages, longer than the
     MCP client's 20s handshake budget, so fetch them before it is started."""
     _prepare.update(state="preparing", detail="Downloading the Google Workspace server…")
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             uvx, *_SERVER_ARGS, "--help", env=uv_process_env(),
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
-        _, err = await asyncio.wait_for(proc.communicate(), 300)
+        try:
+            _, err = await asyncio.wait_for(proc.communicate(), WARM_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            # Without the kill the download runs on, and a Retry starts a second one.
+            raise RuntimeError(f"the download took longer than {WARM_TIMEOUT_S // 60} minutes") from None
         if proc.returncode:
             raise RuntimeError(err.decode(errors="replace").strip().splitlines()[-1][:200]
                                if err.strip() else f"exit {proc.returncode}")
-        _prepare.update(state="ready", detail="")
+    except asyncio.CancelledError:
+        await _stop_proc(proc)
+        raise
     except Exception as exc:  # noqa: BLE001
+        await _stop_proc(proc)
         _prepare.update(state="failed", detail=f"Couldn't fetch workspace-mcp: {exc}"[:240])
         return
-    await manager.reload()
+    try:
+        await manager.reload()
+    except Exception as exc:  # noqa: BLE001
+        _prepare.update(state="failed", detail=f"Couldn't start workspace-mcp: {exc}"[:240])
+        return
+    _prepare.update(state="ready", detail="")
+
+
+def _start_warm(uvx: str) -> None:
+    """One warm-up at a time, kept referenced so it can't be collected mid-run; a newer
+    configuration replaces a run still going."""
+    global _warm_task
+    if _warm_task is not None and not _warm_task.done():
+        _warm_task.cancel()
+    _warm_task = asyncio.create_task(_warm(uvx))
+
+
+def _cancel_warm() -> None:
+    global _warm_task
+    if _warm_task is not None and not _warm_task.done():
+        _warm_task.cancel()
+    _warm_task = None
 
 
 async def enable(client_id: str, client_secret: str, email: str, tier: str = "core",
@@ -208,11 +253,12 @@ async def enable(client_id: str, client_secret: str, email: str, tier: str = "co
                        "trusted_read_only": TRUSTED_READ_ONLY}
     data["servers"] = servers
     _write_file(data)
-    asyncio.create_task(_warm(uvx))
+    _start_warm(uvx)
     return {"ok": True, "state": "preparing"}
 
 
 async def disable() -> dict:
+    _cancel_warm()
     data = _read_file()
     if isinstance(data.get("servers"), dict) and SERVER in data["servers"]:
         del data["servers"][SERVER]

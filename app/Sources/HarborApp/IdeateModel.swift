@@ -255,10 +255,16 @@ final class IdeateModel: ObservableObject {
         message = nil
         failure = nil
         guard networking else { return }
+        let previous = status
         status = .starting
         Task {
-            switch await call("POST", "projects/\(id)/message", body: ["text": text]) {
-            case .refused(let why): status = .done; message = why
+            let reply = await call("POST", "projects/\(id)/message", body: ["text": text])
+            // Another project was opened meanwhile: this reply says nothing about it.
+            guard IdeateReply.applies(sentFor: id, open: current?.id) else { return }
+            switch reply {
+            case .refused(let why):
+                status = IdeatePoll.afterRefusedStart(previous: previous)
+                message = why
             case .ok(let json): apply((json["project"] as? [String: Any]) ?? json); ensurePolling()
             }
         }
@@ -268,7 +274,8 @@ final class IdeateModel: ObservableObject {
         guard let id = current?.id, status.isActive, networking else { return }
         Task {
             switch await call("POST", "projects/\(id)/cancel", body: [:]) {
-            case .refused(let why): message = why
+            case .refused(let why):
+                if IdeateReply.applies(sentFor: id, open: current?.id) { message = why }
             case .ok: await poll(id)
             }
         }
@@ -279,7 +286,9 @@ final class IdeateModel: ObservableObject {
         approvals.removeAll { $0.id == approvalId }
         Task {
             switch await call("POST", "projects/\(id)/approvals/\(approvalId)", body: ["allow": allow]) {
-            case .refused(let why): message = why; await poll(id)
+            case .refused(let why):
+                guard IdeateReply.applies(sentFor: id, open: current?.id) else { return }
+                message = why; await poll(id)
             case .ok: await poll(id); ensurePolling()
             }
         }

@@ -16,6 +16,7 @@ import asyncio
 from copy import deepcopy
 import math
 import json
+import logging
 import time
 from datetime import date, datetime
 
@@ -24,6 +25,8 @@ from service import idle
 from service.assistant.store import assistant_store
 from service.assistant.reminders import due_reminders
 from service.assistant.hub import hub
+
+log = logging.getLogger(__name__)
 
 # Legacy completion date, read only for migration compatibility. New receipts
 # and completion dates are committed together in AssistantStore. It lives on
@@ -215,8 +218,8 @@ async def run() -> None:
         except Exception:  # noqa: BLE001 — never break the loop
             pass
         try:
-            await _fire_scheduled_sends()
-        except Exception:  # noqa: BLE001
+            _start_scheduled_sends()         # background, single-flight: a hung send app
+        except Exception:  # noqa: BLE001  # never holds up the rest of this tick
             pass
         # Codex task monitoring is a read-only local poll. It establishes a
         # baseline on first use, then publishes only terminal transitions or a
@@ -341,6 +344,29 @@ async def _checkin_tick(now: float | None = None) -> None:
                        "open_tasks": len(card["tasks"]), "events_tomorrow": len(card["tomorrow"]["events"])},
                       dedupe_key=f"checkin:{day}", target={"type": "checkin", "date": day})
     checkin.mark_notified(day, now=now)
+
+
+_sends_task: asyncio.Task | None = None
+
+
+def _start_scheduled_sends() -> asyncio.Task | None:
+    """Run this tick's scheduled sends in the background unless the last pass is still
+    going. Each send can wait up to the app request's timeout (45 s) on a hung Mail or
+    Messages; awaited inline, the Codex poll and the next tick's reminders waited too.
+    The pass itself stays serial: two sends to one person keep their order, and a pass
+    stops as soon as the app is gone."""
+    global _sends_task
+    if _sends_task is not None and not _sends_task.done():
+        return None
+    _sends_task = asyncio.get_running_loop().create_task(_fire_scheduled_sends_quietly())
+    return _sends_task
+
+
+async def _fire_scheduled_sends_quietly() -> None:
+    try:
+        await _fire_scheduled_sends()
+    except Exception:  # noqa: BLE001 — the next tick tries again
+        log.debug("scheduled sends pass failed", exc_info=True)
 
 
 async def _fire_scheduled_sends() -> None:

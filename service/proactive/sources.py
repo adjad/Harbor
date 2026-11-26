@@ -180,22 +180,29 @@ def answered_by_sent(sent: list[dict], *, account: str, subject: str, message_id
                      sender: str = "") -> bool:
     """The user sent mail in this thread after its last incoming message: a
     reply to that exact message, one in the same account under the same
-    subject ("Re: …" included), or, for a row with no reply header (Apple Mail's
-    Sent list, whose account is Mail's own id), one under the same subject to the
-    person who wrote the message."""
+    subject ("Re: …" included) that went to the person who wrote, or, for a row
+    with no reply header (Apple Mail's Sent list, whose account is Mail's own
+    id), one under the same subject to the person who wrote the message."""
     want = bare_subject(subject).casefold()
     account = str(account or "").casefold()
     sender = str(sender or "").strip().casefold()
     for row in sent:
         if float(row.get("ts") or 0) <= after:
             continue
-        in_reply_to = str(row.get("in_reply_to") or "").strip()
-        if message_id and in_reply_to == message_id.strip():
+        # Ids as _message_key reads them: Mail.app copies a Message-ID without its
+        # angle brackets, Gmail keeps them, and case is not meaningful.
+        in_reply_to = str(row.get("in_reply_to") or "").strip().strip("<>").casefold()
+        if message_id and in_reply_to == str(message_id).strip().strip("<>").casefold():
             return True
         if want and str(row.get("account") or "").casefold() == account \
                 and bare_subject(row.get("subject") or "").casefold() == want:
-            return True
-        if want and sender and not in_reply_to and row.get("to") \
+            # The subject alone is no proof: it must have gone to the person who wrote.
+            from service.proactive import sent_check
+            if sender and any(address == sender for _name, address in sent_check.recipients(row.get("to"))):
+                return True
+        # Any account (a Gmail web or phone reply to a thread Mail.app copied, whose
+        # account is Mail's own name), with or without a reply header of its own.
+        if want and sender and row.get("to") \
                 and bare_subject(row.get("subject") or "").casefold() == want:
             from service.proactive import sent_check
             if any(address == sender for _name, address in sent_check.recipients(row.get("to"))):
@@ -255,6 +262,70 @@ def _message_key(row: dict) -> str:
     return str(row.get("message_id") or "").strip().strip("<>").casefold()
 
 
+def _participants(row: dict, mine) -> set[str]:
+    """The people on a message other than the user: its sender, and everyone it
+    went to or copied. Addresses, casefolded."""
+    from service.proactive import sent_check
+    mine = {str(m).casefold() for m in (mine or ())}
+    people = set()
+    if odd_sender(row):
+        return people                     # a dressed-up sender can't say whose conversation it is
+    if not _is_mine(row, mine):
+        address = _address(row)
+        if address:
+            people.add(address.casefold())
+    for field in ("to", "cc"):
+        people.update(a for _n, a in sent_check.recipients(row.get(field)) if a not in mine)
+    return people
+
+
+def split_threads(messages: list[dict], mine) -> list[list[dict]]:
+    """One subject's messages as separate conversations: two messages belong
+    together when one replies to the other (In-Reply-To or References name its
+    Message-ID) or they share a person besides the user. A message with no one
+    to go by (the user's own row with no recipients, a dressed-up sender) joins
+    the conversation next to it: the one before, or for the first, the one after.
+    Order is kept within each."""
+    parent = list(range(len(messages)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def join(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    by_person: dict[str, int] = {}
+    by_id: dict[str, int] = {}
+    for i, row in enumerate(messages):
+        key = _message_key(row)
+        if key:
+            by_id.setdefault(key, i)
+    for i, row in enumerate(messages):
+        links = [str(row.get("in_reply_to") or "")] + str(row.get("references") or "").split()
+        for link in links:
+            j = by_id.get(link.strip().strip("<>").casefold())
+            if j is not None:
+                join(i, j)
+        people = _participants(row, mine)
+        if not people and not any(by_id.get(l.strip().strip("<>").casefold()) is not None for l in links) \
+                and len(messages) > 1:
+            join(i, i - 1 if i else 1)
+        for person in people:
+            if person in by_person:
+                join(i, by_person[person])
+            else:
+                by_person[person] = i
+    groups: dict[int, list[dict]] = {}
+    for i, row in enumerate(messages):
+        groups.setdefault(find(i), []).append(row)
+    return [groups[k] for k in sorted(groups)]
+
+
 def dedupe_copies(rows: list[dict], linked: set[str]) -> list[dict]:
     """One row per message. The same email often arrives twice — through a
     Google-linked account (read-only) and through Mail.app — so a Mail.app copy
@@ -305,17 +376,38 @@ def mail_rows(now: float, linked: set[str] | None = None) -> list[dict]:
     return dedupe_copies(rows, linked)
 
 
-def _sent_to_list(row: dict) -> bool:
-    """Addressed to a list or undisclosed recipients, not to the user."""
-    to = str(row.get("to") or "").casefold()
-    if not to:
-        return False
+def user_addresses() -> set[str]:
+    """Every address the user receives at: Mail's account addresses (which carry
+    each account's aliases), the Google-linked accounts, and the accounts their
+    sent mail went out from (send-as addresses)."""
+    mine: set[str] = set()
     try:
         from service.memory.identity import user_emails
-        mine = [e.casefold() for e in user_emails()]
+        mine |= {e.casefold() for e in user_emails()}
     except Exception:  # noqa: BLE001
+        pass
+    mine |= gmail_accounts()
+    try:
+        for row in sent_rows() + cached_native_sent():
+            for field in ("account", "from", "sender_address"):
+                value = str(row.get(field) or "").strip().casefold()
+                if "@" in value and " " not in value:
+                    mine.add(value.strip("<>"))
+    except Exception:  # noqa: BLE001
+        pass
+    return {m for m in mine if m}
+
+
+def _sent_to_list(row: dict) -> bool:
+    """Addressed to a list or undisclosed recipients, not to the user: the user
+    is in neither To nor Cc. Only when Cc is known (a row from a reader that
+    doesn't carry it can't tell a copied person from a list)."""
+    to = str(row.get("to") or "").casefold()
+    if not to or "cc" not in row:
         return False
-    return bool(mine) and not any(m in to for m in mine)
+    mine = user_addresses()
+    addressed = to + " " + str(row.get("cc") or "").casefold()
+    return bool(mine) and not any(m in addressed for m in mine)
 
 
 def bulk_mail(row: dict) -> bool:
@@ -324,13 +416,18 @@ def bulk_mail(row: dict) -> bool:
     from service.assistant.mail_gists import is_mass_mail
     from service.tools.email_tools import is_machine_sender
     from service.proactive.guard import bulk_sender
+    from service.assistant.daily_workspace import _QUOTED_HISTORY
     name = display_name(row.get("sender"), _address(row))
-    body = str(row.get("body") or "")
-    return (not_a_need(row) or is_mass_mail(row) or is_machine_sender(f"{row.get('sender', '')} {_address(row)}")
-            or _sent_to_list(row) or bool(re.match(r"\s*(?:(?:re|fwd?):\s*)*\[[^\]]{2,40}\]", str(row.get("subject") or ""), re.I))
-            or bulk_sender(name, _address(row))
-            or bool(re.search(r"\bunsubscribe\b|manage (?:your )?(?:email )?preferences|"
-                              r"view (?:this email )?in (?:your )?browser|you(?:'|’)re receiving this", body, re.I)))
+    machine = is_machine_sender(f"{row.get('sender', '')} {_address(row)}") or bulk_sender(name, _address(row))
+    # A footer counts only in the message's own words: a person's reply that
+    # quotes a newsletter ("Count me in!" above its "Unsubscribe") is not bulk.
+    own = _QUOTED_HISTORY.split(str(row.get("body") or ""))[0]
+    footer = bool(re.search(r"\bunsubscribe\b|manage (?:your )?(?:email )?preferences|"
+                            r"view (?:this email )?in (?:your )?browser|you(?:'|’)re receiving this", own, re.I))
+    # A [tag] subject is no mark of a list on its own: people write "[URGENT] need
+    # your signature" and "Re: [Draft] paper intro". A list's tag comes from a
+    # machine-like sender, which `machine` already counts.
+    return not_a_need(row) or is_mass_mail(row) or machine or _sent_to_list(row) or footer
 
 
 def _deadline(row: dict) -> bool:
@@ -501,12 +598,109 @@ def shown_title(subject: str, who: str, *, school: bool = False) -> str:
     return text
 
 
-def _excerpt(row: dict) -> str:
+MAX_FORWARD = 400          # a forwarded message's own body, under its own cap
+_FORWARD_MARK = re.compile(r"(?im)^[ \t]*+(?:-{2,}+ *Forwarded message *-{2,}+|Begin forwarded message:)[ \t\r]*$")
+_QUOTE_LINE = re.compile(r"^[ \t]*+(?:>|&gt;)")
+_ATTRIBUTION = re.compile(r"(?i)^\s*(?:on|am|le|el)\b[^\n]{0,400}\b(?:wrote|schrieb|a écrit|escribió)\s*:?\s*$")
+_FORWARD_HEADER = re.compile(r"(?i)^\s*\*{0,2}(?:from|date|sent|to|cc|subject)\s*:")
+
+
+def own_words(body: str) -> tuple[str, bool]:
+    """(the message's own words, whether more than the top of the body was kept).
+
+    The top of the body, above its quoted history, as before. Two more:
+    - an inline reply ("> question" then the answer, in turns) whose top is only
+      a greeting keeps every line that isn't quoted;
+    - a forward keeps the forwarded message's body under MAX_FORWARD, after the
+      sender's own note, marked as forwarded.
+    Recovered words are not the sender's newest words at a known time, so the
+    caller never acts on them without a tap (body_ts)."""
     from service.assistant.daily_workspace import _QUOTED_HISTORY
-    from service.tools.imessage_tools import redact_summary_codes
-    body = _QUOTED_HISTORY.split(str(row.get("body") or ""))[0]
-    text = clean(redact_summary_codes(body), 4000)
-    return text[:MAX_EXCERPT].rsplit(" ", 1)[0] + "…" if len(text) > MAX_EXCERPT else text
+    body = str(body or "")
+    top = _QUOTED_HISTORY.split(body)[0]
+    recovered = False
+    cut = _FORWARD_MARK.search(body)
+    scope = (body[:cut.start()] if cut else body).splitlines()
+    quoted = [i for i, line in enumerate(scope) if _QUOTE_LINE.match(line)]
+    # Inline only when the sender answers BELOW a quoted line; a top-post with
+    # its history quoted underneath keeps just its top.
+    below = [line for line in scope[quoted[0] + 1:] if line.strip() and not _QUOTE_LINE.match(line)] if quoted else []
+    if len(top.strip()) < 40 and below:
+        answers = [line for line in scope[:quoted[0]] if line.strip() and not _ATTRIBUTION.match(line)
+                   and not _HISTORY_HINT.search(line)] + [line for line in below if not _ATTRIBUTION.match(line)]
+        joined = "\n".join(answers).strip()
+        if len(joined) > len(top.strip()):
+            top, recovered = joined, True
+    forward = _FORWARD_MARK.search(body)
+    if forward:
+        rest = body[forward.end():].splitlines()
+        while rest and (not rest[0].strip() or _FORWARD_HEADER.match(rest[0])):
+            rest.pop(0)
+        inner = clean("\n".join(line for line in rest if not _QUOTE_LINE.match(line)), MAX_FORWARD * 2)
+        if inner:
+            inner = inner[:MAX_FORWARD].rsplit(" ", 1)[0] + "…" if len(inner) > MAX_FORWARD else inner
+            top = (top.strip() + "\n" if top.strip() else "") + "[Forwarded] " + inner
+            recovered = True
+    return top, recovered
+
+
+def _bounded(text: str, limit: int) -> str:
+    """`text` within `limit`, keeping its start and its end: a question in the last
+    paragraph is the ask, so a long body is never cut from the end alone."""
+    if len(text) <= limit:
+        return text
+    tail_room = limit // 3
+    head = text[:limit - tail_room - 3].rsplit(" ", 1)[0]
+    tail = text[-tail_room:]
+    tail = tail.split(" ", 1)[1] if " " in tail else tail
+    return head + " … " + tail
+
+
+def reading_on_device() -> bool:
+    """True only when the Brief's model calls (triage, the judge, drafts: the
+    fast role, cycle.resident_reply) run on Harbor's own engine on this Mac.
+    Only then do items carry text with just secret values masked; otherwise
+    (a remote-only profile, "Everything", a non-local endpoint, or any doubt)
+    they keep the strict redaction the cloud always got. Fails closed."""
+    try:
+        from service.config.endpoints import role_target
+        from service.inference.remote_policy import remote_only_profile
+        if remote_only_profile() is not None:
+            return False
+        target = role_target("fast")
+        return bool(target.endpoint.managed and target.endpoint.name == "local")
+    except Exception:  # noqa: BLE001 — unknown routing reads as off this Mac
+        return False
+
+
+def _excerpt(row: dict, *, strict: bool = True) -> str:
+    """The message's own words (own_words), bounded at both ends. `strict` (what
+    is shown: quotes) uses the display redaction; the on-device reading (item
+    text for triage, the judge and drafts) masks only secret values
+    (imessage_tools.redact_secret_values)."""
+    from service.tools.imessage_tools import redact_secret_values, redact_summary_codes
+    body, _recovered = own_words(str(row.get("body") or ""))
+    text = clean((redact_summary_codes if strict else redact_secret_values)(body), 4000)
+    return _bounded(text, MAX_EXCERPT)
+
+
+def fit_newest(head: str, blocks: list[str], limit: int) -> tuple[str, int]:
+    """(text, first kept block index): `head` and as many of the NEWEST blocks as
+    fit in `limit`, oldest dropped whole. The newest is always kept, held to the
+    room left at both its ends. Never a slice of the joined string from the end."""
+    kept = len(blocks)
+    while kept > 1 and len(head) + sum(len(b) + 1 for b in blocks[-kept:]) > limit:
+        kept -= 1
+    first = len(blocks) - kept
+    shown = list(blocks[first:])
+    if shown and len(head) + sum(len(b) + 1 for b in shown) > limit:
+        room = max(40, limit - len(head) - sum(len(b) + 1 for b in shown[:-1]) - 1)
+        header, _, body = shown[-1].partition(":\n")
+        if body:
+            shown[-1] = header + ":\n" + _bounded(body, max(20, room - len(header) - 2))
+        else:
+            shown[-1] = _bounded(shown[-1], room)
+    return head + "\n".join(shown), first
 
 
 def _sentences(text: str) -> list[str]:
@@ -601,10 +795,14 @@ def _body_timing(messages: list[dict], newest: dict | None) -> dict:
 
 def mail_items(rows: list[dict], *, mine: set[str], now: float, tz: str,
                linked: set[str] | None = None, own: str | None = None,
-               counts: dict | None = None, sent: list[dict] | None = None) -> list[dict]:
+               counts: dict | None = None, sent: list[dict] | None = None,
+               on_device: bool | None = None) -> list[dict]:
     """One item per thread (account + bare subject), newest first. Threads made
     only of mass mail, or only of the user's own mail, are left out. `sent`
-    (the user's own sent mail, sent_rows) marks a thread answered elsewhere."""
+    (the user's own sent mail, sent_rows) marks a thread answered elsewhere.
+    `on_device` (reading_on_device() by default): False keeps item text strictly
+    redacted, for a model off this Mac."""
+    on_device = reading_on_device() if on_device is None else on_device
     from service.assistant.daily_workspace import display_name, mass_mail_filter
     from service.proactive.triage import raw_secret
     from service.tools.email_tools import critical_account_mail, critical_mail_title
@@ -624,7 +822,16 @@ def mail_items(rows: list[dict], *, mine: set[str], now: float, tz: str,
                             bare_subject(subject).casefold()), []).append(row)
     zone = ZoneInfo(tz)
     items = []
+    # Different people writing under one subject ("Question", "Hello") are
+    # different conversations: a reply to one never answers the other.
+    split = []
     for (bucket, account, thread_subject), messages in threads.items():
+        parts = split_threads(messages, mine)
+        for part in parts:
+            # The first conversation keeps the subject's id; another is told apart by its people.
+            tag = "" if part is parts[0] else "|" + ",".join(sorted(set().union(*(_participants(m, mine) for m in part))))
+            split.append(((bucket, account, thread_subject), tag, part))
+    for (bucket, account, thread_subject), split_tag, messages in split:
         incoming = [m for m in messages if not _is_mine(m, mine)]
         if not incoming:
             continue
@@ -670,8 +877,8 @@ def mail_items(rows: list[dict], *, mine: set[str], now: float, tz: str,
         secret = any(raw_secret(f"{m.get('subject') or ''}\n{m.get('body') or ''}") for m in messages[-3:])
         # A withheld subject is keyed by the raw thread subject, so two threads
         # whose subjects redact alike stay separate items.
-        item_id = "mail:" + _digest(account, bare_subject(raw_subject).casefold() if subject == raw_subject
-                                    else "withheld:" + thread_subject)
+        item_id = "mail:" + _digest(account, (bare_subject(raw_subject).casefold() if subject == raw_subject
+                                     else "withheld:" + thread_subject) + split_tag)
         ref = {"kind": "email", "message_id": str(last_in.get("message_id") or ""), "account": account,
                "account_id": str(last_in.get("account_id") or ""), "to": _address(last_in),
                "subject": raw_subject, "has_body": bool(last_in.get("body"))}
@@ -683,7 +890,7 @@ def mail_items(rows: list[dict], *, mine: set[str], now: float, tz: str,
             text = f"Subject: {title}"
             # Keyed by the raw thread subject: alerts whose subjects redact to the
             # same stand-in ("Private details omitted.") stay separate items.
-            items.append(dict(id="mail:" + _digest(account, "critical", thread_subject), source="mail",
+            items.append(dict(id="mail:" + _digest(account, "critical", thread_subject + split_tag), source="mail",
                               account=bucket, raw_account=account, who=who, title=title, text=text, lines=[], received_ts=float(last_in["ts"]),
                               replied=replied, ref=ref, reply_ref=reply_ref_for_row(last_in),
                               unread=last_in.get("unread"), person=False, critical=True, secret=secret,
@@ -702,9 +909,9 @@ def mail_items(rows: list[dict], *, mine: set[str], now: float, tz: str,
                               entries=[{k: e[k] for k in ("name", "due_phrase")} for e in entries[:8]],
                               hash=_digest(text, replied)))
             continue
-        blocks, quotes = [], [subject]
+        blocks, quotes, block_rows = [], [subject], []
         head = f"Subject: {subject}\n"
-        offset, shown_in = len(head), []          # incoming messages whose block header survives the cap
+        recovered_rows = set()
         for message in messages[-3:]:
             from_user = _is_mine(message, mine)
             speaker = "You (the user)" if from_user else shown_sender(message)
@@ -712,16 +919,24 @@ def mail_items(rows: list[dict], *, mine: set[str], now: float, tz: str,
                 speaker = _DOC_APP.sub("", speaker).strip() or speaker
             stamp = datetime.fromtimestamp(message["ts"], zone).strftime("%a %b %-d %-I:%M %p")
             excerpt = _excerpt(message) if message.get("body") else ""
+            # What the on-device model reads: only secret values masked.
+            reading = _excerpt(message, strict=not on_device) if message.get("body") else ""
+            if message.get("body") and own_words(str(message.get("body") or ""))[1]:
+                recovered_rows.add(id(message))
             header = f"From {speaker} · {stamp}:\n"
-            blocks.append(header + (excerpt or "(subject only)"))
-            if not from_user and offset + len(header) <= MAX_ITEM_CHARS:
-                shown_in.append(message)
-            offset += len(blocks[-1]) + 1
+            blocks.append(header + (reading or "(subject only)"))
+            block_rows.append(message)
             if not from_user and excerpt:
                 quotes.extend(_sentences(excerpt))
-        text = head + "\n".join(blocks)
-        text = text[:MAX_ITEM_CHARS]
+        # The newest message is the one being answered: oldest blocks go first.
+        text, first = fit_newest(head, blocks, MAX_ITEM_CHARS)
+        shown_in = [m for m in block_rows[first:] if not _is_mine(m, mine)]
         timing = _body_timing(messages, shown_in[-1] if shown_in else None)
+        if shown_in and id(shown_in[-1]) in recovered_rows:
+            # Its words in the text include an inline reply's turns or a forward:
+            # not the sender's newest words at a known time, so nothing acts on
+            # them without a tap.
+            timing["body_ts"] = None
         timing["mail_blocks_in"] = len(shown_in)
         # A doc comment came from Google's no-reply address: nothing to answer by email.
         reply_ref = None if reason == "doc_comment" else reply_ref_for_row(last_in)
@@ -748,14 +963,21 @@ def mail_items(rows: list[dict], *, mine: set[str], now: float, tz: str,
                           user_wrote=any(_is_mine(m, mine) for m in messages),
                           **({"recall": reason} if reason else {}),
                           hash=_digest(text, replied)))
-    items.sort(key=lambda i: i["received_ts"], reverse=True)
     # The cap is per account: a busy linked inbox never pushes out the owner's mail.
+    # Open threads are kept before answered ones, so twenty answered threads never
+    # push out the one still waiting; what is kept is listed newest first.
     kept, per = [], {}
-    for item in items:
+    for item in sorted(items, key=_cap_rank):
         per[item["account"]] = per.get(item["account"], 0) + 1
         if per[item["account"]] <= MAX_MAIL_THREADS:
             kept.append(item)
+    kept.sort(key=lambda i: i["received_ts"], reverse=True)
     return kept
+
+
+def _cap_rank(item: dict) -> tuple:
+    """Which items a cap keeps first: unanswered, then unread, then newest."""
+    return (bool(item.get("replied")), item.get("unread") is not True, -float(item.get("received_ts") or 0))
 
 
 # --- texts ----------------------------------------------------------------------
@@ -911,13 +1133,21 @@ def _raw_secret(text: str) -> bool:
 
 
 def text_items(records: list[tuple], *, now: float, own: str | None = None,
-               counts: dict | None = None) -> list[dict]:
+               counts: dict | None = None, acknowledged: dict[str, float] | None = None,
+               on_device: bool | None = None) -> list[dict]:
     """One item per conversation active in the last few days: its latest lines,
     rendered sender-first so the model can't credit the user's words to the
-    other person."""
-    from service.tools.imessage_tools import redact_summary_codes
+    other person. `acknowledged` (chat GUID -> the user's newest tapback there,
+    imessage_tools.acknowledged_chats by default) counts a reaction after the
+    last incoming line as the user's answer."""
+    from service.tools.imessage_tools import redact_secret_values, redact_summary_codes
+    # Off this Mac (reading_on_device), the model reads the strict lines too.
+    on_device = reading_on_device() if on_device is None else on_device
+    lighter = redact_secret_values if on_device else redact_summary_codes
     own = own_account() if own is None else own
     conversations: dict[str, list[tuple[float, str, str]]] = {}
+    # The same lines for the on-device model: only secret values masked.
+    reading: dict[str, list[tuple[float, str, str]]] = {}
     chats: dict[str, set[str]] = {}
     services: dict[str, set[str]] = {}       # every in-window line's delivery service ("" = not known)
     origins: dict[str, list[tuple[str, str, str]]] = {}  # (chat guid, service, sender handle) per in-window row
@@ -932,6 +1162,7 @@ def text_items(records: list[tuple], *, now: float, own: str | None = None,
             ever_sent.add(context)
         if now - TEXT_WINDOW_S <= ts <= now + 300:
             conversations.setdefault(context, []).append((ts, context, redact_summary_codes(text)))
+            reading.setdefault(context, []).append((ts, context, lighter(text)))
             raw_texts.setdefault(context, []).append((ts, context, text))
             if guid:
                 chats.setdefault(context, set()).add(guid)
@@ -954,6 +1185,7 @@ def text_items(records: list[tuple], *, now: float, own: str | None = None,
                 tally(counts, own, filtered=1)
             continue
         row_origins = origins.get(context, [])[-MAX_TEXT_LINES:]
+        read_rows = reading.get(context, rows)[-MAX_TEXT_LINES:]
         rows = rows[-MAX_TEXT_LINES:]
         incoming = [(r, o) for r, o in zip(rows, row_origins) if r[2].partition(":")[0].strip() != "Me"]
         incoming_origins = [o for _, o in incoming]
@@ -963,8 +1195,18 @@ def text_items(records: list[tuple], *, now: float, own: str | None = None,
         group = context.startswith("Group ")
         label = clean(context[len("Group "):].strip().strip('"') if group else _pretty_number(context), 60)
         replied = rows[-1][2].partition(":")[0].strip() == "Me"
-        rendered = _render(rows)
-        text = ("Conversation: " + label + (" (group)" if group else "") + "\n" + "\n".join(rendered))[:MAX_ITEM_CHARS]
+        if not replied:
+            if acknowledged is None:
+                from service.tools.imessage_tools import acknowledged_chats
+                acknowledged = acknowledged_chats()
+            # A tapback from the user after the last incoming line answers it.
+            reacted = max((acknowledged.get(g, float("-inf")) for g in chats.get(context, set()) if isinstance(g, str)),
+                          default=float("-inf"))
+            replied = reacted >= incoming[-1][0]
+        rendered = _render(read_rows)
+        # The newest lines are kept; the oldest go first.
+        text, _first = fit_newest("Conversation: " + label + (" (group)" if group else "") + "\n", rendered,
+                                  MAX_ITEM_CHARS)
         # line_ts: when each quoted line itself arrived, one per entry of `lines`. An item's
         # received_ts is only its NEWEST line; a rule about when something arrived (acting.allows)
         # must use the time of the line it is reading, never the conversation's latest.
@@ -1013,8 +1255,11 @@ def text_items(records: list[tuple], *, now: float, own: str | None = None,
                           secret=_raw_secret("\n".join(r[2] for r in raw_texts.get(context, [])[-MAX_TEXT_LINES:])),
                           ref={"kind": "text", "conversation": context, "label": label},
                           reply_ref="messages:" + context, hash=_digest(text, replied)))
-    items.sort(key=lambda i: i["received_ts"], reverse=True)
-    return items[:MAX_CONVERSATIONS]
+    # Unanswered conversations are kept before answered ones (an unanswered
+    # three-day-old ask outranks twenty chats the user already replied to).
+    kept = sorted(items, key=_cap_rank)[:MAX_CONVERSATIONS]
+    kept.sort(key=lambda i: i["received_ts"], reverse=True)
+    return kept
 
 
 # --- notes ------------------------------------------------------------------------
@@ -1114,7 +1359,30 @@ def schedule(store, now: float, tz: str, *, own: str | None = None, linked: set[
                                   all_day=False, source="reminders", account=own))
     calendar.sort(key=lambda r: r["when_ts"])
     past.sort(key=lambda r: r["when_ts"], reverse=True)
-    return {"calendar": calendar, "reminders": reminders, "past_calendar": past}
+    return {"calendar": calendar, "reminders": reminders, "past_calendar": past,
+            "ongoing": _ongoing(store, now, start, hidden, linked=linked, own=own)}
+
+
+def _ongoing(store, now: float, start: float, hidden: set, *, linked, own: str) -> list[dict]:
+    """Today's events that already started and haven't ended (a conference that
+    began yesterday, a meeting in progress), each with its end_ts. For the
+    Brief's summary sentence only: never to-dos or cards."""
+    try:
+        rows = store.calendar_events_overlapping(start, start + 86400)
+    except Exception:  # noqa: BLE001 — no end times: nothing is known to be on now
+        return []
+    out = []
+    for row in rows:
+        end = row.get("end_ts")
+        if (row.get("id") in hidden or not _finite(row.get("when_ts")) or not _finite(end)
+                or not float(row["when_ts"]) <= now < float(end)):
+            continue
+        title = clean(row.get("title"), 200)
+        if title:
+            out.append(dict(id=str(row["id"]), title=title, when_ts=float(row["when_ts"]), end_ts=float(end),
+                            all_day=bool(row.get("all_day")), source="calendar",
+                            account=calendar_account(row, linked=linked, own=own)))
+    return out
 
 
 # --- everything -------------------------------------------------------------------

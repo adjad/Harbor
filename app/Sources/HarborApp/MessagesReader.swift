@@ -19,6 +19,39 @@ final class MessagesReader {
         let attempted: Int
         let skipped: Int
         let truncated: Int
+        /// The user's own newest tapback per chat (chat GUID -> Unix seconds): a
+        /// reaction answers the chat (the Brief stops asking for a reply), but it
+        /// is never a line of the conversation.
+        var acknowledged: [String: Double] = [:]
+    }
+
+    /// Tapback types Messages stores for an added reaction (love, like, dislike,
+    /// laugh, emphasis, question); 3000-3005 are their removals.
+    static let tapbackTypes = 2000...2005
+
+    /// The newest tapback the user added in each chat since `cutoffNs`, or none
+    /// when the store has no chat GUID column. Read-only, like every read here.
+    func readOwnTapbacks(_ db: OpaquePointer?, cutoffNs: Int64) -> [String: Double] {
+        guard hasColumn(db, table: "chat", name: "guid") else { return [:] }
+        let sql = """
+        SELECT c.guid, MAX(m.date) FROM message m
+        JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
+        JOIN chat c ON cmj.chat_id = c.ROWID
+        WHERE m.is_from_me = 1 AND m.associated_message_type BETWEEN \(Self.tapbackTypes.lowerBound) AND \(Self.tapbackTypes.upperBound)
+          AND m.date > \(cutoffNs)
+        GROUP BY c.guid
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [:] }
+        defer { sqlite3_finalize(stmt) }
+        var out: [String: Double] = [:]
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            guard let guid = columnText(stmt, 0), !guid.isEmpty else { continue }
+            let dateNs = sqlite3_column_int64(stmt, 1)
+            guard dateNs > 0 else { continue }
+            out[guid] = Double(dateNs) / 1_000_000_000 + Self.appleEpochOffset
+        }
+        return out
     }
 
     private struct DecodedBody {
@@ -102,7 +135,12 @@ final class MessagesReader {
                 "window_days": 365, "row_limit": 20000,
                 "reached_row_limit": scan.attempted == 20000,
             ]
-            let structured = [Self.wire(coverage)] + scan.structured
+            // Right after coverage: the user's own tapbacks per chat (never lines).
+            let acknowledged = scan.acknowledged.isEmpty ? [] : [Self.wire([
+                "version": 1, "kind": "acknowledged",
+                "chats": scan.acknowledged.sorted { $0.key < $1.key }.map { ["conversation": $0.key, "at": $0.value] },
+            ])]
+            let structured = [Self.wire(coverage)] + acknowledged + scan.structured
             // V3 occupies the leading, reader-controlled block. Message text
             // can never precede it or append a trusted record to that block.
             // `skipped` counts rows with no readable text at all, so a decoding
@@ -242,7 +280,8 @@ final class MessagesReader {
                                      members: members, fallback: who)
 
             let oneLine = Self.flattenLegacyLine(text)
-            out.append("V2 | \(epochSecs) | \(isUnread ? "U" : "R") | \(conversationId) | \(context) | \(who): \(oneLine)")
+            out.append("V2 | \(epochSecs) | \(isUnread ? "U" : "R") | \(conversationId) | "
+                       + "\(Self.wireField(context)) | \(Self.wireField(who)): \(oneLine)")
             guard structured.count < Self.structuredLimit else { truncated += 1; continue }
             let clipped = String(text.prefix(Self.structuredTextLimit))
             if clipped.count < text.count { truncated += 1 }
@@ -289,8 +328,10 @@ final class MessagesReader {
             lastFailure = MessagesReadFailure.from(db, path: dbPath)
             return nil
         }
-        return MessageScan(lines: out, structured: structured, attempted: attempted,
-                           skipped: skipped, truncated: truncated)
+        var scan = MessageScan(lines: out, structured: structured, attempted: attempted,
+                               skipped: skipped, truncated: truncated)
+        scan.acknowledged = readOwnTapbacks(db, cutoffNs: cutoffNs)
+        return scan
     }
 
     private func hasColumn(_ db: OpaquePointer?, table: String, name: String) -> Bool {
@@ -309,6 +350,13 @@ final class MessagesReader {
         guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),
               let json = String(data: data, encoding: .utf8) else { return "" }
         return "V3 | \(json)"
+    }
+
+    /// A V2 metadata field (a chat's name, a sender): "|" would read as the
+    /// field separator and shift the message text, so it is written as "¦";
+    /// line breaks become spaces as in a body.
+    static func wireField(_ text: String) -> String {
+        flattenLegacyLine(text).replacingOccurrences(of: "|", with: "\u{00A6}")
     }
 
     private static func flattenLegacyLine(_ text: String) -> String {

@@ -83,17 +83,19 @@ def _strict_passages(sessions, facts, query, limit, exclude_session):
     match = _and_query(query)
     if not match:
         return []
+    from service.memory.queue import SCAN_LIMIT, suppression_view
     queue = MemoryQueue(sessions)
     limit = max(1, min(50, limit))
     result, offset = [], 0
-    while len(result) < limit:
+    view = suppression_view(facts)
+    while len(result) < limit and offset < SCAN_LIMIT:
         with sessions._lock:
             try:
                 rows = sessions._db.execute(
                     '''SELECT text,session_id,turn_idx,created_at,role FROM memory_turn_fts
                     WHERE memory_turn_fts MATCH ? AND session_id!=? AND role='user'
-                    ORDER BY bm25(memory_turn_fts),created_at DESC LIMIT 100 OFFSET ?''',
-                    (match, exclude_session, offset)).fetchall()
+                    ORDER BY bm25(memory_turn_fts),created_at DESC LIMIT ? OFFSET ?''',
+                    (match, exclude_session, SCAN_LIMIT, offset)).fetchall()
             except sqlite3.OperationalError as exc:
                 if 'no such table' not in str(exc) and 'no such module' not in str(exc):
                     raise
@@ -101,14 +103,14 @@ def _strict_passages(sessions, facts, query, limit, exclude_session):
                 rows = sessions._db.execute(
                     f'''SELECT content text,session_id,idx turn_idx,created_at,role
                     FROM turns WHERE session_id!=? AND role='user' AND ({predicates})
-                    ORDER BY created_at DESC LIMIT 100 OFFSET ?''',
+                    ORDER BY created_at DESC LIMIT ? OFFSET ?''',
                     (exclude_session, *('%' + _like_prefix(t) + '%' for t in terms(query)),
-                     offset)).fetchall()
+                     SCAN_LIMIT, offset)).fetchall()
         if not rows:
             break
         for row in rows:
             item = dict(row)
-            if all_terms_match(query, item['text']) and queue.visible(item, facts):
+            if all_terms_match(query, item['text']) and queue.visible(item, facts, view):
                 result.append(item)
                 if len(result) == limit:
                     break

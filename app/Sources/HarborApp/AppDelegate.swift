@@ -204,6 +204,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Before anything else, so even a copy waiting for another to quit answers a quit.
+        installQuitAppleEventHandler()
         // One Harbor at a time. A second launch used to terminate the first one's
         // backend and race it for the port; now it hands over to the running app.
         let selfPID = ProcessInfo.processInfo.processIdentifier
@@ -294,6 +296,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func launch() {
         launched = true
+        LaunchTimeline.mark(.finishedLaunching)
         // Opened from Downloads (or macOS's temporary copy of a download): offer to
         // move into Applications first, before anything starts. Only the person's
         // click moves it; then this copy quits and the moved one opens.
@@ -383,13 +386,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             BrowserBridgeActivation.shared.controlPathForBackend()
                 .map { ["HARBOR_BROWSER_BRIDGE_CONTROL": $0] } ?? [:]
         }
-        backend.didLaunchBackend = { BrowserBridgeActivation.shared.backendLaunched(pid: $0) }
+        backend.didLaunchBackend = {
+            BrowserBridgeActivation.shared.backendLaunched(pid: $0)
+            Task { @MainActor in LaunchTimeline.mark(.serviceStarted) }
+        }
         let launchedAt = Date()
         var outage = 0
         backend.onReachabilityChange = { [weak self] up in
             guard let self else { return }
             outage += 1
             if up {
+                LaunchTimeline.mark(.serviceReady)
                 self.model.serviceReachable = true
                 self.model.serviceStarting = false
                 self.considerKnowYouOffer(after: 5)
@@ -405,6 +412,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     await self.todayModel.refresh()
                     await DayCards.refresh(force: true)
                     self.model.onResize()
+                    LaunchTimeline.mark(.dayLoaded)
                     // The readers' posts land a moment later (EventKit reads off the
                     // main thread), so look once more for what they brought.
                     try? await Task.sleep(nanoseconds: NativeSyncPace.reachableRefreshDelay)
@@ -633,6 +641,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         createPanelIfNeeded()
         model.collapsed = true
         panel?.present()
+        // The first turn of the run loop after the present is the notch's first frame.
+        DispatchQueue.main.async { LaunchTimeline.mark(.notchShown) }
         watchSetupReadiness()
         watchSleepDuringDownload()
         armKnowYouOffers()
@@ -642,6 +652,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // macOS's Quit & Reopen, from the System Settings page the notch's permission
         // page sent the person to: back where they were, with the new answer.
         if let item = NotchPermissionPage.takeResume(), !firstRun { openPermissionPage(item) }
+        // A reopen Harbor scheduled itself (Quit & Reopen, or the page's Reopen button) with
+        // the Harbor window up: that window comes back, Settings on the pane it was on.
+        if let window = PrivacyRelaunch.takeReopenWindow(), !firstRun {
+            switch window {
+            case .settings: openSettings()
+            case .window: openChat()
+            }
+        }
         if resetPending { finishPendingReset() }
         if ignoredResetMarker { model.showTransientNotice(HarborReset.ignoredMarkerNotice, duration: 15) }
     }
@@ -2568,6 +2586,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 20) {
             MainActor.assumeIsolated { self.finishShutdown() }
         }
+        shutdownBeganAt = Date()
         // Stopping the engine unloads any models and frees its ~2GB baseline too.
         Task {
             // A meeting being recorded: stop the microphone and the call audio first, and let
@@ -2578,13 +2597,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // gets killed — see PendingConfigWrites' docstring for the race this
             // closes. Capped so a genuinely stuck request can't hang quitting.
             await PendingConfigWrites.shared.waitUntilIdle()
+            noteQuitStep("meeting and settings")
+            // The browser bridge and the engine stop side by side: neither waits on
+            // the other, and both are done before the service is stopped.
+            async let bridgeStopped: Void = BrowserBridgeActivation.shared.shutdown()
             // Only Harbor's own service: another program on the port (kept open at
             // the port-conflict alert) must not have its engine stopped for good.
+            // The service also ends its event stream here, so its own stop below
+            // doesn't wait out uvicorn's graceful bound on that open response.
             if !backend.portConflict { await client.shutdownOMLX() }
-            await BrowserBridgeActivation.shared.shutdown()
+            await bridgeStopped
+            noteQuitStep("engine and browser bridge")
             await backend.stopAndWait()
             await MainActor.run { self.finishShutdown() }
         }
+    }
+
+    /// When this quit began, and each step's time so far (LaunchTimeline.quitLine).
+    private var shutdownBeganAt: Date?
+    private var quitSteps: [(String, Int)] = []
+    private var lastQuitStepAt: Date?
+
+    private func noteQuitStep(_ name: String, now: Date = Date()) {
+        guard let began = shutdownBeganAt else { return }
+        let from = lastQuitStepAt ?? began
+        quitSteps.append((name, LaunchTimeline.elapsedMilliseconds(since: from.timeIntervalSince1970,
+                                                                    now: now.timeIntervalSince1970)))
+        lastQuitStepAt = now
     }
 
     /// /resetharbor, after the person clicked Reset Harbor on its card. Returns why it
@@ -2635,6 +2674,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func finishShutdown() {
         guard !shutdownFinished else { return }
         shutdownFinished = true
+        if let began = shutdownBeganAt {
+            if lastQuitStepAt != nil { noteQuitStep("service") }
+            let now = Date().timeIntervalSince1970
+            NSLog("%@", LaunchTimeline.quitLine(
+                steps: quitSteps,
+                total: LaunchTimeline.elapsedMilliseconds(since: began.timeIntervalSince1970, now: now)))
+        }
         // Signals the backend if the stop steps did not get to it. After a clean
         // stop the backend is already detached, so this does nothing.
         backend.stop()
@@ -2662,6 +2708,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Harbor answers quit Apple Events itself (System Settings' Quit & Reopen, the
+    /// Dock, a logout). AppKit's own handler first checks that the responder chain
+    /// validates terminate:, and when it doesn't it drops the quit without asking
+    /// Harbor: on 2026-11-25 at 13:39 System Settings' Quit & Reopen was cancelled
+    /// twice that way ("Failed responder chain validation for terminate: action.
+    /// Canceling termination.") and the old copy ran until a Force Quit 26 s later.
+    /// Harbor has no documents to save, so nothing needs that check.
+    private func installQuitAppleEventHandler() {
+        NSAppleEventManager.shared().setEventHandler(
+            self, andSelector: #selector(handleQuitAppleEvent(_:withReplyEvent:)),
+            forEventClass: AEEventClass(kCoreEventClass), andEventID: AEEventID(kAEQuitApplication))
+    }
+
+    /// Replies at once (when this returns), so the sender never waits on the stop;
+    /// the quit itself runs on the next turn of the run loop through
+    /// applicationShouldTerminate, the same safe stop as every other quit. The event
+    /// is kept so the quit's sender is still known (PrivacyRelaunch.handledQuitEvent).
+    @objc private func handleQuitAppleEvent(_ event: NSAppleEventDescriptor,
+                                            withReplyEvent reply: NSAppleEventDescriptor) {
+        switch PrivacyRelaunch.quitEventAction(shutdownStarted: shutdownStarted || shutdownFinished) {
+        case .alreadyQuitting:
+            NSLog("%@", "Harbor quit: another quit Apple Event while stopping; the stop under way ends Harbor")
+        case .terminate:
+            PrivacyRelaunch.handledQuitEvent = event
+            DispatchQueue.main.async { NSApp.terminate(nil) }
+        }
+    }
+
     // A quit from the Dock, the application menu or the system does not call quit().
     // Run the same shutdown and reply once it finishes, so a logout is not cancelled.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -2671,12 +2745,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !launched { shutdownFinished = true; return .terminateNow }
         // Read now, while the quit Apple Event is still the one being handled.
         relaunchIfSystemSettingsAsked(PrivacyRelaunch.Quit.current())
+        // A reopen on its way (this quit's, or the permission page's Reopen button):
+        // the reopened Harbor shows the Harbor window again if it is up now.
+        PrivacyRelaunch.noteWindowForReopen(openHarborWindowForReopen())
         systemAwaitingReply = true
         if !shutdownStarted { beginShutdown() }
         return .terminateLater
     }
 
     private var relaunchScheduled = false
+
+    /// The Harbor window that is up, for a reopen to bring back (Settings keeps its pane).
+    private func openHarborWindowForReopen() -> PrivacyRelaunch.ReopenWindow? {
+        guard harborWindow.isOpen else { return nil }
+        return harborWindow.navigation.section == .settings ? .settings : .window
+    }
 
     /// macOS's Quit & Reopen after a privacy switch: System Settings gives up on
     /// the reopen while Harbor is still stopping its engine, so Harbor opens itself
@@ -2704,7 +2787,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let helper = Process()
         helper.executableURL = URL(fileURLWithPath: HarborReset.relaunchShell)
         helper.arguments = arguments
-        do { try helper.run() } catch { NSLog("%@", "Harbor quit: couldn't schedule the reopen (\(error))") }
+        do {
+            try helper.run()
+            PrivacyRelaunch.noteReopenScheduled()
+        } catch { NSLog("%@", "Harbor quit: couldn't schedule the reopen (\(error))") }
     }
 
     /// Settings is a section of the Harbor window (⌘,, the menus, the window's

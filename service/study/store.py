@@ -65,6 +65,23 @@ def _local_day(ts):
         return None
 
 
+def _same_day_groups(rows: list) -> list[list]:
+    """Rows sharing a title, split by due day: same-title items due on different days are
+    different items. Rows with no due day join the dated rows only when those are all one
+    day (the same item seen on a page that shows no date); otherwise they stay together."""
+    by_day: dict = {}
+    undated = []
+    for row in rows:
+        day = _local_day(row["due_ts"]) if row["due_ts"] is not None else None
+        (by_day.setdefault(day, []) if day is not None else undated).append(row)
+    groups = list(by_day.values())
+    if len(groups) == 1:
+        groups[0].extend(undated)
+    elif undated:
+        groups.append(undated)
+    return groups
+
+
 def _blank(value) -> bool:
     return value is None or (isinstance(value, str) and not value.strip())
 
@@ -348,14 +365,23 @@ class StudyStore:
                     course_ids.add(canonical)
                     if retired:
                         touched.add(canonical)
-                for a in map(_assignment_in, assignments):
+                incoming = list(map(_assignment_in, assignments))
+                # How many rows of each (course, title) this import carries: one means a moved
+                # due date may still find its old row; several are distinct items.
+                carried: dict = {}
+                for a in incoming:
+                    key = (alias.get(a.get("course_id"), a.get("course_id")), merge_key(a.get("title")))
+                    carried[key] = carried.get(key, 0) + 1
+                for a in incoming:
                     aid = a.get("id")
                     if not isinstance(aid, str) or not aid:
                         continue
                     course_id = alias.get(a.get("course_id"), a.get("course_id"))
                     a = a | {"course_id": course_id}
                     stored = self._db.execute("SELECT 1 FROM assignments WHERE id=?", (aid,)).fetchone()
-                    twin = None if stored else self._twin(course_id, a.get("title"), aid)
+                    twin = None if stored else self._twin(
+                        course_id, a.get("title"), aid, a.get("due_ts"),
+                        alone=carried.get((course_id, merge_key(a.get("title"))), 0) <= 1)
                     if twin is not None:
                         a = a | {"id": twin["id"]}   # _write keeps the twin's grade (see _unsaid_status)
                     self._write("assignments", _ASSIGNMENT_FIELDS, a, _ASSIGNMENT_DEFAULTS, now)
@@ -511,15 +537,24 @@ class StudyStore:
         self._db.execute("UPDATE sources SET course_id=? WHERE course_id=?", (canonical, old))
         self._db.execute("DELETE FROM courses WHERE id=?", (old,))
 
-    def _twin(self, course_id, title, aid: str):
+    def _twin(self, course_id, title, aid: str, due_ts=None, *, alone: bool = True):
+        """The stored row this incoming one is: same course and title, and the same due day
+        (or one side has none). With no such row, a title the import carries once may be the
+        same item with a moved due date, but only when exactly one stored row has that title."""
         if not course_id:
             return None
         key = merge_key(title)
-        for row in self._db.execute("SELECT * FROM assignments WHERE course_id=? AND id<>? ORDER BY updated_at, id",
-                                    (course_id, aid)).fetchall():
-            if key and merge_key(row["title"]) == key:
+        if not key:
+            return None
+        rows = [row for row in self._db.execute(
+                    "SELECT * FROM assignments WHERE course_id=? AND id<>? ORDER BY updated_at, id",
+                    (course_id, aid)).fetchall() if merge_key(row["title"]) == key]
+        day = _local_day(due_ts) if due_ts is not None else None
+        for row in rows:
+            other = _local_day(row["due_ts"]) if row["due_ts"] is not None else None
+            if day is None or other is None or day == other:
                 return row
-        return None
+        return rows[0] if alone and len(rows) == 1 else None
 
     def _dedupe_assignments(self, course_id: str, now: float) -> None:
         """Rows of one course with the same normalised title become the richest one."""
@@ -529,17 +564,21 @@ class StudyStore:
             key = merge_key(row["title"])
             if key:
                 groups.setdefault(key, []).append(row)
-        for rows in groups.values():
-            if len(rows) < 2:
-                continue
-            survivor = max(rows, key=_richness)   # max keeps the first (oldest) on a tie
-            rest = tuple(r for r in rows if r["id"] != survivor["id"])
-            self._write("assignments", _ASSIGNMENT_FIELDS, {"id": survivor["id"]}, _ASSIGNMENT_DEFAULTS, now,
-                        keep=rest)
-            for r in rest:
-                self._db.execute("UPDATE materials SET assignment_id=? WHERE assignment_id=?",
-                                 (survivor["id"], r["id"]))
-                self._db.execute("DELETE FROM assignments WHERE id=?", (r["id"],))
+        for titled in groups.values():
+            for rows in _same_day_groups(titled):
+                self._merge_rows(rows, now)
+
+    def _merge_rows(self, rows: list, now: float) -> None:
+        if len(rows) < 2:
+            return
+        survivor = max(rows, key=_richness)   # max keeps the first (oldest) on a tie
+        rest = tuple(r for r in rows if r["id"] != survivor["id"])
+        self._write("assignments", _ASSIGNMENT_FIELDS, {"id": survivor["id"]}, _ASSIGNMENT_DEFAULTS, now,
+                    keep=rest)
+        for r in rest:
+            self._db.execute("UPDATE materials SET assignment_id=? WHERE assignment_id=?",
+                             (survivor["id"], r["id"]))
+            self._db.execute("DELETE FROM assignments WHERE id=?", (r["id"],))
 
     def courses(self) -> list[dict]:
         with self._lock:
@@ -689,12 +728,14 @@ class StudyStore:
 
     def set_deck_error(self, source_id: str, message: str | None) -> None:
         """The plain-language reason a deck could not be read (key-free), or None to clear it."""
-        errors = dict(self.meta("deck_errors", {}) or {})
-        if message:
-            errors[source_id] = str(message)[:300]
-        else:
-            errors.pop(source_id, None)
-        self.set_meta("deck_errors", errors)
+        def change(errors):
+            errors = dict(errors or {})
+            if message:
+                errors[source_id] = str(message)[:300]
+            else:
+                errors.pop(source_id, None)
+            return errors
+        self.update_meta("deck_errors", change, {})
 
     def source(self, source_id: str) -> dict | None:
         """The full row, with "text"."""
@@ -839,28 +880,48 @@ class StudyStore:
         with self._lock:
             self._db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)", (key, json.dumps(value)))
 
+    def update_meta(self, key: str, change, default=None):
+        """Read, change and write one meta value under the lock, so two threads editing the
+        same map (a Day refresh in the threadpool, a booking on the loop) never drop each
+        other's entry. `change` gets the stored value (or `default`) and returns the new one;
+        it must not call back into the store."""
+        with self._lock:
+            row = self._db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+            value = change(json.loads(row[0]) if row else default)
+            self._db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)", (key, json.dumps(value)))
+        return value
+
     def has_sample(self) -> bool:
         with self._lock:
             return any(self._db.execute(f"SELECT 1 FROM {t} WHERE sample=1 LIMIT 1").fetchone()
                        for t in ("courses", "assignments", "materials"))
 
     def clear(self) -> None:
-        with self._lock:
-            self._db.executescript("BEGIN; DELETE FROM courses; DELETE FROM assignments; DELETE FROM materials;"
-                                   " DELETE FROM attempts; DELETE FROM meta; DELETE FROM sources;"
-                                   " DELETE FROM deck_pages; DELETE FROM misses; COMMIT;")
+        self._delete_all(["DELETE FROM courses", "DELETE FROM assignments", "DELETE FROM materials",
+                          "DELETE FROM attempts", "DELETE FROM meta", "DELETE FROM sources",
+                          "DELETE FROM deck_pages", "DELETE FROM misses"])
 
     def clear_sample(self) -> None:
         """Only the built-in sample: real courses, sources and anything made from them stay."""
+        self._delete_all([
+            "DELETE FROM attempts WHERE material_id IN (SELECT id FROM materials WHERE sample=1)",
+            "DELETE FROM misses WHERE material_id IN (SELECT id FROM materials WHERE sample=1)",
+            "DELETE FROM materials WHERE sample=1",
+            "DELETE FROM assignments WHERE sample=1",
+            "DELETE FROM courses WHERE sample=1"])
+
+    def _delete_all(self, statements: list[str]) -> None:
+        """All or nothing. executescript("BEGIN; ...; COMMIT;") left the transaction open when
+        a statement failed, and every later BEGIN then failed until a restart."""
         with self._lock:
-            self._db.executescript(
-                "BEGIN;"
-                " DELETE FROM attempts WHERE material_id IN (SELECT id FROM materials WHERE sample=1);"
-                " DELETE FROM misses WHERE material_id IN (SELECT id FROM materials WHERE sample=1);"
-                " DELETE FROM materials WHERE sample=1;"
-                " DELETE FROM assignments WHERE sample=1;"
-                " DELETE FROM courses WHERE sample=1;"
-                " COMMIT;")
+            self._db.execute("BEGIN")
+            try:
+                for statement in statements:
+                    self._db.execute(statement)
+                self._db.execute("COMMIT")
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
 
 
 _COURSE_DEFAULTS = {"name": "", "source": "canvas", "sample": False}

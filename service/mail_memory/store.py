@@ -274,6 +274,25 @@ class Store:
             return self._db.execute("UPDATE items SET state='expired' WHERE state='new' AND due<?",
                                     (today,)).rowcount
 
+    ITEM_KEEP_S = 30 * 86400
+
+    def prune(self, *, messages_before: float, now: float | None = None) -> dict:
+        """Age out what is no longer used: message rows (sender, subject, Message-ID) whose
+        mail is older than `messages_before`, past the index window so the walk never
+        lists them again, unless an open suggestion or a profile-fact candidate still
+        points at them; and suggestions decided or expired over ITEM_KEEP_S ago, with
+        their evidence quotes. Open suggestions are never touched."""
+        now = time.time() if now is None else now
+        with self._lock:
+            items = self._db.execute(
+                "DELETE FROM items WHERE state IN ('accepted','dismissed','expired')"
+                " AND COALESCE(decided, created) < ?", (now - self.ITEM_KEEP_S,)).rowcount
+            messages = self._db.execute(
+                "DELETE FROM messages WHERE ts < ? AND state IN ('done','skipped','failed','excluded')"
+                " AND key NOT IN (SELECT key FROM items)"
+                " AND key NOT IN (SELECT key FROM fact_candidates)", (messages_before,)).rowcount
+        return {"messages": messages, "items": items}
+
     # --- profile-fact candidates -------------------------------------------------------
 
     FACT_STATES = ("done", "skipped", "pending", "failed")

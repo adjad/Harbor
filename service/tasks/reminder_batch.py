@@ -167,8 +167,17 @@ def compile_dated_reminders(text: str, *, now: datetime, turn: int = 0) -> TaskP
         when = part['when'].strip()
         ordinal = re.fullmatch(r'(?:the\s+)?(\d{1,2})(?:st|nd|rd|th)?', when, re.I)
         if ordinal and reference is not None:
+            # "dec 31 for X and the 2nd for Y": an ordinal before the previous day is the
+            # next month's (carrying the year), never a day before it. The same day asks.
+            day = int(ordinal[1])
+            if day == reference.day:
+                return result([])
+            year, month = reference.year, reference.month
+            if day < reference.day:
+                year, month = (year + 1, 1) if month == 12 else (year, month + 1)
             try:
-                resolved = reference.replace(day=int(ordinal[1]), hour=9, minute=0, second=0, microsecond=0)
+                resolved = reference.replace(year=year, month=month, day=day,
+                                             hour=9, minute=0, second=0, microsecond=0)
             except ValueError:
                 return result([])
             defaulted = 'morning'

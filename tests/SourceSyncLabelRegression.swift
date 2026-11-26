@@ -1,4 +1,4 @@
-// Compile alongside app/Sources/HarborApp/HarborClient.swift. No network calls.
+// Compile alongside app/Sources/HarborApp/HarborClient.swift and ResearchExportName.swift. No network calls.
 import Foundation
 
 @main

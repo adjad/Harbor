@@ -136,7 +136,17 @@ final class OverlayModel: ObservableObject {
     /// Returns why it stopped before erasing anything; on success Harbor relaunches.
     var onResetHarbor: (() async -> String)?
 
-    @Published var input = ""
+    /// The Ask field's text. It lives in its own small object (AskInputText)
+    /// so a key typed redraws the field's row, not the whole panel: as a
+    /// @Published here, every keystroke rebuilt the open page with every
+    /// reply in it. The panel still redraws when the field empties or stops
+    /// being empty (inputEmptinessObserver), which is all it reads of it.
+    let askInput = AskInputText()
+    var input: String {
+        get { askInput.text }
+        set { askInput.text = newValue }
+    }
+    private var inputEmptinessObserver: AnyCancellable?
     @Published var answer = ""
     @Published var reasoning = ""
     @Published var showReasoning = false
@@ -314,8 +324,16 @@ final class OverlayModel: ObservableObject {
         _debugMode = Published(initialValue: loadDebugMode())
         // Rows that show the report read it through this model, so redraw with it.
         reportObserver = report.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }
+        inputEmptinessObserver = askInput.blankChanges.sink { [weak self] _ in self?.objectWillChange.send() }
         voiceObservers = [
-            voice.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() },
+            // The panel reads the voice's state (the field's placeholder, the
+            // mic's look) and its microphone refusal, never its level: the
+            // meter observes the voice itself (VoiceMicButton). Forwarding
+            // every change redrew the whole panel, the open page and every
+            // reply in it, at the rate the microphone sends levels.
+            voice.$state.removeDuplicates().map { _ in () }
+                .merge(with: voice.$needsMicrophoneAccess.removeDuplicates().map { _ in () })
+                .sink { [weak self] _ in self?.objectWillChange.send() },
             speaker.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() },
             // The listening line and a failure change the panel's height.
             voice.$state.removeDuplicates().sink { [weak self] _ in
@@ -1401,9 +1419,15 @@ final class OverlayModel: ObservableObject {
         guard let p = pending else { return }
         pending = nil
         phase = .working
-        Task {
-            await client.approve(sessionId: p.sessionId, actionId: p.actionId,
-                                 approved: approved, scope: scope, requestId: p.requestId)
+        Task { [weak self] in
+            let delivered = await client.approve(sessionId: p.sessionId, actionId: p.actionId,
+                                                 approved: approved, scope: scope, requestId: p.requestId)
+            // Not delivered: the card comes back so the answer can be given again,
+            // unless something else has taken its place meanwhile.
+            guard !delivered, let self, self.pending == nil, self.phase == .working else { return }
+            self.pending = p
+            self.phase = .confirming
+            self.showTransientNotice("Harbor didn't get that answer. Try again.", duration: 6)
         }
     }
 
@@ -1640,7 +1664,17 @@ final class OverlayModel: ObservableObject {
     /// "Explain my screen": only with Screen Recording already granted (never
     /// requested here). The capture becomes a pending preview; nothing is sent
     /// until the person presses send.
-    var screenCommandAvailable: Bool { CGPreflightScreenCaptureAccess() }
+    /// Whether /screen can run: macOS's Screen Recording answer, remembered for
+    /// a few seconds. The command list asks on every key while a "/" command is
+    /// typed, and each ask is a call to the privacy service.
+    var screenCommandAvailable: Bool {
+        let now = Date()
+        if let kept = screenAccessKept, now.timeIntervalSince(kept.at) < 3 { return kept.allowed }
+        let allowed = CGPreflightScreenCaptureAccess()
+        screenAccessKept = (allowed, now)
+        return allowed
+    }
+    private var screenAccessKept: (allowed: Bool, at: Date)?
 
     func captureScreenForPreview() {
         guard CGPreflightScreenCaptureAccess() else {

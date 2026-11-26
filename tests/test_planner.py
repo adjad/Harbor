@@ -941,3 +941,11 @@ def test_screen_capture_timeout_is_a_plain_sentence_not_an_exception(monkeypatch
     out = X.screen_capture(region=region, path=str(tmp_path / "s.png"))
     assert out.startswith("(") and "nothing was saved" in out
     assert not (tmp_path / "s.png").exists()
+
+
+@pytest.mark.parametrize("raw", ['{"status": "call_tools", "calls": 1}', '{"calls": true}',
+                                 '{"calls": {"tool": "search_notes"}}', '{"status": ["answer"], "calls": []}',
+                                 '{"status": {"x": 1}}', '{"calls": "search_notes"}'])
+def test_off_grammar_fields_become_a_plan_without_calls(raw):
+    plan = planner.parse_plan(raw, {"search_notes"})
+    assert plan.calls == [] and plan.ends_tool_use

@@ -50,6 +50,17 @@ def created_receipt(who: str, value: str = "") -> str:
             f"Call manage_contacts again with action='{action}' to add it.")
 
 
+def _birthday_in(year: int, month: int, day: int) -> datetime.date | None:
+    """That birthday in `year`; Feb 29 is kept on Feb 28 in a year without one. None
+    only for a day that never exists (13-01, 04-31)."""
+    try:
+        return datetime.date(year, month, day)
+    except ValueError:
+        if (month, day) == (2, 29):
+            return datetime.date(year, 2, 28)
+        return None
+
+
 @register(
     "contact_dates",
     "List upcoming birthdays from Contacts, soonest first. Needs birth dates "
@@ -80,11 +91,10 @@ def contact_dates(days: int = 30) -> str:
         if not m:
             continue
         month, day = int(m.group(1)), int(m.group(2))
-        try:
-            this_year = today.replace(month=month, day=day)
-        except ValueError:
-            continue  # Feb 29 in a context that can't hold it
-        target = this_year if this_year >= today else this_year.replace(year=today.year + 1)
+        this_year = _birthday_in(today.year, month, day)
+        if this_year is None:
+            continue  # not a real calendar day
+        target = this_year if this_year >= today else _birthday_in(today.year + 1, month, day)
         delta = (target - today).days
         if delta <= window:
             upcoming.append((delta, target, names))

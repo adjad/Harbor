@@ -32,12 +32,40 @@ from pathlib import Path
 
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 
-# Always writable: the tool's own folder needs scratch space, and these device
-# nodes / temp dirs are required for ordinary stdio and tempfile use.
+# Always writable: these device nodes, for ordinary stdio. Scratch space is the
+# tool's own folder under SCRATCH_ROOT (TMPDIR points there), not the skill's
+# folder (which holds the SKILL.md and script the person approved) and not the
+# shared /private/var/folders.
 _ALWAYS_WRITE = [
     '(literal "/dev/null")', '(literal "/dev/stdout")', '(literal "/dev/stderr")',
-    '(literal "/dev/dtracehelper")', '(subpath "/private/var/folders")',
+    '(literal "/dev/dtracehelper")',
 ]
+
+# No handing work to a process outside the box (pentest #3): Launch Services
+# (`open`, which can start an app or a .command file), Apple Events (osascript),
+# the pasteboard, privacy grants and the secrets broker, and no new launchd jobs.
+# The same denies the Ideate profile uses (service/ideate/sandbox.py).
+_MACH_DENY = [
+    '(deny mach-lookup (global-name "com.apple.coreservices.launchservicesd")'
+    ' (global-name "com.apple.coreservices.appleevents") (global-name "com.apple.pasteboard.1")'
+    ' (global-name-prefix "com.apple.lsd."))',
+    '(deny mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.nsurlsessiond")'
+    ' (global-name "com.apple.tccd") (global-name-prefix "com.apple.securityd")'
+    ' (global-name-prefix "com.apple.windowserver") (global-name-prefix "com.apple.screencapture"))',
+    "(deny job-creation)",
+    # An allow-default profile must also refuse these outright: sending an Apple
+    # Event and asking Launch Services to open something do not need the
+    # mach-lookups above once a port is known (checked: osascript still reached
+    # System Events without them).
+    "(deny appleevent-send)",
+    "(deny lsopen)",
+]
+
+
+def scratch_dir(skill_dir: Path) -> Path:
+    """The one folder a skill tool may write without a declared scope."""
+    from service.paths import MOE_DIR
+    return MOE_DIR / "skill-scratch" / Path(skill_dir).name
 
 # Where personal data actually lives. Reads are denied across these roots and
 # re-allowed only for declared scopes.
@@ -62,11 +90,13 @@ _NEVER_READ = [
     "~/Library/Keychains",
     "~/.moe/sessions.db", "~/.moe/facts.db", "~/.moe/assistant.db",
     "~/.moe/gmail.json", "~/.moe/mcp.json", "~/.moe/google_workspace", "~/.moe/grants.json",
-    "~/.moe/access_mode.json",
+    "~/.moe/access_mode.json", "~/.moe/phone_gateway",
 ]
 # The same Harbor files under HARBOR_HOME, when it points somewhere else.
 _NEVER_READ_HARBOR = ["sessions.db", "facts.db", "assistant.db", "gmail.json", "mcp.json",
-                    "google_workspace", "grants.json", "access_mode.json"]
+                    "google_workspace", "grants.json", "access_mode.json",
+                    # the phone gateway's link key and paired-device secrets (pentest #20)
+                    "phone_gateway"]
 
 # Network: a skill tool may reach the internet (a weather skill must), but not
 # this Mac's own services. Harbor's API on 127.0.0.1:8765 treats some requests
@@ -89,10 +119,15 @@ def build_profile(skill_dir: Path, read_scopes: list[Path],
                   write_scopes: list[Path]) -> str:
     """A sandbox profile allowing reads/writes only within the given scopes.
 
-    The skill's own folder is always readable and writable — that's where the
-    script itself lives and where it may keep state.
+    The skill's own folder is readable but never writable: it holds the
+    SKILL.md (with the tool's scopes) and the script the person approved, so a
+    tool may not widen its own scopes or rewrite itself (pentest #2). Its
+    writable scratch is scratch_dir().
     """
     home = Path.home()
+    scratch = scratch_dir(skill_dir)
+    # Both spellings: HARBOR_HOME may sit behind a link (/tmp -> /private/tmp).
+    scratches = list(dict.fromkeys([scratch, scratch.resolve()]))
     # write scopes imply read — a tool that can modify a folder can obviously
     # see it, and declaring both separately for the same path is pure friction.
     readable = list(dict.fromkeys([*read_scopes, *write_scopes]))
@@ -102,12 +137,14 @@ def build_profile(skill_dir: Path, read_scopes: list[Path],
         # --- writes: deny everything, then re-allow the declared scopes ---
         "(deny file-write*)",
         *(f"(allow file-write* {frag})" for frag in _ALWAYS_WRITE),
-        f'(allow file-write* (subpath "{_q(skill_dir.resolve())}"))',
+        *(f'(allow file-write* (subpath "{_q(p)}"))' for p in scratches),
         *(f'(allow file-write* (subpath "{_q(p)}"))' for p in write_scopes),
         # --- reads: deny the user-data roots, re-allow declared scopes ---
         *(f'(deny file-read* (subpath "{_q(Path(p))}"))' for p in _READ_DENY_ROOTS),
         f'(allow file-read* (subpath "{_q(skill_dir.resolve())}"))',
+        *(f'(allow file-read* (subpath "{_q(p)}"))' for p in scratches),
         *(f'(allow file-read* (subpath "{_q(p)}"))' for p in readable),
+        *_MACH_DENY,
     ]
     # Re-deny the sensitive paths LAST so they win even if a granted scope
     # (e.g. all of ~) would otherwise cover them. In SBPL the last matching
@@ -118,6 +155,12 @@ def build_profile(skill_dir: Path, read_scopes: list[Path],
     for p in dict.fromkeys(never):
         lines.append(f'(deny file-read* (subpath "{_q(p)}"))')
         lines.append(f'(deny file-write* (subpath "{_q(p)}"))')
+    # Never writable, whatever scope was granted (a scope of ~ covers them): every
+    # skill's folder, this skill's included, and the record of what was approved.
+    from service.skills import SKILLS_DIR
+    from service.skills.trust import TRUST_PATH
+    for p in dict.fromkeys([skill_dir.resolve(), Path(skill_dir), SKILLS_DIR, TRUST_PATH]):
+        lines.append(f'(deny file-write* (subpath "{_q(Path(p))}"))')
     lines.extend(_NETWORK_DENY)
     return "\n".join(lines) + "\n"
 

@@ -14,6 +14,13 @@ from tests.test_remote_inference_policy import RemoteFixture,policy
 SOURCE=Path(__file__).resolve().parents[1]/'service/main.py'
 def selected(names,namespace):
     tree=ast.parse(SOURCE.read_text())
+    if 'lifespan' in names:
+        # The lifespan's quit and timing helpers (bounded shutdown steps, the event stream's end).
+        names=set(names)|{'_ms','_bounded','_quit_signal','_end_event_streams','_chain_sigterm'}
+        for key,value in (('time',__import__('time')),('threading',__import__('threading')),('_IMPORT_STARTED',0.0),
+                          ('_quit_streams',None),('_SHUTDOWN_TRAINER_SECONDS',1.0),('_SHUTDOWN_TASKS_SECONDS',1.0),
+                          ('_SHUTDOWN_STEP_SECONDS',0.5)):
+            namespace.setdefault(key,value)
     nodes=[ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0)]
     nodes.extend(n for n in tree.body if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) and n.name in names)
     module=ast.fix_missing_locations(ast.Module(body=nodes,type_ignores=[]))

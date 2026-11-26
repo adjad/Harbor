@@ -12,7 +12,7 @@ struct ResearchHomeView: View {
                 if !sidebarVisible { Spacer().frame(width: 62) }   // clear the window's traffic lights
                 Button { sidebarVisible.toggle() } label: { Image(systemName: "sidebar.left") }
                     .buttonStyle(ChatIconButtonStyle()).help("Show or hide the sidebar (⌘B)").accessibilityLabel("Toggle sidebar")
-                Text("Research").font(.system(size: 14.5, weight: .medium)).foregroundStyle(ChatTheme.text)
+                Text("Research").font(.harbor(.callout, on: .window, weight: .medium)).foregroundStyle(ChatTheme.text)
                 Spacer()
             }
             .padding(.leading, 14).padding(.trailing, 16)

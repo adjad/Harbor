@@ -12,10 +12,18 @@ Why this is safe to accept: the app key defends against other user accounts and
 sandboxed apps, which cannot read the private state directory. The gateway secret keeps
 that property, because it lives in the same place, while letting a gateway the user
 started themself work. It is never logged.
+
+The key lives only as long as one gateway run (pentest #20): `serve` makes a new one
+when it starts (start_secret) and removes it when it stops (end_secret), so a key
+read from disk once is no good after the next start. An approval that arrives with
+it answers once or declines; it never records a standing "always"
+(approval_scope_problem), so a phone, or anything holding the key, cannot widen
+what Harbor does without asking later.
 """
 from __future__ import annotations
 
 import hmac
+import json
 import os
 import re
 import secrets
@@ -114,3 +122,50 @@ def gateway_key_valid(method: str, path: str, sent: list[str]) -> bool:
         return False
     secret = read_secret()
     return secret is not None and hmac.compare_digest(given, secret.encode("ascii"))
+
+
+def start_secret(path: Path | None = None) -> str:
+    """A new secret for this gateway run: whatever key an earlier run left is removed
+    first, so it stops working now."""
+    target = path or secret_path()
+    try:
+        info = os.lstat(target)
+    except FileNotFoundError:
+        pass
+    else:
+        if not stat.S_ISDIR(info.st_mode):
+            os.unlink(target)
+    return ensure_secret(target)
+
+
+def end_secret(key: str, path: Path | None = None) -> None:
+    """Remove the secret when the run that made it stops; a newer run's key, which a
+    second gateway may have written meanwhile, is left in place."""
+    target = path or secret_path()
+    if read_secret(target) == key:
+        try:
+            os.unlink(target)
+        except FileNotFoundError:
+            pass
+
+
+GATEWAY_APPROVE_PATH = "/agent/approve"
+# An approval body is a few ids and two fields; anything near this is not one.
+APPROVE_BODY_LIMIT = 16 * 1024
+
+
+def approval_scope_problem(body: bytes) -> str | None:
+    """Why an /agent/approve body that came with the gateway key must be refused, or
+    None. Only "always" is refused: "once" answers this card, and "never" can only
+    make Harbor ask less of itself (a standing block)."""
+    if len(body) > APPROVE_BODY_LIMIT:
+        return "That approval is too large."
+    if not body.strip():
+        return None
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return None                   # the endpoint itself rejects a malformed body
+    if isinstance(data, dict) and data.get("scope") == "always":
+        return 'An answer from the phone gateway applies once; "Always allow" is set on the Mac.'
+    return None

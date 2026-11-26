@@ -335,6 +335,13 @@ class _Builder:
             aid = f"canvas:{canvas_id}:{_sha(title)}"
         else:
             aid = "canvas:" + _sha(f"{_norm(course_name or '')}|{title}")
+        # Same-title items of one course ("Quiz", "Weekly Reflection") differ by due day;
+        # without it, three of them kept only the last.
+        if due_ts is not None:
+            try:
+                aid += ":" + datetime.fromtimestamp(float(due_ts), self.zone).date().isoformat()
+            except (TypeError, ValueError, OverflowError, OSError):
+                pass
         self.assignments[aid] = {
             "id": aid, "course_id": course_id, "title": title[:300], "kind": kind,
             "due_ts": due_ts, "all_day": all_day, "points": points, "score": score,

@@ -318,7 +318,9 @@ final class ResearchModel: ObservableObject {
         streamTask = Task { [weak self] in
             guard let self else { return }
             var retryDelay: UInt64 = 500_000_000
+            var failures = 0
             while !Task.isCancelled && selectionID == selection && streamID == connection {
+                let seqBefore = lastSeq
                 await client.streamResearch(jobId: id, after: lastSeq) { [weak self] event in
                     Task { @MainActor in
                         guard let self, self.selectionID == selection, self.streamID == connection else { return }
@@ -326,18 +328,33 @@ final class ResearchModel: ObservableObject {
                     }
                 }
                 guard !Task.isCancelled, selectionID == selection, streamID == connection else { return }
-                if let snapshot = await client.researchSnapshot(jobId: id) {
-                    guard !Task.isCancelled, selectionID == selection, streamID == connection else { return }
+                let snapshot = await client.researchSnapshot(jobId: id)
+                guard !Task.isCancelled, selectionID == selection, streamID == connection else { return }
+                if let snapshot {
                     restore(snapshot)
                     if !isRunning && phase != .planning { return }
                 }
-                guard !Task.isCancelled, selectionID == selection, streamID == connection else { return }
+                failures = ResearchReconnect.failures(after: failures, readSnapshot: snapshot != nil,
+                                                      newEvents: lastSeq > seqBefore)
+                if failures >= ResearchReconnect.maxFailures {
+                    endLost(ResearchReconnect.lostLine)
+                    return
+                }
                 if phase != .paused { status = "Reconnecting to research…" }
                 do { try await Task.sleep(nanoseconds: retryDelay) }
                 catch { return }
                 retryDelay = min(retryDelay * 2, 8_000_000_000)
             }
         }
+    }
+
+    /// Stops listening to a job that can't be reached, keeping what was gathered.
+    private func endLost(_ line: String) {
+        streamTask?.cancel()
+        phase = .error
+        errorText = line
+        status = "Research stopped updating"
+        stopElapsedTimer()
     }
 
     private func restore(_ snapshot: HarborClient.ResearchSnapshot) {
@@ -426,7 +443,15 @@ final class ResearchModel: ObservableObject {
             // Transport errors have no persisted sequence. Preserve gathered
             // work and let listen() reconcile/reconnect instead of declaring
             // the backend job itself failed.
-            if seq == 0 { status = "Connection interrupted. Reconnecting…"; return }
+            // A job that is gone (404, 410) is the exception: nothing will bring it back.
+            if seq == 0 {
+                if ResearchReconnect.isGone(streamMessage: ev.str("message")) {
+                    endLost(ResearchReconnect.goneLine)
+                } else {
+                    status = "Connection interrupted. Reconnecting…"
+                }
+                return
+            }
             phase = .error; errorText = ev.str("message"); status = "Research failed"
             stopElapsedTimer()
         case "plan", "done":

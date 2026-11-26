@@ -896,12 +896,13 @@ enum NotchSettingsChrome {
     /// A tab chip: filled with a checkmark when picked, an outline with a plus when not.
     static func tabChipLabel(_ title: String, on: Bool) -> some View {
         HStack(spacing: 5) {
-            Image(systemName: on ? "checkmark" : "plus").font(.system(size: 10, weight: .bold))
+            Image(systemName: on ? "checkmark" : "plus").font(.harbor(size: 10, weight: .bold))
                 .accessibilityHidden(true)
             Text(title).font(.harbor(.body, weight: on ? .semibold : .regular))
         }
         .foregroundStyle(on ? Color.black : Theme.textSecondary)
         .padding(.horizontal, 12).padding(.vertical, 5)
+        .frame(minHeight: Theme.iconButtonSize)
         .background(Capsule().fill(on ? Color(white: 0.95) : Color.clear))
         .overlay(Capsule().strokeBorder(on ? Color.clear : Theme.chipStroke, lineWidth: 1))
         .contentShape(Capsule())
@@ -911,6 +912,7 @@ enum NotchSettingsChrome {
         Button(action: action) {
             Text(title).font(.harbor(.body)).foregroundStyle(primary ? Theme.textPrimary : Theme.textSecondary)
                 .padding(.horizontal, 12).padding(.vertical, 5)
+                .frame(minHeight: Theme.iconButtonSize)
                 .background(Capsule().fill(Theme.chipFill))
                 .overlay(Capsule().strokeBorder(Theme.chipStroke, lineWidth: 1))
                 .contentShape(Capsule())

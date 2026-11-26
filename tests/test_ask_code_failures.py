@@ -184,12 +184,20 @@ def test_skill_runner_returns_a_host_receipt_only_on_exit_zero(monkeypatch, tmp_
     from service.skills import tools as skill_tools
     from service.tools import classify_tool_outcome
 
+    class Stream:
+        def __init__(self):
+            self.chunks = [b"screen locked"]
+
+        async def read(self, _n):
+            return self.chunks.pop(0) if self.chunks else b""
+
     class Proc:
         def __init__(self, code):
             self.returncode = code
+            self.stdout = Stream()
 
-        async def communicate(self):
-            return b"screen locked", None
+        async def wait(self):
+            return self.returncode
 
     codes = iter([0, 3])
 

@@ -1,6 +1,12 @@
 import AppKit
 import SwiftUI
 
+/// Account and Workspace state colours from the shared ink, so the caption
+/// text stays readable on the light Settings window.
+private let googleOK = HarborInk.dynamic(light: HarborInk.rgb(HarborInk.ok.light), dark: HarborInk.rgb(HarborInk.ok.dark))
+private let googleAttention = HarborInk.dynamic(light: HarborInk.rgb(HarborInk.attention.light),
+                                              dark: HarborInk.rgb(HarborInk.attention.dark))
+
 /// Settings ▸ Google: one section, one sign-in per account.
 ///
 /// A Google sign-in serves everything: the Google Workspace tools Ask uses
@@ -244,9 +250,10 @@ struct GoogleSettingsPane: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Google").font(.title2.weight(.medium))
-            Text("Gmail, Calendar, Drive, Docs and Chat through Google Workspace. Brief reads your mail and calendar; Ask can use Google tools and asks before anything that changes.")
+            Text("Gmail, Calendar, Drive, Docs and Chat through Google Workspace.")
                 .font(.caption).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+                .help("Brief reads your mail and calendar; Ask can use Google tools and asks before anything that changes.")
 
             if !model.status.accounts.isEmpty {
                 VStack(alignment: .leading, spacing: 12) {
@@ -255,7 +262,10 @@ struct GoogleSettingsPane: View {
             }
 
             VStack(alignment: .leading, spacing: 6) {
-                Button(model.authorizing ? "Waiting for Google…" : "Connect Google account") { model.connect() }
+                Button { model.connect() } label: {
+                    Text(model.authorizing ? "Waiting for Google…" : "Connect Google account")
+                        .frame(minWidth: 170)
+                }
                     .buttonStyle(.borderedProminent).tint(palette.accent)
                     .disabled(model.authorizing || !model.canConnect)
                 if !model.consentNotice.isEmpty {
@@ -301,7 +311,7 @@ struct GoogleSettingsPane: View {
     }
 
     private func color(_ state: GoogleStatus.Account.State) -> Color {
-        state == .connected ? .green : .orange
+        state == .connected ? googleOK : googleAttention
     }
 
     private func accountRow(_ account: GoogleStatus.Account) -> some View {
@@ -335,6 +345,7 @@ struct GoogleSettingsPane: View {
                 accountToErase = account.id
                 confirmErase = true
             }
+            .accessibilityLabel("Disconnect and erase")
             .help("Revokes Harbor's Google access and deletes this account's mail, calendar events, summaries and to-dos from Harbor. Asks first.")
         }
     }
@@ -344,27 +355,29 @@ struct GoogleSettingsPane: View {
             // The Workspace server that serves Ask's Google tools.
             HStack(spacing: 8) {
                 Image(systemName: model.wsRunning ? "checkmark.circle.fill" : "circle.dashed")
-                    .foregroundStyle(model.wsRunning ? Color.green : palette.textMuted)
+                    .foregroundStyle(model.wsRunning ? googleOK : palette.textMuted)
                 Text(model.wsRunning ? "Running — \(model.wsTools) Google tools"
                      : model.wsPreparing ? "Setting up Google tools…"
                      : model.wsConfigured ? "Google tools configured but not running"
                      : "Google tools not set up. Connecting an account sets them up.")
                     .font(.caption)
                 Spacer()
-                Button(model.wsPreparing ? "Setting up…" : "Update settings") { model.enableWorkspace() }
+                Button { model.enableWorkspace() } label: {
+                    Text(model.wsPreparing ? "Setting up…" : "Update settings").frame(minWidth: 96)
+                }
                     .disabled(model.wsPreparing || (!model.canConnect))
                 if model.wsConfigured { Button("Remove") { model.disableWorkspace() } }
             }
             // Workspace trouble shows once, here, never on an account row.
             if !model.status.workspaceNote.isEmpty {
-                Text(model.status.workspaceNote).font(.caption).foregroundStyle(.orange)
+                Text(model.status.workspaceNote).font(.caption).foregroundStyle(googleAttention)
                     .fixedSize(horizontal: false, vertical: true)
                 if !model.status.workspaceNoteDetail.isEmpty {
                     Text(model.status.workspaceNoteDetail).font(.caption2).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             } else if !model.wsError.isEmpty {
-                Text(model.wsError).font(.caption).foregroundStyle(.orange)
+                Text(model.wsError).font(.caption).foregroundStyle(googleAttention)
             }
             if !model.wsMessage.isEmpty {
                 Text(model.wsMessage).font(.caption).foregroundStyle(.secondary)

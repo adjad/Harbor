@@ -4,11 +4,15 @@ from __future__ import annotations
 import asyncio
 from contextvars import ContextVar
 import json
+import logging
+from pathlib import Path
 import re
+import traceback
 
 from service.memory.facts import CATEGORIES, fingerprint
 from service.memory.queue import MemoryQueue
 
+log = logging.getLogger(__name__)
 current_source: ContextVar[dict | None] = ContextVar('memory_source', default=None)
 EXTRACTOR_VERSION = 'verbatim-user-v2'
 EXTRACTION_SYSTEM = '''Return JSON only: {"facts":[{"quote":"exact complete user sentence","category":"fact|preference|person|project|routine"}]}.
@@ -199,7 +203,7 @@ class MemoryWorker:
                         break
                 if interrupted:
                     if job:
-                        self.queue.finish(job, 'queued')
+                        self.queue.finish(job, 'queued', refund=True)
                     elif any(j['id'] == investigation['id'] and j['status'] == 'running' for j in self.connections.list()):
                         self.connections.set_status(investigation['id'], 'queued')
                     continue
@@ -211,12 +215,17 @@ class MemoryWorker:
                     self.generation.cancel()
                     await asyncio.gather(self.generation, return_exceptions=True)
                 if job:
-                    self.queue.finish(job, 'queued')
+                    self.queue.finish(job, 'queued', refund=True)
                 if investigation:
                     self.connections.set_status(investigation['id'], 'queued')
                 raise
             except Exception as exc:
-                # Store types, never raw model responses or user source text.
+                # Store and log types and code locations, never messages: those can
+                # carry raw model responses or user source text.
+                where = traceback.extract_tb(exc.__traceback__)[-1:] if exc.__traceback__ else []
+                log.warning('memory capture %s failed: %s at %s', 'investigation' if investigation else 'job',
+                            type(exc).__name__,
+                            f'{Path(where[0].filename).name}:{where[0].lineno}' if where else 'unknown')
                 if job:
                     self.queue.finish(job, 'failed' if job['attempts'] >= 3 else 'queued', type(exc).__name__)
                 if investigation:

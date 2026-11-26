@@ -33,6 +33,39 @@ def _key(text: str) -> str:
     return hashlib.sha256(_norm(text).encode()).hexdigest()
 
 
+class SuppressionView:
+    """FactStore's suppression rules over one read of memory_suppression."""
+
+    def __init__(self, rows):
+        self.sources, self.quotes, self.fragments = set(), set(), {}
+        for kind, value in rows:
+            if kind == 'source':
+                self.sources.add(value)
+            elif kind == 'quote':
+                self.quotes.add(value)
+            elif kind.startswith('fragment:'):
+                try:
+                    self.fragments.setdefault(int(kind.split(':')[1]), set()).add(value)
+                except ValueError:
+                    continue
+
+    def source(self, source_type, source_id):
+        return f'{source_type}:{source_id}' in self.sources
+
+    def text(self, text):
+        # Old suppression hashes remain effective after the migration.
+        if self.quotes and any(_key(q) in self.quotes for q in [text, *re.split(r'[.!?\n]+', text)] if q.strip()):
+            return True
+        if not self.fragments:
+            return False
+        words = _norm(text).split()
+        for n, hashes in self.fragments.items():
+            for i in range(len(words) - n + 1):
+                if hashlib.sha256(' '.join(words[i:i+n]).encode()).hexdigest() in hashes:
+                    return True
+        return False
+
+
 # Public name retained for existing callers and migrated evidence fixtures.
 key = _key
 
@@ -232,20 +265,15 @@ class FactStore:
             return self._blocked('source', f'{source_type}:{source_id}')
 
     def suppressed_text(self, text):
-        words = _norm(text).split()
+        return self.suppression_view().text(text)
+
+    def suppression_view(self):
+        """Every suppression key read in one query, for a caller that checks many rows (a
+        recall search): it used to cost 2-4 queries a row plus a re-read of every
+        fragment hash per row. A snapshot: a forget during the search applies next time."""
         with self._lock:
-            # Old suppression hashes remain effective after the migration.
-            if any(self._blocked('quote', _key(q)) for q in [text, *re.split(r'[.!?\n]+', text)] if q.strip()):
-                return True
-            rows = self._db.execute("SELECT kind,value FROM memory_suppression WHERE kind LIKE 'fragment:%'").fetchall()
-        by_length = {}
-        for r in rows:
-            by_length.setdefault(int(r['kind'].split(':')[1]), set()).add(r['value'])
-        for n, hashes in by_length.items():
-            for i in range(len(words) - n + 1):
-                if hashlib.sha256(' '.join(words[i:i+n]).encode()).hexdigest() in hashes:
-                    return True
-        return False
+            rows = self._db.execute('SELECT kind,value FROM memory_suppression').fetchall()
+        return SuppressionView(rows)
 
     def add(self, text, category='fact', session_id=None, pinned=False, *, origin='explicit',
             status='active', evidence=None, explanation='', subject='', predicate='', object=''):

@@ -21,9 +21,11 @@ arguments in — is exactly the untrusted input path that makes it exploitable.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import re
 import shlex
+import signal
 import tempfile
 from pathlib import Path
 
@@ -48,6 +50,29 @@ def authentic_completion_tool(tool) -> bool:
 _PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
 _TIMEOUT_S = 120
 _MAX_OUTPUT = 8000
+# Bytes read from a tool before it is stopped: what _MAX_OUTPUT characters can
+# take in UTF-8, so the service never holds more than this of one tool's output
+# (pentest #8: a printing loop used to grow the service for the whole timeout).
+_MAX_OUTPUT_BYTES = _MAX_OUTPUT * 4
+_READ_CHUNK = 16384
+_STOP_DRAIN_S = 3.0
+
+
+async def _read_capped(proc) -> tuple[bytes, bool]:
+    """The tool's output, at most _MAX_OUTPUT_BYTES of it, and whether it was cut
+    off. A tool that prints more is stopped as soon as it passes the ceiling."""
+    kept = bytearray()
+    while True:
+        chunk = await proc.stdout.read(_READ_CHUNK)
+        if not chunk:
+            break
+        room = _MAX_OUTPUT_BYTES - len(kept)
+        kept += chunk[:max(room, 0)]
+        if len(chunk) > room:
+            await _stop(proc)
+            return bytes(kept), True
+    await proc.wait()
+    return bytes(kept), False
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,48}$")
 
 
@@ -115,6 +140,12 @@ def _make_runner(skill_dir: Path, spec: dict, name: str = ""):
         # running process reaches. Without this, a generated tool inherits the
         # user's full filesystem rights the moment it starts.
         profile_file = None
+        # The tool's own scratch folder, outside its skill folder (sandbox.scratch_dir).
+        scratch = sandbox.scratch_dir(skill_dir)
+        try:
+            scratch.mkdir(parents=True, exist_ok=True, mode=0o700)
+        except OSError as e:
+            return f"(couldn't prepare this skill's scratch folder: {e})"
         if sandbox.available():
             profile = sandbox.build_profile(skill_dir, read_scopes, write_scopes)
             fd, profile_path = tempfile.mkstemp(suffix=".sb", prefix="harbor-skill-")
@@ -130,7 +161,12 @@ def _make_runner(skill_dir: Path, spec: dict, name: str = ""):
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
                     cwd=str(skill_dir),
-                    env={**child_environment(), "HARBOR_SKILL_DIR": str(skill_dir)},
+                    env={**child_environment(), "HARBOR_SKILL_DIR": str(skill_dir),
+                         "HARBOR_SKILL_SCRATCH": str(scratch), "TMPDIR": str(scratch) + "/",
+                         # No .pyc beside the skill: its folder is fingerprinted (skills/trust.py).
+                         "PYTHONDONTWRITEBYTECODE": "1"},
+                    # Its own process group, so a stop reaches the children a script starts.
+                    start_new_session=True,
                 )
             except FileNotFoundError:
                 return f"(couldn't run this skill's tool — {argv[0]} isn't installed)"
@@ -138,10 +174,14 @@ def _make_runner(skill_dir: Path, spec: dict, name: str = ""):
                 return f"(couldn't run this skill's tool: {e})"
 
             try:
-                out, _ = await asyncio.wait_for(proc.communicate(), _TIMEOUT_S)
+                out, cut = await asyncio.wait_for(_read_capped(proc), _TIMEOUT_S)
             except asyncio.TimeoutError:
-                proc.kill()
+                await _stop(proc)
                 return f"(this skill's tool timed out after {_TIMEOUT_S}s)"
+            except BaseException:
+                # The turn was cancelled (Ask closed, Stop): the tool must not run on.
+                await _stop(proc)
+                raise
         finally:
             # The profile must outlive the process, so it's removed only once
             # the run is fully done — including the early-return paths above.
@@ -149,6 +189,9 @@ def _make_runner(skill_dir: Path, spec: dict, name: str = ""):
                 profile_file.unlink(missing_ok=True)
 
         text = (out or b"").decode(errors="replace").strip()
+        if cut:
+            return (text[:_MAX_OUTPUT] + f"\n…[truncated: this skill's tool printed more than "
+                    f"{_MAX_OUTPUT} characters and was stopped]")
         if len(text) > _MAX_OUTPUT:
             text = text[:_MAX_OUTPUT] + "\n…[truncated]"
         if proc.returncode != 0:
@@ -170,6 +213,32 @@ def _make_runner(skill_dir: Path, spec: dict, name: str = ""):
     return run
 
 
+async def _stop(proc: asyncio.subprocess.Process) -> None:
+    """Kill a skill tool's whole process group and reap it."""
+    if proc.returncode is None:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+    # asyncio's wait() also waits for the pipes to close, and a full stdout
+    # pipe whose reader is paused never does: drain it (discarding) first, for
+    # at most _STOP_DRAIN_S in all. A grandchild that left the process group
+    # (setsid) keeps the pipe open and could print forever, so the pipe is then
+    # closed on our side and the wait given up.
+    if proc.stdout is not None:
+        with contextlib.suppress(Exception):
+            async with asyncio.timeout(_STOP_DRAIN_S):
+                while await proc.stdout.read(65536):
+                    pass
+    transport = getattr(proc, "_transport", None)
+    if transport is not None:
+        with contextlib.suppress(Exception):
+            transport.close()
+    with contextlib.suppress(Exception):
+        await asyncio.wait_for(asyncio.shield(proc.wait()), _STOP_DRAIN_S)
+
+
 def register_skill_tools(skills: dict) -> list[str]:
     """Register every enabled skill's declared tools; retract stale ones."""
     for name in _registered:
@@ -177,12 +246,19 @@ def register_skill_tools(skills: dict) -> list[str]:
     _registered.clear()
 
     added: list[str] = []
+    # Tool names already claimed in this pass, by skill: a later skill may not
+    # take one over (standing grants are keyed by tool name; pentest #23).
+    claimed: dict[str, str] = {}
     for skill in skills.values():
         if not skill.enabled or skill.error:
             continue
         for spec in skill.tools:
             name = str(spec.get("name") or "").strip().lower()
             if not _NAME_RE.match(name):
+                continue
+            if name in claimed:
+                print(f"[skills] tool {name!r} from {skill.name!r} skipped: "
+                      f"the {claimed[name]!r} skill already provides it", flush=True)
                 continue
             # Never let a skill shadow a built-in. Silently replacing
             # `send_email` or `run_shell` with a skill's own version would be a
@@ -207,6 +283,7 @@ def register_skill_tools(skills: dict) -> list[str]:
             register(name, description, schema, category="skill_tool")(
                 _make_runner(skill.path, spec, name))
             _registered.add(name)
+            claimed[name] = skill.name
             added.append(name)
     return added
 

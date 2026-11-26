@@ -166,10 +166,45 @@ def app_key_problem(path: str, headers: Headers, method: str = "") -> str | None
     return None
 
 
+async def _gateway_approval(scope, headers: Headers, receive):
+    """For an /agent/approve that came in on the phone gateway's key (no app key):
+    read its small body, and return (why it is refused or None, a receive that
+    replays the body). None for every other request, which is left untouched."""
+    from service.gateway_link import (APPROVE_BODY_LIMIT, GATEWAY_APPROVE_PATH,
+                                      approval_scope_problem)
+    if (scope.get("path") != GATEWAY_APPROVE_PATH or scope.get("method", "").upper() != "POST"
+            or headers.getlist(APP_KEY_HEADER)):
+        return None
+    from service.credential_pipe import app_key_state
+    if not app_key_state()[0]:
+        return None                   # no app key required: nothing came in on the gateway key
+    body, more = b"", True
+    while more:
+        message = await receive()
+        if message.get("type") != "http.request":
+            return "The approval was not received.", receive
+        body += message.get("body", b"")
+        more = bool(message.get("more_body"))
+        if len(body) > APPROVE_BODY_LIMIT:
+            return approval_scope_problem(body), receive
+    sent = False
+
+    async def replay():
+        nonlocal sent
+        if not sent:
+            sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return await receive()
+
+    return approval_scope_problem(body), replay
+
+
 class AppKeyGuard:
     """Pure ASGI middleware (no buffering, so streams pass through): every request
     and WebSocket handshake must carry this launch's app key, when one is required.
-    The one exception is the phone gateway's link secret on the routes it forwards."""
+    The one exception is the phone gateway's link secret on the routes it forwards;
+    only an approval that came in on it has its small body read first, so a standing
+    "always" is refused (service/gateway_link.py)."""
 
     def __init__(self, app):
         self.app = app
@@ -177,8 +212,13 @@ class AppKeyGuard:
     async def __call__(self, scope, receive, send):
         kind = scope.get("type")
         if kind in ("http", "websocket"):
-            problem = app_key_problem(scope.get("path", ""), Headers(scope=scope),
+            headers = Headers(scope=scope)
+            problem = app_key_problem(scope.get("path", ""), headers,
                                       scope.get("method", "") if kind == "http" else "")
+            if not problem and kind == "http":
+                checked = await _gateway_approval(scope, headers, receive)
+                if checked is not None:
+                    problem, receive = checked
             if problem:
                 if kind == "http":
                     await JSONResponse({"detail": problem}, status_code=403)(scope, receive, send)

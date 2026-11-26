@@ -174,11 +174,12 @@ struct NotchConnectGoogle: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 Image(systemName: "person.crop.circle.badge.plus").foregroundStyle(Theme.textPrimary)
+                    .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text("Google account").font(.system(size: 12.5, weight: .semibold))
+                    Text("Google account").font(.harbor(.body, weight: .semibold))
                         .foregroundStyle(Theme.textPrimary)
                     Text(model.consentLine)
-                        .font(.system(size: 11)).foregroundStyle(Theme.textMuted)
+                        .font(.harbor(.footnote)).foregroundStyle(Theme.textMuted)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: 8)
@@ -189,14 +190,16 @@ struct NotchConnectGoogle: View {
             }
             let notice = GoogleConsentCopy.notice(model.status)
             if !notice.isEmpty && !model.stage.busy {
-                Text(notice).font(.system(size: 11)).foregroundStyle(Theme.textSecondary)
+                Text(notice).font(.harbor(.footnote)).foregroundStyle(Theme.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
             if !model.stage.line.isEmpty {
                 HStack(spacing: 6) {
-                    if model.stage.busy { ProgressView().controlSize(.mini) }
-                    Text(model.stage.line).font(.system(size: 11.5))
-                        .foregroundStyle(isFailure ? Color.orange : Theme.textSecondary)
+                    if model.stage.busy {
+                        ProgressView().controlSize(.mini).accessibilityLabel("Connecting to Google")
+                    }
+                    Text(model.stage.line).font(.harbor(.footnote, weight: .medium))
+                        .foregroundStyle(isFailure ? Theme.warn : Theme.textSecondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
@@ -213,7 +216,7 @@ struct NotchConnectGoogle: View {
 
     private func chip(_ title: String, primary: Bool = false, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Text(title).font(.system(size: 11.5, weight: primary ? .semibold : .medium))
+            Text(title).font(.harbor(.footnote, weight: primary ? .semibold : .medium))
                 .foregroundStyle(primary ? Color.black : Theme.textSecondary)
                 .padding(.horizontal, 9).padding(.vertical, 4)
                 .background(Capsule().fill(primary ? Color.white : Theme.chipFill))

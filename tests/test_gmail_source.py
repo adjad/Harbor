@@ -194,6 +194,20 @@ class GmailSource(unittest.TestCase):
         self.assertEqual(E._parse_header_records(E._headers)[0]["subject"], "Hi | there")
         self.assertEqual(G.extract_body(msg("a")["payload"]), "Synthetic body")
 
+    def test_body_uses_part_charset_and_skips_blank_plain_alternative(self):
+        def part(mime, raw, ctype=None):
+            return {"mimeType": mime, "body": {"data": base64.urlsafe_b64encode(raw).decode()},
+                    "headers": [{"name": "Content-Type", "value": ctype or f"{mime}; charset=utf-8"}]}
+        latin = part("text/plain", "Grüße aus Köln".encode("latin-1"), 'text/plain; charset="ISO-8859-1"')
+        self.assertEqual(G.extract_body(latin), "Grüße aus Köln")
+        sjis = part("text/plain", "会議の資料".encode("shift_jis"), "text/plain; charset=Shift_JIS")
+        self.assertEqual(G.extract_body(sjis), "会議の資料")
+        unknown = part("text/plain", "plain café".encode(), "text/plain; charset=x-made-up")
+        self.assertEqual(G.extract_body(unknown), "plain café")
+        alternative = {"mimeType": "multipart/alternative", "parts": [
+            part("text/plain", b"  \r\n "), part("text/html", b"<p>Your synthetic receipt</p>")]}
+        self.assertEqual(G.extract_body(alternative), "Your synthetic receipt")
+
     def test_header_only_tool_gets_new_arrival_with_mail_closed(self):
         E.set_email_availability(False, reason="Mail is closed", read_source="local_index")
         calls = []
@@ -1751,6 +1765,71 @@ print('fresh process retained original native fallback')
         for selector in (ME, "native-A"):
             rows = E._filter_account_records(E._parse_header_records(E._headers), selector)
             self.assertEqual(rows[0]["subject"], "New native fallback")
+
+    def test_message_deleted_between_listing_and_fetch_is_skipped_not_fatal(self):
+        async def run():
+            token = G._context.set((ME, dict(self.accounts[ME]), 0))
+            G._access[ME] = {"token": "fake", "expires": time.time() + 3600}
+
+            async def get(url, params=None, headers=None):
+                path = url.rsplit("/gmail/v1/users/me/", 1)[-1]
+                if path == "messages":
+                    return httpx.Response(200, json={"messages": [{"id": "kept"}, {"id": "gone"}]})
+                if path == "messages/gone":
+                    return httpx.Response(404, json={"error": {"message": "Not Found"}})
+                return httpx.Response(200, json=msg(path.rsplit("/", 1)[-1], "Kept synthetic"))
+            http = AsyncMock()
+            http.get.side_effect = get
+            try:
+                await G._ensure_meta(http, ["kept", "gone"])
+                self.assertIn((ME, "kept"), G._meta)
+                self.assertNotIn((ME, "gone"), G._meta)
+                await G._sync_raw(http, ME)
+                self.assertEqual(set(G._raw[ME]), {"kept"})
+                self.assertIn("raw", G._last.get(ME, {}))
+                with self.assertRaises(G.GmailError):      # a listing 404 still fails loudly
+                    http.get.side_effect = lambda *a, **k: httpx.Response(404)
+                    await G._list_ids(http, 5)
+            finally:
+                G._context.reset(token)
+        asyncio.run(run())
+
+    def test_metadata_and_auth_caches_are_bounded_and_keep_the_current_listing(self):
+        cache = G._Bounded(3, keep=lambda v: v is None)
+        cache["dup"] = None
+        for k in "abcde":
+            cache[k] = {"id": k}
+        self.assertEqual(list(cache), ["dup", "d", "e"])     # the shared-id marker is never dropped
+        started = time.perf_counter()
+        big = G._Bounded(1000)
+        for n in range(50_000):
+            big[n] = n
+        self.assertEqual(len(big), 1000)
+        self.assertLess(time.perf_counter() - started, 2.0)  # one eviction per insert, not a rescan
+
+        async def run():
+            token = G._context.set((ME, dict(self.accounts[ME]), 0))
+            G._access[ME] = {"token": "fake", "expires": time.time() + 3600}
+
+            async def get(url, params=None, headers=None):
+                return httpx.Response(200, json=msg(url.rsplit("/", 1)[-1]))
+            http = AsyncMock()
+            http.get.side_effect = get
+            try:
+                with patch.object(G, "_meta", G._Bounded(60)), \
+                        patch.object(G, "_auth", G._Bounded(60, keep=lambda v: v is None)):
+                    pinned = [f"pinned{i}" for i in range(20)]       # listed on every sync
+                    for day in range(30):                            # 10 new arrivals a day
+                        await G._ensure_meta(http, pinned + [f"d{day}-{i}" for i in range(10)])
+                    self.assertLessEqual(len(G._meta), 60)
+                    self.assertLessEqual(len(G._auth), 60)
+                    self.assertTrue(all((ME, i) in G._meta for i in pinned))
+                    calls = http.get.await_count
+                    await G._ensure_meta(http, pinned)
+                    self.assertEqual(http.get.await_count, calls)     # nothing re-fetched
+            finally:
+                G._context.reset(token)
+        asyncio.run(run())
 
     def test_queued_metadata_does_not_dispatch_after_disconnect_epoch(self):
         async def run():

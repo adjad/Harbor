@@ -24,6 +24,7 @@ def test_native_history_mapping_contract(tmp_path):
             "-module-cache-path",
             str(tmp_path / "modules"),
             "app/Sources/HarborApp/HarborClient.swift",
+            "app/Sources/HarborApp/ResearchExportName.swift",
             "app/Sources/HarborApp/AgentSend.swift",
             "app/Sources/HarborApp/AssistantDelivery.swift",
             "app/Sources/HarborApp/CalendarReader.swift",

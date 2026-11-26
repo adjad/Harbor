@@ -106,7 +106,8 @@ def plan_pages(store, assignment: dict, matches: list[dict], now: float) -> list
     return out[:MAX_PAGES]
 
 
-async def prepare(now: float | None = None, *, store=None, status=None, make=None) -> list[str]:
+async def prepare(now: float | None = None, *, store=None, status=None, make=None,
+                  notify_loop: asyncio.AbstractEventLoop | None = None) -> list[str]:
     """Make the quizzes that are due; returns the new material ids. Never raises for one
     assignment's failure: the next one is still tried (within the bounds)."""
     now = time.time() if now is None else now
@@ -124,11 +125,15 @@ async def prepare(now: float | None = None, *, store=None, status=None, make=Non
     make = make or generate.make
     courses = {c.get("id"): c for c in store.courses() if isinstance(c, dict)}
     made: list[str] = []
+    by_course: dict = {}       # each course's deck pages read once, not once per assignment
     for a in candidates(store, now):
         done = prepared(store)
         if sum(1 for v in done.values() if isinstance(v, dict) and (v.get("at") or 0) > now - 86400) >= MAX_PER_DAY:
             break
-        matches = match.match(a, store)
+        cid = a.get("course_id") if isinstance(a.get("course_id"), str) else None
+        if cid not in by_course:
+            by_course[cid] = match.pages_for(store, cid)
+        matches = match.match(a, by_course[cid])
         if not matches:
             continue
         refs = plan_pages(store, a, matches, now)
@@ -155,18 +160,51 @@ async def prepare(now: float | None = None, *, store=None, status=None, make=Non
         store.set_meta(PREPARED, done)
         made.append(saved["id"])
     if made:
-        try:
-            from service.assistant.hub import hub
-            await hub.publish({"type": "changed"})
-        except Exception:  # noqa: BLE001
-            pass
+        _notify_changed(notify_loop)
     return made
 
 
-def _run(now: float, store_factory) -> None:
+def _notify_changed(loop: asyncio.AbstractEventLoop | None) -> None:
+    """Tell the app a quiz is ready. The hub's queues belong to the service's loop, and
+    kick() runs prepare() on its own loop in a thread: hand the publish to the owner."""
+    try:
+        from service.assistant.hub import hub
+        try:
+            current = asyncio.get_running_loop()
+        except RuntimeError:
+            current = None
+        if loop is not None and loop is not current and not loop.is_closed():
+            loop.call_soon_threadsafe(_publish_changed, hub)
+        else:
+            hub.publish_sync({"type": "changed"})
+    except Exception:  # noqa: BLE001
+        log.debug("study: ready notice not sent", exc_info=True)
+
+
+def _publish_changed(hub) -> None:
+    try:
+        hub.publish_sync({"type": "changed"})
+    except Exception:  # noqa: BLE001
+        log.debug("study: ready notice not sent", exc_info=True)
+
+
+def _service_loop() -> asyncio.AbstractEventLoop | None:
+    """The service's event loop, from a coroutine on it or from one of its worker threads."""
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    try:
+        from anyio import from_thread
+        return from_thread.run_sync(asyncio.get_running_loop)
+    except Exception:  # noqa: BLE001 — not a worker thread of the service loop
+        return None
+
+
+def _run(now: float, store_factory, loop: asyncio.AbstractEventLoop | None = None) -> None:
     try:
         store = store_factory() if store_factory else None
-        asyncio.run(prepare(now, store=store))
+        asyncio.run(prepare(now, store=store, notify_loop=loop))
     except Exception:  # noqa: BLE001
         log.debug("study prepare skipped", exc_info=True)
     finally:
@@ -188,7 +226,8 @@ def kick(now: float | None = None, *, store=None, store_factory=None, force: boo
         _last_kick = time.monotonic()
         factory = store_factory or ((lambda: store) if store is not None else None)
         try:
-            threading.Thread(target=_run, args=(now, factory), name="study-prepare", daemon=True).start()
+            threading.Thread(target=_run, args=(now, factory, _service_loop()), name="study-prepare",
+                             daemon=True).start()
         except Exception:  # noqa: BLE001
             _running.release()
             return False

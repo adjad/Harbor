@@ -411,9 +411,24 @@ func dayChecks(_ check: (Bool, String) -> Void) {
     check(DayTimeline.briefLines(calendar: light, mail: (ready: true, needing: [BriefNeed(title: "Private details omitted.")]),
                                  texts: nil, soon: .nothing)[1].text == "1 private email not shown", "only private mail: counted")
     let unread = DayTimeline.briefLines(calendar: nil, mail: nil, texts: nil, soon: .nothing)
-    check(unread.map(\.text) == ["Nothing on your calendar", "Mail hasn't been checked yet", "Messages haven't been checked yet",
-                                 "Nothing in the next week"] && unread[1].muted && unread[2].muted,
+    check(unread.map(\.text) == ["Calendar hasn't been checked yet", "Mail hasn't been checked yet", "Messages haven't been checked yet",
+                                 "Nothing in the next week"] && unread[0].muted && unread[1].muted && unread[2].muted,
           "no coverage (the workspace couldn't be read) is unknown, never off")
+    // "Nothing on your calendar" only once the calendar came in empty: never while
+    // it loads, after a read that timed out (not ready, no state), or when unknown.
+    func cal(_ unsynced: Bool = false, access: SourceAccess? = nil, read: Bool = false) -> DayTimeline.BriefLine {
+        DayTimeline.briefLines(calendar: nil, calendarUnsynced: unsynced, calendarAccess: access, calendarRead: read,
+                               mail: nil, texts: nil, soon: .unknown)[0]
+    }
+    check(cal(read: true).text == "Nothing on your calendar" && !cal(read: true).muted, "a read, empty calendar says so")
+    check(cal(access: SourceAccess(source: "calendar", ready: true)).text == "Nothing on your calendar",
+          "a ready calendar with nothing on it says so")
+    check(cal(true, read: true).text == "Reading your calendar…" && cal(true).muted, "still loading is never empty")
+    check(cal(access: SourceAccess(source: "calendar", ready: false, state: "syncing")).text == "Reading your calendar…",
+          "a syncing calendar reads as loading")
+    let timedOut = cal(access: SourceAccess(source: "calendar", ready: false))
+    check(timedOut.text != "Nothing on your calendar" && timedOut.muted, "a read that timed out is never empty: \(timedOut.text)")
+    check(cal().text == "Calendar hasn't been checked yet" && cal().muted, "unknown is never empty")
     // MAIL says what the top email is about; TEXTS says who is waiting, never what they wrote.
     let described = DayTimeline.briefLines(calendar: nil, mail: (ready: true, needing: [
         BriefNeed(title: "Lab report", sender: "Lab partner", person: true, received: 100),
@@ -1071,6 +1086,31 @@ func firstDayChecks(_ check: (Bool, String) -> Void, dayStart: Double, dayEnd: D
             == cantRead, "an unread calendar is named")
     check(DayTimeline.blurb(empty, needs: [], isToday: true, endOfDay: dayEnd, clock: clock, dayStart: dayStart)
             == "Nothing is planned for the rest of today.", "a read, empty calendar is an honest all-clear")
+    // Reminders still coming in, or not read, or no workspace: the calendar's part
+    // only, never "nothing is due", "nothing planned" or "Clear after".
+    let dueClaims = ["Nothing is planned", "nothing else planned", "Nothing is due", "Clear after"]
+    let oneEvent = build([DayBlockInput(id: "coffee", title: "Coffee", start: at(14), end: at(14.5), kind: "calendar")])
+    for state in [DayDueState.reading, .unread] {
+        for timeline in [empty, oneEvent] {
+            let line = DayTimeline.blurb(timeline, needs: [], isToday: true, endOfDay: dayEnd, clock: clock, dayStart: dayStart,
+                                         due: state)
+            check(!dueClaims.contains { line.contains($0) }, "no all-clear for what's due before it is read: \(line)")
+            check(line.contains("Harbor is still reading your reminders.") == (state == .reading),
+                  "reading Reminders says so; an unread source has its own row: \(line)")
+        }
+    }
+    check(DayTimeline.blurb(empty, needs: [], isToday: true, endOfDay: dayEnd, clock: clock, dayStart: dayStart, due: .reading)
+            == "Nothing on the calendar for the rest of today. Harbor is still reading your reminders.",
+          "an empty calendar while Reminders come in")
+    check(DayTimeline.blurb(oneEvent, needs: [], isToday: true, endOfDay: dayEnd, clock: clock, dayStart: dayStart, due: .unread)
+            == "One thing on the clock for the rest of today.", "one event, what's due unknown")
+    let remindersSyncing = SourceAccess(source: "reminders", ready: false, state: "syncing")
+    check(DayDueState.of(reminders: remindersSyncing, workspaceRead: true) == .reading
+          && DayDueState.of(reminders: SourceAccess(source: "reminders", ready: false), workspaceRead: true) == .unread
+          && DayDueState.of(reminders: SourceAccess(source: "reminders", ready: true), workspaceRead: false) == .unread
+          && DayDueState.of(reminders: SourceAccess(source: "reminders", ready: true), workspaceRead: true) == .read
+          && DayDueState.of(reminders: nil, workspaceRead: true) == .read,
+          "what's due is known once Reminders are read and the workspace was built")
     noCalendarChecks(check, build: { build($0, needs: $1, allDay: $2) }, at: at, now: now, dayStart: dayStart, dayEnd: dayEnd, clock: clock, cantRead: cantRead)
 
     // The lede gives an all-clear only for what was read.

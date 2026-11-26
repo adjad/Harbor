@@ -24,7 +24,12 @@ SWEEP_EVERY_S = 60.0
 
 # Cards whose work is the reply itself: answering the thread finishes them.
 _REPLY_METHODS = {"email_reply", "text_reply", "read"}
-_REPLY_TITLE = re.compile(r"^\s*(?:reply|respond|answer|get back|text|email|message|write back)\b", re.I)
+_REPLY_TITLE = re.compile(r"^\s*(?:reply|respond|answer|get back|text|email|message|write back|confirm"
+                          r"|let\s+\S+(?:\s+\S+)?\s+know)\b", re.I)
+# Work the answer may not finish ("Send Dana the signed form"): answering the
+# thread retires its card, and the to-do stays, marked "you replied".
+_DELIVER_TITLE = re.compile(r"^\s*(?:send|share|forward)\b", re.I)
+_TASK_METHODS = {"add_to_day"}
 # A calendar or reminder offer is finished by the user's own entry.
 _SCHEDULE_METHODS = {"reminder", "calendar_event"}
 
@@ -36,9 +41,11 @@ def seen_entry(item: dict) -> dict | None:
         return None
     if item.get("source") == "messages":
         conversation = (item.get("ref") or {}).get("conversation")
-        if not conversation or item.get("group"):
+        if not conversation:
             return None
-        return {"source": "messages", "conversation": conversation, "received_ts": float(received)}
+        # A group chat too: the user's own newest line in it answers it.
+        return {"source": "messages", "conversation": conversation, "received_ts": float(received),
+                **({"group": True} if item.get("group") else {})}
     if item.get("source") == "mail" and not item.get("critical"):
         ref = item.get("ref") or {}
         return {"source": "mail", "account": str(item.get("raw_account") or ref.get("account") or ""),
@@ -55,13 +62,22 @@ def _bare_address(value) -> str:
     return (found.group(1) if found else value if "@" in value and " " not in value else "").casefold()
 
 
-def latest_sent_texts(records) -> dict[str, float]:
-    """The newest text the user sent, by conversation."""
+def latest_sent_texts(records, acknowledged: dict[str, float] | None = None) -> dict[str, float]:
+    """The newest text the user sent, or tapback they added, by conversation.
+    `acknowledged` is chat GUID -> newest tapback (imessage_tools.acknowledged_chats
+    by default); a record's chat GUID (its 4th field) ties it to a conversation."""
+    if acknowledged is None:
+        from service.tools.imessage_tools import acknowledged_chats
+        acknowledged = acknowledged_chats()
     latest: dict[str, float] = {}
     for record in records:
         ts, context, text = record[:3]
         if str(text).partition(":")[0].strip() == "Me" and ts > latest.get(context, float("-inf")):
             latest[context] = ts
+        guid = record[3] if len(record) > 3 else ""
+        reacted = acknowledged.get(guid) if isinstance(guid, str) and guid else None
+        if reacted is not None and reacted > latest.get(context, float("-inf")):
+            latest[context] = reacted
     return latest
 
 
@@ -91,6 +107,43 @@ def _reply_work(card: dict, todo: dict | None) -> bool:
     method = (card.get("action") or {}).get("method")
     return (method in _REPLY_METHODS or (todo or {}).get("kind") == "reply"
             or bool(_REPLY_TITLE.match(str(card.get("title") or ""))))
+
+
+def _task_work(card: dict, todo: dict | None) -> bool:
+    """A card for work beyond the answer itself (a task, a "send/share/forward")."""
+    method = (card.get("action") or {}).get("method")
+    return (method in _TASK_METHODS or not method
+            or bool(_DELIVER_TITLE.match(str(card.get("title") or (todo or {}).get("title") or ""))))
+
+
+def _retire_card_keep_todo(store, card: dict, now: float) -> None:
+    """A task card whose thread the user answered: the card goes (dismissed by
+    id), but its content and asks stay unsuppressed, so its to-do keeps showing."""
+    with store._lock:
+        store.decisions()["dismissed"][card["id"]] = now
+        store._write("decisions.json")
+    store.remove_card(card["id"])
+
+
+def replied_todos(store) -> dict[str, float]:
+    """To-do id -> when the user answered the thread it came from."""
+    value = store._read("decisions.json").get("replied_todos")
+    return {k: float(v) for k, v in value.items() if isinstance(v, (int, float))} \
+        if isinstance(value, dict) else {}
+
+
+def _mark_todo_replied(store, todo_id: str, now: float) -> None:
+    with store._lock:
+        data = store._read("decisions.json")
+        if not isinstance(data.get("replied_todos"), dict):
+            data["replied_todos"] = {}
+        data["replied_todos"][todo_id] = now
+        store._write("decisions.json")
+
+
+def replied_label(at: float) -> str:
+    """ "you replied Tue" (the local day the answer went out)."""
+    return "you replied " + time.strftime("%a", time.localtime(at))
 
 
 def _on_own_schedule(card: dict, sched: dict) -> bool:
@@ -147,12 +200,21 @@ def retire(store, *, answered: set[str], sched: dict | None = None, now: float |
     todos = {t.get("id"): t for t in state.get("todos") or []}
     done_ids = set(store.done_todos(now)) if hasattr(store, "done_todos") else set()
     retired, finished = [], []
+    kept: set[str] = set()
     for card in list(state.get("cards") or []):
         method = (card.get("action") or {}).get("method")
         if method in ("undo_add", "block_time"):
             continue                      # Harbor's own "ADDED" notice, and held work time
         todo = todos.get(card.get("todo_id"))
-        by_reply = bool(_refs(card) & answered) and _reply_work(card, todo)
+        answered_here = bool(_refs(card) & answered)
+        if answered_here and _task_work(card, todo) and card.get("id") not in contacted:
+            # Answered, but the work may still be open: the card goes, the to-do stays.
+            _retire_card_keep_todo(store, card, now)
+            retired.append(card["id"])
+            if todo and todo.get("id") not in done_ids:
+                kept.add(todo["id"])
+            continue
+        by_reply = answered_here and _reply_work(card, todo)
         if by_reply or card.get("id") in contacted or (sched and _on_own_schedule(card, sched)):
             store.dismiss_card(card, now)
             retired.append(card["id"])
@@ -163,11 +225,27 @@ def retire(store, *, answered: set[str], sched: dict | None = None, now: float |
     for todo in todos.values():
         if todo.get("id") in done_ids or todo.get("source") not in ("mail", "messages"):
             continue
-        reply = todo.get("kind") == "reply" or bool(_REPLY_TITLE.match(str(todo.get("title") or "")))
+        title = str(todo.get("title") or "")
+        reply = (todo.get("kind") == "reply" or bool(_REPLY_TITLE.match(title))) and not _DELIVER_TITLE.match(title)
         if (reply and _refs(todo) & answered) or todo.get("id") in contacted:
             store.set_todo_done(todo, True, now)
             done_ids.add(todo["id"])
             finished.append(todo["id"])
+        elif _refs(todo) & answered:
+            kept.add(todo["id"])
+    marked_todos = []
+    if kept:
+        already = replied_todos(store)
+        for todo_id in sorted(kept - done_ids):
+            if todo_id not in already:
+                _mark_todo_replied(store, todo_id, now)
+                marked_todos.append(todo_id)
+        when = replied_todos(store)
+        with store._lock:
+            fresh = store.state()
+            fresh["todos"] = [{**t, "replied_label": replied_label(when.get(t.get("id"), now))}
+                              if t.get("id") in kept else t for t in fresh.get("todos") or []]
+            store._write("state.json")
     threads = state.get("threads") or []
     marked = [t["id"] for t in threads if t.get("id", "").removeprefix("thread:") in answered and not t.get("replied")]
     if marked:
@@ -176,7 +254,65 @@ def retire(store, *, answered: set[str], sched: dict | None = None, now: float |
             fresh["threads"] = [{**t, "replied": True, "needs_reply": False, "handled": True}
                                 if t.get("id") in marked else t for t in fresh.get("threads") or []]
             store._write("state.json")
-    return {"cards": retired, "todos": finished, "threads": marked}
+    return {"cards": retired, "todos": finished, "threads": marked, "replied": marked_todos}
+
+
+def _same_handle(a, b) -> bool:
+    """One Messages handle against another: an address exactly (case aside),
+    a phone number by its last ten digits."""
+    a, b = str(a or "").strip().casefold(), str(b or "").strip().casefold()
+    if not a or not b:
+        return False
+    if "@" in a or "@" in b:
+        return a == b
+    da, db = re.sub(r"\D", "", a), re.sub(r"\D", "", b)
+    return len(da) >= 7 and da[-10:] == db[-10:]
+
+
+def conversations_with(handle, records=None) -> set[str]:
+    """The cached conversations whose incoming messages came from `handle`."""
+    if records is None:
+        records = sources.text_records()
+    return {str(r[1]) for r in records
+            if len(r) > 6 and r[1] and _same_handle(r[6], handle)}
+
+
+def mark_sent_reply(*, kind: str, message_id: str = "", account: str = "", subject: str = "",
+                    to=(), conversation: str = "", handle: str = "", store=None,
+                    now: float | None = None, records=None, publish: bool = True) -> dict:
+    """Bookkeeping after a VERIFIED send only (a receipt that names the approved
+    recipient): the answered thread is marked replied, its reply cards are
+    dismissed (which suppresses their asks) and the app is told to refresh.
+
+    kind "mail": the thread is found as the sweep would find it, from a sent row
+    built from the receipt (in_reply_to = message_id, the same subject and
+    account, the same recipients). kind "text": `conversation`, or every cached
+    conversation with `handle`. Never fatal: a failure leaves the next sweep to
+    find the sent message itself."""
+    try:
+        from service.proactive.store import store as default_store
+        store = store or default_store()
+        now = time.time() if now is None else now
+        seen = store.state().get("seen") or {}
+        texts: dict[str, float] = {}
+        sent: list[dict] = []
+        if kind == "mail":
+            recipients = [to] if isinstance(to, str) else [str(t) for t in to or ()]
+            sent = [{"ts": now, "to": recipients, "subject": str(subject or ""),
+                     "in_reply_to": str(message_id or ""), "account": str(account or "")}]
+        elif kind == "text":
+            chats = {conversation} if conversation else conversations_with(handle, records) if handle else set()
+            texts = {chat: now for chat in chats if chat}
+        else:
+            return {"cards": [], "todos": [], "threads": [], "replied": []}
+        answered = answered_refs(seen, texts=texts, sent=sent)
+        changed = retire(store, answered=answered, now=now)
+        if publish and any(changed.values()):
+            from service.assistant.hub import hub
+            hub.publish_sync({"type": "changed"})
+        return changed
+    except Exception:  # noqa: BLE001 — bookkeeping never turns a sent reply into an error
+        return {"cards": [], "todos": [], "threads": [], "replied": []}
 
 
 _last_sweep = 0.0

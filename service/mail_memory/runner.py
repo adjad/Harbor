@@ -85,6 +85,25 @@ WINDOW_DAYS = 90
 CLOUD_WINDOW_DAYS = 200
 
 
+PRUNE_EVERY_S = 86400
+PRUNE_MARGIN_DAYS = 14
+
+
+def _prune(st, now: float) -> None:
+    """Once a day, age out mail-memory rows the walk can never list again: beyond the
+    widest index window (cloud's) plus a margin, so a mode switch never re-reads them."""
+    try:
+        last = float(st.meta("last_prune") or 0)
+    except ValueError:
+        last = 0.0
+    if now - last < PRUNE_EVERY_S:
+        return
+    gone = st.prune(messages_before=now - (CLOUD_WINDOW_DAYS + PRUNE_MARGIN_DAYS) * 86400, now=now)
+    st.set_meta("last_prune", str(now))
+    if gone["messages"] or gone["items"]:
+        log.info("mail memory aged out %d messages and %d suggestions", gone["messages"], gone["items"])
+
+
 def window_days() -> int:
     from service.inference.remote_policy import cloud_everything_active
     return CLOUD_WINDOW_DAYS if cloud_everything_active() else WINDOW_DAYS
@@ -287,6 +306,16 @@ def _demo_hold() -> bool:
     return stage_mode.holds_background()
 
 
+def _on_this_mac(client) -> bool:
+    """Mail-derived prompts go only to an engine on this Mac: Harbor's own, or a
+    loopback app such as the user's oMLX.app. Anything unknown is off this Mac."""
+    try:
+        from service.config.endpoints import is_loopback
+        return getattr(client, "managed", False) is True or is_loopback(str(getattr(client, "base_url", "") or ""))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 async def _stand_down() -> str | None:
     """Why the fast model can't take a call now, or None when it can: a remote-only
     profile, the model not resident, something else resident (another app's model on
@@ -303,6 +332,8 @@ async def _stand_down() -> str | None:
     from service.config import role_to_model
     model = role_to_model("fast")
     client = _c()
+    if not _on_this_mac(client):
+        return "not_local"
     loaded = set(await client.loaded_models())
     try:
         warm = set(client.keep_warm())
@@ -531,6 +562,7 @@ async def tick(*, now: float | None = None) -> float:
     note_skip(None, now=now)
 
     st.expire(today.isoformat())
+    _prune(st, now)
     row = st.next_pending(now)
     facts_only = False
     if row is None:

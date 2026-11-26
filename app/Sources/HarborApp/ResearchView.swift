@@ -66,6 +66,7 @@ struct ResearchView: View {
                 Button(action: onBack) {
                     Image(systemName: "chevron.left")
                         .font(.harbor(size: 12, weight: .bold))
+                        .frame(width: Theme.iconButtonSize, height: Theme.iconButtonSize).contentShape(Rectangle())
                 }.buttonStyle(.borderless).help("Back").accessibilityLabel("Back")
             }
             Image(systemName: "binoculars.fill")
@@ -83,10 +84,14 @@ struct ResearchView: View {
             }
             if model.evidenceCount > 0 {
                 chip("\(model.evidenceCount) evidence", icon: "checkmark.seal")
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(model.evidenceCount == 1 ? "1 piece of evidence" : "\(model.evidenceCount) pieces of evidence")
             }
             if !model.sources.isEmpty {
-                chip("\(model.sources.filter { $0.status == "read" }.count) read",
-                     icon: "doc.text.magnifyingglass")
+                let readCount = model.sources.filter { $0.status == "read" }.count
+                chip("\(readCount) read", icon: "doc.text.magnifyingglass")
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(readCount == 1 ? "1 source read" : "\(readCount) sources read")
             }
             if !model.jobId.isEmpty && model.phase != .idle && model.phase != .planning {
                 let pinHelp = model.pinned ? "Pinned — kept from automatic 30-day cleanup"
@@ -97,6 +102,7 @@ struct ResearchView: View {
                 } else {
                     Button(action: model.togglePin) {
                         Image(systemName: model.pinned ? "pin.fill" : "pin")
+                            .frame(width: Theme.iconButtonSize, height: Theme.iconButtonSize).contentShape(Rectangle())
                     }.buttonStyle(.borderless).disabled(model.actionInProgress).help(pinHelp)
                         .accessibilityLabel(model.pinned ? "Unpin research job" : "Pin research job")
                 }
@@ -153,6 +159,7 @@ struct ResearchView: View {
         } else {
             Button { deleteConfirmation.arm(jobID: model.jobId) } label: {
                 Image(systemName: "trash")
+                    .frame(width: Theme.iconButtonSize, height: Theme.iconButtonSize).contentShape(Rectangle())
             }
             .buttonStyle(.borderless).disabled(model.actionInProgress)
             .help("Delete this research job and all its data")
@@ -256,7 +263,7 @@ struct ResearchView: View {
                     } else {
                         Button(action: model.start) {
                             Label("Start research", systemImage: "arrow.right.circle.fill")
-                                .font(.system(size: 13, weight: .semibold))
+                                .font(.harbor(size: 13, weight: .semibold))
                         }.buttonStyle(.borderedProminent)
                     }
                 }
@@ -269,7 +276,7 @@ struct ResearchView: View {
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
                     ProgressView().controlSize(.small)
-                    Text(model.status).font(.system(size: 13, weight: .medium))
+                    Text(model.status).font(.harbor(size: 13, weight: .medium)).lineLimit(2)
                     Spacer()
                     Button(model.paused ? "Resume" : "Pause", action: model.togglePause)
                         .buttonStyle(.bordered)
@@ -277,11 +284,11 @@ struct ResearchView: View {
                         .buttonStyle(.bordered)
                 }
                 Divider().overlay(Theme.hairline)
-                Text("Activity").font(.system(size: 12, weight: .semibold)).foregroundStyle(Theme.textSecondary)
+                Text("Activity").font(.harbor(size: 12, weight: .semibold)).foregroundStyle(Theme.textSecondary)
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 7) {
                         ForEach(Array(model.activity.enumerated()), id: \.offset) { _, item in
-                            Text(item).font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
+                            Text(item).font(.harbor(size: 12)).foregroundStyle(Theme.textSecondary)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
                     }
@@ -299,10 +306,10 @@ struct ResearchView: View {
                         HStack {
                             Spacer()
                             Button("Apply from next round", action: model.updateDomains)
-                                .buttonStyle(.bordered).font(.system(size: 11))
+                                .buttonStyle(.bordered).font(.harbor(size: 11))
                         }
                     }.padding(.top, 6)
-                }.font(.system(size: 12, weight: .semibold)).foregroundStyle(Theme.textSecondary)
+                }.font(.harbor(size: 12, weight: .semibold)).foregroundStyle(Theme.textSecondary)
                 HStack {
                     TextField("Steer the research…", text: $model.steering)
                         .modifier(AdaptiveField(compact: compact)).onSubmit(model.sendSteering)

@@ -1045,7 +1045,9 @@ def _credential_roots() -> list[Path]:
                   # question being shown, and is kept with the gate for one rule.
                   moe / "act_for_me_asked.json",
                   # /resetharbor's commit marker: its presence erases Harbor's data at the next start.
-                  moe / ".reset-pending"]
+                  moe / ".reset-pending",
+                  # The phone gateway's link key and paired-device secrets (pentest #20).
+                  moe / "phone_gateway"]
     return roots
 
 
@@ -1053,6 +1055,7 @@ _SHELL_SECRET = [
     r"(?<![\w-])\.(?:ssh|aws|gnupg|netrc)(?![\w-])",
     r"\.config/(?:gh|gcloud)\b", r"\bkeychains?\b", r"\bsecurity\s+(?:find|dump|export)-",
     r"\b(?:gmail|mcp|grants|access_mode|act_for_me(?:_asked)?)\.json\b", r"\bgoogle_workspace\b", r"\.reset-pending\b",
+    r"\bphone_gateway\b", r"\bgateway-link\.key\b",
 ]
 # The ~/.moe folder itself (not a file in it): moving or replacing it swaps
 # grants.json and access_mode.json without naming them (#409 audit). Any run
@@ -1144,6 +1147,79 @@ def credential_path_hit(args: dict, tool: str | None = None, *, mutating: bool =
     return None
 
 
+# Places whose files run later as code: login items (LaunchAgents), shell startup
+# files, git config (hooks and aliases), Harbor's own data folder (skills, grants,
+# settings) and the packaged app (its service code and policy.yaml). A file tool
+# that writes, deletes or moves anything into or out of one asks in every mode,
+# whatever full access or a standing grant says (#1 of the 2026-11-25 pentest):
+# injected text in a mail could otherwise plant login persistence with no card.
+_SHELL_STARTUP_FILES = (".zshrc", ".zshenv", ".zprofile", ".zlogin", ".zlogout", ".bash_profile",
+                        ".bashrc", ".bash_login", ".bash_logout", ".profile", ".inputrc")
+
+
+def _code_exec_roots() -> list[Path]:
+    from service.safety import shell_sandbox
+    home = Path.home()
+    roots = [home / "Library" / "LaunchAgents", Path("/Library/LaunchAgents"),
+             home / "Library" / "LaunchDaemons", Path("/Library/LaunchDaemons"),
+             home / ".config" / "fish", home / ".config" / "git", home / ".gitconfig",
+             home / "Library" / "Application Support" / "com.apple.backgroundtaskmanagementagent"]
+    roots += [home / name for name in _SHELL_STARTUP_FILES]
+    try:
+        roots += shell_sandbox.protected_roots()
+    except Exception:  # noqa: BLE001 — the fixed list still applies
+        pass
+    return list(dict.fromkeys(roots))
+
+
+def code_exec_path_hit(args: dict, tool: str | None = None) -> str | None:
+    """The location a file tool's arguments (or the paths it derives, such as a
+    move's destination child) put inside a place whose files run as code, or None."""
+    roots: list[str] = []
+    for root in _code_exec_roots():
+        roots.append(str(root).rstrip("/").casefold())
+        try:
+            roots.append(str(root.resolve()).rstrip("/").casefold())
+        except (OSError, RuntimeError):
+            pass
+    operands = list(_path_operands(args, tool))
+    try:
+        operands += list(_derived_path_operands(tool, args))
+    except (ValueError, OSError, RuntimeError):
+        pass
+    # Home and the folders above it hold every root; a move into ~ is ordinary.
+    home = Path.home()
+    above_home = set()
+    for base in dict.fromkeys((home, home.resolve())):
+        above_home.update(str(p).rstrip("/").casefold() or "/" for p in (base, *base.parents))
+    for _, operand in operands:
+        try:
+            forms = _path_forms(operand)
+        except (ValueError, OSError, RuntimeError):
+            return operand            # cannot tell where it points: ask
+        if any(_within(form, roots) for form in forms):
+            return operand
+        for form in forms:
+            p = form.rstrip("/").casefold() or "/"
+            # A folder that holds one of the places: moving ~/.config aside, writing
+            # into the moved copy and moving it back plants git config with no card
+            # unless the folder itself counts (Auditor finding on #1).
+            if p not in above_home and any(r.startswith(p + "/") for r in roots):
+                return operand
+            # A repository's own hooks and config run on the next git command.
+            if _GIT_CODE.search(p):
+                return operand
+    return None
+
+
+# A git directory's hooks and config, anywhere: .git/hooks/..., .git/config,
+# config.worktree, a submodule's (.git/modules/<name>/...), a linked worktree's
+# (.git/worktrees/<name>/config.worktree), a bare repo's (name.git/hooks), or a
+# .git folder itself.
+_GIT_CODE = re.compile(
+    r"(?:^|/)[^/]*\.git(?:/(?:(?:modules|worktrees)/[^/]+/)*(?:hooks|config(?:\.worktree)?)(?:/|$)|$)")
+
+
 def _grep_file_operands(cmd: str) -> str:
     """A plain grep's file operands, without its search pattern: searching a
     README for the words "mcp.json" reads the README, not mcp.json."""
@@ -1170,7 +1246,7 @@ def _grep_file_operands(cmd: str) -> str:
 # expand to one of them names it just as surely as spelling it out.
 _MOE_PROTECTED_NAMES = ("gmail.json", "mcp.json", "grants.json", "access_mode.json", "act_for_me.json",
                         "act_for_me_asked.json",
-                        ".reset-pending", "google_workspace")
+                        ".reset-pending", "google_workspace", "phone_gateway")
 _SHELL_WORD_BREAK = re.compile(r"[\s'\";|&()<>`]+")
 # Shell settings under which `*`, `?` and `[...]` also match a leading dot: bash's dotglob
 # (and GLOBIGNORE, which turns dotglob on), zsh's GLOB_DOTS (any case, any underscores)
@@ -4043,6 +4119,10 @@ def _decide(category: str, args: dict, tool: str | None = None) -> Decision:
                 else app_open_hit(args) if tool == "open_app" else None)
     secret = (credential_path_hit(args, tool, mutating=category != "fs_read")
               if category in ("fs_read", "fs_write", "fs_delete") else None)
+    # A file change in a place whose files run later as code (_code_exec_roots):
+    # computed before grants, so no Always allow and no access mode skips it.
+    persists = (code_exec_path_hit(args, tool)
+                if category in ("fs_write", "fs_delete") and not secret else None)
     # A Mac setting switched off that cuts the network, a device or a
     # protection (_TOGGLE_OFF_CUTS). A grant on "wifi" was given for a call the
     # user saw, not for every future Wi-Fi off.
@@ -4062,7 +4142,7 @@ def _decide(category: str, args: dict, tool: str | None = None) -> Decision:
                 and tool not in ALWAYS_CONFIRM_TOOLS and tool not in ALWAYS_CONFIRM_FILE_TOOLS
                 and tool not in ALWAYS_CONFIRM_DELETE_TOOLS
                 and not destructive and not outbound and not secret and not cut_off
-                and grants.is_grantable(tool, args)):
+                and not persists and grants.is_grantable(tool, args)):
             return Decision(Tier.ALLOW, f"you allowed {tool} for this target")
 
     # Irreversible and unbounded: always show the exact command, in every access
@@ -4115,6 +4195,13 @@ def _decide(category: str, args: dict, tool: str | None = None) -> Decision:
         if read_only():
             return Decision(Tier.DENY, "view-only mode: keys and saved sign-ins are off limits")
         return Decision(Tier.CONFIRM, f"{secret} holds keys or saved sign-ins — always confirmed")
+
+    if persists:
+        if read_only():
+            return Decision(Tier.DENY, "view-only mode: changing files is disabled")
+        return Decision(Tier.CONFIRM, f"{persists} is in a place whose files run as code later "
+                        "(login items, shell startup files, Harbor's own folder or app) — "
+                        "always confirmed, even with full access")
 
     if cut_off:
         if read_only():
@@ -4358,6 +4445,30 @@ def turn_reads_untrusted(tool: str, category: str, args: dict) -> bool:
     # An `ls` of a named folder (Downloads, Desktop...) lists names other
     # people chose; a bare `ls` of home does not.
     return argv[0].endswith("/ls") and any(not a.startswith("-") for a in argv[1:])
+
+
+# Writes to the user's own mailbox and reminders that Full access otherwise runs
+# without a card. Each is reversible and nothing leaves the Mac, but once a
+# turn has read text Harbor did not write, that text may have chosen them: a
+# planted line in one email can have other mail archived or marked read
+# unseen, or fill Reminders (pentest #22). So they ask once such a read has
+# happened in the turn; before it they follow Full access.
+UNTRUSTED_GATED_CATEGORIES = frozenset({"email_triage"})
+UNTRUSTED_GATED_TOOLS = frozenset({"add_reminder", "update_reminder", "complete_reminder"})
+
+
+def after_untrusted_read_decision(tool: str, category: str, args: dict,
+                                  decision: Decision) -> Decision:
+    """Turn an ALLOW for a mailbox or reminder write into a CONFIRM, for a turn that
+    has already read untrusted content. Standing grants don't lift it either."""
+    if decision.tier is not Tier.ALLOW:
+        return decision
+    if category not in UNTRUSTED_GATED_CATEGORIES and tool not in UNTRUSTED_GATED_TOOLS:
+        return decision
+    what = "changes your mail" if category in UNTRUSTED_GATED_CATEGORIES else "changes your reminders"
+    return Decision(Tier.CONFIRM, f"this turn read mail, a message, a page or a file Harbor did not "
+                    f"write, and this {what}, so it is confirmed even with full access. "
+                    "Check that it is what you asked for.")
 
 
 # Categories whose actions are opaque to the host in the same way as

@@ -116,7 +116,7 @@ enum StudyPageReader {
                 let text = collectText(area, deadline: deadline)
                 guard !text.isEmpty else { continue }
                 seen.insert(url)
-                pages.append(StudyPage(url: url, title: String(title.prefix(500)), text: text))
+                pages.append(StudyPage(url: url, title: ScalarCap.prefix(title, 500), text: text))
             }
         }
         return pages
@@ -167,7 +167,7 @@ enum StudyPageReader {
         var out = Collected(deadline: deadline)
         harvest(area, into: &out, depth: 0)
         var text = out.lines.joined(separator: "\n")
-        if text.count > maxCharacters { text = String(text.prefix(maxCharacters)) }
+        text = ScalarCap.prefix(text, maxCharacters)
         return text
     }
 

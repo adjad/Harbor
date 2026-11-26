@@ -156,7 +156,7 @@ struct AboutYouView: View {
                 if model.loadFailed {
                     VStack(alignment: .leading, spacing: 10) {
                         Text("Harbor's service didn't answer, so your answers can't be shown yet. Nothing has changed.")
-                            .font(.system(size: 13)).foregroundStyle(ChatTheme.text2)
+                            .font(.harbor(.body, on: .window)).foregroundStyle(ChatTheme.text2)
                             .fixedSize(horizontal: false, vertical: true)
                         Button("Try again") { Task { await model.load() } }.disabled(model.busy)
                     }
@@ -207,7 +207,10 @@ struct AboutYouView: View {
                     }
                     actions
                 } else {
-                    Text("Loading…").font(.system(size: 13)).foregroundStyle(ChatTheme.text3)
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text("Loading your answers…").font(.harbor(.body, on: .window)).foregroundStyle(ChatTheme.text3)
+                    }
                 }
             }
             .padding(.vertical, 6)
@@ -226,30 +229,30 @@ struct AboutYouView: View {
     private var intro: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("What you told Harbor about yourself, and how Harbor uses it. It shapes your replies and your morning brief. Change anything below, or erase it all.")
-                .font(.system(size: 13)).foregroundStyle(ChatTheme.text2)
+                .font(.harbor(.body, on: .window)).foregroundStyle(ChatTheme.text2)
                 .fixedSize(horizontal: false, vertical: true)
             if model.loaded {
                 Label(model.status.whereItLives, systemImage: model.status.localOnly ? "lock.fill" : "cloud")
-                    .font(.system(size: 11.5)).foregroundStyle(ChatTheme.text3)
+                    .font(.harbor(.footnote, on: .window)).foregroundStyle(ChatTheme.text3)
             }
             if model.loaded && model.status.stale, let days = model.status.daysSinceUpdate {
                 Label("It's been \(days) days since you changed this. Still true?", systemImage: "clock")
-                    .font(.system(size: 12)).foregroundStyle(ChatTheme.amber)
+                    .font(.harbor(.footnote, on: .window)).foregroundStyle(ChatTheme.amber)
             }
             if model.loaded && !model.status.hasContent {
                 Text("Nothing here yet. Answer the four questions in the notch, or fill in whatever you like below.")
-                    .font(.system(size: 12.5)).foregroundStyle(ChatTheme.text3)
+                    .font(.harbor(.footnote, on: .window)).foregroundStyle(ChatTheme.text3)
             }
         }
     }
 
     private var inEffect: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("What Harbor does with this").font(.system(size: 11, weight: .semibold)).foregroundStyle(ChatTheme.text3).textCase(.uppercase)
+            Text("What Harbor does with this").font(.harbor(.caption, on: .window, weight: .semibold)).foregroundStyle(ChatTheme.text3).textCase(.uppercase)
             ForEach(Array(model.preview.enumerated()), id: \.offset) { _, line in
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Image(systemName: "checkmark").font(.system(size: 10, weight: .bold)).foregroundStyle(ChatTheme.teal)
-                    Text(line).font(.system(size: 12.5)).foregroundStyle(ChatTheme.text)
+                    Image(systemName: "checkmark").font(.harbor(size: 10, weight: .bold)).foregroundStyle(ChatTheme.teal)
+                    Text(line).font(.harbor(.footnote, on: .window)).foregroundStyle(ChatTheme.text)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
@@ -273,13 +276,13 @@ struct AboutYouView: View {
                     .disabled(model.busy || !model.status.hasContent)
             }
             if !model.error.isEmpty {
-                Text(model.error).font(.system(size: 12)).foregroundStyle(ChatTheme.danger)
+                Text(model.error).font(.harbor(.footnote, on: .window)).foregroundStyle(ChatTheme.danger)
             } else if let savedAt = model.savedAt {
                 Text("Saved " + savedAt.formatted(date: .omitted, time: .shortened) + ". In effect for your next reply and brief.")
-                    .font(.system(size: 12)).foregroundStyle(ChatTheme.text3)
+                    .font(.harbor(.footnote, on: .window)).foregroundStyle(ChatTheme.text3)
             }
             Text("Things you asked Harbor to remember are under Facts. Habits Harbor noticed on its own are under Routines.")
-                .font(.system(size: 11.5)).foregroundStyle(ChatTheme.text3)
+                .font(.harbor(.footnote, on: .window)).foregroundStyle(ChatTheme.text3)
                 .fixedSize(horizontal: false, vertical: true)
         }
     }
@@ -290,9 +293,9 @@ struct AboutYouView: View {
                                         @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             VStack(alignment: .leading, spacing: 2) {
-                Text(title).font(.system(size: 13, weight: .semibold)).foregroundStyle(ChatTheme.text)
+                Text(title).font(.harbor(.body, on: .window, weight: .semibold)).foregroundStyle(ChatTheme.text)
                 if let detail {
-                    Text(detail).font(.system(size: 11.5)).foregroundStyle(ChatTheme.text3)
+                    Text(detail).font(.harbor(.footnote, on: .window)).foregroundStyle(ChatTheme.text3)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
@@ -303,7 +306,7 @@ struct AboutYouView: View {
     private func textField(_ text: Binding<String>, placeholder: String, submit: @escaping () -> Void = {}) -> some View {
         TextField(placeholder, text: text)
             .textFieldStyle(.plain)
-            .font(.system(size: 13)).foregroundStyle(ChatTheme.text)
+            .font(.harbor(.body, on: .window)).foregroundStyle(ChatTheme.text)
             .onSubmit(submit)
             .padding(.vertical, 7).padding(.horizontal, 10)
             .background(RoundedRectangle(cornerRadius: 9).fill(ChatTheme.field))
@@ -314,7 +317,7 @@ struct AboutYouView: View {
         TextField(placeholder, text: text, axis: .vertical)
             .textFieldStyle(.plain)
             .lineLimit(2...8)
-            .font(.system(size: 13)).foregroundStyle(ChatTheme.text)
+            .font(.harbor(.body, on: .window)).foregroundStyle(ChatTheme.text)
             .padding(.vertical, 8).padding(.horizontal, 10)
             .background(RoundedRectangle(cornerRadius: 9).fill(ChatTheme.field))
             .overlay(RoundedRectangle(cornerRadius: 9).stroke(ChatTheme.line, lineWidth: 1))
@@ -325,7 +328,7 @@ struct AboutYouView: View {
         VStack(alignment: .leading, spacing: 6) {
             ForEach(items.wrappedValue, id: \.self) { item in
                 HStack(spacing: 8) {
-                    Text(item).font(.system(size: 13)).foregroundStyle(ChatTheme.text)
+                    Text(item).font(.harbor(.body, on: .window)).foregroundStyle(ChatTheme.text)
                     Spacer()
                     Button { items.wrappedValue.removeAll { $0 == item } } label: { Image(systemName: "xmark") }
                         .buttonStyle(ChatIconButtonStyle()).help("Remove").accessibilityLabel("Remove \(item)")
@@ -344,9 +347,15 @@ struct AboutYouView: View {
         VStack(alignment: .leading, spacing: 6) {
             ForEach(model.profile.people, id: \.name) { person in
                 HStack(spacing: 8) {
-                    Text(person.name).font(.system(size: 13, weight: .medium)).foregroundStyle(ChatTheme.text)
-                    if !person.relation.isEmpty { Text(person.relation).font(.system(size: 12)).foregroundStyle(ChatTheme.text2) }
-                    if !person.note.isEmpty { Text(person.note).font(.system(size: 12)).foregroundStyle(ChatTheme.text3).lineLimit(1) }
+                    Text(person.name).font(.harbor(.body, on: .window, weight: .medium)).foregroundStyle(ChatTheme.text)
+                        .lineLimit(1).layoutPriority(1)
+                    if !person.relation.isEmpty {
+                        Text(person.relation).font(.harbor(.footnote, on: .window)).foregroundStyle(ChatTheme.text2).lineLimit(1)
+                    }
+                    if !person.note.isEmpty {
+                        Text(person.note).font(.harbor(.footnote, on: .window)).foregroundStyle(ChatTheme.text3)
+                            .lineLimit(1).truncationMode(.tail).help(person.note)
+                    }
                     Spacer()
                     Button { model.profile.people.removeAll { $0 == person } } label: { Image(systemName: "xmark") }
                         .buttonStyle(ChatIconButtonStyle()).help("Remove").accessibilityLabel("Remove \(person.name)")

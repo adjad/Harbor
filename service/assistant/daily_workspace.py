@@ -770,6 +770,11 @@ def assess(day, timezone, state, evidence, *, now, behavior=None, ignored_window
                         value = clean(value, 120)
                     if value not in (None, "") and (not isinstance(value, float) or finite(value)):
                         item[field] = value
+                if source == "email" and item.get("replied") is True:
+                    # Answered from Gmail, Mail or a phone: no longer something that
+                    # needs the user, for any reader (the Brief's MAIL tile and count,
+                    # Needs you, the Day, review suggestions), not only Needs you.
+                    continue
             items.append(item)
 
     supported_behavior = valid_availability(behavior, timezone, now)

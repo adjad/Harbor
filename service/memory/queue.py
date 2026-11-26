@@ -7,6 +7,21 @@ import uuid
 
 from service.memory.facts import fts_query, secure_delete_fts, terms
 
+# Most candidate rows a recall search checks before it answers with what it has.
+SCAN_LIMIT = 600
+
+
+class _PerCallView:
+    """A facts object without suppression_view(): ask it row by row, as before."""
+
+    def __init__(self, facts):
+        self.source, self.text = facts.suppressed_source, facts.suppressed_text
+
+
+def suppression_view(facts):
+    make = getattr(facts, 'suppression_view', None)
+    return make() if callable(make) else _PerCallView(facts)
+
 
 def install(db):
     db.execute('SAVEPOINT memory_queue_install')
@@ -133,14 +148,18 @@ class MemoryQueue:
             row = self.sessions._db.execute('SELECT * FROM memory_jobs WHERE claim=?', (claim,)).fetchone()
         return dict(row) if row else None
 
-    def finish(self, job, status='done', error=''):
+    def finish(self, job, status='done', error='', *, refund=False):
+        """End a claim. `refund` gives back the attempt next() counted: a job that was
+        only interrupted (a turn started, Demo mode, shutdown) never ran to a failure,
+        so it must not use up the three tries a real failure gets."""
         if status not in ('done', 'queued', 'failed', 'cancelled'):
             raise ValueError('Invalid job status')
         with self.sessions._lock, self.sessions._db:
-            return bool(self.sessions._db.execute('''UPDATE memory_jobs SET status=?,error=?,available_at=?,claim=''
+            return bool(self.sessions._db.execute('''UPDATE memory_jobs SET status=?,error=?,available_at=?,claim='',
+                attempts=MAX(0, attempts - ?)
                 WHERE session_id=? AND turn_idx=? AND generation=? AND claim=? AND status='running' ''',
                 (status, error[:200], time.time() + (min(300, 15 * job['attempts']) if status == 'queued' else 0),
-                 job['session_id'], job['turn_idx'], job['generation'], job['claim'])).rowcount)
+                 int(bool(refund)), job['session_id'], job['turn_idx'], job['generation'], job['claim'])).rowcount)
 
     def current(self, job):
         with self.sessions._lock:
@@ -166,17 +185,19 @@ class MemoryQueue:
         with self.sessions._lock, self.sessions._db:
             return self.sessions._db.execute("UPDATE memory_jobs SET status='cancelled',claim='' WHERE origin='historical' AND status IN ('queued','running')").rowcount
 
-    def visible(self, row, facts):
+    def visible(self, row, facts, view=None):
+        """`view` (FactStore.suppression_view()) lets a search read the suppression rules once."""
         is_corpus = getattr(self.sessions, 'is_corpus_session', None)
         if is_corpus and is_corpus(row['session_id']):
             return False
-        if facts.suppressed_source('conversation', f"{row['session_id']}:{row['turn_idx']}") or facts.suppressed_text(row['text'] or ''):
+        view = view if view is not None else suppression_view(facts)
+        if view.source('conversation', f"{row['session_id']}:{row['turn_idx']}") or view.text(row['text'] or ''):
             return False
         if row['role'] != 'user':
             # Assistant paraphrases inherit the preceding user's suppression.
             with self.sessions._lock:
                 prior = self.sessions._db.execute("SELECT idx,content FROM turns WHERE session_id=? AND idx<? AND role='user' ORDER BY idx DESC LIMIT 1", (row['session_id'], row['turn_idx'])).fetchone()
-            if prior and (facts.suppressed_source('conversation', f"{row['session_id']}:{prior['idx']}") or facts.suppressed_text(prior['content'] or '')):
+            if prior and (view.source('conversation', f"{row['session_id']}:{prior['idx']}") or view.text(prior['content'] or '')):
                 return False
         return True
 
@@ -185,28 +206,30 @@ class MemoryQueue:
             return []
         limit = max(1, min(50, limit))
         result, offset = [], 0
-        # Page through ranked matches until visible results fill the budget.
-        # There is no newest-session cutoff, nor a fixed pre-filter hit cutoff.
-        while len(result) < limit:
+        view = suppression_view(facts)
+        # Page through ranked matches until visible results fill the budget, or
+        # SCAN_LIMIT rows were checked: a common word over a long, mostly forgotten
+        # history would otherwise page on with the sessions lock held between pages.
+        while len(result) < limit and offset < SCAN_LIMIT:
             with self.sessions._lock:
                 try:
                     rows = self.sessions._db.execute('''SELECT text,session_id,turn_idx,created_at,role FROM memory_turn_fts
                         WHERE memory_turn_fts MATCH ? AND session_id!=? AND (?=0 OR role='user')
-                        ORDER BY bm25(memory_turn_fts),created_at DESC LIMIT 100 OFFSET ?''',
-                        (fts_query(query), exclude_session, int(user_only), offset)).fetchall()
+                        ORDER BY bm25(memory_turn_fts),created_at DESC LIMIT ? OFFSET ?''',
+                        (fts_query(query), exclude_session, int(user_only), SCAN_LIMIT, offset)).fetchall()
                 except sqlite3.OperationalError as exc:
                     if 'no such table' not in str(exc) and 'no such module' not in str(exc):
                         raise
                     predicates = ' OR '.join('LOWER(content) LIKE ?' for _ in terms(query))
                     rows = self.sessions._db.execute(f'''SELECT content text,session_id,idx turn_idx,created_at,role
                         FROM turns WHERE session_id!=? AND (?=0 OR role='user') AND ({predicates})
-                        ORDER BY created_at DESC LIMIT 100 OFFSET ?''',
-                        (exclude_session, int(user_only), *('%' + t + '%' for t in terms(query)), offset)).fetchall()
+                        ORDER BY created_at DESC LIMIT ? OFFSET ?''',
+                        (exclude_session, int(user_only), *('%' + t + '%' for t in terms(query)), SCAN_LIMIT, offset)).fetchall()
             if not rows:
                 break
             for row in rows:
                 item = dict(row)
-                if self.visible(item, facts):
+                if self.visible(item, facts, view):
                     result.append(item)
                     if len(result) == limit:
                         break
@@ -216,6 +239,7 @@ class MemoryQueue:
     def source_context(self, sid, idx, facts):
         rows = self.sessions.turns_range(sid, max(0, idx - 2), idx + 3)
         target = next((r for r in rows if r['idx'] == idx), None)
-        if not target or not self.visible({**target, 'text': target['content'], 'turn_idx': idx}, facts):
+        view = suppression_view(facts)
+        if not target or not self.visible({**target, 'text': target['content'], 'turn_idx': idx}, facts, view):
             return None
-        return [dict(r) for r in rows if self.visible({**r, 'text': r['content'], 'turn_idx': r['idx']}, facts)]
+        return [dict(r) for r in rows if self.visible({**r, 'text': r['content'], 'turn_idx': r['idx']}, facts, view)]

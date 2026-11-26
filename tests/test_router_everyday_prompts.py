@@ -400,7 +400,10 @@ def test_body_literals_in_named_companions_do_not_bypass_contact_proof(
     if valid:
         expected = {"to": "+1 (650) 555-0134", "text": body}
         assert [args for name, args in calls if name == "send_message"] == [expected]
-        assert [item["args"] for item in approvals] == [expected]
+        assert [item["args"] for item in approvals if item.get("tool") == "send_message"] == [expected]
+        # After the contact lookup read text in this turn, the reminder asks too
+        # (2026-11-25 pentest fix #22); nothing else does.
+        assert {item.get("tool") for item in approvals} <= {"send_message", "add_reminder"}
         assert len(calls) == 4 and ("toggle_setting", {"setting": "wifi", "on": False}) in calls
         assert [row[0] for row in assistant._db.execute("SELECT title FROM commitments")] == ["buy milk"]
     else:

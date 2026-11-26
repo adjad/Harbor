@@ -140,9 +140,44 @@ def harbor_ports() -> list[int]:
                               if isinstance(port, int) and 1 <= port <= 65535))
 
 
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
+
+
+def _loopback_port(url: str) -> int | None:
+    from urllib.parse import urlsplit
+    try:
+        parts = urlsplit(str(url))
+        if (parts.hostname or "").lower() not in _LOOPBACK_HOSTS:
+            return None
+        return parts.port or (443 if parts.scheme == "https" else 80)
+    except ValueError:
+        return None
+
+
+def engine_ports() -> list[int]:
+    """The local inference engines a shell command has no business reaching: oMLX's
+    standard port, the bundled engine's, and the configured oMLX and local provider
+    when they are on this Mac. Their load and unload endpoints would let a command
+    swap or evict the model under Harbor (pentest #21). A config that can't be read
+    still leaves the fixed ports denied."""
+    from service.engine.manager import BUNDLED_PORT
+    ports: list[int | None] = [8000, BUNDLED_PORT]
+    try:
+        from service import config
+        ports.append(_loopback_port(config.omlx_base_url()))
+    except Exception:  # noqa: BLE001 - a profile is still built without it
+        pass
+    try:
+        from service import config
+        ports.append(_loopback_port(config.local_provider_settings().get("base_url", "")))
+    except Exception:  # noqa: BLE001
+        pass
+    return [port for port in dict.fromkeys(ports) if isinstance(port, int) and 1 <= port <= 65535]
+
+
 def build_profile() -> str:
     """The sandbox profile: everything allowed, except writing under protected_roots(),
-    mounting over them, and reaching Harbor's own service."""
+    mounting over them, and reaching Harbor's own service or the local engines."""
     folders, parents = [], []
     for root in protected_roots():
         for path in _spellings(root):
@@ -155,7 +190,8 @@ def build_profile() -> str:
     for what in ("file-write*", "file-mount"):
         lines += [f'(deny {what} (subpath "{_q(path)}"))' for path in folders]
         lines += [f'(deny {what} (literal "{_q(path)}"))' for path in parents]
-    lines += [f'(deny network-outbound (remote ip "localhost:{port}"))' for port in harbor_ports()]
+    ports = dict.fromkeys([*harbor_ports(), *engine_ports()])
+    lines += [f'(deny network-outbound (remote ip "localhost:{port}"))' for port in ports]
     return "\n".join(lines) + "\n"
 
 

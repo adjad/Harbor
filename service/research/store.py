@@ -10,7 +10,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from service.paths import MOE_DIR
+from service.paths import MOE_DIR, private_moe_dir, private_sqlite_file
 
 DB_PATH = MOE_DIR / "research.db"
 
@@ -133,6 +133,11 @@ _TRANSIENT_OPEN = ("disk i/o error", "locked", "readonly")
 class ResearchStore:
     def __init__(self, path: Path = DB_PATH) -> None:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if path.parent == MOE_DIR:
+            private_moe_dir(MOE_DIR)
+        # Before connecting: SQLite gives new -wal/-shm files the main file's
+        # mode, and sidecars an older build left 0644 are tightened (pentest #16).
+        private_sqlite_file(path)
         self.path = path
         for attempt in range(_OPEN_ATTEMPTS):
             db = None

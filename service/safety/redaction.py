@@ -13,6 +13,7 @@ never raises.
 """
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import Any
 
@@ -32,7 +33,12 @@ _PREFIXED = (
     _WORD_START + r"sk-(?:proj-)?[A-Za-z0-9_-]{32,}",  # OpenAI-style
     _WORD_START + r"gh[pousr]_[A-Za-z0-9]{30,}",       # GitHub tokens
     r"github_pat_[A-Za-z0-9_]{40,}",
-    _WORD_START + r"xox[abprs]-[A-Za-z0-9-]{20,}",     # Slack
+    _WORD_START + r"xox[a-eprs]-[A-Za-z0-9-]{20,}",    # Slack (xoxc/xoxd: browser session)
+    _WORD_START + r"ya29\.[A-Za-z0-9_-]{20,}",         # Google OAuth access token
+    _WORD_START + r"1//[A-Za-z0-9_-]{30,}",            # Google OAuth refresh token
+    _WORD_START + r"[sr]k_(?:live|test)_[A-Za-z0-9]{20,}",  # Stripe secret / restricted
+    _WORD_START + r"npm_[A-Za-z0-9]{36}",              # npm
+    _WORD_START + r"glpat-[A-Za-z0-9_-]{20,}",         # GitLab
     r"AKIA[0-9A-Z]{16}",                        # AWS access key id
     r"AIza[0-9A-Za-z_-]{35}",                   # Google API key
     _WORD_START + r"hf_[A-Za-z0-9]{30,}",              # Hugging Face
@@ -40,17 +46,21 @@ _PREFIXED = (
 )
 _PEM = r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)"
 _BEARER = r"(?i:\bBearer)\s+[A-Za-z0-9._~+/=-]{20,}"
+# Only as a header: "Basic" alone starts ordinary sentences.
+_BASIC = r"(?i:\bAuthorization\s*[:=]\s*[\"']?\s*Basic)\s+[A-Za-z0-9+/]{8,}={0,2}"
 # Share the complete label grammar between serialized assignments and typed
 # audit dictionaries. Qualifiers (OPENAI_, client_, aws_) are identifiers, not
-# arbitrary prose; metadata suffixes such as token_count do not match.
+# arbitrary prose; metadata suffixes such as token_count do not match. The
+# qualifier is bounded (at most eight, each up to 32 characters): unbounded, a
+# long run of "ab-" made every start position scan to its end (pentest #9).
 _CREDENTIAL_LABEL = (
-    r"(?:(?:[a-z][a-z0-9]*[_-])+)?"
+    r"(?:[a-z][a-z0-9]{0,31}[_-]){0,8}"
     r"(?:api[_-]?key|secret(?:[_-]?(?:access[_-]?)?key)?|"
     r"(?:access|auth|refresh)[_-]?token|token|passw(?:or)?d|passwd)")
 _CREDENTIAL_FIELD = re.compile(_CREDENTIAL_LABEL, re.I)
 _ASSIGNED = re.compile(
     rf"(?i)\b({_CREDENTIAL_LABEL}[\"']?\s*[:=]\s*[\"']?)([^\s\"'`,;]{{12,}})")
-_TOKEN = re.compile("|".join([_PEM, _BEARER, *_PREFIXED]), re.S)
+_TOKEN = re.compile("|".join([_PEM, _BEARER, _BASIC, *_PREFIXED]), re.S)
 
 # After removing credentials, a message this short that began as a slash
 # command (or is little more than the key itself) is someone handing Harbor a
@@ -80,6 +90,18 @@ def scrub(text: str) -> tuple[str, int]:
     cleaned = _TOKEN.sub(token, text)
     cleaned = _ASSIGNED.sub(assigned, cleaned)
     return cleaned, count
+
+
+# Above this length scrub_async runs the scan on a worker thread, so one long
+# paste or tool result never holds the event loop.
+_OFF_LOOP_CHARS = 16_384
+
+
+async def scrub_async(text: str) -> tuple[str, int]:
+    """scrub() for async callers: long text is scanned off the event loop."""
+    if isinstance(text, str) and len(text) > _OFF_LOOP_CHARS:
+        return await asyncio.to_thread(scrub, text)
+    return scrub(text)
 
 
 def scrub_obj(value: Any, _depth: int = 0) -> Any:

@@ -737,7 +737,8 @@ async def _resident_reply(system: str, material: str, abort, *,
         if remote and not remote_parity():
             _stood_down("remote-only inference is on; the inbox summary stays on this Mac")
             return None
-        if not remote and getattr(client, "managed", True) is not True:
+        # Fail closed: a client that can't say it is this Mac's own engine isn't.
+        if not remote and getattr(client, "managed", False) is not True:
             _stood_down("the engine isn't this Mac's own; the inbox summary stays on this Mac")
             return None
     if remote:

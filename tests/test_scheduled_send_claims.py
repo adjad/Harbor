@@ -360,3 +360,49 @@ def test_view_only_does_not_undo_a_cancel(monkeypatch):
         assert app.sent == [] and events == []
     finally:
         temp.cleanup()
+
+
+def test_a_hung_send_runs_in_the_background_one_pass_at_a_time(monkeypatch):
+    """A send the app never answers (Mail hung) must not hold up the scheduler tick:
+    the pass runs as one background task, and a second tick doesn't start another."""
+    import asyncio
+    from service.assistant import scheduler
+
+    started, release = [], None
+
+    async def hung():
+        started.append(1)
+        await release.wait()
+    monkeypatch.setattr(scheduler, "_fire_scheduled_sends", hung)
+    monkeypatch.setattr(scheduler, "_sends_task", None)
+
+    async def tick_twice():
+        nonlocal release
+        release = asyncio.Event()
+        loop_free = time.perf_counter()
+        first = scheduler._start_scheduled_sends()
+        second = scheduler._start_scheduled_sends()
+        await asyncio.sleep(0)
+        elapsed = time.perf_counter() - loop_free
+        assert first is not None and second is None and started == [1]
+        assert elapsed < 0.5                         # the tick went on at once
+        release.set()
+        await first
+        third = scheduler._start_scheduled_sends()   # the pass finished: the next tick starts one
+        await third
+        assert started == [1, 1]
+    asyncio.run(tick_twice())
+
+
+def test_a_failing_pass_is_contained(monkeypatch):
+    import asyncio
+    from service.assistant import scheduler
+
+    async def broken():
+        raise RuntimeError("synthetic")
+    monkeypatch.setattr(scheduler, "_fire_scheduled_sends", broken)
+    monkeypatch.setattr(scheduler, "_sends_task", None)
+
+    async def go():
+        await scheduler._start_scheduled_sends()     # no exception escapes the task
+    asyncio.run(go())

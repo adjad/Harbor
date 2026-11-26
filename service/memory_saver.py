@@ -645,7 +645,7 @@ async def prewarm(client) -> str:
     from service.config import role_to_model
     from service.inference.remote_policy import remote_only_profile
     note_intent()
-    if remote_only_profile() is not None or not getattr(client, "managed", True):
+    if remote_only_profile() is not None or getattr(client, "managed", False) is not True:
         return "remote"
     bundled = bundled_engine(client)
     if not bundled and not (omlx_app(client) and _state.parked):

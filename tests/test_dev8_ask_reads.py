@@ -410,3 +410,19 @@ def test_sent_view_without_gmail_points_to_the_google_pane(monkeypatch):
     _setup(monkeypatch, accounts=(), problem="no_mail_index")
     out = asyncio.run(email_tools.sent_emails_view())
     assert "Settings › Google" in out and "Settings › Accounts" not in out
+
+
+def test_sent_mail_without_message_ids_is_matched_by_recipient_and_time(monkeypatch):
+    base = (int(time.time()) // 120) * 120 - 600
+    # Same subject 40 s apart (one 2-minute bucket) to two people: two emails.
+    _setup(monkeypatch,
+           gmail=[{"ts": base + 10, "to": "Bo <bo@example.com>", "subject": "Intro", "account": "me@gmail.com"},
+                  {"ts": base + 50, "to": "cy@example.com", "subject": "Intro", "account": "me@gmail.com"}])
+    out = asyncio.run(email_tools.sent_emails_view())
+    assert "2 found" in out and "bo@example.com" in out and "cy@example.com" in out
+    # One email seen through Gmail and Mail 20 s apart across a bucket boundary: one.
+    _setup(monkeypatch,
+           gmail=[{"ts": base - 10, "to": "Bo <bo@example.com>", "subject": "Intro", "account": "me@gmail.com"}],
+           native=[_native(base + 10, "Intro", ("bo@example.com",), account="GMAIL-IN-MAIL", mid="")])
+    out = asyncio.run(email_tools.sent_emails_view())
+    assert "1 found" in out

@@ -255,16 +255,19 @@ def test_the_profile_names_each_folder_as_written_and_as_it_resolves(world, monk
     # ... and nothing wider than that: no parent is closed as a whole, the root is not named.
     assert '(literal "/")' not in profile and '(subpath "/")' not in profile
     assert f'(subpath "{_HARBOR.parent}")' not in profile and f'(subpath "{world}")' not in profile
-    # Harbor's own service, and no other local port.
-    assert lines[-1] == '(deny network-outbound (remote ip "localhost:8765"))'
-    assert all(line.startswith(("(deny file-write* ", "(deny file-mount ")) for line in lines[2:-1])
+    # Harbor's own service and the local engines (pentest #21), and no other local port.
+    net = [line for line in lines if line.startswith("(deny network-outbound")]
+    expected = [8765, *(p for p in shell_sandbox.engine_ports() if p != 8765)]
+    assert net == [f'(deny network-outbound (remote ip "localhost:{port}"))' for port in expected]
+    assert lines[-len(net):] == net
+    assert all(line.startswith(("(deny file-write* ", "(deny file-mount ")) for line in lines[2:-len(net)])
 
 
 def test_the_service_port_follows_an_isolated_backend(monkeypatch):
     monkeypatch.setattr("service.identity.bind_port", lambda argv=None: 8775)
     assert shell_sandbox.harbor_ports() == [8765, 8775]
-    assert shell_sandbox.build_profile().endswith(
-        '(deny network-outbound (remote ip "localhost:8765"))\n'
+    assert shell_sandbox.build_profile().split("(deny network-outbound", 1)[1].startswith(
+        ' (remote ip "localhost:8765"))\n'
         '(deny network-outbound (remote ip "localhost:8775"))\n')
     # Nothing that is not a port reaches the profile: sandbox-exec would reject all of it.
     for odd in (None, 0, 65536, 99999, -1, "8775", 8765):

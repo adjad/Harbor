@@ -401,7 +401,9 @@ private struct StudySourceRow: View {
             Image(systemName: "exclamationmark.triangle").font(.harbor(size: 9, weight: .semibold))
                 .frame(width: 16)
                 .accessibilityHidden(true)
-            Text(line).font(.harbor(.caption)).lineLimit(1).truncationMode(.tail)
+            // Two lines for the reason; the row's minHeight keeps a one-line case where it was.
+            Text(line).font(.harbor(.caption)).lineLimit(2).truncationMode(.tail)
+                .fixedSize(horizontal: false, vertical: true)
                 .help(line)
             Spacer(minLength: 6)
             if source.canRetryDeck {
@@ -429,7 +431,8 @@ private struct StudySourceRow: View {
                     .frame(width: 24, height: 24).contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .opacity(hovering ? 1 : 0)
+            // Faint until hover, so it can be found without a pointer or by keyboard.
+            .opacity(hovering ? 1 : 0.35)
             .disabled(disabled)
             .help("Remove from Study. Nothing changes in Google Drive.")
             .accessibilityLabel("Remove \(source.title)")

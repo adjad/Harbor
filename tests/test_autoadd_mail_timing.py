@@ -106,7 +106,12 @@ LEFT_HEADER = "Reminder!\nFrom: Maya Chen <maya@nsu.example>\n" + INVITE   # a h
                               "wrapped_attribution"])
 def test_the_cut_now_knows_these_history_markers(body):
     excerpt = sources._excerpt({"body": body})
-    assert "Oct 31" not in excerpt and excerpt.startswith(("Reminder!", "FYI"))
+    assert excerpt.startswith(("Reminder!", "FYI"))
+    # A forward's body is kept, marked as forwarded (and never acted on without a
+    # tap: test_a_top_posted_reminder_never_adds_the_quoted_old_date); quoted
+    # history is not.
+    own, _, forwarded = excerpt.partition("[Forwarded]")
+    assert "Oct 31" not in own and ("Oct 31" in forwarded) == (body is GMAIL_FWD)
 
 
 @pytest.mark.parametrize("body", [OUTLOOK, GMAIL_FWD, ORIGINAL, QUOTED, UNMARKED, LEFT_HEADER],

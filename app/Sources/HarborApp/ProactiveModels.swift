@@ -819,6 +819,32 @@ extension ProactiveState {
 }
 
 
+/// A thread answered from the Brief (ProactiveActions.repliedThreads) leaves
+/// the list once its reply is closed: while the reply is open its row stays,
+/// showing "Sent ✓". Only a send the service verified marks it.
+enum BriefReplied {
+    static func listed(id: String, replied: Set<String>, replying: String?) -> Bool {
+        !replied.contains(id) || replying == id
+    }
+}
+
+/// The Brief's last plan for today, kept so opening the Brief never waits on a
+/// fetch to show what it showed a moment ago: Day may be on another day (the
+/// Brief pins back to today and reads it again), and until that read lands the
+/// plan held for today's key is shown. Never after a failed read (a refused or
+/// unreadable plan must not leave stale rows looking actionable), and never for
+/// another day or time zone. Generic so the pure checks compile it alone.
+enum BriefHold {
+    static func key(day: String, zone: String) -> String { day + "|" + zone }
+
+    /// What the Brief shows: the current plan, else the held one for this key.
+    static func pick<Plan>(current: Plan?, held: (key: String, plan: Plan)?, key: String, failed: Bool) -> Plan? {
+        if let current { return current }
+        guard !failed, let held, held.key == key else { return nil }
+        return held.plan
+    }
+}
+
 /// The Brief while it is still building after a long gap, and after its wait
 /// timed out (service/proactive/brief_warmup.py). Pure, for the checks.
 enum BriefBuilding {

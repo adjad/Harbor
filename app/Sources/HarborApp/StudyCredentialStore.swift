@@ -53,6 +53,7 @@ enum StudyCredentialStore {
         QAKeys.values[provider] = nil
         #else
         _ = SecItemDelete(query(provider: provider) as CFDictionary)
+        _ = SecItemDelete(query(provider: SecretReplacement.spare(for: provider)) as CFDictionary)
         #endif
     }
 
@@ -90,9 +91,9 @@ enum StudyCredentialStore {
     /// read never brings up a Keychain prompt. It uses the same Keychain calls
     /// as BackendCredentials.add, but that one trusts a dedicated signed helper;
     /// this is where a Settings cloud key ends up after "Always Allow". A plain update would keep an
-    /// older item's narrower access list, so the item is always re-created.
+    /// older item's narrower access list, so the item is always re-created: the
+    /// new one is added first (SecretReplacement), so a failed add keeps the old key.
     private static func write(_ data: Data, provider: String) throws {
-        let query = query(provider: provider)
         var trusted: [SecTrustedApplication] = []
         var me: SecTrustedApplication?
         guard SecTrustedApplicationCreateFromPath(nil, &me) == errSecSuccess, let me else {
@@ -108,18 +109,24 @@ enum StudyCredentialStore {
                               &access) == errSecSuccess, let access else {
             throw StudyCredentialError.storage
         }
-        let deleted = SecItemDelete(query as CFDictionary)
-        guard deleted == errSecSuccess || deleted == errSecItemNotFound else {
-            throw StudyCredentialError.storage
-        }
-        var item = query
-        item[kSecValueData as String] = data
-        item[kSecAttrLabel as String] = "Harbor Study key (\(provider))"
-        item[kSecAttrSynchronizable as String] = false
-        item[kSecAttrAccess as String] = access
-        guard SecItemAdd(item as CFDictionary, nil) == errSecSuccess else {
-            throw StudyCredentialError.storage
-        }
+        let replacement = SecretReplacement(
+            add: { account in
+                var item = query(provider: account)
+                item[kSecValueData as String] = data
+                item[kSecAttrLabel as String] = "Harbor Study key (\(provider))"
+                item[kSecAttrSynchronizable as String] = false
+                item[kSecAttrAccess as String] = access
+                return SecItemAdd(item as CFDictionary, nil) == errSecSuccess
+            },
+            remove: { account in
+                let status = SecItemDelete(query(provider: account) as CFDictionary)
+                return status == errSecSuccess || status == errSecItemNotFound
+            },
+            rename: { from, to in
+                SecItemUpdate(query(provider: from) as CFDictionary,
+                              [kSecAttrAccount as String: to] as CFDictionary) == errSecSuccess
+            })
+        guard replacement.replace(account: provider) else { throw StudyCredentialError.storage }
     }
     #endif
 }

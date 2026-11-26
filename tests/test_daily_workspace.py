@@ -388,8 +388,9 @@ def test_a_reply_from_apple_mail_marks_a_non_google_email_answered(cached_source
         monkeypatch.setattr(sources, "_native_sent", sent)
         evidence = collect_evidence(store, state(), DAY, ZONE, now=NOW)["email"]
         [found] = evidence["records"]
-        [item] = run(e={"email": evidence})["attention"]
-        assert item.get("replied") == found.get("replied")
+        attention = run(e={"email": evidence})["attention"]
+        # An answered email leaves attention for every reader; an open one stays, unmarked.
+        assert attention == [] if found.get("replied") else [i.get("replied") for i in attention] == [None]
         return found
 
     assert "replied" not in record([])

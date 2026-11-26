@@ -360,3 +360,22 @@ def test_only_google_s_own_holiday_calendars_free_a_day():
     assert not _is_holiday_calendar_item({**own, "source": "calendar"})
     native = {"source": "calendar", "source_id": "EK-1", "context": "US Holidays"}
     assert _is_holiday_calendar_item(native)
+
+
+def test_period_availability_reads_its_day_snapshots_off_the_event_loop(source, monkeypatch):
+    """One store snapshot per day ('this month' is ~30): never on the loop, where it would
+    stall every other turn's streaming."""
+    import threading
+    seen = []
+    real = S._store.today_snapshot
+
+    def snapshot(day, zone):
+        seen.append(threading.get_ident())
+        return real(day, zone)
+    monkeypatch.setattr(S._store, 'today_snapshot', snapshot)
+
+    async def ask():
+        return threading.get_ident(), await S.find_free_time(period='this week')
+    loop_thread, answer = asyncio.run(ask())
+    assert seen and loop_thread not in seen
+    assert '(error' not in answer

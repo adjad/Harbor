@@ -39,6 +39,7 @@ from pathlib import Path
 import yaml
 
 from service.paths import MOE_DIR
+from service.skills import trust
 
 SKILLS_DIR = MOE_DIR / "skills"
 BUNDLED_SKILLS_DIR = Path(__file__).parent / "bundled"
@@ -117,6 +118,9 @@ class Skill:
     # built-in tools it may call and which of them change anything. Checked by
     # service.skills.contracts.validate (and tests); never widens a tool's rules.
     contract: dict = field(default_factory=dict)
+    # Why a user skill loaded switched off whatever its SKILL.md says: it was
+    # added outside Harbor, or changed since the person approved it (skills.trust).
+    trust_note: str = ""
 
     @property
     def compose(self) -> bool:
@@ -148,7 +152,8 @@ class Skill:
                 "tools": [t.get("name") for t in self.tools],
                 "path": str(self.path), "error": self.error,
                 "bundled": self.bundled,
-                "conversation_workflow": self.conversation_workflow}
+                "conversation_workflow": self.conversation_workflow,
+                "trust_note": self.trust_note}
 
 
 def trigger_matches(trigger: str, text: str) -> bool:
@@ -197,6 +202,9 @@ def _parse(path: Path, *, bundled: bool = False) -> Skill | None:
     triggers = meta.get("triggers") or harbor_meta.get("triggers") or []
     if isinstance(triggers, str):
         triggers = [t.strip() for t in triggers.split(",")]
+    elif not isinstance(triggers, list):
+        triggers = []         # `triggers: 5` or `true` would crash the scan below
+    triggers = [t.strip() for t in triggers if isinstance(t, str) and t.strip()]
 
     tools = meta.get("tools") or harbor_meta.get("tools") or []
     if not isinstance(tools, list):
@@ -207,7 +215,7 @@ def _parse(path: Path, *, bundled: bool = False) -> Skill | None:
         description=str(meta.get("description") or ""),
         body=m.group(2).strip()[:MAX_BODY_CHARS],
         path=path.parent,
-        triggers=[str(t) for t in triggers],
+        triggers=triggers,
         enabled=bool(meta.get("enabled", harbor_meta.get("enabled", True))),
         tools=[t for t in tools if isinstance(t, dict)],
         always=bool(meta.get("always", harbor_meta.get("always", False))),
@@ -242,7 +250,21 @@ def load() -> dict[str, Skill]:
                 md = child / "SKILL.md"
                 if not md.exists():
                     continue
-                skill = _parse(md, bundled=bundled)
+                try:
+                    skill = _parse(md, bundled=bundled)
+                except Exception as exc:  # noqa: BLE001 — one bad skill must not hide the rest
+                    skill = Skill(child.name, "", "", child, error=f"unreadable skill: {exc}",
+                                  bundled=bundled)
+                if skill and not bundled:
+                    # Only a skill the person approved as it is now may be on
+                    # (skills.trust); one added or changed behind Harbor's back
+                    # loads switched off, with the reason Settings shows. A copy
+                    # of a bundled skill still shows in its place (it may be the
+                    # person's own edit), so they can switch it on there.
+                    note = trust.problem(child)
+                    if note:
+                        skill.enabled = False
+                        skill.trust_note = note
                 if skill:
                     found[skill.name] = skill
     except Exception:  # noqa: BLE001 — skills are optional; never break startup
@@ -405,6 +427,9 @@ def set_enabled(name: str, enabled: bool) -> bool:
             harbor_meta["enabled"] = enabled
         md.write_text("---\n" + yaml.safe_dump(meta, sort_keys=False) + "---\n\n"
                       + m.group(2).lstrip())
+        # The person switching a skill on in Settings approves it as it is now.
+        if enabled:
+            trust.approve(skill.path)
     except Exception:  # noqa: BLE001
         return False
     load()
@@ -430,14 +455,33 @@ def install(source: str) -> dict:
         else:
             if not (src / "SKILL.md").exists():
                 return {"ok": False, "error": f"{src} has no SKILL.md"}
-            dest = SKILLS_DIR / src.name
-            if dest.exists():
-                shutil.rmtree(dest)
-            shutil.copytree(src, dest)
+            src = src.resolve()
+            root = SKILLS_DIR.resolve()
+            dest = root / src.name
+            if src == dest:
+                # Already the installed copy: re-installing it must not delete it first.
+                trust.approve(dest)
+                load()
+                return {"ok": True, "name": next((s.name for s in _skills.values()
+                                                  if s.path.resolve() == dest), dest.name),
+                        "path": str(dest)}
+            if not src.name or src == root or root in src.parents or src in root.parents:
+                return {"ok": False, "error": f"can't install {src} from inside or above the skills folder"}
+            # Copy beside the old copy, then swap, so a failed copy leaves the old skill.
+            staging = Path(tempfile.mkdtemp(prefix=f".{src.name}-", dir=root))
+            try:
+                shutil.copytree(src, staging / "skill")
+                if dest.exists():
+                    shutil.rmtree(dest)
+                os.replace(staging / "skill", dest)
+            finally:
+                shutil.rmtree(staging, ignore_errors=True)
+        # Installed by the person from Settings: approved as copied.
+        trust.approve(dest)
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": str(e)}
     load()
-    installed = next((s.name for s in _skills.values() if s.path == dest), dest.name)
+    installed = next((s.name for s in _skills.values() if s.path.resolve() == dest.resolve()), dest.name)
     return {"ok": True, "name": installed, "path": str(dest)}
 
 
@@ -450,6 +494,7 @@ def uninstall(name: str) -> dict:
                 "error": f"{name} ships with Harbor; disable it instead"}
     try:
         shutil.rmtree(skill.path)
+        trust.forget(skill.path)
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": str(e)}
     load()

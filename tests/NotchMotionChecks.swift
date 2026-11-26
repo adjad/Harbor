@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 import AppKit
 import QuartzCore
@@ -319,6 +320,12 @@ enum Harness {
                 }
             }
             let m = rig.model
+            if !reduce {
+                let line = observationCheck(m)
+                report += line + "\n"
+                print(line)
+                if line.hasPrefix("FAIL") { failures += 1 }
+            }
             try await run("ask-to-brief", prepare: { m.tab = .ask }) { m.tab = .brief }
             try await run("brief-to-day") { m.tab = .day }
             try await run("day-to-ask") { m.tab = .ask }
@@ -474,11 +481,27 @@ enum Harness {
         let rig = try MotionRig(reduce: false)
         try await rig.open()
         let m = rig.model
+        // A settled Ask conversation (invented text) for the typing, streaming
+        // and voice-level steps: each of those changes nothing but one small
+        // thing, so their cost is what the rest of the panel adds to it.
+        let conversation = Self.profileConversation()
+        var typed = 0
         let steps: [(String, () -> Void)] = [
             ("ask->brief", { m.tab = .brief }), ("brief->day", { m.tab = .day }),
             ("day->meet", { m.tab = .meet }), ("meet->ask", { m.tab = .ask }),
             ("ask->day", { m.tab = .day }), ("day->ask", { m.tab = .ask }),
+            ("ask->ideate", { m.tab = .ideate }), ("ideate->ask", { m.tab = .ask }),
+            ("ask->study", { m.tab = .study }), ("study->ask", { m.tab = .ask }),
             ("gear open", { m.showingQuickSettings = true }), ("gear close", { m.showingQuickSettings = false }),
+            ("chat ready", { m.turns = conversation; m.phase = .done; m.input = "" }),
+            ("type key", { typed += 1; m.input = String(repeating: "a", count: typed % 40 + 1) }),
+            ("type key 2", { typed += 1; m.input = String(repeating: "a", count: typed % 40 + 1) }),
+            ("voice level", { m.voice.objectWillChange.send() }),
+            ("stream start", { m.input = ""; m.phase = .streaming; m.answer = "Here is" }),
+            ("stream token", { m.answer += " a few more words, **some bold**, and a list:\n- one item" }),
+            ("stream token 2", { m.answer += " and another" }),
+            ("stream done", { m.phase = .idle; m.answer = ""; m.turns = []; m.phase = .idle }),
+            ("collapse", { m.collapsed = true }), ("expand", { m.collapsed = false }),
         ]
         var times: [String: [Double]] = [:]
         print("profile pid \(getpid()), \(rounds) rounds")
@@ -504,6 +527,45 @@ enum Harness {
         try text.write(to: out.appendingPathComponent("profile.txt"), atomically: true, encoding: .utf8)
         rig.close()
         return true
+    }
+
+    /// The panel redraws for what it shows, not for every key or mic level:
+    /// typing sends the model's change only when the field goes blank or stops
+    /// being blank, and the voice's level never reaches the model.
+    @MainActor static func observationCheck(_ m: OverlayModel) -> String {
+        var changes = 0
+        let sub = m.objectWillChange.sink { _ in changes += 1 }
+        defer { sub.cancel() }
+        m.input = ""
+        changes = 0
+        for typed in ["W", "Wh", "Wha", "What", "What is", "What is due", ""] { m.input = typed }
+        let typing = changes
+        changes = 0
+        for _ in 0..<20 { m.voice.objectWillChange.send() }
+        let levels = changes
+        let ok = typing == 2 && levels == 0
+        return "\(ok ? "PASS" : "FAIL") observation: 7 keys sent \(typing) panel changes (want 2), 20 voice levels sent \(levels) (want 0)"
+    }
+
+    /// Six exchanges of invented Markdown answers, the shape a real Ask chat has.
+    @MainActor static func profileConversation() -> [OverlayModel.Turn] {
+        let answer = """
+        You have **three things** before the study group at 4, and the first is the one with a date on it:
+        - Finish the *lab write-up* for Ms. Okafor's section (due tonight)
+        - Read chapter 7, about 20 pages
+        - Send the slides to [the group](https://example.com/slides)
+
+        The lab is the long one, so start there. If you have time after, the reading is easier in two halves.
+        1. Write the method section first
+        2. Then the results, with the two graphs
+        3. Leave the discussion for last
+        """
+        var turns: [OverlayModel.Turn] = []
+        for i in 0..<6 {
+            turns.append(OverlayModel.Turn(role: "user", text: "What should I do first today? (\(i + 1))"))
+            turns.append(OverlayModel.Turn(role: "assistant", text: answer + "\n\nReply \(i + 1)."))
+        }
+        return turns
     }
 
     static func transition(_ rig: MotionRig, name: String, reduce: Bool, change: @escaping () -> Void,

@@ -2401,6 +2401,10 @@ async def run_agent(
                     return Decision(Tier.CONFIRM, "this turn read a file, page or message Harbor "
                                     f"did not write, and this would contact {target[:300]}. "
                                     "Confirm the exact destination.")
+        if dec.tier is Tier.ALLOW and untrusted_read_in_turn[0]:
+            # Mailbox triage and reminders the read text may have chosen ask first.
+            from service.safety.policy import after_untrusted_read_decision
+            dec = after_untrusted_read_decision(tool.name, tool.category, args, dec)
         if (dec.tier is Tier.CONFIRM and tool.category == "shell"
                 and untrusted_read_in_turn[0]):
             # After an untrusted read, a script file the card cannot show whole

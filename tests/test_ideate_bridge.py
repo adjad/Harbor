@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
 import sys
 import time
 from pathlib import Path
@@ -786,3 +787,20 @@ def test_events_start_from_the_newest_and_page_forward(tmp_path):
     assert seqs(st.events(project, after=newest[-1]["seq"], limit=3)) == []
     first = st.events(project, after=2, limit=3)
     assert seqs(first) == [first[0]["seq"] + i for i in range(3)] and first[0]["seq"] == 3
+
+
+def test_a_launch_that_cannot_start_its_thread_leaves_ideate_free(world, monkeypatch):
+    manager, client, _ = world
+    real_start = threading.Thread.start
+
+    def refuse(self):
+        if self.name.startswith("ideate-"):
+            raise RuntimeError("can't start new thread")
+        return real_start(self)
+    monkeypatch.setattr(threading.Thread, "start", refuse)
+    with pytest.raises(RuntimeError):
+        manager.start_new("A synthetic notes page", "ui")
+    assert manager.active is None
+    monkeypatch.setattr(threading.Thread, "start", real_start)
+    body = start(client, monkeypatch)                  # not Busy: a new run starts
+    assert body["id"]

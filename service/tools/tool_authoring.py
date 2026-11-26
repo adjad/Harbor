@@ -486,6 +486,9 @@ async def create_tool(name: str, description: str = "", task: str = "",
         skill_md = ("---\n" + yaml.safe_dump(meta, sort_keys=False) + "---\n\n"
                     f"Self-authored tool. Generated locally, {time.strftime('%Y-%m-%d')}.\n")
         (skill_dir / "SKILL.md").write_text(skill_md)
+        # Approved on the create-tool card with this exact code (skills.trust).
+        from service.skills import trust
+        trust.approve(skill_dir)
     except Exception as e:  # noqa: BLE001
         return f"(couldn't write the new tool to disk: {e})"
 

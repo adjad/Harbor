@@ -129,6 +129,12 @@ class InteractiveApprover:
         fut = self._pending.get(action_id)
         if fut and not fut.done():
             action = self._actions.get(action_id, {})
+            if (approved and scope == "never") or (not approved and scope == "always"):
+                # A verdict and a scope that contradict each other ("allow" with
+                # "never", "deny" with "always") are no card's answer: the app
+                # never sends that pair. Nothing standing is recorded and the
+                # action is declined (pentest #24).
+                approved, scope = False, "once"
             if action.get("grantable") is False and scope == "always":
                 # The card offered no "Always allow" (a picture proposed this
                 # write); a client sending one anyway gets a one-time answer.

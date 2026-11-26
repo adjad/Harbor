@@ -93,7 +93,22 @@ struct NotchBriefView: View {
         })
     }
 
-    private var plan: TodayPlan? { today.currentPlan }
+    /// Today's plan, or the one held for today while a read of it is on its
+    /// way (BriefHold): opening the Brief from another day in Day shows the
+    /// Brief at once instead of "Loading your day…".
+    private var plan: TodayPlan? {
+        let key = BriefHold.key(day: Self.dayKey(today.now, today.timezone), zone: today.timezone.identifier)
+        if let current = today.currentPlan, today.isShowingCurrentDay { Self.held = (key, current) }
+        return BriefHold.pick(current: today.currentPlan, held: Self.held, key: key, failed: !today.error.isEmpty)
+    }
+    @MainActor private static var held: (key: String, plan: TodayPlan)?
+
+    private static func dayKey(_ date: Date, _ zone: TimeZone) -> String {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = zone
+        let c = calendar.dateComponents([.year, .month, .day], from: date)
+        return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
+    }
 
     var body: some View {
         // Refresh presentation at minute boundaries while visible, without a
@@ -145,7 +160,8 @@ struct NotchBriefView: View {
                 ProcessingRow(label: "Building your first Brief…")
             }
             if let plan {
-                if today.isShowingCurrentDay, let proactive = plan.workspace?.proactive {
+                // A held plan (BriefHold) is always today's.
+                if today.isShowingCurrentDay || today.currentPlan == nil, let proactive = plan.workspace?.proactive {
                     // The proactive engine's Brief, with no opening sentence: what
                     // needs you (cards, mail and texts) and what is on your plate
                     // (calendar, school work, to-dos, found in mail), side by side
@@ -166,7 +182,11 @@ struct NotchBriefView: View {
                             .fixedSize(horizontal: false, vertical: true)
                             .transition(.opacity)
                     } else if proactive.updating && !proactive.isWorking { ProcessingRow(label: Self.updatingLabel) }
-                    ProactiveBriefSection(proactive: proactive, model: model, today: today, actions: actions,
+                    ProactiveBriefSection(proactive: proactive, model: model, today: today,
+                                          minute: BriefTimeContext(date: today.now, timezone: today.timezone).minuteStart,
+                                          planLoaded: today.lastRefreshed, zoneID: today.timezone.identifier,
+                                          localeID: today.clockLocale.identifier,
+                                          conversationSettled: model.conversationSettled, actions: actions,
                                           events: restOfToday(plan),
                                           allDayEvents: allDayToday(plan), endedEvents: endedToday(plan),
                                           scrollCap: uncapped ? nil : Self.proactiveCap,
@@ -175,6 +195,7 @@ struct NotchBriefView: View {
                                           studyCards: plan.study?.briefCards ?? StudyBriefCards(),
                                           dueSoon: plan.study?.dueSoon ?? [],
                                           mailMemory: mailMemory)
+                    .equatable()
                     HStack(spacing: 12) {
                         askChip(plan)
                         Spacer(minLength: 0)

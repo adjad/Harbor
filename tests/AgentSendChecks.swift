@@ -1,4 +1,4 @@
-// Compile with app/Sources/HarborApp/HarborClient.swift, AgentSend.swift and AskAccess.swift.
+// Compile with app/Sources/HarborApp/HarborClient.swift, ResearchExportName.swift, AgentSend.swift and AskAccess.swift.
 // Drives HarborClient.runAgent through a stub URLProtocol that answers every
 // request in-process: nothing reaches a socket, least of all the live backend.
 import Foundation

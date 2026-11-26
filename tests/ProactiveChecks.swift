@@ -423,6 +423,25 @@ struct ProactiveChecks {
         check(!BriefBuilding.calendarPending(building: false, buildingFor: ["calendar"], late: ["email"]),
               "Calendar in, only Mail late: the plain calendar line")
 
+        check(BriefReplied.listed(id: "thread:a", replied: [], replying: nil), "an unanswered thread is listed")
+        check(BriefReplied.listed(id: "thread:a", replied: ["thread:a"], replying: "thread:a"),
+              "a thread answered from the Brief stays while its reply shows Sent")
+        check(!BriefReplied.listed(id: "thread:a", replied: ["thread:a"], replying: nil),
+              "then it leaves the list once the reply is closed")
+        check(BriefReplied.listed(id: "thread:b", replied: ["thread:a"], replying: nil), "other threads stay")
+        let todayKey = BriefHold.key(day: "2027-01-15", zone: "America/Los_Angeles")
+        check(BriefHold.pick(current: "fresh", held: (todayKey, "held"), key: todayKey, failed: false) == "fresh",
+              "the current plan always wins")
+        check(BriefHold.pick(current: nil as String?, held: (todayKey, "held"), key: todayKey, failed: false) == "held",
+              "while today's read is on its way, the plan held for today shows at once")
+        check(BriefHold.pick(current: nil as String?, held: (todayKey, "held"),
+                             key: BriefHold.key(day: "2027-01-16", zone: "America/Los_Angeles"), failed: false) == nil,
+              "never a plan held for another day")
+        check(BriefHold.pick(current: nil as String?, held: (todayKey, "held"),
+                             key: BriefHold.key(day: "2027-01-15", zone: "Europe/Paris"), failed: false) == nil,
+              "never a plan held for another time zone")
+        check(BriefHold.pick(current: nil as String?, held: (todayKey, "held"), key: todayKey, failed: true) == nil,
+              "never after a failed read")
         print("Proactive checks: \(count) passed")
     }
 }

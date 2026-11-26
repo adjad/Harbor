@@ -169,6 +169,8 @@ final class AccessProbeMonitor: ObservableObject {
             NSLog("%@", "Harbor reopen: couldn't schedule the reopen (\(error)); staying open")
             return
         }
+        // The reopened Harbor comes back to the Harbor window if one is up (applicationShouldTerminate).
+        PrivacyRelaunch.noteReopenScheduled()
         PrivacyRelaunch.clearPaneOpened()
         NSApp.terminate(nil)
     }

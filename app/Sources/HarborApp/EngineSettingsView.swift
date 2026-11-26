@@ -3,6 +3,10 @@ import CoreFoundation
 import Foundation
 import SwiftUI
 
+/// The other-engine warning colour from the shared ink, readable on the light Settings window.
+private let engineAttention = HarborInk.dynamic(light: HarborInk.rgb(HarborInk.attention.light),
+                                              dark: HarborInk.rgb(HarborInk.attention.dark))
+
 private enum EngineMode: String {
     case bundled
     case externalOmlx = "external-omlx"
@@ -290,16 +294,17 @@ struct EngineSettingsView: View {
                                                              modelBytes: engine.externalEngineModelBytes) {
                     Label(other.text, systemImage: other.warns ? "exclamationmark.triangle.fill" : "info.circle")
                         .font(.caption)
-                        .foregroundStyle(other.warns ? Color.orange : Color.secondary)
+                        .foregroundStyle(other.warns ? engineAttention : Color.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             } else if loader.isLoading {
                 ProgressView("Loading engine settings…")
                     .controlSize(.small)
             } else {
-                Text("Engine settings are unavailable.")
+                Text("Harbor couldn't read the engine's settings. They'll appear here once its service answers.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             if let message = loader.statusMessage {

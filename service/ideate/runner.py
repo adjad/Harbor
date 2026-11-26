@@ -172,9 +172,21 @@ class Manager:
         kind = self.store.meta(project).get("kind") or "general"
         run = Run(project, text, resume, install, target, kind)
         self.active = run
-        self.store.update(project, status="starting")
-        run.thread = threading.Thread(target=self._drive, args=(run,), name=f"ideate-{project.id}", daemon=True)
-        run.thread.start()
+        try:
+            self.store.update(project, status="starting")
+            run.thread = threading.Thread(target=self._drive, args=(run,), name=f"ideate-{project.id}",
+                                          daemon=True)
+            run.thread.start()
+        except BaseException:
+            # Nothing will run _finish for a run that never started: without this, Ideate
+            # stayed Busy until a restart.
+            if self.active is run:
+                self.active = None
+            try:
+                self.store.update(project, status="failed")
+            except Exception:  # noqa: BLE001 — the disk may be what failed
+                pass
+            raise
 
     # ------------------------------------------------------------------------- drive ----
     def _drive(self, run: Run) -> None:

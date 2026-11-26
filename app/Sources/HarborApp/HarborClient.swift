@@ -673,8 +673,12 @@ final class HarborClient {
     // the same tool+target stops asking), or "never" (record a standing block).
     // See service/safety/grants.py — some tools, notably sending mail and
     // messages, refuse a standing grant and always re-ask regardless.
+    /// True once the service took the answer (2xx). A transport error is tried once
+    /// more; a refusal is not (swarm #10: the answer used to be fire-and-forget, so a
+    /// lost POST left the turn waiting out the service's 300 s confirm timeout).
+    @discardableResult
     func approve(sessionId: String, actionId: String, approved: Bool,
-                 scope: String = "once", requestId: String = "") async {
+                 scope: String = "once", requestId: String = "") async -> Bool {
         var req = URLRequest(url: Self.baseURL.appendingPathComponent("agent/approve"))
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -685,7 +689,26 @@ final class HarborClient {
         // Routes the answer to the exact request that raised the card.
         if !requestId.isEmpty { body["request_id"] = requestId }
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
-        _ = try? await URLSession.shared.data(for: req)
+        req.timeoutInterval = 10
+        return await Self.postWithOneRetry {
+            let (_, response) = try await URLSession.shared.data(for: req)
+            return (response as? HTTPURLResponse)?.statusCode ?? 0
+        }
+    }
+
+    /// Runs `send` and reports a 2xx; a thrown (transport) error is tried once more
+    /// after `pause`. Used by the approval answer.
+    nonisolated static func postWithOneRetry(pause: TimeInterval = 0.5,
+                                             _ send: () async throws -> Int) async -> Bool {
+        for attempt in 0..<2 {
+            do {
+                let status = try await send()
+                return (200..<300).contains(status)
+            } catch {
+                if attempt == 0 { try? await Task.sleep(nanoseconds: UInt64(pause * 1_000_000_000)) }
+            }
+        }
+        return false
     }
 
     // Send the exact text the user reviewed in Harbor's editable draft card.
@@ -1353,7 +1376,7 @@ final class HarborClient {
                                                options: .regularExpression).prefix(60)
         let dir = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
             ?? FileManager.default.homeDirectoryForCurrentUser
-        let target = dir.appendingPathComponent("\(safe.isEmpty ? "harbor-research" : String(safe)).md")
+        let target = ResearchExportName.unused(safe.isEmpty ? "harbor-research" : String(safe), in: dir)
         do { try Self.writeOwnerOnly(data, to: target); return target } catch { return nil }
     }
 

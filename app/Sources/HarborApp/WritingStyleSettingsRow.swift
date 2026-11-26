@@ -122,10 +122,10 @@ struct WritingStyleSettingsRow: View {
                 .controlSize(.small)
                 .disabled(model.pending)
             } else {
-                Text("Write reply drafts in my style").font(.system(size: 14, weight: .medium))
-                Button("Check") { Task { await model.refresh() } }
+                Text("Write reply drafts in my style").font(.harbor(.callout, on: .window, weight: .medium))
+                Button("Refresh") { Task { await model.refresh() } }
                     .controlSize(.small)
-                    .accessibilityLabel("Check whether Harbor has learned your writing style")
+                    .accessibilityLabel("Refresh writing style status")
             }
         }
         .task { await model.refresh() }
@@ -139,7 +139,7 @@ struct WritingStyleSettingsRow: View {
 
     private func label(_ state: WritingStyle) -> some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text("Write reply drafts in my style").font(.system(size: 14, weight: .medium))
+            Text("Write reply drafts in my style").font(.harbor(.callout, on: .window, weight: .medium))
             Text(state.line).font(.caption).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }

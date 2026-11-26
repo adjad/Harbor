@@ -199,6 +199,19 @@ PROFILE_TESTS = {
         "tests/test_reminder_date_only_due_today.py",
     },
     "safety": {
+        # 2026-11-25 pentest fixes, each with its attack path; temp HOME and invented values.
+        "tests/test_security_fix_persistence_paths.py",
+        "tests/test_security_fix_skill_trust.py",
+        "tests/test_security_fix_skill_sandbox.py",
+        "tests/test_security_fix_skill_tools.py",
+        "tests/test_security_fix_redaction.py",
+        "tests/test_security_fix_omlx_settings.py",
+        "tests/test_security_fix_research_private.py",
+        "tests/test_security_fix_cloud_names.py",
+        "tests/test_security_fix_gateway_key.py",
+        "tests/test_security_fix_approver_scope.py",
+        "tests/test_security_fix_shell_engine_ports.py",
+        "tests/test_security_fix_untrusted_mailbox.py",
         # The user's access choice survives a restart; boots under tmp_path only.
         "tests/test_access_mode_persistence.py",
         "tests/test_always_confirm_grants.py",
@@ -521,6 +534,8 @@ ADDITIONAL_FULL_TESTS = {
     # shown as meetings (sync route, Google reader): invented plan, stubbed store, scratch HARBOR_HOME.
     "tests/test_day_blocks_in_ask.py",
     "tests/test_harbor_calendar_marker.py",
+    # Source checks for UI review notes: reads Swift files only.
+    "tests/test_app_bugs_ui_notes.py",
     # Reply-draft reads and day-plan corrections: regex and registry checks only.
     "tests/test_reply_draft_reads.py",
     # Ask quality: code-failure fixes, tool-pair descriptions, the Harbor self-reference
@@ -581,6 +596,7 @@ ADDITIONAL_FULL_TESTS = {
     "tests/test_proactive_mail_recall.py",
     "tests/test_proactive_past_week.py",
     "tests/test_proactive_quality.py",
+    "tests/test_reply_drafts_context.py",
     "tests/test_remote_model_only.py",
     "tests/test_workspace_accounts.py",
     # Bounded public-manifest JS fixtures only; no DOM, browser or network access.
@@ -935,6 +951,28 @@ ADDITIONAL_FULL_TESTS = {
     # Answer edge trimming and the plain-language weather reply; pure text.
     "tests/test_answer_polish.py",
     "tests/workflow20/test_contract.py",
+    # Skill install and skill-tool stop: synthetic skills in tmp_path, a bash script
+    # child under the test only; no model, sandbox profile or real ~/.moe.
+    "tests/test_skill_install_safety.py",
+    "tests/test_skill_tool_stop.py",
+    # Quit and relaunch ordering and bounds: pure asyncio and source checks; no service or app.
+    "tests/test_relaunch_speed.py",
+    # /chat and /agent refuse a body without usable text (422) before making a client; synthetic targets.
+    "tests/test_chat_agent_prompt_validation.py",
+    # Swarm #6: a chat deleted mid-turn leaves no rows; scratch stores, fake engine.
+    "tests/test_swarm_session_delete.py",
+    # Swarm #37: audit log rotation and tail read; scratch files.
+    "tests/test_swarm_audit_log.py",
+    # Swarm app-side fixes: source checks of their wiring.
+    "tests/test_swarm_app_wiring.py",
+    # Proactive store reads: JSON files in tmp_path only.
+    "tests/test_proactive_store_reads.py",
+    # Leap-day birthdays: patched birthday table and today; no Contacts read.
+    "tests/test_contact_birthdays_leap.py",
+    # Brief item accuracy: invented mail/text rows, tmp proactive stores, a faked hub.
+    "tests/test_brief_items_accuracy.py",
+    # Background mail model calls stand down off this Mac: fake clients only.
+    "tests/test_background_model_stays_local.py",
 }
 # Integrated runtime contracts are mandatory; missing files fail selection.
 MINI_RUNTIME_INTEGRATION_TESTS = {
@@ -1000,6 +1038,9 @@ _NATIVE_GATE_DEPENDENCIES = {
     "native/model-use-groups-contract": "native/model-use-groups-compile",
     "native/access-probe-contract": "native/access-probe-compile",
     "native/look-capture-path-contract": "native/look-capture-path-compile",
+    "native/relaunch-speed-contract": "native/relaunch-speed-compile",
+    "native/swarm-lifecycle-contract": "native/swarm-lifecycle-compile",
+    "native/notch-smoothness-contract": "native/notch-smoothness-compile",
 }
 
 
@@ -1284,6 +1325,7 @@ def _native_gates(build_dir: Path) -> list[tuple[str, list[str]]]:
     ask_suggestions = str(build_dir / "ask-suggestions")
     screen_look = str(build_dir / "screen-look")
     read_aloud_voice = str(build_dir / "read-aloud-voice")
+    app_bugs = str(build_dir / "app-bugs")
     study_find = str(build_dir / "study-find")
     notch_tab = str(build_dir / "notch-tab")
     ideate = str(build_dir / "ideate")
@@ -1397,6 +1439,7 @@ def _native_gates(build_dir: Path) -> list[tuple[str, list[str]]]:
             [
                 TRUSTED_SWIFTC, "-module-cache-path", module_cache,
                 "app/Sources/HarborApp/HarborClient.swift", "app/Sources/HarborApp/AgentSend.swift",
+                "app/Sources/HarborApp/ResearchExportName.swift",
                 "tests/SourceSyncLabelRegression.swift", "-o", sync_label,
             ],
         ),
@@ -1417,6 +1460,7 @@ def _native_gates(build_dir: Path) -> list[tuple[str, list[str]]]:
                 TRUSTED_SWIFTC, "-parse-as-library", "-swift-version", "5",
                 "-module-cache-path", module_cache,
                 "app/Sources/HarborApp/HarborClient.swift", "app/Sources/HarborApp/AgentSend.swift",
+                "app/Sources/HarborApp/ResearchExportName.swift",
                 "app/Sources/HarborApp/AskAccess.swift",
                 "tests/AgentSendChecks.swift", "-o", agent_send,
             ],
@@ -1439,6 +1483,7 @@ def _native_gates(build_dir: Path) -> list[tuple[str, list[str]]]:
                 TRUSTED_SWIFTC, "-parse-as-library", "-swift-version", "5",
                 "-module-cache-path", module_cache,
                 "app/Sources/HarborApp/AskSuggestionsStore.swift", "app/Sources/HarborApp/HarborClient.swift",
+                "app/Sources/HarborApp/ResearchExportName.swift",
                 "app/Sources/HarborApp/AgentSend.swift", "app/Sources/HarborApp/AskAccess.swift",
                 "app/Sources/HarborApp/NotchCommand.swift",
                 "tests/AskSuggestionsChecks.swift", "-o", ask_suggestions,
@@ -1548,6 +1593,17 @@ def _native_gates(build_dir: Path) -> list[tuple[str, list[str]]]:
             ],
         ),
         ("native/study-find-contract", [study_find]),
+        (
+            "native/app-bugs-compile",
+            [
+                TRUSTED_SWIFTC, "-parse-as-library", "-swift-version", "5",
+                "-module-cache-path", module_cache,
+                "app/Sources/HarborApp/AppBugRules.swift",
+                "app/Sources/HarborApp/ResearchExportName.swift",
+                "tests/AppBugChecks.swift", "-o", app_bugs,
+            ],
+        ),
+        ("native/app-bugs-contract", [app_bugs]),
         (
             "native/notch-tab-compile",
             [
@@ -1716,6 +1772,43 @@ def _native_gates(build_dir: Path) -> list[tuple[str, list[str]]]:
             ],
         ),
         ("native/settings-response-contract", [settings_response]),
+        (
+            "native/relaunch-speed-compile",
+            [
+                TRUSTED_SWIFTC, "-parse-as-library", "-swift-version", "5",
+                "-module-cache-path", module_cache,
+                "app/Sources/HarborApp/PrivacyRelaunch.swift",
+                "app/Sources/HarborApp/LaunchTimeline.swift",
+                "tests/RelaunchSpeedChecks.swift", "-o", str(build_dir / "relaunch-speed"),
+            ],
+        ),
+        ("native/relaunch-speed-contract", [str(build_dir / "relaunch-speed")]),
+        (
+            "native/swarm-lifecycle-compile",
+            [
+                TRUSTED_SWIFTC, "-parse-as-library", "-swift-version", "5",
+                "-module-cache-path", module_cache,
+                "app/Sources/HarborApp/BackendCredentials.swift", "app/Sources/HarborApp/BackendManager.swift",
+                "app/Sources/HarborApp/PortGuard.swift", "app/Sources/HarborApp/BackendOwnership.swift",
+                "app/Sources/HarborApp/BackendTrust.swift", "app/Sources/HarborApp/HarborClient.swift",
+                "app/Sources/HarborApp/AgentSend.swift", "app/Sources/HarborApp/AssistantDelivery.swift",
+                "app/Sources/HarborApp/ResultPost.swift",
+                "tests/SwarmLifecycleChecks.swift", "-o", str(build_dir / "swarm-lifecycle"),
+            ],
+        ),
+        ("native/swarm-lifecycle-contract", [str(build_dir / "swarm-lifecycle")]),
+        (
+            "native/notch-smoothness-compile",
+            [
+                TRUSTED_SWIFTC, "-parse-as-library", "-swift-version", "5",
+                "-module-cache-path", module_cache,
+                "app/Sources/HarborApp/MarkdownView.swift", "app/Sources/HarborApp/Math.swift",
+                "app/Sources/HarborApp/Theme.swift", "app/Sources/HarborApp/AskInputText.swift",
+                "app/Sources/HarborApp/ScriptRunner.swift",
+                "tests/NotchSmoothnessChecks.swift", "-o", str(build_dir / "notch-smoothness"),
+            ],
+        ),
+        ("native/notch-smoothness-contract", [str(build_dir / "notch-smoothness")]),
     ]
 
 

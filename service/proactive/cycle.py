@@ -408,13 +408,30 @@ def card_due(item: dict, now: float) -> bool:
     return True
 
 
-def _asks_something(candidate: dict) -> bool:
-    """An unanswered text carries an action item: triage named what it asks
-    of the user, or the latest incoming line is a question."""
-    if str((candidate.get("result") or {}).get("asks_of_me") or "").strip():
+def _line_asks(line: str) -> bool:
+    """A line that asks something of the user: a question, or a plan or a
+    request in their own words (triage._ASK)."""
+    return "?" in line or bool(triage._ASK.search(guard.normalize_slang(line)))
+
+
+def _text_asks(item: dict, result: dict) -> bool:
+    """An unanswered text carries an action item. With lines since the user's
+    own last reply (item["pending"]), only those count: an ask the user already
+    answered earlier in the slice must not keep it waiting ("ok see you then"
+    after the plan was settled). Without them (the user hasn't written in this
+    window), triage named what it asks of the user, or the latest line asks."""
+    pending = [str(line) for line in item.get("pending") or [] if str(line).strip()]
+    if pending:
+        return any(_line_asks(line) for line in pending)
+    if str((result or {}).get("asks_of_me") or "").strip():
         return True
-    lines = candidate["item"].get("lines") or []
-    return bool(lines) and "?" in lines[-1]
+    lines = item.get("lines") or []
+    return bool(lines) and _line_asks(str(lines[-1]))
+
+
+def _asks_something(candidate: dict) -> bool:
+    """An unanswered text carries an action item (_text_asks)."""
+    return _text_asks(candidate["item"], candidate.get("result") or {})
 
 
 def with_waiting_people(ranked: list[dict], pool: list[dict], sched: dict, *, now: float, tz: str,
@@ -490,7 +507,10 @@ def needs_reply(item: dict, result: dict, now: float) -> bool:
         return False
     age = now - float(item.get("received_ts") or 0)
     if item["source"] == "messages":
-        return age <= WAITING_S
+        # Like mail, a text must ask something (_text_asks), and one the user
+        # already read gets READ_GRACE_S to answer it before it shows as waiting
+        # (card_due): a read "ok see you then" was taken care of.
+        return age <= WAITING_S and _text_asks(item, result) and card_due(item, now)
     asks = str(result.get("asks_of_me") or "")
     return (item["source"] == "mail" and bool(asks) and age <= _WAITING_MAIL_S
             and ("?" in (item.get("text") or "") or bool(_ANSWER.search(asks))))
@@ -545,6 +565,17 @@ def attention(thread: dict, now: float, tz: str) -> tuple[str, str]:
     return "fyi", ""
 
 
+FYI_READ_S = 86400
+
+
+def read_fyi_expired(thread: dict, now: float) -> bool:
+    """An FYI row (nothing to answer, no deadline ahead) the user has read and
+    that is over a day old: it no longer needs attention. Unknown read state
+    stays."""
+    return (thread.get("attention") == "fyi" and thread.get("unread") is False
+            and now - float(thread.get("received_ts") or now) > FYI_READ_S)
+
+
 def order_threads(threads: list[dict]) -> list[dict]:
     rank = {"reply": 0, "deadline": 1, "fyi": 2}
     return sorted(threads, key=lambda t: (rank.get(t.get("attention"), 2), -(t.get("received_ts") or 0)))
@@ -565,6 +596,8 @@ def _threads(survivors: list[dict], now: float | None = None, tz: str = "UTC") -
                     "needs_reply": needs_reply(item, result, now),
                     "asked": "?" in (item.get("text") or "") and bool(result.get("asks_of_me")),
                     "replied": bool(item.get("replied")),
+                    # True, False, or None when the cache doesn't say (read_fyi_expired).
+                    "unread": item.get("unread"),
                     "deadline": mentioned_deadline(item, now, tz),
                     "received_ts": item.get("received_ts"), "reply_ref": item.get("reply_ref", ""),
                     "asks": [a] if (a := stable.ask_key(item)) else []})
@@ -1517,10 +1550,13 @@ NO_EVENTS_SENTENCE = "Nothing on your calendar for the rest of today."
 CALENDAR_UNREAD_SENTENCE = "Harbor can't see your calendar yet."
 
 
-def _day_summary(cards: list[dict], todos: list[dict], threads: list[dict], now: float, tz: str) -> str:
+def _day_summary(cards: list[dict], todos: list[dict], threads: list[dict], now: float, tz: str,
+                 ongoing: list[dict] | None = None) -> str:
     """A natural one- or two-sentence overview, built by code: "Two events
     today — PeakHacks Hack Day at 11:45 and Hacktoberfest at noon. Three
-    people are waiting on replies." """
+    people are waiting on replies." With no timed event still ahead, today's
+    all-day events and the ones in progress (sources.schedule's "ongoing") are
+    named instead; "nothing on your calendar" only when there are none."""
     zone = ZoneInfo(tz)
     today = datetime.fromtimestamp(now, zone).date()
     events = sorted((t for t in todos if t["source"] == "calendar" and t.get("due_ts") and t.get("timed", True)
@@ -1533,7 +1569,7 @@ def _day_summary(cards: list[dict], todos: list[dict], threads: list[dict], now:
         rest = f", plus {len(events) - 2} more" if len(events) > 2 else ""
         sentences.append(f"{lead} — {' and '.join(named)}{rest}.")
     else:
-        sentences.append(NO_EVENTS_SENTENCE)
+        sentences.append(_on_today_sentence(todos, ongoing or [], now, zone) or NO_EVENTS_SENTENCE)
     waiting = {t["who"] for t in threads if t.get("needs_reply") and t.get("who")}
     if waiting:
         n = len(waiting)
@@ -1543,6 +1579,24 @@ def _day_summary(cards: list[dict], todos: list[dict], threads: list[dict], now:
         if open_todos:
             n = len(open_todos)
             sentences.append(f"{_count(n)} thing{'s' if n != 1 else ''} on your to-do list.")
+    return " ".join(sentences)
+
+
+def _on_today_sentence(todos: list[dict], ongoing: list[dict], now: float, zone) -> str:
+    """"All day: Team offsite." / "Design review is on until 3 PM.": what is
+    on today without a timed event still ahead. "" when nothing is."""
+    today = datetime.fromtimestamp(now, zone).date()
+    all_day = [t["title"] for t in todos if t["source"] == "calendar" and not t.get("timed", True)
+               and t.get("due_ts") and datetime.fromtimestamp(t["due_ts"], zone).date() == today]
+    all_day += [e["title"] for e in ongoing if e.get("all_day") and e["title"] not in all_day]
+    running = [e for e in ongoing if not e.get("all_day")]
+    sentences = []
+    if all_day:
+        sentences.append("All day: " + " and ".join(_short_title(t) for t in all_day[:2])
+                         + (f", plus {len(all_day) - 2} more" if len(all_day) > 2 else "") + ".")
+    if running:
+        event = min(running, key=lambda e: e["end_ts"])
+        sentences.append(f"{_short_title(event['title'])} is on until {_clock_words(event['end_ts'], zone)}.")
     return " ".join(sentences)
 
 
@@ -1666,6 +1720,8 @@ def snapshot(*, account: str | None = None, now: float | None = None, tz: str | 
     # Answered by the user (here or in Messages/Mail): no longer needs attention,
     # unless it names a deadline still ahead.
     threads = [t for t in threads if not t.get("replied") or t.get("attention") == "deadline"]
+    # Read and over a day old, with nothing to answer: taken care of.
+    threads = [t for t in threads if not read_fyi_expired(t, now)]
     threads = _clearable(threads, cleared, "title", "received_ts", cleared_asks)
     erased = store.erased_accounts()
     seen = {str(a).casefold() for a in state.get("accounts") or []}
@@ -1677,7 +1733,9 @@ def snapshot(*, account: str | None = None, now: float | None = None, tz: str | 
         match = lambda x: str(x.get("account") or "").casefold() == account.casefold()  # noqa: E731
         cards, todos, threads = [c for c in cards if match(c)], [t for t in todos if match(t)], \
             [t for t in threads if match(t)]
-    summary = _day_summary(cards, todos, threads, now, tz)
+    ongoing = [e for e in sched.get("ongoing") or []
+               if not account or str(e.get("account") or "").casefold() == account.casefold()]
+    summary = _day_summary(cards, todos, threads, now, tz, ongoing=ongoing)
     if running():
         view_state = "working"
     elif state.get("as_of") is not None:

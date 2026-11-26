@@ -211,8 +211,8 @@ struct StudyProgressBar: View {
     var body: some View {
         GeometryReader { geo in
             ZStack(alignment: .leading) {
-                Capsule().fill(Color.white.opacity(0.08))
-                Capsule().fill(Color.white.opacity(0.7))
+                Capsule().fill(Theme.chipFill)
+                Capsule().fill(Theme.accent.opacity(0.7))
                     .frame(width: max(4, geo.size.width * CGFloat(min(max(fraction, 0), 1))))
             }
         }
@@ -233,10 +233,10 @@ struct StudyScoreRing: View {
 
     var body: some View {
         ZStack {
-            Circle().stroke(Color.white.opacity(0.08), lineWidth: 6)
+            Circle().stroke(Theme.chipFill, lineWidth: 6)
             Circle()
                 .trim(from: 0, to: CGFloat(shown))
-                .stroke(Color.white.opacity(0.9), style: StrokeStyle(lineWidth: 6, lineCap: .round))
+                .stroke(Theme.accent.opacity(0.9), style: StrokeStyle(lineWidth: 6, lineCap: .round))
                 .rotationEffect(.degrees(-90))
             VStack(spacing: 0) {
                 Text("\(correct)").font(.harbor(size: 22, weight: .semibold)).monospacedDigit()

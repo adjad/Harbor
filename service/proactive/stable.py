@@ -13,8 +13,8 @@ Two problems this module answers, both code only (no model, no source read):
    the same way twice, so the cards flip between runs. ``carry`` keeps a card
    that was already shown for as long as its ask stands (not dismissed, fired,
    answered, past due or withheld), adds new cards after it, and never
-   reshuffles. ``reusable_drafts`` hands a shown reply's draft back so the
-   model is not asked to write it again.
+   reshuffles. ``reusable_drafts`` hands a shown reply's model-written draft
+   back so the model is not asked to write it again.
 """
 from __future__ import annotations
 
@@ -60,12 +60,16 @@ def is_gone(record: dict, gone: set[str], suppressed: set[str]) -> bool:
 
 def reusable_drafts(previous: list[dict]) -> dict[tuple, str]:
     """{(item ref, ask, method): draft} for the reply cards already shown, so a
-    cycle that finds the same ask again keeps the words it wrote."""
+    cycle that finds the same ask again keeps the words the model wrote. A
+    template is never handed back: the model is asked again once it can answer."""
+    from service.proactive.prepare import is_template
     out = {}
     for card in previous:
         method = (card.get("action") or {}).get("method")
         draft = (card.get("action") or {}).get("draft")
         ask = card_ask(card)
+        if (card.get("action") or {}).get("draft_source") == "template" or is_template(draft):
+            continue
         if method in _REPLY_METHODS and draft and ask and card_ref(card):
             out[(card_ref(card), ask, method)] = draft
     return out

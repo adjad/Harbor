@@ -15,9 +15,9 @@ struct MemoryHomeView: View {
             Rectangle().fill(ChatTheme.line).frame(height: 1)
             VStack(alignment: .leading, spacing: 14) {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Memory").font(.system(size: 22, weight: .medium)).foregroundStyle(ChatTheme.text)
+                    Text("Memory").font(.harbor(size: 22, weight: .medium)).foregroundStyle(ChatTheme.text)
                     Text("What Harbor knows about you, and where it learned it.")
-                        .font(.system(size: 13)).foregroundStyle(ChatTheme.text3)
+                        .font(.harbor(.body, on: .window)).foregroundStyle(ChatTheme.text3)
                 }
                 Picker("Memory", selection: $navigation.memoryTab) {
                     ForEach(HarborRoute.MemoryFocus.allCases, id: \.self) { tab in
@@ -55,7 +55,7 @@ struct MemoryHomeView: View {
             if !sidebarVisible { Spacer().frame(width: 62) }   // clear the window's traffic lights
             Button { sidebarVisible.toggle() } label: { Image(systemName: "sidebar.left") }
                 .buttonStyle(ChatIconButtonStyle()).help("Show or hide the sidebar (⌘B)").accessibilityLabel("Toggle sidebar")
-            Text("Memory").font(.system(size: 14.5, weight: .medium)).foregroundStyle(ChatTheme.text)
+            Text("Memory").font(.harbor(.callout, on: .window, weight: .medium)).foregroundStyle(ChatTheme.text)
             Spacer()
             ChatPill(text: "Local", tinted: true)
         }

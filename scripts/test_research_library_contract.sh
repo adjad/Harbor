@@ -13,8 +13,10 @@ if [[ ! -x "$test_python" ]]; then test_python=python3; fi
 swiftc -parse-as-library -swift-version 5 \
     -module-cache-path "$library_scratch/module-cache" \
     "$project_root/app/Sources/HarborApp/HarborClient.swift" \
+    "$project_root/app/Sources/HarborApp/ResearchExportName.swift" \
     "$project_root/app/Sources/HarborApp/AgentSend.swift" \
     "$project_root/app/Sources/HarborApp/ResearchModel.swift" \
+    "$project_root/app/Sources/HarborApp/AppBugRules.swift" \
     "$project_root/app/Sources/HarborApp/ResearchLibraryModel.swift" \
     "$project_root/app/Sources/HarborApp/ResearchLibraryView.swift" \
     "$project_root/app/Sources/HarborApp/Theme.swift" \

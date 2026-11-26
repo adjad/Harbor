@@ -392,6 +392,22 @@ final class MailReader {
                     set AppleScript's text item delimiters to ", "
                     set toLine to toAddrs as string
                     set AppleScript's text item delimiters to oldDelims
+                    -- Cc: mail that copies the user is addressed to them too (the
+                    -- Brief's list-mail rule reads To and Cc). Its own try: a
+                    -- message whose Cc can't be read keeps its record, Cc empty.
+                    set ccLine to ""
+                    try
+                        set ccAddrs to {}
+                        repeat with r in (cc recipients of m)
+                            set end of ccAddrs to (address of r)
+                        end repeat
+                        set AppleScript's text item delimiters to ", "
+                        set ccLine to ccAddrs as string
+                        set AppleScript's text item delimiters to oldDelims
+                    on error
+                        set AppleScript's text item delimiters to oldDelims
+                        set ccLine to ""
+                    end try
                     -- message id (the RFC Message-ID header) is the only stable
                     -- handle a tool can use to come back and act on THIS
                     -- message later — reply to it, mark it read, archive it.
@@ -409,12 +425,12 @@ final class MailReader {
                     considering case
                         if "\(esc(account?.id ?? ""))" is not "" and acctID is not "\(esc(account?.id ?? ""))" then error "Message account identity changed."
                     end considering
-                    set rowFields to {epochSecs as text, readFlag as text, acctName as text, acctID, (sender of m) as text, toLine as text, (subject of m) as text, msgId as text, (content of m) as text}
+                    set rowFields to {epochSecs as text, readFlag as text, acctName as text, acctID, (sender of m) as text, toLine as text, (subject of m) as text, msgId as text, (content of m) as text, ccLine as text}
                     repeat with fieldValue in rowFields
                         set fieldText to contents of fieldValue
                         if (fieldText contains FS) or (fieldText contains RS) then error "Mail raw field contains a reserved record separator." number -2700
                     end repeat
-                    set output to output & (item 1 of rowFields) & FS & (item 2 of rowFields) & FS & (item 3 of rowFields) & FS & (item 4 of rowFields) & FS & (item 5 of rowFields) & FS & (item 6 of rowFields) & FS & (item 7 of rowFields) & FS & (item 8 of rowFields) & FS & (item 9 of rowFields) & RS
+                    set output to output & (item 1 of rowFields) & FS & (item 2 of rowFields) & FS & (item 3 of rowFields) & FS & (item 4 of rowFields) & FS & (item 5 of rowFields) & FS & (item 6 of rowFields) & FS & (item 7 of rowFields) & FS & (item 8 of rowFields) & FS & (item 9 of rowFields) & FS & (item 10 of rowFields) & RS
                 on error problem number code
                     -- A skipped record is not a complete reference search.
                     -- Report this account as failed rather than silently

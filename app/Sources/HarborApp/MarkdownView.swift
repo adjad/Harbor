@@ -463,12 +463,40 @@ struct MarkdownView: View {
          .replacingOccurrences(of: "<br>", with: "\n", options: .caseInsensitive)
     }
 
-    private func inline(_ s: String) -> AttributedString {
+    private func inline(_ s: String) -> AttributedString { Self.inlineCached(s) }
+
+    /// A paragraph, list item or table cell as styled text, remembered by its
+    /// source. Block parsing was already cached, but this ran again for every
+    /// piece of every reply each time the surface redrew (a key typed in Ask,
+    /// a streamed token, a voice level), and it is the costliest step: an
+    /// Ask chat of a few replies spent most of each redraw here. While a reply
+    /// streams, only its last piece is new, so the pieces before it hit too.
+    static func inlineCached(_ s: String) -> AttributedString {
+        let key = s as NSString
+        if let hit = inlineCache.object(forKey: key) { return hit.text }
+        let made = inlineParsed(s)
+        inlineCache.setObject(InlineText(made), forKey: key, cost: key.length)
+        return made
+    }
+
+    /// The uncached parse (inlineCached's miss, and the checks' reference).
+    static func inlineParsed(_ s: String) -> AttributedString {
         let opts = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
         guard let parsed = try? AttributedString(markdown: s, options: opts) else { return AttributedString(s) }
         // Paragraphs, list items and table cells all come through here.
         return MarkdownLinks.safe(parsed)
     }
+
+    private final class InlineText {
+        let text: AttributedString
+        init(_ text: AttributedString) { self.text = text }
+    }
+    private static let inlineCache: NSCache<NSString, InlineText> = {
+        let cache = NSCache<NSString, InlineText>()
+        cache.countLimit = 4096
+        cache.totalCostLimit = 4_000_000   // characters of source text
+        return cache
+    }()
 }
 
 

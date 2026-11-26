@@ -53,8 +53,9 @@ after the gap ended counts:
 - email: every connected Google account fetched its headers after the gap
   ended. An error is never a read. A temporary one (offline, timed out) is
   waited for like any fetch still owed, but only while no other account has
-  read: once every account has read or failed, only the healthy ones are
-  waited on. An account whose sign-in stops mail
+  read: once every account has read or failed since the gap ended (its
+  headers_error_at, email_tools.external_email_error), only the healthy ones
+  are waited on. An error from before the gap is not a failure in it. An account whose sign-in stops mail
   (cycle._unread_reason says "reconnect": expired, refused, no Gmail scope)
   can't come in by waiting: it isn't waited for, and the Brief names it
   "reconnect" (honest(), mail_unread_by) rather than late. With none
@@ -188,11 +189,16 @@ def _email(started: float, now: float) -> tuple[str, float | None]:
                 # mail_unread_by). Not waited for, and not counted as read.
                 failing += 1
                 continue
-            if (item or {}).get("headers_error"):
-                # A temporary failure (offline, timed out). An error is never a read.
+            error_at = _stamp((item or {}).get("headers_error_at"))
+            if (item or {}).get("headers_error") and error_at is not None and error_at >= started:
+                # It failed for now (offline, timed out) since the gap ended. An
+                # error is never a read.
                 erroring += 1
                 continue
-            lagging = True   # healthy, no fetch since the gap ended yet: waited for
+            # No fetch since the gap ended yet, or only an error from before it
+            # (an error is kept, and restored at launch, until a fetch succeeds):
+            # its fetch after the wake may be in flight, so it is waited for.
+            lagging = True
         if erroring and not stamps and not lagging:
             # No account has read since the gap ended and the rest failed for now:
             # it may come in any minute, so wait (named late if it stays silent).

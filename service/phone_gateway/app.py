@@ -139,7 +139,9 @@ def _build_approve_body(raw: dict[str, Any]) -> dict[str, Any]:
         "session_id": _checked_sid(raw.get("session_id")),
         "action_id": action_id,
         "approved": raw["approved"],
-        "scope": raw["scope"],
+        # The backend takes no standing "always" with the gateway's key
+        # (service/gateway_link.py): the phone's answer applies to this card.
+        "scope": "once" if raw["scope"] == "always" else raw["scope"],
     }
     if raw.get("request_id") is not None:
         request_id = raw["request_id"]

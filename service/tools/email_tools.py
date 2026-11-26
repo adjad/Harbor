@@ -342,7 +342,7 @@ def configure_external_accounts(accounts: dict[str, dict]) -> None:
 def _source_identity(record: str, *, raw: bool = False) -> tuple[str, str]:
     if raw:
         fields = record.split(_RAW_FS)
-        if len(fields) == 9:
+        if len(fields) in (9, 10):
             return fields[2], fields[3]
         if len(fields) == 8:
             return fields[2], ""
@@ -559,6 +559,7 @@ def cache_external_emails(*, account: str, headers: str | None = None,
             item[part] = data
             item[part + "_at"] = now
             item[part + "_error"] = ""
+            item[part + "_error_at"] = 0.0
             item[part + "_verified"] = True
     if headers is not None:
         item["verified"] = True
@@ -576,6 +577,10 @@ def cache_external_emails(*, account: str, headers: str | None = None,
 
 def external_email_error(account: str, part: str, reason: str) -> None:
     if account in _external_accounts:
+        # When it last failed, every time (the same reason again too): a failure
+        # since a wake is told apart from one restored from before it
+        # (proactive/brief_warmup.py).
+        _external_accounts[account][part + "_error_at"] = time.time() if reason else 0.0
         if _external_accounts[account].get(part + "_error", "") == (reason or ""):
             return  # Same failure as last time (offline, expired): nothing changed.
         _external_accounts[account][part + "_error"] = reason
@@ -1488,8 +1493,9 @@ def _parse_raw_text(raw: str) -> list[dict]:
     Skips anything that doesn't parse (e.g. a message AppleScript couldn't
     read).
 
-    Current records have 9 fields: timestamp, read flag, account name, native
-    account ID, sender, recipients, subject, Message-ID, and body. Also accepts
+    Current records have 10 fields: timestamp, read flag, account name, native
+    account ID, sender, recipients, subject, Message-ID, body, and Cc (last, so
+    a 9-field record from an older app still parses, with no Cc). Also accepts
     the older 8-field flagged and 6/7-field unflagged formats. The caches
     are restored from disk across restarts (see cache_store), so right after an
     upgrade this parses a file the OLD app wrote — rejecting those on a length
@@ -1503,6 +1509,10 @@ def _parse_raw_text(raw: str) -> list[dict]:
         if not record:
             continue
         parts = record.split(_RAW_FS)
+        cc = None
+        if len(parts) == 10:
+            cc = parts[9].strip()
+            parts = parts[:9]
         # Read status was added as field 1 (right after the timestamp, same
         # placement and same reason as the header format). `unread` is None for
         # records written before it existed — see _parse_pipe_lines.
@@ -1533,7 +1543,7 @@ def _parse_raw_text(raw: str) -> list[dict]:
         out.append({"ts": ts, "account": account, "account_id": account_id, "sender": sender.strip(),
                     "to": to.strip(), "subject": subject.strip(),
                     "message_id": msg_id.strip(), "body": body.strip(),
-                    "unread": unread})
+                    "unread": unread, **({"cc": cc} if cc is not None else {})})
     return out
 
 
@@ -3972,11 +3982,26 @@ async def _native_sent(days: int) -> tuple[list[dict], str, bool]:
 
 
 def _sent_key(row: dict) -> str:
-    """One key for the same sent email seen through Gmail and through Mail."""
-    mid = str(row.get("message_id") or "").strip().strip("<>").lower()
-    if mid:
-        return mid
-    return f"{str(row.get('subject') or '').strip().casefold()}|{int(float(row.get('ts') or 0) // 120)}"
+    """One key for the same sent email seen through Gmail and through Mail ("" without a
+    Message-ID: those are matched by _same_sent instead)."""
+    return str(row.get("message_id") or "").strip().strip("<>").lower()
+
+
+_SENT_ADDRESS = re.compile(r"[\w.+'-]+@[\w-]+(?:\.[\w-]+)+")
+
+
+def _same_sent(a: dict, b: dict) -> bool:
+    """Two Message-ID-less rows are the same email: same subject, sent within two minutes
+    of each other, and (when both name addresses) to a shared recipient. A fixed 2-minute
+    bucket split one email across a boundary and merged two same-subject emails sent to
+    different people."""
+    if str(a.get("subject") or "").strip().casefold() != str(b.get("subject") or "").strip().casefold():
+        return False
+    if abs(float(a.get("ts") or 0) - float(b.get("ts") or 0)) > 120:
+        return False
+    to_a = {m.casefold() for m in _SENT_ADDRESS.findall(str(a.get("to") or ""))}
+    to_b = {m.casefold() for m in _SENT_ADDRESS.findall(str(b.get("to") or ""))}
+    return not (to_a and to_b) or bool(to_a & to_b)
 
 
 async def sent_emails_view(query: str | None = None, day: str | None = None, count: int = 5,
@@ -4021,11 +4046,15 @@ async def sent_emails_view(query: str | None = None, day: str | None = None, cou
     if query:
         rows = [r for r in rows if _matches(query, "", str(r.get("to") or ""), str(r.get("subject") or ""), "")]
     seen: set[str] = set()
-    unique = []
+    unique, keyless = [], []
     for r in sorted(rows, key=lambda r: float(r.get("ts") or 0), reverse=True):
         key = _sent_key(r)
-        if key not in seen:
-            seen.add(key)
+        if key:
+            if key not in seen:
+                seen.add(key)
+                unique.append(r)
+        elif not any(_same_sent(r, other) for other in keyless):
+            keyless.append(r)
             unique.append(r)
     rows = unique
     sources = (["Apple Mail"] if not problem else []) + sorted(accounts)

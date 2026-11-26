@@ -342,4 +342,22 @@ async def execute_task(plan: TaskPlan, emit, approver, *, test_mode: bool = Fals
     if plan.intent == "email.reply":
         envelope = plan.steps[0].args["expected_reply"]
         receipt = f"Reply sent to {', '.join(envelope['to'])} from {envelope['from']}."
+    if not test_mode and plan.intent in ("email.reply", "message.send"):
+        _note_answered(plan)
     return TaskExecution("completed", receipt, calls, results)
+
+
+def _note_answered(plan: TaskPlan) -> None:
+    """A verified reply or text answers its thread in the Brief too
+    (handled.mark_sent_reply: mark it replied, retire its reply cards, refresh)."""
+    from service.proactive.handled import mark_sent_reply
+    args = plan.steps[0].args if plan.steps else {}
+    if plan.intent == "email.reply":
+        env = args.get("expected_reply") or {}
+        mark_sent_reply(kind="mail", message_id=str(env.get("message_id") or ""),
+                        account=str(env.get("account") or ""), subject=str(env.get("subject") or ""),
+                        to=list(env.get("to") or []) + list(env.get("cc") or []))
+    else:
+        handle = str((plan.resolved_recipient or {}).get("address") or args.get("to") or "")
+        if handle:
+            mark_sent_reply(kind="text", handle=handle)

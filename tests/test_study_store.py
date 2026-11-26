@@ -387,19 +387,48 @@ def test_a_twin_under_another_id_keeps_its_grade_on_the_merge_path(store):
     assert len(rows) == 1 and rows[0]["status"] == "graded" and rows[0]["score"] == 19.0
 
 
-def test_folding_duplicates_keeps_the_later_deadline_over_an_old_missing(store):
-    # Two rows of one course with one title fold into the richer one (the upcoming row with the
-    # later deadline); the old row's "missing" belongs to the old deadline and is not carried over.
+def test_folding_duplicates_keeps_same_day_twins_together_and_different_days_apart(store):
+    # Same title on one due day (one item seen on two pages): fold into the richer row.
+    # Same title on different days ("Weekly Reflection" every week): different items.
     store.upsert_courses([course()])
-    store.upsert_assignments([item(aid="a-old", status="missing", due=NOW - 3600, details="", points=None),
-                              item(aid="a-new", status="upcoming", due=NOW + 86400)])
+    store.upsert_assignments([item(aid="a-old", status="missing", due=NOW - 86400 * 2, details="", points=None),
+                              item(aid="a-new", status="upcoming", due=NOW + 86400),
+                              item(aid="a-new-copy", status="upcoming", due=NOW + 86400 + 60, details="")])
     with store._lock:
         store._db.execute("BEGIN")
         store._dedupe_assignments("canvas:1", NOW)
         store._db.execute("COMMIT")
-    rows = store.assignments()
-    assert len(rows) == 1 and rows[0]["id"] == "a-new" and rows[0]["status"] == "upcoming"
+    rows = sorted(store.assignments(), key=lambda r: r["due_ts"])
+    assert [r["id"] for r in rows] == ["a-old", "a-new"]
+    assert rows[0]["status"] == "missing" and rows[1]["status"] == "upcoming"
 
+
+def test_same_title_items_of_one_course_all_survive_an_import(store):
+    from service.study.canvas_parse import _Builder
+    b = _Builder("https://school.instructure.com/courses/1/assignments", NOW, ZONE)
+    for week in range(3):
+        b.assignment(course_id="canvas:1", course_name="Intro", canvas_id="1", title="Weekly Reflection",
+                     kind="assignment", due_ts=NOW + 86400 * 7 * week)
+    page = b.page("assignments")
+    assert len(page.assignments) == 3
+    store.import_rows([course()], page.assignments)
+    assert len([a for a in store.assignments() if a["title"] == "Weekly Reflection"]) == 3
+    # Re-importing the same page changes nothing; a dashboard copy with no date joins nothing new.
+    store.import_rows([course()], page.assignments)
+    assert len(store.assignments()) == 3
+
+
+def test_a_moved_due_date_updates_the_one_row(store):
+    from service.study.canvas_parse import _Builder
+    def parsed(due):
+        b = _Builder("https://school.instructure.com/courses/1/assignments", NOW, ZONE)
+        b.assignment(course_id="canvas:1", course_name="Intro", canvas_id="1", title="Project 2",
+                     kind="assignment", due_ts=due)
+        return b.page("assignments").assignments
+    store.import_rows([course()], parsed(NOW + 86400))
+    store.import_rows([course()], parsed(NOW + 86400 * 3))           # the professor moved it
+    rows = store.assignments()
+    assert len(rows) == 1 and rows[0]["due_ts"] == NOW + 86400 * 3
 
 
 def test_handed_in_work_is_never_reopened_by_a_later_looking_deadline(tmp_path):
@@ -902,3 +931,18 @@ def test_this_file_is_in_the_simulation_manifest():
     from pathlib import Path
     manifest = (Path(__file__).resolve().parents[1] / "scripts" / "run_simulation_qa.py").read_text()
     assert '"tests/test_study_store.py"' in manifest
+
+
+def test_a_failed_clear_rolls_back_and_leaves_the_store_writable(tmp_path):
+    import sqlite3 as _sqlite3
+    from service.study.store import StudyStore as _Store
+    s = _Store(tmp_path / "clear.db")
+    s.set_meta("kept", 1)
+    s._db.execute("DROP TABLE misses")          # an older file, or a failing statement mid-clear
+    for clear in (s.clear, s.clear_sample):
+        with pytest.raises(_sqlite3.OperationalError):
+            clear()
+        assert not s._db.in_transaction
+    assert s.meta("kept") == 1                    # all or nothing
+    s.set_meta("after", 2)                        # BEGIN works again
+    assert s.meta("after") == 2

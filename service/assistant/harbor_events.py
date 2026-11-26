@@ -23,6 +23,7 @@ import logging
 import math
 import os
 import re
+import stat
 import time
 
 from service import paths
@@ -84,16 +85,24 @@ def record(events) -> None:
                      "calendar": str(event.get("calendar") or "")[:300]})
     rows = rows[:MAX_KEPT]
     try:
-        target = _path()
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_suffix(".tmp")
-        tmp.write_text(json.dumps(rows))
-        os.replace(tmp, target)
+        # Titles and times of the person's day: owner-only from the first byte.
+        paths.private_write_bytes(_path(), json.dumps(rows).encode("utf-8"))
     except OSError:
         log.debug("could not record Harbor calendar events", exc_info=True)
 
 
+def _tighten(target) -> None:
+    """A file an older build wrote with the default mode becomes owner-only on the first read."""
+    try:
+        info = os.lstat(target)
+        if stat.S_ISREG(info.st_mode) and info.st_mode & 0o077:
+            os.chmod(target, 0o600)
+    except OSError:
+        pass
+
+
 def recorded() -> list[dict]:
+    _tighten(_path())
     try:
         data = json.loads(_path().read_text())
     except (OSError, ValueError):

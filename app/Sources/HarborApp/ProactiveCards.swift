@@ -100,12 +100,28 @@ final class ProactiveActions: ObservableObject {
     /// the result of a send. Not published: each composer observes its own.
     private(set) var replyModels: [String: BriefReplyModel] = [:]
 
+    /// Threads answered from the Brief with a send the service verified: the
+    /// row leaves once its reply is closed, ahead of the next cycle reading
+    /// Sent (BriefReplied). Forgotten when the Brief stops listing the thread.
+    @Published private(set) var repliedThreads: Set<String> = []
+    /// Told about each verified send from the Brief, for the service's "mark
+    /// replied" route once it exists (email_reply_api.py); the local hide above
+    /// doesn't wait for it.
+    static var onReplySent: ((ProactiveThread) -> Void)? = nil
+
+    /// A reply from the Brief was sent and verified (BriefReplyModel's onSent).
+    func markReplied(_ thread: ProactiveThread) {
+        repliedThreads.insert(thread.id)
+        Self.onReplySent?(thread)
+    }
+
     /// The reply for a thread: made on the first ask, the same one afterwards.
     func replyModel(for thread: ProactiveThread, transport: BriefReplyModel.Transport? = nil) -> BriefReplyModel {
         if let kept = replyModels[thread.id] { return kept }
         let made = BriefReplyModel(replyRef: thread.replyRef, account: thread.replyAccount,
                                    baseURL: BriefReplyModel.defaultBaseURL,
-                                   transport: transport ?? BriefReplyModel.defaultTransport)
+                                   transport: transport ?? BriefReplyModel.defaultTransport,
+                                   onSent: { [weak self] in self?.markReplied(thread) })
         replyModels[thread.id] = made
         return made
     }
@@ -133,6 +149,7 @@ final class ProactiveActions: ObservableObject {
         for (id, kept) in replyModels where !listed.contains(id) && kept.phase != .sending {
             replyModels[id] = nil
         }
+        repliedThreads.formIntersection(listed)
     }
 
     func draft(_ card: ProactiveCard) -> String { drafts[card.id] ?? card.action?.draft ?? "" }
@@ -373,10 +390,25 @@ final class ProactiveActions: ObservableObject {
 /// One layout, measured on the width it is given; both zones scroll with the
 /// tab. Every button is one the Brief already had: nothing is sent or added
 /// without a tap.
-struct ProactiveBriefSection: View {
+struct ProactiveBriefSection: View, Equatable {
     let proactive: ProactiveState
-    @ObservedObject var model: OverlayModel
-    @ObservedObject var today: TodayModel
+    /// Not observed: the Brief redraws when what it shows changes (the inputs
+    /// below, compared in ==), not on every change to the app's or the day's
+    /// models (typing in Ask, a notice, a planner flag). The parent observes
+    /// both and passes what the cards read from them.
+    let model: OverlayModel
+    let today: TodayModel
+    /// The minute the Brief is read at (BriefTimeContext.minuteStart), so
+    /// "due in…" and the calendar line follow the clock without a fetch.
+    var minute: Date = .distantPast
+    /// When the day's plan last loaded (TodayModel.lastRefreshed): the to-dos
+    /// and Needs you rows the cards read from it.
+    var planLoaded: Date? = nil
+    /// The day's time zone and clock locale, which the times are shown in.
+    var zoneID = ""
+    var localeID = ""
+    /// OverlayModel.conversationSettled: "Ask about this" waits for a turn to end.
+    var conversationSettled = true
     @ObservedObject var actions: ProactiveActions = .shared
     /// Clear (and Mark done for a dated reminder) behind each to-do's and
     /// thread's trailing ×; shared with the Top 3's Needs you rows.
@@ -418,6 +450,35 @@ struct ProactiveBriefSection: View {
 
     private var unread: [SourceAccess] { proactive.unreadSources(coverage) }
 
+    /// Whether a redraw could show anything new. The models are the same
+    /// objects; their observed parts (actions, item actions, mail memory,
+    /// acting) still redraw the section on their own.
+    nonisolated static func == (a: ProactiveBriefSection, b: ProactiveBriefSection) -> Bool {
+        MainActor.assumeIsolated {
+            a.model === b.model && a.today === b.today && a.actions === b.actions && a.itemActions === b.itemActions
+                && a.mailMemory === b.mailMemory && a.acting === b.acting
+                && a.minute == b.minute && a.planLoaded == b.planLoaded && a.zoneID == b.zoneID
+                && a.localeID == b.localeID && a.conversationSettled == b.conversationSettled
+                && a.allDayEvents == b.allDayEvents && a.endedEvents == b.endedEvents && a.scrollCap == b.scrollCap
+                && a.coverage == b.coverage && a.wide == b.wide && a.schoolRows == b.schoolRows
+                && a.studyCards == b.studyCards && a.dueSoon == b.dueSoon
+                && a.events.count == b.events.count
+                && zip(a.events, b.events).allSatisfy { $0.start == $1.start && $0.title == $1.title }
+                && a.proactive == b.proactive
+        }
+    }
+
+    /// One monospaced tag character's advance at a text scale, measured once per scale.
+    @MainActor private static var tagAdvance: [CGFloat: CGFloat] = [:]
+    @MainActor private static func tagCharWidth() -> CGFloat {
+        let scale: CGFloat = Theme.textScale
+        if let known = tagAdvance[scale] { return known }
+        let font = NSFont.monospacedSystemFont(ofSize: 9 * scale, weight: .semibold)
+        let advance: CGFloat = ("M" as NSString).size(withAttributes: [.font: font]).width + 0.3
+        tagAdvance[scale] = advance
+        return advance
+    }
+
     /// A heading row with buttons (READY FOR YOU's), one height.
     private static let controlsHeaderHeight: CGFloat = 22
     /// The gap between the zones side by side, and between them stacked.
@@ -431,9 +492,7 @@ struct ProactiveBriefSection: View {
         let study: [String] = studyCards.cards.map(studyTag)
         let found: [String] = foundItems.isEmpty ? [] : [BriefReady.foundTag]
         let due: [String] = dueSoon.compactMap { BriefReady.dueTag(day: $0.day) }
-        let font = NSFont.monospacedSystemFont(ofSize: 9 * Theme.textScale, weight: .semibold)
-        let advance: CGFloat = ("M" as NSString).size(withAttributes: [.font: font]).width + 0.3
-        return BriefReady.tagColumn(due + cards + study + found, charWidth: advance)
+        return BriefReady.tagColumn(due + cards + study + found, charWidth: Self.tagCharWidth())
     }
 
     private func cardTag(_ card: ProactiveCard) -> String {
@@ -466,7 +525,15 @@ struct ProactiveBriefSection: View {
         actions.account.flatMap { picked in proactive.accounts.contains(picked) ? picked : nil }
     }
 
+    #if HARBOR_NOTCH_QA
+    /// How many times the body ran (scripts/bench_brief_render.sh).
+    static var qaBodies = 0
+    #endif
+
     var body: some View {
+        #if HARBOR_NOTCH_QA
+        let _ = { Self.qaBodies += 1 }()
+        #endif
         let shown = proactive.only(chosen)
         zones(shown)
         // Every account's threads, not only the chosen chip's.
@@ -2035,7 +2102,10 @@ struct ProactiveBriefSection: View {
 
     /// Mail and texts as listed: none just cleared, none a reply card holds.
     private func listedThreads(_ shown: ProactiveState, cards: [ProactiveCard]) -> [ProactiveThread] {
-        let open = shown.orderedThreads.filter { !itemActions.isHidden($0.actionRow) }
+        let open = shown.orderedThreads.filter {
+            !itemActions.isHidden($0.actionRow)
+                && BriefReplied.listed(id: $0.id, replied: actions.repliedThreads, replying: actions.replying)
+        }
         return ProactiveState.threads(open, coveredBy: cards)
     }
 
@@ -2148,7 +2218,7 @@ struct ProactiveBriefSection: View {
                 NotchChrome.small("Ask about this") {
                     model.askAbout("\(thread.who): \(thread.line)", reference: thread.reference)
                 }
-                .disabled(!model.conversationSettled)
+                .disabled(!conversationSettled)
                 NotchChrome.small("Open \(appName(thread)) ↗") { openSource(thread) }
             }
             if actions.replying == thread.id { replyArea(thread).revealInPanel("reply-\(thread.id)") }

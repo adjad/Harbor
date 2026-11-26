@@ -179,8 +179,12 @@ struct MemoryView: View {
             if let status = model.status {
                 HStack {
                     Text("\(status.count) saved · \(status.proposals) awaiting review · \(status.worker)")
+                        .lineLimit(1).monospacedDigit()
                     Spacer()
-                    Text("Queued: \(status.jobs["queued", default: 0]) · Failed: \(status.jobs["failed", default: 0])")
+                    if status.jobs["queued", default: 0] > 0 || status.jobs["failed", default: 0] > 0 {
+                        Text("Queued: \(status.jobs["queued", default: 0]) · Failed: \(status.jobs["failed", default: 0])")
+                            .lineLimit(1).monospacedDigit()
+                    }
                     if status.jobs["failed", default: 0] > 0 {
                         Button("Retry") { Task { await model.mutate("/memory/retry") } }
                     }
@@ -190,10 +194,15 @@ struct MemoryView: View {
                 ForEach(scope.filters, id: \.status) { Text($0.title).tag($0.status) }
             }.pickerStyle(.segmented).labelsHidden().fixedSize()
             TextField("Search memories", text: $query).textFieldStyle(.roundedBorder)
-            if !model.error.isEmpty { Text(model.error).foregroundStyle(.red).textSelection(.enabled) }
+            if !model.error.isEmpty {
+                Text(model.error).font(.callout).foregroundStyle(ChatTheme.danger)
+                    .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+            }
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 12) {
-                    if model.facts.isEmpty { Text("No matching memories.").foregroundStyle(.secondary).padding() }
+                    if model.facts.isEmpty {
+                        Text(emptyText).foregroundStyle(.secondary).padding().frame(maxWidth: .infinity)
+                    }
                     ForEach(model.facts) { fact in card(fact) }
                 }
             }
@@ -240,6 +249,8 @@ struct MemoryView: View {
             } message: { Text("Old source passages will be excluded from memory retrieval. The original conversation remains in chat history.") }
     }
 
+    private var emptyText: String { MemoryEmptyText.line(status: filter, query: query) }
+
     private func card(_ fact: MemoryFact) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(fact.text).textSelection(.enabled)
@@ -247,7 +258,7 @@ struct MemoryView: View {
                 .font(.caption).foregroundStyle(.secondary)
             if !fact.explanation.isEmpty { Text(fact.explanation).font(.caption) }
             HStack {
-                Button(fact.status == "superseded" ? "Evidence and history" : "Evidence, edit and review") {
+                Button(fact.status == "superseded" ? "History…" : "Details…") {
                     Task {
                         if let detail = await model.detail(fact.id) {
                             correction = detail.text; replaces = 0; sourceText = ""; sourceRequest = UUID(); selected = detail
@@ -270,7 +281,8 @@ struct MemoryView: View {
 
     private func editor(_ fact: MemoryFact) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Memory \(fact.id)").font(.title2.bold())
+            Text("Memory details").font(.title2.bold())
+            Text("Memory #\(fact.id)").font(.caption).foregroundStyle(.secondary)
             if fact.status == "superseded" {
                 Text(fact.text).textSelection(.enabled)
                 Text("Historical version; excluded from active memory.").foregroundStyle(.secondary)
@@ -308,11 +320,14 @@ struct MemoryView: View {
             if fact.status == "proposed" || fact.status == "deferred" {
                 Picker("On confirmation", selection: $replaces) {
                     Text("Keep as a separate memory").tag(0)
-                    ForEach(model.activeFacts) { prior in Text("Replace #\(prior.id): \(prior.text)").tag(prior.id) }
+                    ForEach(model.activeFacts) { prior in Text("Replace #\(prior.id): \(prior.text)").lineLimit(1).truncationMode(.tail).tag(prior.id) }
                 }
                 Text("Choose the old memory when this statement is a correction. Dates alone never overwrite a confirmed memory.").font(.caption).foregroundStyle(.secondary)
             }
-            if !model.error.isEmpty { Text(model.error).foregroundStyle(.red) }
+            if !model.error.isEmpty {
+                Text(model.error).font(.callout).foregroundStyle(ChatTheme.danger)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             HStack {
                 Button("Close") { selected = nil; sourceText = "" }
                 Spacer()

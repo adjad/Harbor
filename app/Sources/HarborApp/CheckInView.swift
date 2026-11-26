@@ -501,14 +501,22 @@ struct CheckInSection: View {
                 if moving == nil || !model.card.tasksSettled {
                     HStack {
                         Text(footerLine).font(.harbor(size: 10.5)).foregroundStyle(Theme.textMuted)
+                            .lineLimit(1).truncationMode(.tail)
                         Spacer()
-                        Button(model.card.tasksSettled ? "Done for today" : "Skip tonight") {
+                        Button {
                             Task { await model.complete(day: day, timezone: timezone.identifier); onChanged() }
+                        } label: {
+                            // Styling inside the label, so the whole capsule takes the click.
+                            Text(model.card.tasksSettled ? "Done for today" : "Skip tonight")
+                                .font(.harbor(size: 11.5, weight: .medium)).foregroundStyle(Theme.textSecondary)
+                                .lineLimit(1)
+                                .padding(.horizontal, 10).padding(.vertical, 5)
+                                .background(Capsule().fill(Theme.chipFill))
+                                .overlay(Capsule().stroke(Theme.chipStroke, lineWidth: 1))
+                                .contentShape(Capsule())
                         }
-                        .buttonStyle(.plain).font(.harbor(size: 11.5, weight: .medium)).foregroundStyle(Theme.textSecondary)
-                        .padding(.horizontal, 10).padding(.vertical, 5)
-                        .background(Capsule().fill(Theme.chipFill))
-                        .overlay(Capsule().stroke(Theme.chipStroke, lineWidth: 1))
+                        .buttonStyle(.plain)
+                        .layoutPriority(1)
                         // Closing the card would hide Undo and the outcome.
                         .disabled(model.busy || model.hasCardCancelActivity)
                         .help(model.hasCardCancelActivity ? "Wait for the cancel to finish first" : "Closes tonight's check-in")

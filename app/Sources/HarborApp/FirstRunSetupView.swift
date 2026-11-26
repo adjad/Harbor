@@ -1814,11 +1814,12 @@ struct FirstRunSetupView: View {
                         .font(.system(size: 11.5, weight: s == step ? .semibold : .regular))
                         .foregroundStyle(s == step ? Theme.textPrimary : (done ? Color.green.opacity(0.8) : Theme.textMuted))
                         .lineLimit(1)
-                        .padding(.horizontal, 8).padding(.vertical, 3)
+                        .padding(.horizontal, 8).padding(.vertical, 5)
                         .background(Capsule().fill(s == step ? Theme.chipFill : .clear))
                         .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
+                .help(s.title)
                 .accessibilityLabel("Step \(s.rawValue + 1) of \(Step.allCases.count), \(s.title)")
                 .accessibilityValue(done ? "Done" : "")
                 .accessibilityAddTraits(s == step ? [.isSelected, .isHeader] : [])
@@ -2063,7 +2064,7 @@ struct FirstRunSetupView: View {
 
     @ViewBuilder private var diskWarningLine: some View {
         if let warning = diskWarning {
-            Text(warning).font(.system(size: 12)).foregroundStyle(Color.orange).padding(.bottom, 4)
+            Text(warning).font(.system(size: 12)).foregroundStyle(Theme.warn).padding(.bottom, 4)
                 .fixedSize(horizontal: false, vertical: true)
         }
     }
@@ -2214,7 +2215,7 @@ struct FirstRunSetupView: View {
                     EmptyView()
                 }
                 if let slept = notices.sleepLine(brain, downloads: setup.downloads) {
-                    Text(slept).font(.system(size: 11)).foregroundStyle(.secondary).padding(.bottom, 2)
+                    Text(slept).font(.system(size: 11)).foregroundStyle(Theme.textMuted).padding(.bottom, 2)
                 }
                 ProgressView(value: fraction).tint(OnboardingPalette.lilac).padding(.top, 2)
                     .accessibilityLabel("Model download")
@@ -2223,7 +2224,7 @@ struct FirstRunSetupView: View {
                     TimelineView(.periodic(from: .now, by: 5)) { context in
                         if progressWatch.stalled(at: context.date) {
                             Text(String(format: "%.1f of %.1f GB", done, total) + " · No progress — check your connection")
-                                .foregroundStyle(Color.orange)
+                                .foregroundStyle(Theme.warn)
                         } else {
                             Text(String(format: "%.1f of %.1f GB", done, total)
                                  + (FirstRunBrain.timeLeft(left).map { " · \($0)" } ?? ""))
@@ -2239,7 +2240,7 @@ struct FirstRunSetupView: View {
                     .disabled(setup.busy != nil)
                     .help("Stops the download. Resume starts it again.")
                 }
-                .font(.system(size: 12)).foregroundStyle(Theme.textMuted).padding(.top, 6)
+                .font(.system(size: 12).monospacedDigit()).foregroundStyle(Theme.textMuted).padding(.top, 6)
             }
         case .failed(let model, let label, let message, let paused):
             OnboardingCard(icon: "arrow.clockwise.circle", title: (paused ? "Download stopped" : "Download failed") + " · " + label,
@@ -2436,7 +2437,7 @@ struct FirstRunSetupView: View {
                 case .notOnThisMac:
                     Text(label).font(.system(size: 12)).foregroundStyle(Theme.textMuted)
                 case .notAllowed:
-                    Text(label).font(.system(size: 11.5)).foregroundStyle(Color.orange.opacity(0.9))
+                    Text(label).font(.system(size: 11.5)).foregroundStyle(Theme.warn)
                     Button("Open System Settings") {
                         if FirstRunPermissions.settingsThroughRequest(item) { Task { await permissions.request(item) } }
                         else { Permissions.openSettingsPane(Self.settingsPane(item)) }
@@ -2562,11 +2563,12 @@ struct FirstRunSetupView: View {
                         HStack(spacing: 8) {
                             Image(systemName: "text.cursor").accessibilityHidden(true)
                             Text("“\(prompt)”")
-                            Spacer(minLength: 0)
+                                .lineLimit(2).multilineTextAlignment(.leading)
+                                .frame(maxWidth: .infinity, alignment: .leading)
                         }
                         .font(.system(size: 12.5)).foregroundStyle(Theme.textPrimary)
                         .padding(.horizontal, 12).padding(.vertical, 8)
-                        .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.04)))
+                        .background(RoundedRectangle(cornerRadius: 8).fill(OnboardingPalette.cardFill))
                         .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.hairline))
                         .contentShape(Rectangle())
                     }
@@ -2698,7 +2700,7 @@ struct FirstRunSetupView: View {
                     HStack {
                         if progressWatch.stalled(at: context.date) {
                             Text(String(format: "%.1f of %.1f GB", done, total) + " · No progress — check your connection")
-                                .foregroundStyle(Color.orange)
+                                .foregroundStyle(Theme.warn)
                         } else {
                             Text(FirstRunBrain.progressLine(doneGb: done, totalGb: total,
                                                             speed: activeDownload(model)?.speedText, secondsLeft: left))
@@ -2864,6 +2866,7 @@ struct FirstRunButtonStyle: ButtonStyle {
             .padding(.horizontal, 13).padding(.vertical, 6)
             .background(RoundedRectangle(cornerRadius: 7)
                 .fill(primary ? OnboardingPalette.violet : Color.white.opacity(0.06)))
+            .contentShape(RoundedRectangle(cornerRadius: 7))
             .overlay(RoundedRectangle(cornerRadius: 7).stroke(primary ? .clear : Theme.chipStroke))
             .opacity(enabled ? (configuration.isPressed ? 0.8 : 1) : 0.4)
     }

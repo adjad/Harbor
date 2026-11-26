@@ -35,6 +35,14 @@ from service.attention.exclusions import screen
 from service.attention.matching import find_on_file
 from service.attention.resolve import _CANCEL, Resolved, resolve
 
+# What a yes from the user looks like, anywhere in the reply ("great see you then").
+_CONFIRMS = re.compile(r"\b(?:yes|yea|yeah|yep|yup|sure|ok(?:ay)?|sounds\s+(?:good|great|perfect)|works(?:\s+for\s+me)?|"
+                       r"perfect|great|bet|deal|definitely|absolutely|of\s+course|i'?ll\s+be\s+there|see\s+you|"
+                       r"can\s+do|count\s+me\s+in|i'?m\s+in|will\s+do|confirmed?|looking\s+forward)\b", re.I)
+# A counter-offer or a hedge: the plan is not settled by it.
+_HEDGE = re.compile(r"\b(?:how\s+about|what\s+about|instead|rather|check(?:ing)?|not\b|dunno|don'?t\s+know|"
+                    r"maybe|might|perhaps|probably|let\s+me|i'?ll\s+see|depends|unless|reschedule|another\s+(?:day|time)|"
+                    r"different\s+(?:day|time)|later|tentative(?:ly)?|if\s+i\s+can)\b", re.I)
 CODE = "uncaptured_commitment"
 SOON_HOURS = 48.0
 REPLY_WINDOW_S = 6 * 3600
@@ -125,13 +133,20 @@ class UncapturedCommitment:
         self.contacts = Contacts(snapshot.items)
 
     def _user_confirmed(self, item: Item) -> bool:
-        """The user wrote back in the same thread soon after, and not to decline."""
+        """The user wrote back in the same thread soon after to say yes: their
+        latest reply in the window affirms, and nothing they wrote declines. A
+        counter-offer ("not tomorrow, how about thursday"), a question ("who else
+        is coming?") or a hedge ("I'll have to check with my boss") is no yes."""
         if item.source != "messages":
             return False
-        later = [i for i in self.snapshot.items
-                 if i.source == "messages" and i.conversation == item.conversation
-                 and i.direction == "outgoing" and item.ts < i.ts <= item.ts + REPLY_WINDOW_S]
-        return bool(later) and not any(_DECLINE.search(i.text) for i in later)
+        later = sorted((i for i in self.snapshot.items
+                        if i.source == "messages" and i.conversation == item.conversation
+                        and i.direction == "outgoing" and item.ts < i.ts <= item.ts + REPLY_WINDOW_S),
+                       key=lambda i: i.ts)
+        if not later or any(_DECLINE.search(i.text) for i in later):
+            return False
+        last = later[-1].text
+        return bool(_CONFIRMS.search(last)) and not _HEDGE.search(last) and "?" not in last
 
     def _inherit(self, item: Item, arrival: datetime) -> tuple[Resolved, Item] | None:
         """A time the reply does not state, taken from the user's own earlier message.

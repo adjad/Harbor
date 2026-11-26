@@ -91,15 +91,85 @@ enum PrivacyRelaunch {
     static func paneOpenedAt(_ defaults: UserDefaults = .standard) -> TimeInterval? {
         defaults.object(forKey: paneOpenedKey) == nil ? nil : defaults.double(forKey: paneOpenedKey)
     }
+
+    // MARK: Harbor's own quit Apple Event handler
+
+    /// The quit Apple Event Harbor's own handler took (AppDelegate.handleQuitAppleEvent).
+    /// AppKit's handler checked the responder chain first and dropped the quit without
+    /// asking Harbor when the check failed: 2026-11-25 13:39, System Settings' Quit &
+    /// Reopen twice ("Failed responder chain validation for terminate: action.
+    /// Canceling termination."), then a Force Quit 26 s later. Harbor's handler answers
+    /// at once and quits on the next turn of the run loop, when AppKit no longer has
+    /// the event as its current one, so `Quit.current()` reads it from here.
+    @MainActor static var handledQuitEvent: NSAppleEventDescriptor?
+
+    /// What Harbor's handler does with a quit Apple Event. Pure.
+    enum QuitEventAction: Equatable {
+        /// Quit the usual way (applicationShouldTerminate, the same safe stop).
+        case terminate
+        /// A second Quit & Reopen click while the first quit is stopping the engine:
+        /// the stop already under way ends Harbor, within its own bound.
+        case alreadyQuitting
+    }
+
+    static func quitEventAction(shutdownStarted: Bool) -> QuitEventAction {
+        shutdownStarted ? .alreadyQuitting : .terminate
+    }
+
+    // MARK: Back on the same page
+
+    /// Set when Harbor has started its reopen helper (Quit & Reopen from System
+    /// Settings, or the permission page's Reopen button), with the Harbor window
+    /// that was up then, so the reopened Harbor shows it again.
+    static let reopenAtKey = "harbor.relaunch.reopenAt"
+    static let reopenWindowKey = "harbor.relaunch.window"
+    /// A reopen comes back within seconds; an older mark is from a quit that
+    /// never reopened (the helper gives up after 30 s) and is ignored.
+    static let reopenFresh: TimeInterval = 120
+
+    /// The Harbor window surfaces a reopen brings back. The notch's permission page
+    /// has its own mark (NotchPermissionPage.noteResume).
+    enum ReopenWindow: String, Equatable {
+        case settings, window
+    }
+
+    static func noteReopenScheduled(_ defaults: UserDefaults = .standard, now: Date = Date()) {
+        defaults.set(now.timeIntervalSince1970, forKey: reopenAtKey)
+    }
+
+    /// At quit: which Harbor window was up, kept only when a reopen is scheduled.
+    static func noteWindowForReopen(_ window: ReopenWindow?, _ defaults: UserDefaults = .standard,
+                                    now: Date = Date()) {
+        guard let at = defaults.object(forKey: reopenAtKey) as? Double,
+              at <= now.timeIntervalSince1970, now.timeIntervalSince1970 - at <= reopenFresh else { return }
+        if let window { defaults.set(window.rawValue, forKey: reopenWindowKey) }
+        else { defaults.removeObject(forKey: reopenWindowKey) }
+    }
+
+    /// At launch, once: the window to show again after a fresh reopen, or nil.
+    static func takeReopenWindow(_ defaults: UserDefaults = .standard, now: Date = Date()) -> ReopenWindow? {
+        defer {
+            defaults.removeObject(forKey: reopenAtKey)
+            defaults.removeObject(forKey: reopenWindowKey)
+        }
+        guard let at = defaults.object(forKey: reopenAtKey) as? Double,
+              at <= now.timeIntervalSince1970, now.timeIntervalSince1970 - at <= reopenFresh,
+              let raw = defaults.string(forKey: reopenWindowKey) else { return nil }
+        return ReopenWindow(rawValue: raw)
+    }
 }
 
 extension PrivacyRelaunch.Quit {
     /// The quit Apple Event AppKit is handling right now, and who sent it: the
     /// sender's bundle id where Launch Services knows it, and its program's path.
-    static func current() -> Self {
-        guard let event = NSAppleEventManager.shared().currentAppleEvent,
-              event.eventClass == AEEventClass(kCoreEventClass),
-              event.eventID == AEEventID(kAEQuitApplication) else { return .notAppleEvent }
+    /// Also the one Harbor's own handler took (PrivacyRelaunch.handledQuitEvent),
+    /// once AppKit has moved on from it.
+    @MainActor static func current() -> Self {
+        let isQuit: (NSAppleEventDescriptor) -> Bool = {
+            $0.eventClass == AEEventClass(kCoreEventClass) && $0.eventID == AEEventID(kAEQuitApplication)
+        }
+        guard let event = [NSAppleEventManager.shared().currentAppleEvent, PrivacyRelaunch.handledQuitEvent]
+            .compactMap({ $0 }).first(where: isQuit) else { return .notAppleEvent }
         let why = AEKeyword(kAEQuitReason)
         let reason = (event.attributeDescriptor(forKeyword: why) ?? event.paramDescriptor(forKeyword: why))
             .map { fourCharCode($0.typeCodeValue != 0 ? $0.typeCodeValue : $0.enumCodeValue) }

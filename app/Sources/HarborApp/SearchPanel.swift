@@ -10,6 +10,8 @@ import SwiftUI
 struct SearchView: View {
     @ObservedObject var model: SearchModel
     @FocusState private var focused: Bool
+    /// Reply details (Quick Settings): only then does the panel show timings.
+    @AppStorage("harbor.debugMode") private var debugMode = false
 
     @ObservedObject private var display = DisplayGeometry.shared
     private var layout: SurfaceLayout { display.layout }
@@ -53,7 +55,8 @@ struct SearchView: View {
                     .focused($focused)
                     .onChange(of: model.query) { _, _ in model.queryChanged() }
                 if model.busy {
-                    ProgressView().scaleEffect(0.5).frame(width: 14, height: 14)
+                    ProgressView().controlSize(.small).frame(width: 14, height: 14)
+                        .accessibilityLabel("Searching")
                 }
                 if !model.rows.isEmpty {
                     Text("\(model.selection + 1)/\(model.rows.count)")
@@ -65,8 +68,9 @@ struct SearchView: View {
                 Text(model.status)
                     .font(.harbor(size: 10))
                     .foregroundStyle(Theme.textMuted)
+                    .lineLimit(1).truncationMode(.tail)
                 if model.semanticOff {
-                    Text("· semantic search unavailable")
+                    Text("· keyword matches only")
                         .font(.harbor(size: 10))
                         .foregroundStyle(Theme.textMuted)
                 }
@@ -76,10 +80,11 @@ struct SearchView: View {
                         .foregroundStyle(Theme.textMuted)
                 }
                 Spacer()
-                if model.elapsedMs > 0 {
+                if debugMode && model.elapsedMs > 0 {
                     Text("\(model.elapsedMs)ms")
                         .font(.harbor(size: 10, design: .monospaced))
                         .foregroundStyle(Theme.textMuted)
+                        .accessibilityHidden(true)
                 }
             }
         }
@@ -120,7 +125,8 @@ struct SearchView: View {
 
     private var answeringCard: some View {
         HStack(spacing: 8) {
-            ProgressView().scaleEffect(0.45).frame(width: 12, height: 12)
+            ProgressView().controlSize(.mini).frame(width: 12, height: 12)
+                .accessibilityLabel("Reading")
             Text(model.upgradingModel.isEmpty
                  ? "Reading the passages…"
                  : "Loading a stronger model for this…")
@@ -224,19 +230,18 @@ struct SearchView: View {
                 .foregroundStyle(Theme.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
-            HStack(spacing: 8) {
-                if !model.canNavigate {
-                    Text("can't scroll this app — copy to find it there")
-                        .font(.harbor(size: 9))
-                        .foregroundStyle(Theme.textMuted)
+            if model.canNavigate {
+                HStack { Spacer(); copyQuote(c) }
+            } else {
+                // On one line when there is room; otherwise the button goes below,
+                // so the hint never wraps against it.
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 8) { cantJumpHint.fixedSize(); Spacer(); copyQuote(c) }
+                    VStack(alignment: .leading, spacing: 2) {
+                        cantJumpHint.fixedSize(horizontal: false, vertical: true)
+                        HStack { Spacer(); copyQuote(c) }
+                    }
                 }
-                Spacer()
-                Button { model.copyCitation(c) } label: {
-                    Text("Copy quote")
-                        .font(.harbor(size: 10))
-                        .foregroundStyle(Theme.textMuted)
-                }
-                .buttonStyle(.plain)
             }
         }
         .padding(10)
@@ -245,10 +250,29 @@ struct SearchView: View {
         .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.hairline))
     }
 
+    private var cantJumpHint: some View {
+        Text("Can't jump to it in this app. Copy the quote to find it.")
+            .font(.harbor(.caption))
+            .foregroundStyle(Theme.textMuted)
+    }
+
+    private func copyQuote(_ c: SearchModel.Citation) -> some View {
+        Button { model.copyCitation(c) } label: {
+            Text("Copy quote")
+                .font(.harbor(size: 10))
+                .foregroundStyle(Theme.textMuted)
+                .fixedSize()
+                .frame(minHeight: 24).contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Copy this passage")
+    }
+
     private var notFoundCard: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 Image(systemName: "questionmark.circle").foregroundStyle(Theme.textMuted)
+                    .accessibilityHidden(true)
                 Text(model.canWiden
                      ? "No direct answer in the matching passages."
                      : "Couldn't answer that from this document.")

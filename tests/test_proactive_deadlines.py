@@ -267,12 +267,40 @@ def _item(source, text, **extra):
 
 
 def test_needs_reply_only_for_a_person_whose_last_message_is_unanswered():
-    assert cycle.needs_reply(_item("messages", "Sam: are you coming?"), {}, NOON)
+    assert cycle.needs_reply(_item("messages", "Sam: are you coming?", lines=["are you coming?"]), {}, NOON)
     assert not cycle.needs_reply(_item("messages", "Me: yes", replied=True), {}, NOON)
     assert not cycle.needs_reply(_item("messages", "Sam: hi", group=True), {}, NOON)
     assert cycle.needs_reply(_item("mail", "Can you send the slides?"), {"asks_of_me": "Send the slides"}, NOON)
     assert not cycle.needs_reply(_item("mail", "Exam is Wednesday."), {"asks_of_me": "Study"}, NOON)
     assert not cycle.needs_reply(_item("mail", "Sale?", person=False), {"asks_of_me": "Buy"}, NOON)
+
+
+def test_a_text_needs_a_reply_only_when_it_asks_something():
+    """Quality check: a read "ok see you then" stayed under NEEDS ATTENTION for a
+    week. A text must ask something, judged on the lines since the user's own
+    last reply when there are any."""
+    settled = _item("messages", "Me: 7 at the cafe?\nSam: ok see you then", lines=["what time?", "ok see you then"],
+                    pending=["ok see you then"])
+    assert not cycle.needs_reply(settled, {"asks_of_me": "Pick a time"}, NOON)        # the answered ask doesn't count
+    asked_again = settled | {"pending": ["ok see you then", "can you bring the charger?"]}
+    assert cycle.needs_reply(asked_again, {}, NOON)
+    plan = settled | {"pending": ["let's grab lunch friday"]}                       # an ask without a question mark
+    assert cycle.needs_reply(plan, {}, NOON)
+    # Never written in this window: triage's ask, or the latest line asking.
+    fresh = _item("messages", "Sam: thanks", lines=["thanks"])
+    assert not cycle.needs_reply(fresh, {}, NOON)
+    assert cycle.needs_reply(fresh, {"asks_of_me": "Send the notes"}, NOON)
+    # The reply card follows the same rule.
+    assert cycle._asks_something({"item": settled, "result": {"asks_of_me": "Pick a time"}}) is False
+    assert cycle._asks_something({"item": asked_again, "result": {}}) is True
+
+
+def test_a_read_text_gets_a_day_before_it_shows_as_waiting():
+    question = dict(lines=["are you coming?"], pending=["are you coming?"])
+    read_now = _item("messages", "Sam: are you coming?", received_ts=NOON - 3600, unread=False, **question)
+    assert not cycle.needs_reply(read_now, {}, NOON)
+    assert cycle.needs_reply(read_now | {"unread": True}, {}, NOON)
+    assert cycle.needs_reply(read_now | {"received_ts": NOON - cycle.READ_GRACE_S - 60}, {}, NOON)
 
 
 def test_attention_is_reply_then_a_dated_deadline_from_the_source_then_fyi():
@@ -310,3 +338,19 @@ def test_a_reminder_to_attend_something_gets_no_work_block():
             {"id": "r-lab", "title": "Finish lab report before section", "source": "reminders", "kind": "reminder",
              "when_ts": at(16, 0, 26), "all_day": 0}]
     assert [c["title"] for c in deadlines.candidates(rows, NOON, TZ)] == ["Finish lab report before section"]
+
+
+def test_a_read_fyi_row_leaves_after_a_day():
+    """Quality check: read FYI rows stayed in NEEDS ATTENTION for a week."""
+    fyi = {"attention": "fyi", "unread": False, "received_ts": NOON - cycle.FYI_READ_S - 60}
+    assert cycle.read_fyi_expired(fyi, NOON)
+    assert not cycle.read_fyi_expired(fyi | {"received_ts": NOON - 3600}, NOON)       # read, but today's
+    assert not cycle.read_fyi_expired(fyi | {"unread": True}, NOON)                     # not read yet
+    assert not cycle.read_fyi_expired(fyi | {"unread": None}, NOON)                     # read state unknown
+    assert not cycle.read_fyi_expired(fyi | {"attention": "reply"}, NOON)
+    assert not cycle.read_fyi_expired(fyi | {"attention": "deadline"}, NOON)
+    # A cycle's threads carry the read state the row is judged by.
+    item = _item("mail", "Team photos are up on the drive.", unread=False)
+    thread = cycle._threads([{"item": item, "result": {"title": "Team photos"}}], NOON, TZ)[0]
+    assert thread["unread"] is False and cycle.attention(thread, NOON, TZ)[0] == "fyi"
+    assert cycle.read_fyi_expired({**thread, "attention": "fyi"}, NOON)

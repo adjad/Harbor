@@ -64,13 +64,14 @@ def records() -> dict:
 
 
 def _save(block_id: str, record: dict | None) -> None:
-    store = study_store()
-    value = dict(store.meta(META, {}) or {})
-    if record is None:
-        value.pop(block_id, None)
-    else:
-        value[block_id] = record
-    store.set_meta(META, value)
+    def change(value):
+        value = dict(value) if isinstance(value, dict) else {}
+        if record is None:
+            value.pop(block_id, None)
+        else:
+            value[block_id] = record
+        return value
+    study_store().update_meta(META, change, {})
 
 
 def _valid_id(block_id: str) -> bool:
@@ -156,10 +157,13 @@ def edited(record: dict, events: dict) -> bool:
 def _forget(block_id: str, day: str) -> None:
     """Drop a booking whose event is gone, and move its booking key on, so adding it again books anew."""
     _save(block_id, None)
-    store = study_store()
-    gens = dict(store.meta(GENS, {}) or {})
-    gens[f"{block_id}|{day}"] = int(gens.get(f"{block_id}|{day}", 0)) + 1
-    store.set_meta(GENS, gens)
+    key = f"{block_id}|{day}"
+
+    def bump(gens):
+        gens = dict(gens) if isinstance(gens, dict) else {}
+        gens[key] = int(gens.get(key, 0)) + 1
+        return gens
+    study_store().update_meta(GENS, bump, {})
 
 
 def _key(block_id: str, day: str) -> str:

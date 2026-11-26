@@ -299,3 +299,61 @@ def test_attach_without_pages_keeps_the_old_shape_plus_empty_lists(store, monkey
     assert result["study"]["ready"] == [] and result["study"]["weak"] == []
     hw = result["deadlines"][0]
     assert hw["slides"] == [] and hw["covers_text"] is None and "review" not in hw
+
+
+def test_background_prepare_publishes_on_the_service_loop(store, monkeypatch):
+    """kick() builds the quiz on its own loop in a thread; the hub's queues belong to the
+    service loop, so the "changed" notice must be handed to that loop, not put from the thread."""
+    import importlib
+    hub_module = importlib.import_module("service.assistant.hub")
+    _quiz_setup(store)
+    store.set_meta("auto_prepare", True)
+    seen = []
+
+    class FakeHub:
+        def publish_sync(self, event, **_):
+            try:
+                seen.append((event, asyncio.get_running_loop(), threading.get_ident()))
+            except RuntimeError:
+                seen.append((event, None, threading.get_ident()))
+            return event
+
+    monkeypatch.setattr(hub_module, "hub", FakeHub())
+
+    async def service():
+        main = asyncio.get_running_loop()
+        made = await asyncio.to_thread(
+            lambda: asyncio.run(ready.prepare(store=store, status=READY, make=Maker(), notify_loop=main)))
+        for _ in range(20):
+            if seen:
+                break
+            await asyncio.sleep(0.01)
+        return main, made
+
+    main, made = asyncio.run(service())
+    assert len(made) == 1
+    assert [(e, loop) for e, loop, _ in seen] == [({"type": "changed"}, main)]
+    assert seen[0][2] == threading.get_ident()
+
+
+def test_service_loop_is_found_from_a_worker_thread():
+    """day_hook kicks from Starlette's threadpool; the loop it captures is the service's."""
+    import anyio
+    from anyio import to_thread
+
+    async def service():
+        return asyncio.get_running_loop(), await to_thread.run_sync(ready._service_loop)
+
+    main, found = anyio.run(service)
+    assert found is main
+    assert ready._service_loop() is None
+
+
+def test_prepare_reads_a_courses_pages_once_for_all_its_candidates(store, monkeypatch):
+    _quiz_setup(store, n=3)
+    store.set_meta("auto_prepare", True)
+    calls = []
+    real = match.pages_for
+    monkeypatch.setattr(match, "pages_for", lambda s, cid=None: calls.append(cid) or real(s, cid))
+    made = asyncio.run(ready.prepare(store=store, status=READY, make=Maker()))
+    assert len(made) == 3 and calls == ["canvas:7"]

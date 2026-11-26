@@ -76,9 +76,12 @@ def _clock(ts: float, tz: str, all_day: bool = False) -> str:
     return local.strftime("%a") + ("" if all_day else " " + local.strftime("%-I:%M %p"))
 
 
-def build_input(survivors: list[dict], sched: dict, now: float, tz: str) -> tuple[str, dict[str, dict]]:
+def build_input(survivors: list[dict], sched: dict, now: float, tz: str,
+                suppressed: set[str] | None = None) -> tuple[str, dict[str, dict]]:
     """(material, id map). Short ids (S1, C1, R1) keep the prompt small and give
-    the judge nothing it could pass off as a real identifier."""
+    the judge nothing it could pass off as a real identifier. Items the user
+    dismissed (`suppressed`) never take a line, and answered ones come after
+    every unanswered one, so neither crowds an open ask out of the cap."""
     ids: dict[str, dict] = {}
     local = datetime.fromtimestamp(now, ZoneInfo(tz))
     lines = [f"Now: {local.strftime('%a %b %-d, %-I:%M %p')} ({tz})", "", "CALENDAR (today and tomorrow):"]
@@ -100,7 +103,15 @@ def build_input(survivors: list[dict], sched: dict, now: float, tz: str) -> tupl
             ids[f"P{n}"] = {"kind": "calendar", "row": event}
             lines.append(f"- [P{n}] {_clock(event['when_ts'], tz, event.get('all_day'))} {guard.clean(event['title'], 80)}")
     lines += ["", "ITEMS (last 7 days):"]
-    ranked = sorted(survivors, key=lambda s: (not s["result"].get("asks_of_me"), -(s["item"].get("received_ts") or 0)))
+    suppressed = suppressed or set()
+
+    def dismissed(survivor) -> bool:
+        item = survivor["item"]
+        ask = ask_key(item)
+        return f"{item.get('id')}:{item.get('hash')}" in suppressed or (ask is not None and ask in suppressed)
+    ranked = sorted((s for s in survivors if not dismissed(s)),
+                    key=lambda s: (bool(s["item"].get("replied")), not s["result"].get("asks_of_me"),
+                                   -(s["item"].get("received_ts") or 0)))
     for n, survivor in enumerate(ranked[:MAX_SURVIVOR_LINES], 1):
         item, result = survivor["item"], survivor["result"]
         ids[f"S{n}"] = {"kind": "item", "survivor": survivor}
@@ -504,7 +515,7 @@ async def judge(survivors: list[dict], sched: dict, reply_fn, abort, *, now: flo
     suppressed = suppressed or set()
     if not survivors and not sched.get("reminders"):
         return "ok", [], ""
-    material, ids = build_input(survivors, sched, now, tz)
+    material, ids = build_input(survivors, sched, now, tz, suppressed)
     if cached_reply:
         reply = cached_reply
     else:

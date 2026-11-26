@@ -148,7 +148,8 @@ def test_a_placeholder_only_thread_is_not_withheld():
     row = mail("<s1@x>", "Sam Lee", "sam@example.com", "Study room",
                "Can you sign in to the portal and check the room schedule before Friday?")
     [item] = items_for([row])
-    assert "details omitted" in item["text"]          # the redaction placeholder is in the excerpt
+    # The on-device reading keeps the ask; only the display redaction would stand it in.
+    assert "sign in to the portal and check the room schedule" in item["text"]
     assert item["secret"] is False and triage.withheld(item) is False
 
 

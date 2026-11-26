@@ -499,10 +499,16 @@ struct OverlayView: View {
         if model.attachmentIsScreen, let thumb = model.attachedThumbnail {
             screenPreview(thumb).padding(.top, 10)
         }
-        inputRow.padding(.top, 10)
-        VoiceStatusLine(voice: model.voice)
-        if !model.commandSuggestions.isEmpty {
-            commandList.padding(.top, 8)
+        // Everything that reads the typed text, redrawn by a key on its own
+        // (AskInputScope): the rest of the panel doesn't read it.
+        AskInputScope(text: model.askInput) {
+            VStack(alignment: .leading, spacing: 0) {
+                inputRow.padding(.top, 10)
+                VoiceStatusLine(voice: model.voice)
+                if !model.commandSuggestions.isEmpty {
+                    commandList.padding(.top, 8)
+                }
+            }
         }
         Divider().overlay(Theme.hairline).padding(.vertical, 10)
     }

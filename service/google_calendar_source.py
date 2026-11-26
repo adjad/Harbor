@@ -232,9 +232,19 @@ async def _get(http: httpx.AsyncClient, account: str, path: str, params: dict) -
     raise G.GmailError("Google Calendar sign-in could not be refreshed")
 
 
-async def fetch_account(http: httpx.AsyncClient, account: str, now: float | None = None) -> list[dict]:
+# An all-day event and a timed one can be listed a little out of start order, so a capped read
+# only claims to cover what starts this long before the last event it reached.
+COVERAGE_MARGIN_S = 86400.0
+
+
+async def fetch_account(http: httpx.AsyncClient, account: str, now: float | None = None,
+                        coverage: dict | None = None) -> list[dict]:
     """Events from today through DAYS_AHEAD days, primary + selected calendars.
-    Must run inside gmail_source.bound_account(account)."""
+    Must run inside gmail_source.bound_account(account).
+
+    A calendar with more events than MAX_EVENTS_PER_CALENDAR is read only up to that cap. Then
+    ``coverage["until"]`` is the start time before which this read saw everything (the earliest
+    such point of any capped calendar); it is left unset when every calendar was read to the end."""
     lo, hi = window(now)
     listing = await _get(http, account, "users/me/calendarList",
                          {"minAccessRole": "reader", "maxResults": "250"})
@@ -246,6 +256,7 @@ async def fetch_account(http: httpx.AsyncClient, account: str, now: float | None
     for calendar in calendars[:MAX_CALENDARS]:
         name = calendar.get("summaryOverride") or calendar.get("summary") or ""
         page, count = "", 0
+        reached = lo
         while count < MAX_EVENTS_PER_CALENDAR:
             params = {"timeMin": _rfc3339(lo), "timeMax": _rfc3339(hi), "singleEvents": "true",
                       "orderBy": "startTime", "maxResults": "250", "showDeleted": "false"}
@@ -258,6 +269,7 @@ async def fetch_account(http: httpx.AsyncClient, account: str, now: float | None
                                   holiday_calendar=is_holiday_calendar_id(calendar["id"]))
                 if item is None:
                     continue
+                reached = max(reached, float(item["when_ts"]))
                 # The same meeting on two of this account's calendars is one event.
                 key = (item["ical_uid"] or item["source_id"], round(item["when_ts"]))
                 if key in seen:
@@ -267,6 +279,9 @@ async def fetch_account(http: httpx.AsyncClient, account: str, now: float | None
             page = data.get("nextPageToken") or ""
             if not page:
                 break
+        if page and coverage is not None:
+            until = max(lo, reached - COVERAGE_MARGIN_S)
+            coverage["until"] = min(until, coverage.get("until", until))
     return items
 
 
@@ -289,12 +304,13 @@ async def refresh_account(account: str, *, transport: httpx.AsyncBaseTransport |
         try:
             with G.bound_account(account):
                 async with httpx.AsyncClient(timeout=10, transport=transport) as http:
-                    items = await fetch_account(http, account, now)
+                    coverage: dict = {}
+                    items = await fetch_account(http, account, now, coverage)
                 # No await between this check and the write: a disconnect that
                 # erased this account cannot be undone by a late fetch.
                 if not G.still_connected():
                     return 0
-                count = store_events(account, items)
+                count = store_events(account, items, covered_until=coverage.get("until"))
         except CalendarScopeLost as exc:
             # Calendar access was taken back: its events must not linger.
             _erase_quietly(account)
@@ -373,11 +389,14 @@ def _delete_rows(db, ids: list[str]) -> None:
             db.execute(f"DELETE FROM {table} WHERE commitment_id=?", (rid,))
 
 
-def store_events(account: str, items: list[dict], store=None) -> int:
+def store_events(account: str, items: list[dict], store=None, *, covered_until: float | None = None) -> int:
     """Replace this account's Google rows with `items` (an account-scoped
     replace-set: other accounts and EventKit rows are untouched). Upserts by
     (source_id, when_ts) like AssistantStore.sync_source, so a row keeps its id
-    and notify_log across refreshes."""
+    and notify_log across refreshes.
+
+    ``covered_until``: the fetch stopped at its cap, so only rows starting before it that were
+    not fetched are gone; later rows were never read and are kept."""
     store = store or _store()
     prefix = _prefix(account)
     now = time.time()
@@ -420,7 +439,8 @@ def store_events(account: str, items: list[dict], store=None) -> int:
                            (cid, it["invitee_count"], int(flag) if type(flag) is bool else None))
             db.execute("INSERT INTO calendar_event_writable VALUES (?,?)", (cid, 0))
             written += 1
-        _delete_rows(db, [rid for key, rid in existing.items() if key not in seen])
+        _delete_rows(db, [rid for key, rid in existing.items() if key not in seen
+                          and (covered_until is None or key[1] < covered_until)])
     return written
 
 

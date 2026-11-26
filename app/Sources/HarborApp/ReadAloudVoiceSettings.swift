@@ -133,7 +133,9 @@ struct ReadAloudVoiceSettings: View {
                 }
             }
         }
-        .onAppear { voices = ReadAloudVoice.installed() }
+        // Kept from the last read when there is one (installedForOpening), so
+        // opening Settings › General doesn't wait on macOS listing its voices.
+        .onAppear { voices = ReadAloudVoice.installedForOpening { voices = $0 } }
     }
 
     private var rateLabel: String { ReadAloudVoice.rateText(ReadAloudVoice.rateMultiple(rate)) }

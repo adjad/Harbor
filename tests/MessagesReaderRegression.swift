@@ -361,6 +361,8 @@ enum MessagesReaderRegression {
                      "Structured carrier has an explicit row cap and partial coverage")
         try checkTypedStream(root: root)
         checkDelivery(root: root)
+        checkOwnTapbacks(root: root)
+        checkPipeInChatName(root: root)
         checkBackendRetry()
         print("MessagesReader: synthetic read-only regression passed")
     }
@@ -506,6 +508,84 @@ enum MessagesReaderRegression {
 
     /// Only "nothing is listening" is retried, on a bounded, growing schedule.
     // What the app reads back after handing Messages a text.
+    /// The user's own tapback on a chat counts as acknowledging it (the V3
+    /// "acknowledged" line): an incoming tapback or a removed one does not.
+    static func checkOwnTapbacks(root: URL) {
+        let path = root.appendingPathComponent("tapbacks.db").path
+        var db: OpaquePointer?
+        precondition(sqlite3_open(path, &db) == SQLITE_OK)
+        defer { sqlite3_close(db) }
+        func sql(_ statement: String) {
+            precondition(sqlite3_exec(db, statement, nil, nil, nil) == SQLITE_OK,
+                         "Fixture SQL failed: \(statement)")
+        }
+        sql("CREATE TABLE message (date INTEGER, text TEXT, attributedBody BLOB, " +
+            "is_from_me INTEGER, handle_id INTEGER, is_read INTEGER, " +
+            "associated_message_type INTEGER, guid TEXT, date_edited INTEGER)")
+        sql("CREATE TABLE handle (id TEXT)")
+        sql("CREATE TABLE chat (display_name TEXT, chat_identifier TEXT, guid TEXT)")
+        sql("CREATE TABLE chat_message_join (chat_id INTEGER, message_id INTEGER)")
+        sql("CREATE TABLE chat_handle_join (chat_id INTEGER, handle_id INTEGER)")
+        sql("INSERT INTO handle VALUES ('+15555550111'), ('+15555550122'), ('+15555550133')")
+        sql("INSERT INTO chat VALUES ('', 'a', 'tap-chat-a'), ('', 'b', 'tap-chat-b'), ('', 'c', 'tap-chat-c')")
+        sql("INSERT INTO chat_handle_join VALUES (1, 1), (2, 2), (3, 3)")
+        let base = Int64((Date().timeIntervalSince1970 - 978307200 - 600) * 1_000_000_000)
+        // chat a: an incoming ask, then the user's own Like (2001).
+        // chat b: an incoming ask, then the OTHER person's Love (2000) on it.
+        // chat c: an incoming ask, then the user's removed Like (3001).
+        let rows: [(Int64, String, Int, Int, Int, String)] = [
+            (base, "Dinner Friday?", 0, 1, 0, "tap-in-a"),
+            (base + 60_000_000_000, "Liked \u{201C}Dinner Friday?\u{201D}", 1, 0, 2001, "tap-mine-a"),
+            (base, "Can you call?", 0, 2, 0, "tap-in-b"),
+            (base + 60_000_000_000, "Loved \u{201C}Can you call?\u{201D}", 0, 2, 2000, "tap-theirs-b"),
+            (base, "Notes ready?", 0, 3, 0, "tap-in-c"),
+            (base + 60_000_000_000, "Removed a like", 1, 0, 3001, "tap-removed-c"),
+        ]
+        for (index, row) in rows.enumerated() {
+            sql("INSERT INTO message VALUES (\(row.0), '\(row.1)', NULL, \(row.2), \(row.3), 1, " +
+                "\(row.4), '\(row.5)', 0)")
+            sql("INSERT INTO chat_message_join VALUES (\(index / 2 + 1), \(index + 1))")
+        }
+        let scan = MessagesReader(dbPath: path).readRecentMessages()!
+        precondition(Set(scan.acknowledged.keys) == ["tap-chat-a"],
+                     "Only the user's own, standing tapback acknowledges a chat: \(scan.acknowledged)")
+        let expected = Double(base + 60_000_000_000) / 1_000_000_000 + 978307200
+        precondition(abs(scan.acknowledged["tap-chat-a"]! - expected) < 0.01, "The tapback's own time")
+        precondition(!scan.lines.contains { $0.contains("Liked") }, "A tapback is never a conversation line")
+    }
+
+    /// A group named with " | " must not shift the V2 fields into the text.
+    static func checkPipeInChatName(root: URL) {
+        let path = root.appendingPathComponent("pipe-name.db").path
+        var db: OpaquePointer?
+        precondition(sqlite3_open(path, &db) == SQLITE_OK)
+        defer { sqlite3_close(db) }
+        func sql(_ statement: String) {
+            precondition(sqlite3_exec(db, statement, nil, nil, nil) == SQLITE_OK,
+                         "Fixture SQL failed: \(statement)")
+        }
+        sql("CREATE TABLE message (date INTEGER, text TEXT, attributedBody BLOB, " +
+            "is_from_me INTEGER, handle_id INTEGER, is_read INTEGER, " +
+            "associated_message_type INTEGER, guid TEXT, date_edited INTEGER)")
+        sql("CREATE TABLE handle (id TEXT)")
+        sql("CREATE TABLE chat (display_name TEXT, chat_identifier TEXT, guid TEXT)")
+        sql("CREATE TABLE chat_message_join (chat_id INTEGER, message_id INTEGER)")
+        sql("CREATE TABLE chat_handle_join (chat_id INTEGER, handle_id INTEGER)")
+        sql("INSERT INTO handle VALUES ('+15555550144'), ('+15555550155')")
+        sql("INSERT INTO chat VALUES ('Team | Ops' || char(10) || 'Night', 'g', 'pipe-chat')")
+        sql("INSERT INTO chat_handle_join VALUES (1, 1), (1, 2)")
+        let date = Int64((Date().timeIntervalSince1970 - 978307200 - 60) * 1_000_000_000)
+        sql("INSERT INTO message VALUES (\(date), 'Standup moved | see thread', NULL, 0, 1, 1, 0, 'pipe-msg', 0)")
+        sql("INSERT INTO chat_message_join VALUES (1, 1)")
+        let scan = MessagesReader(dbPath: path).readRecentMessages()!
+        let line = scan.lines.first { $0.contains("Standup moved") }!
+        let parts = line.components(separatedBy: " | ")
+        precondition(parts.count == 7, "Only the body may hold a separator: \(line)")
+        precondition(parts[4] == "Group \"Team \u{00A6} Ops Night\"", "The chat name stays one field: \(parts[4])")
+        precondition(parts[5].hasPrefix("+15555550144: Standup moved") && parts[6] == "see thread",
+                     "The body keeps its own text whole after the sender")
+    }
+
     static func checkDelivery(root: URL) {
         let path = root.appendingPathComponent("delivery.db").path
         typealias Check = MessageDeliveryCheck

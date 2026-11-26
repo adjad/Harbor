@@ -23,6 +23,11 @@ if _reset_os.environ.get("HARBOR_LAUNCH_NONCE"):
     from service.harbor_reset import resume_or_exit as _resume_or_exit
     _resume_or_exit()
 
+# Launch timing ([lifecycle] lines): from here, right after the reset pass, through
+# every other import.
+import time as _lifecycle_time
+_IMPORT_STARTED = _lifecycle_time.monotonic()
+
 from service.assistant.verified_reminders import expected_date_fields
 
 import asyncio
@@ -373,6 +378,12 @@ def _sync_keep_warm() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    lifespan_started = time.monotonic()
+    import_ms = _ms(_IMPORT_STARTED, lifespan_started)
+    if app is not None:    # tests drive lifespan(None)
+        # SIGTERM (the app's quit, or the backend ending itself) ends the event stream first, so
+        # uvicorn's graceful wait isn't spent on a response that never finishes.
+        _chain_sigterm(asyncio.get_running_loop())
     from service.identity import refuse_sandbox_on_production_port
     refuse_sandbox_on_production_port()
     from service.config import quarantine
@@ -496,9 +507,18 @@ async def lifespan(app: FastAPI):
     from service import omlx_cache
     try:
         omlx_cache.ensure_cap()
-        omlx_cache.maintain()
     except Exception:  # noqa: BLE001
         pass
+
+    # The stale-file sweep walks the whole cache folder; it no longer holds up the
+    # first answer. Off the loop, after startup, cancelled at shutdown like the prune.
+    async def _sweep_omlx_cache() -> None:
+        try:
+            await asyncio.to_thread(omlx_cache.maintain)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — best-effort, the periodic run retries
+            pass
 
     if profile is None:
         started_tasks.append(asyncio.create_task(_warm_summarizer()))
@@ -553,6 +573,7 @@ async def lifespan(app: FastAPI):
             pass
 
     attachment_prune_task = asyncio.create_task(_prune_attachment_store())
+    cache_sweep_task = asyncio.create_task(_sweep_omlx_cache())
     # Saved timers and alarms only ring once they are armed on this loop.
     try:
         from service.tools import timers_alarms
@@ -576,31 +597,49 @@ async def lifespan(app: FastAPI):
         await asyncio.to_thread(personal_style.recover)
     except Exception:  # noqa: BLE001 — cleanup never blocks startup
         pass
+    ready = time.monotonic()
+    print(f"[lifecycle] serving: import {import_ms} ms, startup {_ms(lifespan_started, ready)} ms, "
+          f"total {_ms(_IMPORT_STARTED, ready)} ms", flush=True)
     try:
         yield
     finally:
-        try:
+        # The app sends SIGTERM and kills this process 5 s later (BackendManager.stopAndWait).
+        # Every step is bounded so the engine stop at the end always runs inside that.
+        steps: list[str] = []
+        stopping = time.monotonic()
+
+        async def step(name: str, work, seconds: float) -> None:
+            began = time.monotonic()
+            finished = await _bounded(work, seconds)
+            steps.append(f"{name} {_ms(began, time.monotonic())} ms" + ("" if finished else " (cut)"))
+
+        async def stop_trainer() -> None:
             from service import personal_style
-            await personal_style.stop()             # ends the trainer; its mail text goes with it
-        except Exception:  # noqa: BLE001
-            pass
+            await personal_style.stop()
+
+        _end_event_streams()
+        # Ends the trainer; its mail text goes with it. A cut stop is finished by
+        # personal_style.recover at the next start.
+        await step("style trainer", stop_trainer(), _SHUTDOWN_TRAINER_SECONDS)
         if bridge_link is not None:
             bridge_link.stop()
         recovery_task.cancel()
         attachment_prune_task.cancel()
-        await asyncio.gather(recovery_task, attachment_prune_task, return_exceptions=True)
-        for task in started_tasks:
+        for task in (cache_sweep_task, *started_tasks):
             task.cancel()
-        await asyncio.gather(*started_tasks, return_exceptions=True)
-        await _stop_summary_folds()
+        await step("background tasks", asyncio.gather(recovery_task, attachment_prune_task, cache_sweep_task,
+                                                       *started_tasks, return_exceptions=True),
+                   _SHUTDOWN_TASKS_SECONDS)
+        await step("summaries", _stop_summary_folds(), _SHUTDOWN_STEP_SECONDS)
         if profile is None or parity:
-            await mcp_manager.stop()
-        await client.aclose()
+            await step("mcp", mcp_manager.stop(), _SHUTDOWN_STEP_SECONDS)
+        await step("client", client.aclose(), _SHUTDOWN_STEP_SECONDS)
         if is_bundled():
             # Normally /shutdown_omlx already stopped it. Short here: the app kills this
             # backend soon after SIGTERM, and an engine still running then outlives Harbor.
             from service.engine.runtime import stop_if_running
-            await asyncio.to_thread(stop_if_running, final=True, grace=2.0)
+            await step("engine", asyncio.to_thread(stop_if_running, final=True, grace=2.0), 3.0)
+        print(f"[lifecycle] stopped in {_ms(stopping, time.monotonic())} ms: " + ", ".join(steps), flush=True)
 
 
 app = FastAPI(title="Harbor", lifespan=lifespan)
@@ -841,6 +880,93 @@ _QUIT_LIFT_SECONDS = 2.5
 # Set once quitting starts: a user's oMLX.app is not started again after it was stopped.
 _quitting = False
 
+# The lifespan's shutdown runs inside the app's 5 s wait after SIGTERM: each step
+# before the engine stop is bounded so that one always runs.
+_SHUTDOWN_TRAINER_SECONDS = 1.0
+_SHUTDOWN_TASKS_SECONDS = 1.0
+_SHUTDOWN_STEP_SECONDS = 0.5
+_quit_streams: tuple[asyncio.AbstractEventLoop, asyncio.Event] | None = None
+
+
+async def _bounded(work, seconds: float) -> bool:
+    """Await `work` for at most `seconds`. True when it finished (an error counts:
+    one step's failure never stops the rest). Past the bound it is cancelled and
+    left behind, never awaited: a task that ignores cancellation can't hang quitting."""
+    task = asyncio.ensure_future(work)
+    done, _ = await asyncio.wait({task}, timeout=seconds)
+    if not done:
+        task.cancel()
+        return False
+    if not task.cancelled():
+        task.exception()    # retrieved, so a failure is not reported as never retrieved
+    return True
+
+
+def _ms(start: float, end: float) -> int:
+    return max(0, round((end - start) * 1000))
+
+
+def _quit_signal() -> asyncio.Event:
+    """This loop's "quitting" event: the app's long-lived streams end when it is set.
+    One per loop, so a test's asyncio.run never sees an earlier loop's quit."""
+    global _quit_streams
+    loop = asyncio.get_running_loop()
+    if _quit_streams is None or _quit_streams[0] is not loop:
+        _quit_streams = (loop, asyncio.Event())
+    return _quit_streams[1]
+
+
+def _end_event_streams() -> None:
+    """Quitting: end /assistant/events now. uvicorn waits for open responses on
+    SIGTERM (--timeout-graceful-shutdown 2), and that stream only ends by itself
+    after ASSISTANT_EVENTS_ROTATE_S, so every quit used to spend the full 2 s
+    there. A delivery not yet acknowledged stays pending and is replayed next start."""
+    _quit_signal().set()
+
+
+def _chain_sigterm(loop: asyncio.AbstractEventLoop) -> None:
+    """Run _end_event_streams on SIGTERM, then the handler that was there (uvicorn's,
+    which begins its shutdown). Only from the main thread; uvicorn restores its own
+    saved handlers when it stops."""
+    import signal
+    if threading.current_thread() is not threading.main_thread():
+        return
+    previous = signal.getsignal(signal.SIGTERM)
+    if not callable(previous):
+        return
+
+    def handler(signum, frame):
+        try:
+            loop.call_soon_threadsafe(_end_event_streams)
+        except RuntimeError:    # the loop has closed
+            pass
+        previous(signum, frame)
+
+    signal.signal(signal.SIGTERM, handler)
+
+
+async def _until_quit(events):
+    """Yield from the async generator `events` until quitting starts, then close it."""
+    quitting = asyncio.ensure_future(_quit_signal().wait())
+    try:
+        while True:
+            following = asyncio.ensure_future(events.__anext__())
+            done, _ = await asyncio.wait({following, quitting}, return_when=asyncio.FIRST_COMPLETED)
+            if following not in done:
+                following.cancel()
+                await asyncio.gather(following, return_exceptions=True)
+                return
+            try:
+                item = following.result()
+            except StopAsyncIteration:
+                return
+            yield item
+            if quitting.done():
+                return
+    finally:
+        quitting.cancel()
+        await events.aclose()
+
 
 async def _unload_resident(seconds: float) -> list[str]:
     """Unload every model the local engine holds, within `seconds`. The models unloaded;
@@ -870,6 +996,9 @@ async def shutdown_omlx() -> dict[str, Any]:
     wait for the server to exit, so a user's oMLX.app has its models unloaded first: that
     frees their memory even if the stop is slow or fails."""
     global _quitting
+    # First, whatever the engine: the app's event stream ends now, so the SIGTERM that
+    # follows this request doesn't wait out uvicorn's graceful bound on it.
+    _end_event_streams()
     if not getattr(client, "managed", True):
         return {"stopped": False}
     _quitting = True
@@ -1980,6 +2109,12 @@ async def chat(body: dict[str, Any]):
                 or max_tokens <= 0):
             raise HTTPException(status_code=422, detail="max_tokens must be a positive integer")
         max_tokens = min(max_tokens, _direct_generation_budget(target)[0])
+    # Checked before any client is made: a body with neither used to raise a KeyError
+    # (a 500) after the remote client below was created, leaking it.
+    if local_prompt is None and not body.get("messages"):
+        prompt = body.get("prompt")
+        if not isinstance(prompt, str):
+            raise HTTPException(status_code=422, detail="Chat requires messages or a prompt")
     owned = None
     if target.endpoint.managed:
         active = client
@@ -2491,7 +2626,10 @@ async def agent(body: dict[str, Any]):
     the cost (measured up to ~1.6MB of events for one real session) is only
     paid when the user actually wants an export.
     """
-    prompt: str = body["prompt"]
+    prompt = body.get("prompt")
+    if not isinstance(prompt, str):
+        # A missing or non-text prompt used to crash redact_credentials with a 500.
+        raise HTTPException(status_code=422, detail="prompt must be text")
     # A credential pasted into chat must never reach the turn store, the audit
     # log or any model (a cloud one included). Redact at the boundary, before a
     # session, history, routing or memory capture can see it. A message that is
@@ -4012,6 +4150,7 @@ async def agent(body: dict[str, Any]):
         # cancellation) ends the turn and unregisters it in the finally below.
         SESSIONS[req_id] = {"sid": sid, "queue": queue, "approver": approver, "trace": trace}
         runner_task = asyncio.create_task(runner())
+        SESSIONS[req_id]["runner"] = runner_task    # DELETE /sessions/{sid} stops it first
         try:
             yield _sse({"type": "session", "id": sid, "trace_id": req_id})
             while True:
@@ -4104,11 +4243,28 @@ async def get_session(sid: str) -> dict[str, Any]:
     return {"ok": True, "session": sess, "turns": store.display_turns_from(sid, 0)}
 
 
+_DELETE_TURN_WAIT_SECONDS = 3.5
+
+
+async def _stop_session_turns(sid: str, seconds: float = _DELETE_TURN_WAIT_SECONDS) -> None:
+    """Cancel every running turn of chat `sid` and wait for them, at most `seconds`."""
+    runners = [entry["runner"] for entry in list(SESSIONS.values())
+               if entry.get("sid") == sid and isinstance(entry.get("runner"), asyncio.Task)
+               and not entry["runner"].done()]
+    for runner in runners:
+        runner.cancel()
+    if runners:
+        await asyncio.wait(runners, timeout=seconds)
+
+
 @app.delete("/sessions/{sid}")
 async def delete_session(sid: str) -> dict[str, Any]:
     fold = _SUMMARY_TASKS.pop(sid, None)
     if fold is not None:
         fold.cancel()                   # a fold still running must not write to a deleted chat
+    # A turn still running in this chat settles its unfinished text when cancelled
+    # (settle_unfinished); let it finish settling before the rows go, bounded.
+    await _stop_session_turns(sid)
     store.delete_session(sid)
     from service.memory.facts import store as fact_store
     fact_store.remove_session(sid)
@@ -4830,7 +4986,8 @@ async def assistant_events() -> StreamingResponse:
     """SSE stream of reminders + `changed` pings for the Swift app."""
     async def stream():
         yield _sse({"type": "hello"})
-        async for ev in assistant_hub.events(rotate_after=ASSISTANT_EVENTS_ROTATE_S):
+        # Ends early when Harbor quits (_end_event_streams).
+        async for ev in _until_quit(assistant_hub.events(rotate_after=ASSISTANT_EVENTS_ROTATE_S)):
             yield _sse(ev)
 
     return StreamingResponse(stream(), media_type="text/event-stream")
@@ -5025,15 +5182,19 @@ async def get_audit(limit: int = 200) -> dict[str, Any]:
     first. The log has always been written; without a way to read it back, "you
     can see what it did" was only true if you knew to go find the file."""
     import json as _json
-    from service.safety.audit import AUDIT_LOG
-    if not AUDIT_LOG.exists():
+    import importlib
+    # The module, not service.safety's re-exported audit() function of the same name.
+    _audit = importlib.import_module("service.safety.audit")
+    if not _audit.AUDIT_LOG.exists() and not _audit.rotated(_audit.AUDIT_LOG).exists():
         return {"entries": []}
     try:
-        lines = AUDIT_LOG.read_text(errors="replace").splitlines()
+        # Read backwards from the end, off the loop (swarm #37): the whole file used
+        # to be read on the event loop for every request.
+        lines = await asyncio.to_thread(_audit.tail_lines, max(limit, 1) * 2, _audit.AUDIT_LOG)
     except Exception as e:  # noqa: BLE001
         return {"entries": [], "error": str(e)}
     entries = []
-    for line in reversed(lines[-max(limit, 1) * 2:]):
+    for line in reversed(lines):
         try:
             entries.append(_json.loads(line))
         except Exception:  # noqa: BLE001 — skip a torn/partial line

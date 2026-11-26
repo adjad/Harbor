@@ -123,7 +123,7 @@ struct StudyConnectorCard: View {
                         .padding(.horizontal, 10).padding(.vertical, 6)
                         .background(RoundedRectangle(cornerRadius: 8).fill(Theme.chipFill))
                         .overlay(RoundedRectangle(cornerRadius: 8)
-                            .stroke(keyFocused ? Color.white.opacity(0.35) : Theme.chipStroke, lineWidth: 1))
+                            .stroke(keyFocused ? ThemePalette.notch.selectedStroke : Theme.chipStroke, lineWidth: 1))
                         .focused($keyFocused)
                         .onSubmit(save)
                         .disabled(saving)
@@ -182,6 +182,7 @@ struct StudyConnectorCard: View {
             HStack(spacing: 3) {
                 Text(StudyText.getKey)
                 Image(systemName: "arrow.up.right").font(.harbor(size: 8.5, weight: .semibold))
+                    .accessibilityHidden(true)
             }
             .font(.harbor(.footnote, weight: .medium)).foregroundStyle(Theme.textSecondary)
             .frame(minHeight: 24)
@@ -236,8 +237,11 @@ struct StudyConnectorCard: View {
     private var actions: some View {
         HStack(spacing: 8) {
             if saving {
+                // Announced once: the spinner carries the label, the text is for the eye.
                 ProgressView().controlSize(.small)
+                    .accessibilityLabel("Saving key")
                 Text("Saving…").font(.harbor(.footnote)).foregroundStyle(Theme.textMuted)
+                    .accessibilityHidden(true)
             }
             Spacer()
             StudyChrome.pill("Cancel") { close() }

@@ -814,6 +814,9 @@ def test_foreground_preempts_worker_and_leaves_claim_retryable(world, monkeypatc
             await actual_sleep(0.02)
             assert q.stats()['jobs'].get('queued') == 1
             assert facts.count() == 0
+            # Only interrupted: the try next() counted is given back, so a busy
+            # person's chat can't use up the three tries a real failure gets.
+            assert sessions._db.execute('SELECT attempts FROM memory_jobs').fetchone()[0] == 0
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -1522,3 +1525,60 @@ def test_rolling_summary_a_failing_prepare_hook_counts_as_a_failure(summary_worl
     sess = sessions.get_session(sid)
     assert sess['summarized_idx'] == context._FOLD_BATCH
     assert sess['summary'].startswith(context._FALLBACK_HEAD)
+
+
+def test_queue_refund_gives_back_only_the_interrupted_try(world):
+    _, sessions, q = world
+    sid = sessions.create_session()
+    sessions.add_turn(sid, 'user', 'I prefer tea.')
+    job = q.next()
+    assert job['attempts'] == 1
+    assert q.finish(job, 'queued', refund=True)
+    sessions._db.execute("UPDATE memory_jobs SET available_at=0")
+    again = q.next()
+    assert again['attempts'] == 1
+    assert q.finish(again, 'queued', 'ValueError')
+    sessions._db.execute("UPDATE memory_jobs SET available_at=0")
+    assert q.next()['attempts'] == 2
+
+
+def test_recall_over_a_mostly_forgotten_history_ranks_once_and_stops_at_the_scan_cap(world, monkeypatch):
+    import service.memory.queue as queue_module
+    from service.memory import retrieval
+    facts, sessions, q = world
+    monkeypatch.setattr(queue_module, 'SCAN_LIMIT', 120)
+    sid = sessions.create_session()
+    for n in range(400):
+        sessions.add_turn(sid, 'user', f'I work on synthetic project {n} on Tuesdays.')
+    sessions.add_turn(sid, 'user', 'I work from the synthetic library.')
+    facts.delete(facts.add('I work on synthetic project', 'fact')['id'])   # forgets 400 of 401
+    ranked, view_reads = [], []
+    sessions._db.set_trace_callback(lambda s: ranked.append(s) if 'bm25' in s else None)
+    real_view = type(facts).suppression_view
+    monkeypatch.setattr(type(facts), 'suppression_view', lambda self: view_reads.append(1) or real_view(self))
+    try:
+        q.search('work', facts, limit=5)
+        retrieval._strict_passages(sessions, facts, 'work synthetic', 5, '')
+    finally:
+        sessions._db.set_trace_callback(None)
+    # One ranked query per search (the old 100-row OFFSET pages re-ranked every match
+    # each page) and the suppression rules read once per search, not per row.
+    assert len(ranked) == 2 and view_reads == [1, 1]
+    monkeypatch.setattr(queue_module, 'SCAN_LIMIT', 600)
+    found = q.search('work', facts, limit=5)
+    assert [r['text'] for r in found] == ['I work from the synthetic library.']
+
+
+def test_suppression_view_matches_the_per_row_rules(world):
+    facts, sessions, q = world
+    fid = facts.add('My sister lives in Lisbon', 'person', evidence=[{
+        'source_type': 'conversation', 'source_id': 's1:4', 'session_id': 's1', 'turn_idx': 4,
+        'quote': 'My sister lives in Lisbon', 'observed_at': 1, 'label': 'User conversation'}])['id']
+    facts.delete(fid)
+    view = facts.suppression_view()
+    for text in ('My sister lives in Lisbon', 'Fun fact: my sister lives in Lisbon now.',
+                 'My brother lives in Porto', ''):
+        assert view.text(text) == facts.suppressed_text(text)
+    assert view.text('Fun fact: my sister lives in Lisbon now.')
+    assert view.source('conversation', 's1:4') and facts.suppressed_source('conversation', 's1:4')
+    assert not view.source('conversation', 's1:5')

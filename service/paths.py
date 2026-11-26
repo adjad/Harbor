@@ -68,6 +68,32 @@ def tighten_private_file(path: str | os.PathLike[str]) -> None:
             log.warning("could not make %s owner-only: %s", path, exc)
 
 
+def private_moe_dir(path: str | os.PathLike[str] | None = None) -> None:
+    """Make Harbor's own folder (~/.moe) owner-only (0700).
+
+    Only a real directory this user owns is changed (lstat, so a link in its
+    place is left alone); anything else is logged, not raised. The files in it
+    are private already, but a 0755 folder still let another account list
+    them and read any sidecar a store left at the umask mode (pentest #16).
+    """
+    target = Path(path) if path is not None else MOE_DIR
+    try:
+        info = os.lstat(target)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        log.warning("could not check %s: %s", target, exc)
+        return
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        log.warning("not making %s owner-only: not a directory this user owns", target)
+        return
+    if info.st_mode & 0o077:
+        try:
+            os.chmod(target, 0o700, follow_symlinks=False)
+        except OSError as exc:
+            log.warning("could not make %s owner-only: %s", target, exc)
+
+
 def private_sqlite_file(path: str | os.PathLike[str]) -> None:
     """Make a Harbor SQLite database owner-only (0600) before it is opened.
 

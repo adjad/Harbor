@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import Combine
 
 // Inert dependency: all requests are captured by the injected transport below.
 enum HarborClient { static let baseURL = URL(string: "http://127.0.0.1:1")! }
@@ -1005,9 +1006,116 @@ struct TodayPlanChecks {
               "the hold keeps the newest eight days, one per day and zone")
         check(DayPlanHold.fade > 0.2 && DayPlanHold.fade < 0.6, "a held day reads as not live")
     }
+    /// The Day's first open after a launch shows today's plan as the last
+    /// launch kept it, never an empty day, while the first read comes in; a
+    /// read that brings nothing new is not published again.
+    @MainActor
+    static func cacheFirstChecks() async throws {
+        let zone = TimeZone(identifier: "America/Los_Angeles")!
+        var now = instant("2026-10-22T19:00:00Z")   // 12:00 PM on 2026-10-22 there
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("harbor-day-cache-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let cache = DayPlanDiskCache(url: folder.appendingPathComponent(DayPlanDiskCache.fileName))
+        let down: (URLRequest) async throws -> (Data, URLResponse) = { _ in throw URLError(.cannotConnectToHost) }
+        var stamp = 1000.0
+        func reply(_ request: URLRequest, blocks: [String]) throws -> (Data, URLResponse) {
+            // Each read differs from the last in what the service always changes.
+            stamp += 30
+            // A write (no query) is answered like a read of the day shown.
+            let items = URLComponents(url: request.url!, resolvingAgainstBaseURL: true)?.queryItems ?? []
+            let day = items.first { $0.name == "day" }?.value ?? "2026-10-22"
+            let zoneID = items.first { $0.name == "timezone" }?.value ?? zone.identifier
+            var body = try JSONSerialization.jsonObject(with: planData(day: day, zone: zoneID, blocks: blocks)) as! [String: Any]
+            body["generated_at"] = stamp
+            body["trace_id"] = String(format: "%032x", Int(stamp))
+            return (try JSONSerialization.data(withJSONObject: body), response(request))
+        }
+
+        // No kept plan: nothing to show, and the Day says it is loading (no error, no plan).
+        let first = TodayModel(now: { now }, timeZoneProvider: { zone }, transport: down, planCache: cache)
+        check(first.savedPlan == nil && first.plan == nil, "No kept plan means no stand-in")
+        first.retrySleep = { _ in try await Task.sleep(for: .seconds(3600)) }
+        await first.refresh()
+        check(first.plan == nil && first.error.isEmpty && first.savedPlan == nil,
+              "A service still starting shows the loading row, never an empty or failed day")
+
+        // A good read is kept for the next launch.
+        first.transport = { try reply($0, blocks: ["Invented standup"]) }
+        await first.refresh()
+        cache.flush()
+        check(first.plan?.blocks.first?.title == "Invented standup", "The read is shown")
+        check(FileManager.default.fileExists(atPath: cache.url.path), "Today's plan is kept on disk")
+        let attributes = try FileManager.default.attributesOfItem(atPath: cache.url.path)
+        check((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600, "The kept plan is readable by its owner only")
+
+        // The next launch: the kept plan is there at once, before any read.
+        let relaunch = TodayModel(now: { now }, timeZoneProvider: { zone }, transport: down, planCache: cache)
+        relaunch.retrySleep = { _ in try await Task.sleep(for: .seconds(3600)) }
+        check(relaunch.savedPlan?.blocks.first?.title == "Invented standup" && relaunch.plan == nil
+              , "The kept plan stands in, and is never taken for this launch's read")
+        for _ in 0..<4 { await relaunch.refresh() }
+        check(relaunch.savedPlan != nil && relaunch.error.isEmpty, "Quiet failures keep the stand-in up")
+        check(relaunch.outageNotice != nil, "After several quiet failures the Day says it is still trying")
+        relaunch.transport = { try reply($0, blocks: ["Invented standup", "Invented review"]) }
+        await relaunch.refresh()
+        check(relaunch.savedPlan == nil && relaunch.plan?.blocks.count == 2,
+              "This launch's read replaces the stand-in")
+
+        // Another day or zone never shows the kept plan.
+        let tomorrow = instant("2026-10-23T19:00:00Z")
+        check(TodayModel(now: { tomorrow }, timeZoneProvider: { zone }, transport: down, planCache: cache).savedPlan == nil,
+              "Yesterday's kept plan is never shown as today's")
+        let tokyo = TimeZone(identifier: "Asia/Tokyo")!
+        check(TodayModel(now: { now }, timeZoneProvider: { tokyo }, transport: down, planCache: cache).savedPlan == nil,
+              "A kept plan for another zone is never shown")
+        // A picked day shows no stand-in from today.
+        let picking = TodayModel(now: { now }, timeZoneProvider: { zone }, transport: down, planCache: cache)
+        picking.selectDate(instant("2026-10-24T19:00:00Z"))
+        check(picking.savedPlan == nil, "Another picked day shows no kept plan")
+        // A damaged file is no plan.
+        try Data("{not json".utf8).write(to: cache.url)
+        check(TodayModel(now: { now }, timeZoneProvider: { zone }, transport: down, planCache: cache).savedPlan == nil,
+              "An unreadable kept plan is ignored")
+        // An injected transport keeps nothing unless a cache is passed.
+        let elsewhere = TodayModel(now: { now }, timeZoneProvider: { zone }, transport: { try reply($0, blocks: ["Invented"]) })
+        await elsewhere.refresh()
+        cache.flush()
+        check((try? Data(contentsOf: cache.url)) == Data("{not json".utf8), "Checks and QA never write the app's kept plan")
+
+        // Unchanged reads: published once, not on every read.
+        var blocks = ["Invented standup"]
+        let quiet = TodayModel(now: { now }, timeZoneProvider: { zone }, transport: { try reply($0, blocks: blocks) },
+                               planCache: cache)
+        var changes = 0
+        var publishes = 0
+        let sinks = [quiet.objectWillChange.sink { changes += 1 }, quiet.$plan.dropFirst().sink { _ in publishes += 1 }]
+        for _ in 0..<10 {
+            await quiet.refresh()
+            now = now.addingTimeInterval(10)
+        }
+        check(publishes == 1 && changes == 1, "Ten reads with nothing new publish once (were \(publishes), \(changes))")
+        check(quiet.lastRefreshed == now.addingTimeInterval(-10), "An unchanged read still counts as a refresh")
+        let shownAt = quiet.plan?.generated_at
+        now = now.addingTimeInterval(TodayModel.republishAfter)
+        await quiet.refresh()
+        check(publishes == 2 && quiet.plan?.generated_at != shownAt,
+              "An unchanged plan is published again after republishAfter, so its time stays current")
+        blocks.append("Invented lab")
+        await quiet.refresh()
+        check(publishes == 3 && quiet.plan?.blocks.count == 2, "A read with something new is published at once")
+        _ = await quiet.mutate("/assistant/today/tasks", method: "POST", body: [:])
+        check(publishes == 4, "The read after a change is always published")
+        quiet.capturePlannerDetails = true
+        await quiet.refresh()
+        check(publishes == 5, "A debug read is always published")
+        _ = sinks
+    }
+
 
     static func main() async throws {
         await reminderCancelChecks()
+        try await cacheFirstChecks()
         await dayPlanHoldChecks()
         try tolerantDecodeChecks()
         try sourceAccessChecks()

@@ -208,7 +208,7 @@ struct CaughtForYouSection: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline) {
-                Text("Caught for you").font(compact ? .system(size: 13, weight: .semibold) : .title3.bold())
+                Text("Caught for you").font(compact ? .harbor(.callout, weight: .semibold) : .title3.bold())
                 Spacer()
                 if let status = model.status, status.settings.mode != "off" {
                     Toggle("Add reminders automatically", isOn: Binding(
@@ -219,24 +219,26 @@ struct CaughtForYouSection: View {
                 }
             }
             if model.status?.settings.mode != "off" {
-                Toggle("Also capture Calendar events (texts by themselves, email on your tap)", isOn: Binding(
+                Toggle("Also add Calendar events (texts by themselves, email on your tap)", isOn: Binding(
                     get: { model.captureEvents }, set: { value in Task { await model.setCaptureEvents(value) } }))
                     .toggleStyle(.switch).controlSize(.mini).font(.caption).disabled(model.busy)
+                    .fixedSize(horizontal: false, vertical: true)
                     .help("With automatic reminders on, new confirmed plans in texts also create Calendar events. A plan from email is shown here and waits for you to tap Review & add. Existing plans stay previews. Dates without times become all-day events; the reminder uses the shown default hour.")
                 if model.captureEvents && !model.live {
-                    Text("Calendar capture is in preview until automatic reminders are on.")
-                        .font(.caption).foregroundStyle(.secondary)
+                    Text("Calendar events stay previews until automatic reminders are on.")
+                        .font(metaFont).foregroundStyle(metaColor)
                 }
             }
             if !model.error.isEmpty {
-                Text(model.error).font(.caption).foregroundStyle(.orange)
+                Text(model.error).font(metaFont).foregroundStyle(compact ? Theme.warn : Color.orange)
             } else if model.status?.settings.mode == "off" {
-                Text("Off. Harbor isn't watching mail or texts for plans.").font(.caption).foregroundStyle(.secondary)
+                Text("Off. Harbor isn't watching mail or texts for plans.").font(metaFont).foregroundStyle(metaColor)
             } else if model.items.isEmpty {
                 Text(model.live
                      ? "Nothing caught this week. When a text states a plan that isn't on your calendar or reminders, Harbor adds a reminder and it shows here."
                      : "Nothing caught this week. Harbor is watching your texts for plans that aren't on your calendar; it lists them here before you let it add any.")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(metaFont).foregroundStyle(metaColor)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             ForEach(compact ? Array(model.items.prefix(3)) : model.items) { item in row(item) }
         }
@@ -255,25 +257,34 @@ struct CaughtForYouSection: View {
         }
     }
 
+    /// The notch draws meta lines like the cards around it and follows Text size; the window keeps
+    /// the system caption.
+    private var metaFont: Font { compact ? .harbor(.footnote) : .caption }
+    private var metaColor: Color { compact ? Theme.textMuted : Color.secondary }
+
     private func row(_ item: AttentionRecord) -> some View {
         HStack(alignment: .top, spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(item.title ?? "A plan from your messages")
-                    .font(compact ? .system(size: 13, weight: .medium) : .headline).lineLimit(2)
+                    .font(compact ? .harbor(.callout, weight: .medium) : .headline).lineLimit(2)
                 Text([item.label, item.when].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · "))
-                    .font(.caption).foregroundStyle(.secondary).lineLimit(compact ? 2 : 3)
+                    .font(metaFont).foregroundStyle(metaColor).lineLimit(compact ? 2 : 3)
                 if let quote = item.quote, !quote.isEmpty {
-                    Text("“\(quote)”").font(.caption).italic().foregroundStyle(.secondary)
+                    Text("“\(quote)”").font(metaFont).italic().foregroundStyle(metaColor)
                         .lineLimit(compact ? 1 : 3).textSelection(.enabled)
                 }
             }
-            Spacer(minLength: 8)
+            // The titles take the row's width; the buttons keep one line.
+            .frame(maxWidth: .infinity, alignment: .leading)
             if item.captureable == true {
                 Button("Review & add") { reviewedCapture = item }
+                    .controlSize(compact ? .small : .regular).fixedSize()
                     .disabled(model.busy)
+                    .accessibilityLabel("Review and add: \(item.title ?? "plan")")
             }
             if item.state == "created" && item.undoable == true {
                 Button("Undo") { Task { await model.undo(item) } }
+                    .controlSize(compact ? .small : .regular).fixedSize()
                     .disabled(model.busy)
                     .help("Removes the reminder Harbor added for this message, and nothing else.")
             }

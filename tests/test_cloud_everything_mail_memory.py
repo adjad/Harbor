@@ -113,7 +113,7 @@ class _Q:
     def has_ready(self): return True
     def next(self): return {"id": 1}
     def current(self, job): return True
-    def finish(self, job, *a): self.finished = a
+    def finish(self, job, *a, **kw): self.finished = a
 
 
 class _Facts:

@@ -295,10 +295,29 @@ final class AssistantDelivery {
                let saved = try? JSONSerialization.jsonObject(with: data) as? [String: [String: Any]] {
                 receipts = saved
             } else {
+                // Set aside, and delivery starts again from an empty file (swarm #35): an
+                // unreadable file used to stop every delivery for good, across relaunches.
+                // The service's claim, not this file, keeps a claimed calendar or reminder
+                // action from running twice; a notice may show once more.
                 receipts = [:]
-                readable = false
+                readable = Self.setAside(path)
+                if readable { NSLog("%@", Self.damagedLogLine) }
             }
         } else { receipts = [:] }
+    }
+
+    nonisolated static let damagedFileName = "assistant-delivery-receipts.damaged.json"
+    nonisolated static let damagedLogLine = "[Harbor] The delivery receipts were damaged; they were set aside and new ones started"
+
+    /// Moves a damaged receipts file aside (replacing an earlier damaged copy), owner-only.
+    /// False when it can't be moved: then nothing is delivered, as before, so nothing
+    /// overwrites a file that may still hold receipts.
+    nonisolated static func setAside(_ path: URL) -> Bool {
+        let aside = path.deletingLastPathComponent().appendingPathComponent(damagedFileName)
+        guard Darwin.rename(path.path, aside.path) == 0 else { return false }
+        var info = stat()
+        if lstat(aside.path, &info) == 0, info.st_mode & S_IFMT == S_IFREG { _ = lchmod(aside.path, 0o600) }
+        return true
     }
 
     private func save(_ id: String, _ receipt: [String: Any]) -> Bool {

@@ -3,7 +3,8 @@
 Before a request leaves the Mac for a cloud provider, emails, phone numbers and
 card-like numbers in its messages (system, user, assistant and tool results,
 tool-call arguments included) are replaced with stable placeholders such as
-``[EMAIL_1]`` and ``[PHONE_1]``. The same value always gets the same placeholder
+``[EMAIL_1]`` and ``[PHONE_1]``, and the names Harbor knows on this Mac (the
+user's own and their saved contacts', see `known_names`) with ``[NAME_1]``. The same value always gets the same placeholder
 within one conversation. Everything the model sends back is unmasked before
 Harbor acts on it or shows it: reply text (including streamed text, where a
 placeholder can be split across chunks), reasoning text, and tool-call arguments
@@ -61,13 +62,15 @@ def _luhn(digits: str) -> bool:
 class Masker:
     """One conversation's mapping between real values and placeholders."""
 
-    __slots__ = ("_forward", "_reverse", "_counts", "_names")
+    __slots__ = ("_forward", "_reverse", "_counts", "_names", "_name_set", "_seeded")
 
     def __init__(self) -> None:
         self._forward: dict[tuple[str, str], str] = {}
         self._reverse: dict[str, str] = {}
         self._counts: dict[str, int] = {}
         self._names: list[str] = []
+        self._name_set: set[str] = set()
+        self._seeded: tuple[str, ...] | None = None
 
     # The mapping must never leak through a log line, a debug dump or a copy.
     def __repr__(self) -> str:
@@ -88,11 +91,23 @@ class Masker:
     def add_names(self, names: Iterable[str]) -> None:
         """Names an on-device helper already knows (a contact, the user): masked as
         [NAME_n] on whole-word, case-sensitive matches. Short names are ignored."""
+        added = False
         for name in names or ():
             name = name.strip() if isinstance(name, str) else ""
-            if len(name) >= 3 and name not in self._names:
+            if len(name) >= 3 and name not in self._name_set:
+                self._name_set.add(name)
                 self._names.append(name)
-        self._names.sort(key=len, reverse=True)
+                added = True
+        if added:
+            self._names.sort(key=len, reverse=True)
+
+    def seed_known_names(self) -> None:
+        """Add the names Harbor knows on this Mac (the user's, their contacts'),
+        again whenever that list has changed since the last call."""
+        names = known_names()
+        if names is not self._seeded:
+            self._seeded = names
+            self.add_names(names)
 
     def _placeholder(self, kind: str, key: str, original: str) -> str:
         found = self._forward.get((kind, key))
@@ -122,10 +137,18 @@ class Masker:
         if not isinstance(text, str) or len(text) < 5:
             return text
         out = _DETECT.sub(self._replace, text)
+        folded = out.casefold()
         for name in self._names:
-            if name in out:
-                token = self._placeholder(_NAME_KIND, name, name)
-                out = re.sub(rf"(?<!\w){re.escape(name)}(?!\w)", lambda _m: token, out)
+            # A full name in any case ("maya inventedname"); a single word only as
+            # written, so "long" and "cook" stay ordinary words. Each spelling gets
+            # its own placeholder, so unmasking gives back exactly what was sent.
+            if name.casefold() not in folded:
+                continue
+            flags = re.IGNORECASE if " " in name else 0
+            out = re.sub(rf"(?<!\w){re.escape(name)}(?!\w)",
+                         lambda m: self._placeholder(_NAME_KIND, m.group(0), m.group(0)), out,
+                         flags=flags)
+            folded = out.casefold()
         return out
 
     def unmask(self, text: str) -> str:
@@ -299,7 +322,93 @@ def masker_for(key: str | None) -> Masker | None:
             _registry.popitem(last=False)
     else:
         _registry.move_to_end(key)
+    masker.seed_known_names()
     return masker
+
+
+# ---- names known on this Mac ----
+#
+# Emails and numbers are found by shape; a name has no shape, so masking it
+# needs the list of names Harbor already holds locally: the user's own (macOS
+# full name and what they asked to be called) and their saved contacts. Each
+# full name is masked, and so is each part of it, so "Maya" alone does not
+# leave either (pentest #18). A part that is also an ordinary capitalised
+# word ("May", "Will", "Grace") is masked only inside the full name, since
+# masking every month and modal verb would cost the model the sentence.
+_NAMES_TTL_S = 60.0
+_EMPTY_NAMES_TTL_S = 5.0
+_names_cache: tuple[float, tuple[str, ...]] = (0.0, ())
+_COMMON_WORDS = frozenset("""
+    january february march april may june july august september october november december
+    monday tuesday wednesday thursday friday saturday sunday today tomorrow
+    will bill mark grace hope joy faith rose summer dawn sunny art pat rich frank sky
+    may april june august bay river hunter chase dean page major king young brown
+    green white black gray grey love star rain storm north west the and you
+""".split())
+
+
+# A contact that is an organisation, not a person: only its full name is masked.
+# Words that only an organisation's name carries...
+_ORG_WORDS = frozenset("""
+    inc llc ltd corp corporation support services pharmacy clinic hospital university college
+    school restaurant airline airlines delivery insurance dmv
+""".split())
+# ...and words that are also surnames ("Sam Bank"): they count only with "of" or
+# "the" in the name, or in a name of three or more words.
+_ORG_WORDS_WEAK = frozenset("bank shop store office team center centre cafe company group co".split())
+
+
+def _is_organisation(full: str) -> bool:
+    words = [w.casefold().strip(".,&") for w in full.split()]
+    if set(words) & _ORG_WORDS:
+        return True
+    return bool(set(words) & _ORG_WORDS_WEAK) and (bool({"of", "the"} & set(words)) or len(words) >= 3)
+
+
+def _name_sources() -> list[str]:
+    """Raw names from on-device sources only; nothing here is fetched or synced."""
+    names: list[str] = []
+    try:
+        from service.memory.identity import _preferred_name, user_name
+        names += [user_name(), _preferred_name()]
+    except Exception:  # noqa: BLE001 - masking is best-effort and never fails a request
+        pass
+    # Contacts as the Messages sync already holds them; never imported (or read) here.
+    import sys
+    messages = sys.modules.get("service.tools.imessage_tools")
+    if messages is not None:
+        try:
+            names += list(messages.contact_names())
+        except Exception:  # noqa: BLE001
+            pass
+    return names
+
+
+def known_names() -> tuple[str, ...]:
+    """Full names and their parts to mask, cached for a minute."""
+    global _names_cache
+    import time
+    now = time.monotonic()
+    stamp, cached = _names_cache
+    # An empty list only briefly: the Messages sync may not have loaded contacts yet.
+    if stamp and now - stamp < (_NAMES_TTL_S if cached else _EMPTY_NAMES_TTL_S):
+        return cached
+    out: dict[str, None] = {}
+    for raw in _name_sources():
+        full = " ".join(str(raw or "").split())
+        if len(full) < 3 or "@" in full or any(ch.isdigit() for ch in full):
+            continue
+        out[full] = None
+        if _is_organisation(full):
+            continue                         # "Bank of America": the whole name, not "America"
+        for part in re.findall(r"[^\W\d_][\w'-]*", full):
+            if len(part) >= 3 and part.casefold() not in _COMMON_WORDS and part[:1].isupper():
+                out[part] = None
+    names = tuple(out)
+    if names == cached:
+        names = cached                       # same object: a Masker skips re-adding
+    _names_cache = (now, names)
+    return names
 
 
 def forget(key: str | None = None) -> None:

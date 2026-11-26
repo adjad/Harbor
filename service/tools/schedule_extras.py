@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from service.assistant.verified_reminders import expected_date_fields
 
+import asyncio
 import datetime as dt
 import hashlib
 import json
@@ -768,6 +769,9 @@ async def _find_free_time_for_day(days: int = 3, minutes: int = 30,
                 or any(s.get("state") != "ready" for s in readiness.get("sources", []))
                 or not readiness.get("reminders_fresh", True)):
             raise ValueError("Harbor could not check current Calendar and Reminders availability. No study slot has been verified; try again after the sources finish syncing.")
-        return _availability_result(options, period, timezone, dt.datetime.now(ZoneInfo(timezone)))
+        # One store snapshot per day (up to a month or more for a period): off the loop,
+        # so a long range never stalls other turns' streaming and approvals.
+        return await asyncio.to_thread(_availability_result, options, period, timezone,
+                                       dt.datetime.now(ZoneInfo(timezone)))
     except (ValueError, TypeError, OverflowError, OSError, KeyError, AttributeError) as exc:
         return f"(error: {exc})"

@@ -234,16 +234,23 @@ struct NudgeCard: View {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Image(systemName: "sparkles").font(.harbor(size: 12))
                     .foregroundStyle(Theme.textPrimary)
+                    .accessibilityHidden(true)
                 Text(nudge.title).font(.harbor(size: 13, weight: .medium))
                     .foregroundStyle(Theme.textPrimary)
                     .fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 4)
                 Button(action: dismiss) {
                     Image(systemName: "xmark").font(.harbor(size: 9, weight: .bold))
+                        .frame(width: Theme.iconButtonSize, height: Theme.iconButtonSize)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain).foregroundStyle(Theme.textMuted)
                 .help("Dismiss")
                 .accessibilityLabel("Dismiss")
+                // The 24 pt hit area overhangs the card's padding, so the glyph stays where it was
+                // and the header is no taller than its title.
+                .padding(.trailing, -6)
+                .padding(.vertical, -6)
             }
             if !nudge.body.isEmpty {
                 Text(nudge.body).font(.harbor(size: 12)).foregroundStyle(Theme.textSecondary)
@@ -252,6 +259,7 @@ struct NudgeCard: View {
             if !nudge.because.isEmpty {
                 HStack(alignment: .firstTextBaseline, spacing: 5) {
                     Image(systemName: "chart.bar.xaxis").font(.harbor(size: 10))
+                        .accessibilityHidden(true)
                     Text(nudge.because).font(.harbor(size: 11))
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -261,6 +269,7 @@ struct NudgeCard: View {
                 HStack(alignment: .firstTextBaseline, spacing: 5) {
                     Image(systemName: nudge.undone ? "arrow.uturn.backward.circle" : "checkmark.circle")
                         .font(.harbor(size: 10))
+                        .accessibilityHidden(true)
                     Text(nudge.undone ? "Undone: \(nudge.autoSummary)" : "Already done: \(nudge.autoSummary)")
                         .font(.harbor(size: 11))
                         .fixedSize(horizontal: false, vertical: true)
@@ -270,18 +279,27 @@ struct NudgeCard: View {
             HStack(spacing: 6) {
                 if nudge.canUndo {
                     chip("Undo", primary: true) { respond(.undo) }
+                        .layoutPriority(1)
                 }
                 ForEach(Array(nudge.offeredActions.enumerated()), id: \.offset) { position, act in
                     if act.isPrompt || !nudge.performed {
                         chip(act.buttonTitle, primary: position == 0 && !nudge.canUndo) {
                             respond(.act(act.index))
                         }
+                        .layoutPriority(1)
                     }
                 }
                 Spacer(minLength: 0)
-                chip("Useful") { respond(.feedback("useful")) }
-                chip("Not now") { respond(.feedback("not_now")) }
-                chip("Wrong") { respond(.feedback("wrong")) }
+                // The feedback chips give way first, so an action's title is never the one cut short.
+                HStack(spacing: 6) {
+                    chip("Useful") { respond(.feedback("useful")) }
+                        .accessibilityLabel("Mark as useful")
+                    chip("Not now") { respond(.feedback("not_now")) }
+                        .accessibilityLabel("Not now")
+                    chip("Wrong") { respond(.feedback("wrong")) }
+                        .accessibilityLabel("Mark as wrong")
+                }
+                .layoutPriority(0)
             }
             .disabled(nudge.busy)
             if !nudge.status.isEmpty {
@@ -294,13 +312,17 @@ struct NudgeCard: View {
     }
 
     private func chip(_ title: String, primary: Bool = false, _ action: @escaping () -> Void) -> some View {
-        Button(title, action: action)
-            .buttonStyle(.plain)
-            .font(.harbor(size: 11, weight: primary ? .medium : .regular))
-            .foregroundStyle(primary ? Color.black : Theme.textSecondary)
-            .lineLimit(1)
-            .padding(.horizontal, 10).padding(.vertical, 4)
-            .background(Capsule().fill(primary ? Color.white : Theme.chipFill))
-            .overlay(Capsule().stroke(primary ? Color.clear : Theme.chipStroke, lineWidth: 1))
+        // Styling inside the label, so the whole capsule takes the click.
+        Button(action: action) {
+            Text(title)
+                .font(.harbor(size: 11, weight: primary ? .medium : .regular))
+                .foregroundStyle(primary ? Color.black : Theme.textSecondary)
+                .lineLimit(1)
+                .padding(.horizontal, 10).padding(.vertical, 4)
+                .background(Capsule().fill(primary ? Color.white : Theme.chipFill))
+                .overlay(Capsule().stroke(primary ? Color.clear : Theme.chipStroke, lineWidth: 1))
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
     }
 }

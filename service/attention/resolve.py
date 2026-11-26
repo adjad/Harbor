@@ -170,8 +170,73 @@ def _yearless(arrival: datetime, month: int, day: int) -> date | None:
 # on the way (the extractor can drop it), and "the next 11:30" is a guess about a different day.
 _STATED_DAY = re.compile(
     r"\b(?:tomorrow|tmrw|tmr|tmw|day\s+after\s+tomorrow|" + "|".join(_WEEKDAYS) + r")\b"
+    r"|\b(?:on\s+)?the\s+\d{1,2}(?:st|nd|rd|th)\b"
     r"|\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b|\b\d{4}-\d{2}-\d{2}\b"
     r"|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{1,2}\b", re.I)
+
+
+# A day of the month on its own: "on the 28th", "the 3rd". The extractor drops it.
+_ORDINAL_DAY = re.compile(r"\b(?:on\s+)?the\s+(\d{1,2})(?:st|nd|rd|th)\b(?!\s+(?:of\s+)?(?:jan|feb|mar|apr|may|jun|jul|"
+                          r"aug|sep|oct|nov|dec))", re.I)
+# The half of the day the sender named for a bare hour ("6 tomorrow morning", "8 in
+# the morning", "7 tonight").
+# Meals and "early" are not day halves ("breakfast Sunday at 2", "leave early at 5").
+_MORNING = re.compile(r"\b(?:in\s+the\s+morning|(?:this|tomorrow|tmrw|tmr|sunday|monday|tuesday|wednesday|thursday|"
+                      r"friday|saturday)\s+morning|morning|a\.m\.)", re.I)
+_LATER = re.compile(r"\b(?:afternoon|evening|tonight|tonite|night|p\.m\.)", re.I)
+
+
+def _ordinal_date(arrival: datetime, text: str) -> date | None:
+    """The next date with the stated day of the month ("on the 28th"), from the
+    arrival day on; None for no such phrase or a day no month has."""
+    m = _ORDINAL_DAY.search(text)
+    if not m:
+        return None
+    wanted = int(m.group(1))
+    if not 1 <= wanted <= 31:
+        return None
+    year, month = arrival.year, arrival.month
+    for _ in range(13):
+        try:
+            cand = date(year, month, wanted)
+        except ValueError:
+            cand = None
+        if cand and cand >= arrival.date():
+            return cand
+        month += 1
+        if month > 12:
+            year, month = year + 1, 1
+    return None
+
+
+# A meal settles the half only for an hour that fits it ("dinner tomorrow at 6"):
+# "breakfast Sunday at 2" or "lunch or dinner at 7" is still a guess.
+# Narrow on purpose: "dinner at 9" may still be anyone's guess, "dinner at 6" is not.
+_MEALS = ((re.compile(r"\b(?:dinner|supper)\b", re.I), "pm", range(4, 7)),
+          (re.compile(r"\bbreakfast\b", re.I), "am", range(6, 10)),
+          (re.compile(r"\blunch\b", re.I), "noon", (11, 12, 1, 2)))
+
+
+def _meal_part(sentence: str, hour: int) -> str:
+    named = [(part, hours) for pattern, part, hours in _MEALS if pattern.search(sentence)]
+    if len(named) != 1 or hour not in named[0][1]:
+        return ""
+    part = named[0][0]
+    return ("am" if hour == 11 else "pm") if part == "noon" else part
+
+
+def _day_part(text: str, at: int, end: int, hour: int | None = None) -> str:
+    """"am", "pm" or "" for the clock at text[at:end]: a day-part word in its own
+    sentence, the nearer one when both appear; else a meal that fits `hour`."""
+    lo = max((text.rfind(c, 0, at) for c in ".!?\n"), default=-1) + 1
+    hi = min([i for i in (text.find(c, end) for c in ".!?\n") if i >= 0] or [len(text)])
+    sentence = text[lo:hi]
+    spot = at - lo
+    found = [(abs(m.start() - spot), "am") for m in _MORNING.finditer(sentence)]
+    found += [(abs(m.start() - spot), "pm") for m in _LATER.finditer(sentence)]
+    if found:
+        return min(found)[1]
+    return _meal_part(sentence, hour) if hour is not None else ""
 
 
 def _without_stray_words(text: str, tz: str, arrival: datetime, source_id: str) -> str:
@@ -266,6 +331,9 @@ def _resolve(text: str, arrival: datetime, tz: str, source_id: str) -> Resolved:
         del days[arrival.date()]
     if len(days) > 1:
         return Resolved(None, None, False, quote, tentative=tentative, blocked="conflicting_times")
+    if not days and (ordinal := _ordinal_date(arrival, text)) is not None:
+        # "on the 28th": a day the extractor can't read; the next such date.
+        days[ordinal] = (("date:ordinal_day",), _ORDINAL_DAY.search(text).start())
     day, (inferred, day_at) = next(iter(days.items())) if days else (None, ((), None))
     inferred = list(inferred)
 
@@ -282,19 +350,31 @@ def _resolve(text: str, arrival: datetime, tz: str, source_id: str) -> Resolved:
     ambiguous = (1 <= hour <= 12 and not _EXPLICIT_MERIDIEM.search(f.span.quote)
                  and not _TWENTY_FOUR_HOUR.search(f.span.quote))
     if ambiguous:
-        inferred.append("meridiem")
         hour %= 12
+        part = _day_part(text, f.span.start, f.span.end, hour or 12)
+        if part:
+            # The sender said which half ("6 tomorrow morning", "7 tonight"): read as said.
+            inferred.append("meridiem:" + part)
+            if part == "pm":
+                hour += 12
+            if day is None:
+                start = _next_clock(arrival, hour, minute, zone)
+                guessed = _far(start, arrival)
+                return Resolved(start, start.date(), True, quote, tuple(inferred + ["date:next_occurrence"]),
+                                tentative or guessed, at=at, guessed=guessed)
+            return Resolved(_at(day, hour, minute, zone), day, True, quote, tuple(inferred), tentative, at=at)
+        inferred.append("meridiem")
         if day is None:                                 # nearest upcoming of am/pm
             start = min(_next_clock(arrival, h, minute, zone) for h in (hour, hour + 12))
             guessed = _far(start, arrival)
             return Resolved(start, start.date(), True, quote,
                             tuple(inferred + ["date:next_occurrence"]),
                             tentative or guessed, at=at, guessed=guessed)
-        # A known day with a bare hour: 1-6 is the afternoon; 7-11 could be either.
-        guessed = not 1 <= hour <= 6
+        # A known day with a bare hour and no word for its half: the afternoon is
+        # our reading, never the sender's, so it is always a guess (tentative).
         hour += 12
-        return Resolved(_at(day, hour, minute, zone), day, True, quote, tuple(inferred),
-                        tentative or guessed, at=at, guessed=guessed)
+        return Resolved(_at(day, hour, minute, zone), day, True, quote, tuple(inferred), True, at=at,
+                        guessed=True)
     if day is None:
         start = _next_clock(arrival, hour, minute, zone)
         guessed = _far(start, arrival)

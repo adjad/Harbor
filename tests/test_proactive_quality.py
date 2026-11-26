@@ -407,6 +407,43 @@ def test_day_summary_reads_naturally():
                     "Three people are waiting on a reply.")
 
 
+def test_day_summary_names_all_day_and_ongoing_events_instead_of_nothing():
+    """Quality check: an all-day "Team offsite", or a conference that began
+    yesterday, got "Nothing on your calendar for the rest of today."."""
+    zone = ZoneInfo(TZ)
+    midnight = datetime.fromtimestamp(NOW, zone).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    offsite = {"source": "calendar", "due_ts": midnight, "title": "Team offsite", "done": False, "timed": False}
+    assert cycle._day_summary([], [offsite], [], NOW, TZ) == "All day: Team offsite."
+    conference = {"title": "Design summit (day 2)", "when_ts": midnight - 86400 + 9 * 3600,
+                  "end_ts": NOW + 2 * 3600, "all_day": False}
+    text = cycle._day_summary([], [], [], NOW, TZ, ongoing=[conference])
+    assert text.startswith("Design summit is on until ") and cycle.NO_EVENTS_SENTENCE not in text
+    multi_day = {"title": "Spring break", "when_ts": midnight - 2 * 86400, "end_ts": midnight + 3 * 86400, "all_day": True}
+    assert cycle._day_summary([], [], [], NOW, TZ, ongoing=[multi_day]) == "All day: Spring break."
+    assert cycle._day_summary([], [], [], NOW, TZ) == cycle.NO_EVENTS_SENTENCE      # still, with nothing on
+
+
+def test_the_schedule_carries_events_in_progress_with_their_end():
+    zone = ZoneInfo(TZ)
+    midnight = datetime.fromtimestamp(NOW, zone).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+    class Store:
+        def upcoming(self, *a, **k): return []
+        def hidden_commitment_ids(self, now): return set()
+        def undated_reminders(self): return []
+        def calendar_events_overlapping(self, start, end):
+            assert start == midnight
+            return [{"id": "ev-summit", "title": "Design summit", "when_ts": midnight - 15 * 3600,
+                     "end_ts": NOW + 3600, "all_day": 0, "source": "calendar"},
+                    {"id": "ev-done", "title": "Standup", "when_ts": NOW - 7200, "end_ts": NOW - 3600,
+                     "all_day": 0, "source": "calendar"},
+                    {"id": "ev-later", "title": "Lab", "when_ts": NOW + 7200, "end_ts": NOW + 9000,
+                     "all_day": 0, "source": "calendar"}]
+    sched = sources.schedule(Store(), NOW, TZ, own="me@example.com", linked=set())
+    assert [e["title"] for e in sched["ongoing"]] == ["Design summit"]
+    assert sched["ongoing"][0]["end_ts"] == NOW + 3600 and sched["calendar"] == []
+
+
 # --- re-audit: the unknown lock survives the next cycle ----------------------------------------------
 
 
@@ -710,7 +747,8 @@ def test_a_judged_item_citing_two_sources_does_not_crash_the_judge():
 def test_a_chat_is_not_withheld_just_because_summarizing_redacted_a_number():
     rows = [(NOW - 120, "Mom", "Mom: rent is 1450 this month, can you call me tonight?", GUID_MOM)]
     item = sources.text_items(rows, now=NOW, own=ME)[0]
-    assert "omitted" in item["text"]               # the summary redactor hid the number
+    # The on-device reading keeps ordinary words and numbers (only secret values are masked).
+    assert "rent is 1450 this month, can you call me tonight?" in item["text"]
     assert not triage.withheld(item)
     otp = sources.text_items([(NOW - 60, "Mom", "Mom: your code is 482913", GUID_MOM)], now=NOW, own=ME)[0]
     assert triage.withheld(otp)

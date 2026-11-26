@@ -191,9 +191,12 @@ def parse_plan(content: str | None, allowed: set[str]) -> Plan:
         return Plan(status="answer", error="unparseable plan")
     if not isinstance(data, dict):
         return Plan(status="answer", error="plan is not an object")
-    status = data.get("status") if data.get("status") in STATUSES else "call_tools"
+    status = data.get("status")
+    status = status if isinstance(status, str) and status in STATUSES else "call_tools"
+    listed = data.get("calls")
     calls: list[tuple[str, dict]] = []
-    for item in data.get("calls") or []:
+    # A backend that ignored the grammar can send `calls: 1`, `true` or an object.
+    for item in listed if isinstance(listed, list) else []:
         if not isinstance(item, dict):
             continue
         name, args = item.get("tool"), item.get("arguments")

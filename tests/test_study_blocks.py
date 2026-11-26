@@ -238,3 +238,50 @@ def test_day_stops_showing_a_block_deleted_in_calendar():
     # a stale or unknown Calendar copy concludes nothing
     blocks, _ = blocks_api.mark([dict(BLOCK)], [], DAY, booked, status=None, events={}, now=2010.0)
     assert [b["added"] for b in blocks] == [True]
+
+
+def test_concurrent_bookings_and_forgets_never_drop_each_other(env, monkeypatch):
+    """A Day refresh forgets one block in the threadpool while a booking saves another on
+    the loop: both read-modify-write the same map, so neither may lose the other's change."""
+    import threading
+    import time as _time
+    _, store, _ = env
+    real_meta = StudyStore.meta
+
+    def slow_meta(self, key, default=None):
+        value = real_meta(self, key, default)
+        _time.sleep(0.05)               # widen the read-then-write window
+        return value
+    monkeypatch.setattr(StudyStore, "meta", slow_meta)
+    blocks_api._save("study-block:old", {"source_id": "EVT-old"})
+    threads = [threading.Thread(target=blocks_api._save, args=(f"study-block:new-{i}", {"source_id": f"EVT-{i}"}))
+               for i in range(4)]
+    threads.append(threading.Thread(target=blocks_api._forget, args=("study-block:old", "2026-11-16")))
+    threads.append(threading.Thread(target=blocks_api._forget, args=("study-block:old", "2026-11-16")))
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    saved = real_meta(store, blocks_api.META, {})
+    assert set(saved) == {f"study-block:new-{i}" for i in range(4)}
+    assert real_meta(store, blocks_api.GENS, {}) == {"study-block:old|2026-11-16": 2}
+
+
+def test_deck_errors_from_two_threads_are_both_kept(tmp_path, monkeypatch):
+    import threading
+    import time as _time
+    store = StudyStore(tmp_path / "study.db")
+    real_meta = StudyStore.meta
+
+    def slow_meta(self, key, default=None):
+        value = real_meta(self, key, default)
+        _time.sleep(0.05)
+        return value
+    monkeypatch.setattr(StudyStore, "meta", slow_meta)
+    threads = [threading.Thread(target=store.set_deck_error, args=(f"src-{i}", "Couldn't read it"))
+               for i in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert set(real_meta(store, "deck_errors", {})) == {"src-0", "src-1", "src-2"}

@@ -143,8 +143,11 @@ struct ChatSidebar: View {
                     .foregroundStyle(ChatTheme.text)
                     .focused(searchFocused)
                 if !store.search.isEmpty {
-                    Button { store.search = "" } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(ChatTheme.text3) }
-                        .buttonStyle(.plain).accessibilityLabel("Clear search")
+                    Button { store.search = "" } label: {
+                        Image(systemName: "xmark.circle.fill").foregroundStyle(ChatTheme.text3)
+                            .frame(width: 20, height: 20).contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain).help("Clear search").accessibilityLabel("Clear search")
                 }
             }
             .padding(.horizontal, 12).padding(.vertical, 7)
@@ -235,7 +238,7 @@ private struct ChatHistoryRow: View {
         Button(action: select) {
             HStack(spacing: 8) {
                 Text(conversation.title)
-                    .font(.harbor(.body, on: .window)).lineLimit(1)
+                    .font(.harbor(.body, on: .window)).lineLimit(1).truncationMode(.tail)
                     .foregroundStyle(isSelected ? ChatTheme.text : ChatTheme.text2)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 // A card in this chat is waiting for a yes, wherever the reader is now.
@@ -251,6 +254,7 @@ private struct ChatHistoryRow: View {
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
+        .help(conversation.title)
         .contextMenu { Button("Delete chat…", role: .destructive) { confirmDelete = true } }
         .confirmationDialog("Delete this chat?", isPresented: $confirmDelete, titleVisibility: .visible) {
             Button("Delete chat", role: .destructive, action: delete)
@@ -260,6 +264,7 @@ private struct ChatHistoryRow: View {
         }
         .accessibilityLabel(conversation.title)
         .accessibilityValue(conversation.hasPendingApproval ? "Waiting for your OK" : "")
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 }
 
@@ -303,12 +308,27 @@ private struct ChatSidebarFooter: View {
 struct ChatIconButtonStyle: ButtonStyle {
     var active = false
     func makeBody(configuration: Configuration) -> some View {
-        configuration.label
+        ChatIconButtonBody(label: configuration.label, active: active, pressed: configuration.isPressed)
+    }
+}
+
+/// Holds the hover state a ButtonStyle can't, so icon buttons answer the
+/// pointer the way the history rows beside them do.
+private struct ChatIconButtonBody<Label: View>: View {
+    let label: Label
+    let active: Bool
+    let pressed: Bool
+    @State private var hovering = false
+
+    var body: some View {
+        label
             .font(.harbor(size: 13))
             .foregroundStyle(active ? ChatTheme.teal : ChatTheme.text2)
             .frame(width: 30, height: 30)
-            .background(RoundedRectangle(cornerRadius: 8).fill(active ? ChatTheme.tealWash : (configuration.isPressed ? ChatTheme.glass2 : .clear)))
+            .background(RoundedRectangle(cornerRadius: 8).fill(
+                active ? ChatTheme.tealWash : (pressed ? ChatTheme.glass2 : (hovering ? ChatTheme.glass : .clear))))
             .contentShape(Rectangle())
+            .onHover { hovering = $0 }
     }
 }
 
@@ -419,7 +439,7 @@ struct ChatEmptyState: View {
             ChatOrb(size: 76)
             Text("What are we working on?")
                 .font(.harbor(size: 34, weight: .regular, design: .serif)).foregroundStyle(ChatTheme.text)
-            Text("Harbor's AI runs on this Mac. Web lookups, and any cloud model you turn on, go online.")
+            Text("Harbor runs on this Mac. Web lookups and any cloud model you turn on go online.")
                 .font(.harbor(.callout, on: .window)).foregroundStyle(ChatTheme.text2).multilineTextAlignment(.center)
             ChatFlowLayout(spacing: 8) {
                 ForEach(suggestions, id: \.self) { s in
@@ -493,7 +513,7 @@ struct ChatConversationView: View {
         VStack(spacing: 0) {
             if conversation.messages.isEmpty {
                 if conversation.loading {
-                    VStack { Spacer(); ProgressView().controlSize(.small); Spacer() }.frame(maxWidth: .infinity)
+                    VStack { Spacer(); ChatThinkingRow(label: "Opening chat…"); Spacer() }.frame(maxWidth: .infinity)
                 } else {
                     ChatEmptyState { store.submit($0) }
                 }
@@ -725,9 +745,10 @@ private struct ChatThinkingRow: View {
     let label: String
     var body: some View {
         HStack(spacing: 8) {
-            ProgressView().controlSize(.small)
+            ProgressView().controlSize(.small).accessibilityHidden(true)
             Text(label).font(.harbor(.body, on: .window)).foregroundStyle(ChatTheme.text3)
         }
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -1094,8 +1115,11 @@ struct ChatComposer: View {
                     HStack(spacing: 8) {
                         Image(systemName: "photo").font(.harbor(size: 12))
                         Text(image.name).font(.harbor(.footnote, on: .window, design: .monospaced)).lineLimit(1)
-                        Button { self.image = nil; attachNote = "" } label: { Image(systemName: "xmark").font(.harbor(size: 10, weight: .semibold)) }
-                            .buttonStyle(.plain).accessibilityLabel("Remove image")
+                        Button { self.image = nil; attachNote = "" } label: {
+                            Image(systemName: "xmark").font(.harbor(size: 10, weight: .semibold))
+                                .frame(width: 20, height: 20).contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain).help("Remove image").accessibilityLabel("Remove image")
                     }
                     .foregroundStyle(ChatTheme.text2)
                     .padding(.horizontal, 10).padding(.vertical, 5)
@@ -1136,16 +1160,19 @@ struct ChatComposer: View {
                             Image(systemName: "stop.fill").font(.harbor(size: 11))
                                 .foregroundStyle(ChatTheme.sendIcon).frame(width: 32, height: 32)
                                 .background(Circle().fill(ChatTheme.sendFill))
+                                .contentShape(Circle())
                         }
-                        .buttonStyle(.plain).help("Stop").accessibilityLabel("Stop")
+                        .buttonStyle(.plain).help("Stop the reply").accessibilityLabel("Stop")
                     } else {
                         Button(action: send) {
                             Image(systemName: "arrow.up").font(.harbor(size: 13, weight: .bold))
                                 .foregroundStyle(canSend ? ChatTheme.sendIcon : ChatTheme.text3)
                                 .frame(width: 32, height: 32)
                                 .background(Circle().fill(canSend ? ChatTheme.sendFill : ChatTheme.glass2))
+                                .contentShape(Circle())
                         }
-                        .buttonStyle(.plain).disabled(!canSend).accessibilityLabel("Send")
+                        .buttonStyle(.plain).disabled(!canSend)
+                        .help(canSend ? "Send (Return)" : "Type a message to send").accessibilityLabel("Send")
                     }
                 }
             }

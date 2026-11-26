@@ -140,8 +140,8 @@ final class StudyModel: ObservableObject {
             #endif
         }
         pages = Array(pages.prefix(StudyPageReader.maxPages)).map { page in
-            page.text.count > Self.maxPageText
-                ? StudyPage(url: page.url, title: page.title, text: String(page.text.prefix(Self.maxPageText)))
+            ScalarCap.exceeds(page.text, Self.maxPageText)
+                ? StudyPage(url: page.url, title: page.title, text: ScalarCap.prefix(page.text, Self.maxPageText))
                 : page
         }
         guard !pages.isEmpty else {

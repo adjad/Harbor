@@ -128,6 +128,70 @@ class GoogleWorkspace(unittest.TestCase):
         self.assertEqual(calls, [("/x/uvx", *PINNED, "--help")])
         self.assertEqual(G._prepare["state"], "ready")
 
+    def test_warm_timeout_kills_the_download_and_a_failed_start_is_not_ready(self):
+        class _Slow:
+            returncode = None
+            killed = waited = False
+
+            async def communicate(self):
+                await asyncio.sleep(10)
+
+            def kill(self):
+                self.killed = True
+                self.returncode = -9
+
+            async def wait(self):
+                self.waited = True
+                return self.returncode
+        slow = _Slow()
+
+        async def fake_exec(*args, **kwargs):
+            return slow
+        with patch.object(G.asyncio, "create_subprocess_exec", fake_exec), \
+                patch.object(G, "WARM_TIMEOUT_S", 0.05), \
+                patch.object(G.manager, "reload", new=AsyncMock()) as reload:
+            asyncio.run(_REAL_WARM("/x/uvx"))
+        self.assertTrue(slow.killed and slow.waited)
+        self.assertEqual(G._prepare["state"], "failed")
+        self.assertIn("longer than", G._prepare["detail"])
+        reload.assert_not_awaited()
+
+        class _Done:
+            returncode = 0
+
+            async def communicate(self):
+                return b"", b""
+
+        async def done_exec(*args, **kwargs):
+            return _Done()
+        with patch.object(G.asyncio, "create_subprocess_exec", done_exec), \
+                patch.object(G.manager, "reload", new=AsyncMock(side_effect=RuntimeError("synthetic"))):
+            asyncio.run(_REAL_WARM("/x/uvx"))
+        self.assertEqual(G._prepare["state"], "failed")
+
+    def test_a_second_warm_replaces_the_first_and_disable_stops_it(self):
+        started = []
+
+        async def fake_warm(uvx):
+            started.append(uvx)
+            await asyncio.sleep(10)
+
+        async def run():
+            with patch.object(G, "_warm", fake_warm):
+                G._start_warm("/x/one")
+                first = G._warm_task
+                G._start_warm("/x/two")
+                second = G._warm_task
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                self.assertTrue(first.cancelled() or first.cancelling())
+                self.assertFalse(second.done())
+                G._cancel_warm()
+                await asyncio.sleep(0)
+                self.assertTrue(second.cancelled())
+                self.assertIsNone(G._warm_task)
+        asyncio.run(run())
+
     def test_enable_needs_uv_and_a_client_id(self):
         with patch.object(G, "find_uvx", return_value=""):
             self.assertFalse(asyncio.run(G.enable("id", "", ""))["ok"])

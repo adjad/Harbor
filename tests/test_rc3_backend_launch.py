@@ -129,7 +129,7 @@ def test_shutdown_is_bounded_so_an_open_event_stream_cannot_hold_it(  # l05-live
     # Quit and restart still wait for the child; the wait itself is unchanged.
     manager = _manager()
     assert re.search(r"func restart\(\) async \{\s*guard !portConflict else \{ return \}\s*"
-                     r"backendChanges \+= 1\s*await stopAndWait\(\)\s*await startIfNeeded\(\)\s*"
+                     r"backendChanges \+= 1\s*await stopAndWait\(\)\s*await finishStartInFlight\(\)\s*await startIfNeeded\(\)\s*"
                      r"endBackendChange\(\)\s*\}", manager)
 
 

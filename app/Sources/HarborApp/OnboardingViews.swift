@@ -10,6 +10,8 @@ import SwiftUI
 enum OnboardingPalette {
     static let violet = Color(red: 0.43, green: 0.42, blue: 0.94)
     static let lilac = Color(red: 0.73, green: 0.74, blue: 0.96)
+    /// The faint fill under an onboarding card and the "Try asking" prompts.
+    static let cardFill = Color.white.opacity(0.04)
 }
 
 /// Dark and frosted: the window's own material, with a faint violet glow at
@@ -71,11 +73,13 @@ struct OnboardingCard<Trailing: View>: View {
                 Text(detail).font(.system(size: 12)).foregroundStyle(Theme.textMuted)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            // A long detail wraps instead of squeezing a trailing button onto two lines.
+            .layoutPriority(1)
             Spacer(minLength: 8)
-            trailing()
+            trailing().fixedSize()
         }
         .padding(.horizontal, 14).padding(.vertical, 11)
-        .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.04)))
+        .background(RoundedRectangle(cornerRadius: 10).fill(OnboardingPalette.cardFill))
         .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.hairline))
         .padding(.bottom, 9)
     }
@@ -159,7 +163,7 @@ struct OnboardingGoogleStep: View {
 
     private func noticeRow(_ text: String, button: String, action: @escaping () -> Void) -> some View {
         HStack(alignment: .top, spacing: 10) {
-            Image(systemName: "exclamationmark.circle").foregroundStyle(Color.orange).accessibilityHidden(true)
+            Image(systemName: "exclamationmark.circle").foregroundStyle(Theme.warn).accessibilityHidden(true)
             Text(text).font(.system(size: 12)).foregroundStyle(Theme.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 8)
@@ -176,7 +180,7 @@ struct OnboardingGoogleStep: View {
             HStack(spacing: 12) {
                 Image(systemName: account.state == .connected ? "checkmark.circle.fill" : "exclamationmark.circle")
                     .font(.system(size: 15))
-                    .foregroundStyle(account.state == .connected ? Color.green.opacity(0.85) : Color.orange)
+                    .foregroundStyle(account.state == .connected ? Color.green.opacity(0.85) : Theme.warn)
                     .frame(width: 30, height: 30)
                     .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 2) {

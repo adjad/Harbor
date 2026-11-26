@@ -305,3 +305,16 @@ def test_all_day_receipt_persists_date_identity_and_never_queues_a_midnight_aler
     assert assistant.reminder_create_retry_state(previous) == 'present'
     assistant.add_manual(action['title'], when)
     assert len(assistant.active_between(when - 1, when + 1, include_stale=True)) == 2
+
+
+def test_a_following_ordinal_not_after_the_previous_day_is_next_month():
+    late = datetime(2026, 12, 20, 10, 0)
+    plan = compile_task('set a reminder on december 31st for party and another on the 2nd for tax', now=late)
+    assert [s.args['when_iso'] for s in plan_task(plan)] == ['2026-12-31T09:00', '2027-01-02T09:00']
+    plan = compile_task('set a reminder on december 25th for gifts and another on the 2nd for tax', now=late)
+    assert [s.args['when_iso'] for s in plan_task(plan)] == ['2026-12-25T09:00', '2027-01-02T09:00']
+    plan = compile_task('set a reminder on october 20th for review and another on the 20th for draft', now=NOW)
+    assert plan is None or not plan.steps                  # the same day: ask, don't guess a month
+    # Jan 31 then "the 30th": February has no 30th, so it is not a reminder date.
+    plan = compile_task('set a reminder on january 31st for rent and another on the 30th for tax', now=NOW)
+    assert plan is None or not plan.steps

@@ -393,6 +393,7 @@ class SessionStore:
 
     def set_summary(self, sid: str, summary: str, summarized_idx: int) -> None:
         with self._lock:
+            # An UPDATE on a deleted chat already changes nothing; kept explicit with add_turn.
             self._db.execute(
                 "UPDATE sessions SET summary=?, summarized_idx=? WHERE id=?",
                 (summary, summarized_idx, sid))
@@ -1037,6 +1038,11 @@ class SessionStore:
             from service.safety.redaction import scrub
             content = scrub(content)[0]
         with self._lock:
+            # A chat deleted while its turn was still settling (DELETE /sessions/{sid}
+            # mid-turn) gets nothing written back: the turns and the full-text index
+            # would keep the deleted chat's text with no session row (swarm #6).
+            if self._db.execute("SELECT 1 FROM sessions WHERE id=?", (sid,)).fetchone() is None:
+                return -1
             # Compute the next idx INSIDE the lock (via SQL) so two concurrent
             # turns on one session can't read the same count and collide on the
             # (session_id, idx) primary key.

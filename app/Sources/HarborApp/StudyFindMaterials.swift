@@ -316,7 +316,7 @@ enum StudyFindReader {
                 harvest(area, into: &w, depth: 0, root: true)
                 clock.deadline += now() - started
                 var body = w.lines.joined(separator: "\n")
-                if body.count > maxCharacters { body = String(body.prefix(maxCharacters)) }
+                body = ScalarCap.prefix(body, maxCharacters)
                 pages.append(StudyFindPage(tab: tab, isNew: isNew, url: url, links: w.links,
                                            frames: w.frames, text: body, truncated: w.truncated))
             }
@@ -1478,7 +1478,7 @@ final class StudyFindRun: ObservableObject {
                 if landed.truncated { c.truncated += 1 }
                 counts = c
                 if (item.kind == "page" || item.kind == "discussion"), !landed.text.isEmpty {
-                    texts[item.id] = String(landed.text.prefix(StudyFindReader.maxCharacters))
+                    texts[item.id] = ScalarCap.prefix(landed.text, StudyFindReader.maxCharacters)
                 }
                 deeper += landed.links
                 deeperFrames += landed.frames

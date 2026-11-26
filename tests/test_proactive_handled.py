@@ -49,7 +49,7 @@ def store(tmp_path):
     s.save_state(as_of=NOW - 600, timezone=TZ, accounts=[ME], cards=[], todos=[], threads=[], seen={
         MOM: {"source": "messages", "conversation": "Mom", "received_ts": NOW - 900},
         PROF: {"source": "mail", "account": ME, "subject": "Thesis draft", "message_id": "<in1@school.edu>",
-               "received_ts": NOW - 3600}})
+               "received_ts": NOW - 3600, "sender": "prof@school.edu"}})
     return s
 
 
@@ -61,7 +61,10 @@ def test_sent_mail_answers_a_thread_by_reply_header_or_subject():
                                     account="other@x", subject="Thesis draft", message_id="<in1@school.edu>",
                                     after=after)
     assert sources.answered_by_sent([sent("Re: Thesis draft", NOW)], account=ME, subject="Thesis draft",
-                                    message_id="", after=after)
+                                    message_id="", after=after, sender="prof@school.edu")
+    # The subject alone is no proof: it must have gone to the person who wrote.
+    assert not sources.answered_by_sent([sent("Re: Thesis draft", NOW)], account=ME, subject="Thesis draft",
+                                        message_id="", after=after, sender="someone@else.example")
     assert not sources.answered_by_sent([sent("Re: Thesis draft", after - 60)], account=ME,
                                         subject="Thesis draft", message_id="", after=after), "sent before it arrived"
     assert not sources.answered_by_sent([sent("Re: Thesis draft", NOW, account="work@x")], account=ME,
@@ -87,7 +90,9 @@ def test_latest_sent_texts_and_seen_entries():
     assert handled.latest_sent_texts(records) == {"Mom": NOW - 60}
     one = {"id": MOM, "source": "messages", "received_ts": NOW - 900, "ref": {"conversation": "Mom"}}
     assert handled.seen_entry(one) == {"source": "messages", "conversation": "Mom", "received_ts": NOW - 900}
-    assert handled.seen_entry({**one, "group": True}) is None, "a group reply isn't an answer to everyone"
+    # A group chat is swept too: the user's own newest line in it answers it.
+    assert handled.seen_entry({**one, "group": True}) == {"source": "messages", "conversation": "Mom",
+                                                          "received_ts": NOW - 900, "group": True}
     assert handled.seen_entry({"id": "mail:x", "source": "mail", "critical": True, "received_ts": NOW}) is None
 
 
@@ -234,7 +239,7 @@ def test_a_reply_card_leaves_and_its_todo_is_checked(store):
 def test_nothing_changes_without_a_reply(store):
     store.save_state(cards=[card("card:mom", MOM, todo_id="todo:mom")], todos=[todo("todo:mom", MOM)])
     assert handled.sweep(store, now=NOW, texts={"Mom": NOW - 1200}, sent=[]) == \
-        {"cards": [], "todos": [], "threads": []}
+        {"cards": [], "todos": [], "threads": [], "replied": []}
     assert [c["id"] for c in store.state()["cards"]] == ["card:mom"]
 
 

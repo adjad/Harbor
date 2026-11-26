@@ -113,7 +113,7 @@ struct MailMemorySettingsRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Mail suggestions").font(.system(size: 14, weight: .medium))
+            Text("Mail suggestions").font(.harbor(.callout, on: .window, weight: .medium))
             Picker("Mail suggestions", selection: Binding(
                 get: { memory.mode },
                 set: { value in Task { await memory.setMode(value) } })) {
@@ -152,7 +152,7 @@ struct MailMemorySettingsRow: View {
                 get: { memory.factsEnabled == true },
                 set: { value in Task { await memory.setFacts(value) } })) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(MailFactsText.title).font(.system(size: 14, weight: .medium))
+                    Text(MailFactsText.title).font(.harbor(.callout, on: .window, weight: .medium))
                     Text(MailFactsText.caption(known: memory.known, enabled: memory.factsEnabled, mode: memory.mode))
                         .font(.caption).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)

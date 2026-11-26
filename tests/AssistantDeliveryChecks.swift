@@ -246,10 +246,19 @@ struct AssistantDeliveryChecks {
             let collision = await AssistantDelivery(path: file).handle(event, client: client,
                 perform: { _ in fatalError() }, calendar: { _ in fatalError() })
             precondition(!collision && server.ackPosts == 1)
+            // A damaged receipts file is set aside and delivery starts again (swarm #35).
             try Data("corrupt receipts".utf8).write(to: file)
+            var performedAfterDamage = 0
             let corrupt = await AssistantDelivery(path: file).handle(event, client: client,
-                perform: { _ in fatalError() }, calendar: { _ in fatalError() })
-            precondition(!corrupt && server.ackPosts == 1)
+                perform: { _ in performedAfterDamage += 1; return true }, calendar: { _ in fatalError() })
+            let aside = file.deletingLastPathComponent().appendingPathComponent(AssistantDelivery.damagedFileName)
+            precondition(corrupt, "delivery goes on after a damaged receipts file")
+            precondition(performedAfterDamage == 1, "the event is handled once")
+            precondition(server.ackPosts == 2, "and acknowledged: \(server.ackPosts)")
+            precondition((try? Data(contentsOf: aside)) == Data("corrupt receipts".utf8), "the damaged copy is kept aside")
+            precondition(!FileManager.default.fileExists(atPath: file.path)
+                         || (try? JSONSerialization.jsonObject(with: Data(contentsOf: file))) is [String: Any],
+                         "whatever is in its place reads")
             scenarios += 1
         }
         // Failed handling and failed ACK must leave retryable state; restart
@@ -466,11 +475,18 @@ struct AssistantDeliveryChecks {
             scenarios += 1
         }
         do {
+            // Swarm #35: the damaged file is kept byte for byte beside a fresh one, and
+            // delivery goes on instead of stopping for good.
             let file = path(), data = Data("not JSON".utf8)
             try data.write(to: file)
-            let corrupt = await AssistantDelivery(path: file).handle(note, client: client, perform: { _ in fatalError() }, calendar: { _ in fatalError() })
-            let preserved = try Data(contentsOf: file)
-            precondition(!corrupt && preserved == data)
+            let server = ReceiptServer(note)
+            DeliveryMock.handler = server.respond
+            var shown = 0
+            let delivered = await AssistantDelivery(path: file).handle(note, client: client,
+                perform: { _ in shown += 1; return true }, calendar: { _ in fatalError() })
+            let aside = file.deletingLastPathComponent().appendingPathComponent(AssistantDelivery.damagedFileName)
+            precondition(delivered && shown == 1, "delivery goes on")
+            precondition((try? Data(contentsOf: aside)) == data, "the damaged bytes are kept aside")
             scenarios += 1
         }
         // A delete of an undated reminder carries expected_due_ts: null. Only delete may;

@@ -274,6 +274,52 @@ class GoogleCalendarSource(unittest.TestCase):
         self.assertNotIn("IGNORE PREVIOUS", dump)
         self.assertNotIn("evil.test", dump)
 
+    # --- more events than one read takes ------------------------------------
+
+    def paged(self, events, per_page):
+        """A one-calendar Google that hands out ``events`` a page at a time."""
+        calls = []
+
+        def handler(request):
+            if request.url.path.endswith("/users/me/calendarList"):
+                return httpx.Response(200, json={"items": [{"id": JUDGE, "primary": True}]})
+            start = int(request.url.params.get("pageToken") or 0)
+            calls.append(start)
+            body = {"items": events[start:start + per_page]}
+            if start + per_page < len(events):
+                body["nextPageToken"] = str(start + per_page)
+            return httpx.Response(200, json=body)
+        handler.calls = calls
+        return handler
+
+    def week_of(self, count):
+        return [timed(f"e{i}", f"Event {i}", 24 * i + 9) for i in range(count)]
+
+    def test_every_page_is_read(self):
+        google = self.paged(self.week_of(6), 2)
+        self.assertEqual(self.refresh(JUDGE, google), 6)
+        self.assertEqual(google.calls, [0, 2, 4])
+
+    def test_a_capped_read_keeps_the_rows_it_never_reached(self):
+        self.refresh(JUDGE, self.paged(self.week_of(6), 2))
+        with patch.object(C, "MAX_EVENTS_PER_CALENDAR", 4):
+            self.refresh(JUDGE, self.paged(self.week_of(6), 2))
+        self.assertEqual([r["title"] for r in self.rows(JUDGE)], [f"Event {i}" for i in range(6)])
+
+    def test_a_capped_read_still_removes_what_it_saw_was_gone(self):
+        self.refresh(JUDGE, self.paged(self.week_of(6), 2))
+        fewer = [e for e in self.week_of(6) if e["id"] != "e0"]      # deleted early in the window
+        with patch.object(C, "MAX_EVENTS_PER_CALENDAR", 4):
+            self.refresh(JUDGE, self.paged(fewer, 2))
+        titles = [r["title"] for r in self.rows(JUDGE)]
+        self.assertNotIn("Event 0", titles)
+        self.assertIn("Event 5", titles)
+
+    def test_a_full_read_still_removes_every_missing_row(self):
+        self.refresh(JUDGE, self.paged(self.week_of(6), 2))
+        self.refresh(JUDGE, self.paged(self.week_of(3), 2))
+        self.assertEqual([r["title"] for r in self.rows(JUDGE)], ["Event 0", "Event 1", "Event 2"])
+
     # --- audit repairs ------------------------------------------------------
 
     def test_dropped_scope_in_refresh_due_erases_the_accounts_rows(self):

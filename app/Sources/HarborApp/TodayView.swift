@@ -373,6 +373,77 @@ enum DayRefreshPace {
     }
 }
 
+/// The last good plan for today, kept on disk in Harbor's home so the Day's
+/// first open after a launch shows the day at once (faded, inert) while the
+/// service starts and the fresh read comes in. One file, today's plan only,
+/// owner-only permissions; Start over removes it with the rest of Harbor's home
+/// (service/harbor_reset.py). A plan for another day or zone is never shown.
+struct DayPlanDiskCache: Sendable {
+    let url: URL
+    /// Larger replies are not kept: decoding one at launch would cost more than it saves.
+    static let maxBytes = 4 << 20
+    static let fileName = "day-plan-cache.json"
+
+    /// Harbor's home (HARBOR_HOME, else ~/.moe), as the service and the ledgers use it.
+    static var app: DayPlanDiskCache {
+        let home = ProcessInfo.processInfo.environment["HARBOR_HOME"].map { URL(fileURLWithPath: $0) }
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".moe")
+        return DayPlanDiskCache(url: home.appendingPathComponent(fileName))
+    }
+
+    /// Writes go one at a time, in order, off the main thread.
+    private static let queue = DispatchQueue(label: "harbor.day-plan-cache", qos: .utility)
+
+    /// The kept plan when it is for `day` in `zone`; nil otherwise, or when it is
+    /// missing, too large or unreadable.
+    func load(day: String, zone: String) -> TodayPlan? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attributes[.size] as? Int, size > 0, size <= Self.maxBytes,
+              let data = try? Data(contentsOf: url),
+              let plan = try? JSONDecoder().decode(TodayPlan.self, from: data),
+              plan.day == day, plan.timezone == zone else { return nil }
+        return plan
+    }
+
+    /// Keeps `data` (a plan reply that decoded) in place of the last one. Never
+    /// creates Harbor's home; a failed write keeps nothing and says nothing.
+    func save(_ data: Data) {
+        guard data.count <= Self.maxBytes else { return }
+        let url = url
+        Self.queue.async {
+            let folder = url.deletingLastPathComponent()
+            guard FileManager.default.fileExists(atPath: folder.path) else { return }
+            let temporary = folder.appendingPathComponent("." + Self.fileName + ".tmp")
+            guard FileManager.default.createFile(atPath: temporary.path, contents: data,
+                                                 attributes: [.posixPermissions: 0o600]) else { return }
+            if rename(temporary.path, url.path) != 0 { try? FileManager.default.removeItem(at: temporary) }
+        }
+    }
+
+    /// Waits for writes already asked for (checks only).
+    func flush() { Self.queue.sync {} }
+}
+
+/// What a plan reply says, without the fields the service changes on every
+/// read (when it was built and the read's trace id), so a read that brings
+/// nothing new is known as such and not published again.
+enum TodayPlanFingerprint {
+    static func of(_ data: Data) -> Data? {
+        guard var reply = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+        reply["generated_at"] = nil
+        reply["trace_id"] = nil
+        if var workspace = reply["workspace"] as? [String: Any] {
+            workspace["generated_at"] = nil
+            if var proposed = workspace["proposed_plan"] as? [String: Any] {
+                proposed["generated_at"] = nil
+                workspace["proposed_plan"] = proposed
+            }
+            reply["workspace"] = workspace
+        }
+        return try? JSONSerialization.data(withJSONObject: reply, options: [.sortedKeys])
+    }
+}
+
 @MainActor
 final class TodayModel: ObservableObject {
     // The one problem report about Today, shared by the notch's Day tab and
@@ -432,22 +503,53 @@ final class TodayModel: ObservableObject {
     private let nowProvider: () -> Date
     private let zoneProvider: () -> TimeZone
     var transport: (URLRequest) async throws -> (Data, URLResponse)
+    /// Where today's last good plan is kept between launches; nil keeps none.
+    private let planCache: DayPlanDiskCache?
+    /// Today's plan as the last launch left it, read once at start; the Day
+    /// shows it faded until the first read of this launch (`savedPlan`).
+    private var launchPlan: TodayPlan?
+    /// What the plan on screen says, less what changes on every read, and when
+    /// it was published: a background read that brings nothing new is not
+    /// published again (no redraw, no panel resize) for `republishAfter`.
+    private var planFingerprint: Data?
+    private var planPublishedAt: Date?
+    /// An unchanged plan is published again after this long anyway, so the
+    /// Brief's "updated" time and anything keyed on `generated_at` stay current.
+    nonisolated static let republishAfter: TimeInterval = 120
 
     private struct DayKey: Equatable {
         let day: String
         let zone: String
     }
 
+    /// - Parameters:
+    ///   - transport: how the service is asked; the app's URLSession when nil.
+    ///   - planCache: where today's plan is kept between launches. When nil it
+    ///     is Harbor's home with the app's own transport, and none with an
+    ///     injected one (checks and QA pass one explicitly).
     init(timezone: TimeZone? = nil, now: @escaping () -> Date = Date.init,
          timeZoneProvider: (() -> TimeZone)? = nil,
-         transport: @escaping (URLRequest) async throws -> (Data, URLResponse) = { try await URLSession.shared.data(for: $0) }) {
+         transport: ((URLRequest) async throws -> (Data, URLResponse))? = nil,
+         planCache: DayPlanDiskCache? = nil) {
         nowProvider = now
         zoneProvider = timeZoneProvider ?? { timezone ?? .autoupdatingCurrent }
         let current = now()
         let zone = timeZoneProvider?() ?? timezone ?? .autoupdatingCurrent
         selectedDate = current
-        displayedKey = DayKey(day: Self.dayString(current, in: zone), zone: zone.identifier)
-        self.transport = transport
+        let key = DayKey(day: Self.dayString(current, in: zone), zone: zone.identifier)
+        displayedKey = key
+        self.transport = transport ?? { try await URLSession.shared.data(for: $0) }
+        let cache = planCache ?? (transport == nil ? DayPlanDiskCache.app : nil)
+        self.planCache = cache
+        launchPlan = cache?.load(day: key.day, zone: key.zone)
+    }
+
+    /// Today's plan from the last launch, while this launch has read none for
+    /// the day shown: for the Day to show at once, faded and inert. Nil for any
+    /// other day or zone, and once a read of this launch has come in.
+    var savedPlan: TodayPlan? {
+        guard plan == nil, let launchPlan, launchPlan.day == day, launchPlan.timezone == timezone.identifier else { return nil }
+        return launchPlan
     }
 
     var timezone: TimeZone { zoneProvider() }
@@ -596,6 +698,8 @@ final class TodayModel: ObservableObject {
         displayedKey = key
         generation += 1
         plan = nil
+        planFingerprint = nil
+        planPublishedAt = nil
         error = ""
         reportMetadata = ["surface": "today", "client_outcome": "not_loaded", "journal_available": false]
         reportDetails = nil
@@ -711,9 +815,26 @@ final class TodayModel: ObservableObject {
         if capturing { components.queryItems?.append(URLQueryItem(name: "debug", value: "true")) }
         do {
             let data = try await request(components.string!)
+            let fingerprint = capturing ? nil : TodayPlanFingerprint.of(data)
+            // Nothing new since the plan on screen (for this day and zone, read by
+            // this launch, published a moment ago): keep it, say nothing, redraw nothing.
+            if !afterMutation, let fingerprint, fingerprint == planFingerprint, let shown = plan,
+               shown.day == selected.day, shown.timezone == selected.zone,
+               let published = planPublishedAt, nowProvider().timeIntervalSince(published) >= 0,
+               nowProvider().timeIntervalSince(published) < Self.republishAfter {
+                guard ticket == generation, selected == currentKey, !Task.isCancelled else { return }
+                lastRefreshed = nowProvider()
+                settleSuccess()
+                return
+            }
             let next = try JSONDecoder().decode(TodayPlan.self, from: data)
             guard ticket == generation, selected == currentKey, !Task.isCancelled else { return }
             plan = next
+            planFingerprint = fingerprint
+            planPublishedAt = nowProvider()
+            // Today's plan is kept for the next launch's first open (never a
+            // debug read, which carries the replay, nor another day's).
+            if !capturing, selected.day == Self.dayString(nowProvider(), in: timezone) { planCache?.save(data) }
             lastRefreshed = nowProvider()
             reportMetadata = ["surface": "today", "client_outcome": "completed", "revision": next.revision,
                               "task_count": next.tasks.count, "block_count": next.blocks.count,
@@ -727,11 +848,7 @@ final class TodayModel: ObservableObject {
                 }
             }
             reportDetails = capturing && capturePlannerDetails ? ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any]) : nil
-            error = ""
-            transientFailures = 0
-            failingSince = nil
-            retryTask?.cancel()
-            retryTask = nil
+            settleSuccess()
         } catch {
             guard ticket == generation, selected == currentKey else { return }
             // View/task cancellation is normal navigation, not a failed day.
@@ -751,11 +868,23 @@ final class TodayModel: ObservableObject {
             reportMetadata = ["surface": "today", "client_outcome": "refresh_failed", "journal_available": false,
                               "client_error_code": (error as NSError).code]
             reportDetails = nil
-            transientFailures = 0
-            failingSince = nil
+            if transientFailures != 0 { transientFailures = 0 }
+            if failingSince != nil { failingSince = nil }
             // A refused or unreadable plan must not leave stale slots looking actionable.
             plan = nil
+            planFingerprint = nil
+            planPublishedAt = nil
         }
+    }
+
+    /// A read succeeded: clear what the failures said. Each published value is
+    /// set only when it changes, since every set redraws Brief and Day.
+    private func settleSuccess() {
+        if !error.isEmpty { error = "" }
+        if transientFailures != 0 { transientFailures = 0 }
+        if failingSince != nil { failingSince = nil }
+        retryTask?.cancel()
+        retryTask = nil
     }
 
     /// Whether a failed read is a passing condition worth retrying quietly: no
@@ -873,6 +1002,8 @@ final class TodayModel: ObservableObject {
               let reply = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               reply["commitments"] is [[String: Any]], !Task.isCancelled,
               key == DayKey(day: Self.dayString(now, in: timezone), zone: timezone.identifier) else { return }
+        // The same reply again redraws nothing (every set redraws Brief and Day).
+        if let shown = upcomingReply, NSDictionary(dictionary: shown).isEqual(to: reply) { return }
         upcomingReply = reply
     }
 
@@ -892,8 +1023,8 @@ final class TodayModel: ObservableObject {
         let key = DayKey(day: day, zone: zone)
         if storedBriefKey != key {
             storedBriefKey = key
-            storedBrief = nil
-            storedBriefChecked = false
+            if storedBrief != nil { storedBrief = nil }
+            if storedBriefChecked { storedBriefChecked = false }
         }
         func stillCurrent() -> Bool {
             day == Self.dayString(nowProvider(), in: timezone) && zone == timezone.identifier && !Task.isCancelled
@@ -902,14 +1033,14 @@ final class TodayModel: ObservableObject {
             let data = try await request("/assistant/daily_summary/latest?day=\(day)")
             guard let reply = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
                   let brief = StoredBrief.parse(reply, day: day), stillCurrent() else { return }
-            storedBrief = brief
-            storedBriefChecked = true
+            if storedBrief != brief { storedBrief = brief }
+            if !storedBriefChecked { storedBriefChecked = true }
         } catch {
             guard stillCurrent(), !(error is CancellationError), (error as? URLError)?.code != .cancelled else { return }
             let failure = error as NSError
-            if failure.domain == "Today", failure.code == 404 { storedBrief = nil }
+            if failure.domain == "Today", failure.code == 404, storedBrief != nil { storedBrief = nil }
             // Any answer settles it: a service that can't say still shows the note.
-            storedBriefChecked = true
+            if !storedBriefChecked { storedBriefChecked = true }
         }
     }
 

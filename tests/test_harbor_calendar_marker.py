@@ -9,6 +9,8 @@ Invented data only; no model, no server, no user store.
 """
 from __future__ import annotations
 
+import os
+import stat
 import time
 from unittest.mock import patch
 
@@ -115,3 +117,23 @@ def test_google_refresh_drops_the_copy_too(store):
              {**google("Dentist", now, sid="g2"), "source_id": G._prefix("sam@example.com") + "g2"}]
     assert G.store_events("sam@example.com", items, store) == 1
     assert [i["title"] for i in G.stored_items(store, {"sam@example.com"})] == ["Dentist"]
+
+
+def test_the_recorded_events_file_is_owner_only(store):
+    now = time.time() + 7200
+    old = os.umask(0o022)
+    try:
+        harbor_events.record([{"block_id": "task:t1", "title": "Homework 3", "when_ts": now, "end_ts": now + 3600}])
+    finally:
+        os.umask(old)
+    target = harbor_events._path()
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o600
+    assert [e["title"] for e in harbor_events.recorded()] == ["Homework 3"]
+
+
+def test_a_file_an_older_build_left_readable_is_tightened_on_read(store):
+    harbor_events.record([{"block_id": "task:t1", "title": "Homework 3", "when_ts": time.time() + 7200}])
+    target = harbor_events._path()
+    os.chmod(target, 0o644)
+    assert harbor_events.recorded()
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o600

@@ -72,6 +72,7 @@ import sys
 import threading
 import time
 import weakref
+from collections import OrderedDict
 import math
 from dataclasses import asdict, dataclass, field, replace
 from contextvars import ContextVar
@@ -154,7 +155,42 @@ RAW_EVERY = 900
 _FS = "\x01"
 _RS = "\x02"
 
-_meta: dict[tuple[str, str], dict] = {}
+class _Bounded(OrderedDict):
+    """A dict that keeps its newest `limit` entries (least recently written or touched go
+    first). `keep` names values never evicted. Headers metadata and auth evidence were kept
+    for every id ever listed until disconnect: a long-running service grew without end."""
+
+    def __init__(self, limit: int, keep=None):
+        super().__init__()
+        self.limit, self.keep = limit, keep
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        self.move_to_end(key)
+        while len(self) > self.limit:
+            for old in self:                      # oldest first; kept values are skipped
+                if not (self.keep and self.keep(OrderedDict.__getitem__(self, old))):
+                    break
+            else:
+                return
+            del self[old]
+
+
+def _touch(cache, keys) -> None:
+    """Mark entries still listed as recent, so an active inbox's ids are the last to go."""
+    move = getattr(cache, "move_to_end", None)
+    if move is None:
+        return
+    for key in keys:
+        if key in cache:
+            move(key)
+
+
+# Above one cloud-everything account's full walk (CLOUD_HISTORY_LIMIT + sent + tabs) for
+# a few accounts; a local account's working set is about 2,400.
+META_CACHE_MAX = 40_000
+
+_meta: dict[tuple[str, str], dict] = _Bounded(META_CACHE_MAX)
 _last: dict[str, dict[str, float]] = {}
 _errors: dict[str, str] = {}
 # account -> the user's sent messages: {ts, to, subject, message_id, in_reply_to}.
@@ -168,7 +204,9 @@ _raw: dict[str, dict[str, str]] = {}
 # In memory only, never persisted: after a restart a message has no evidence until the next
 # sync fetches it again (no evidence = no proof). Dropped with _meta on reconnect, disconnect
 # and erase. See auth_results_for / authenticated_for and service/mail_auth.py.
-_auth: dict[tuple[str, str], dict | None] = {}
+# Bounded like _meta; a None marker (a shared Message-ID) is never evicted, so a
+# duplicate can't be forgotten and its twin trusted on a later fetch.
+_auth: dict[tuple[str, str], dict | None] = _Bounded(META_CACHE_MAX, keep=lambda value: value is None)
 _access: dict[str, dict] = {}
 _epochs: dict[str, int] = {}
 _locks: dict[tuple[str, str], asyncio.Lock] = {}
@@ -794,6 +832,11 @@ class GmailError(RuntimeError):
     pass
 
 
+class GmailMessageGone(GmailError):
+    """HTTP 404 for one message: it was deleted (or moved out of reach) between the
+    listing and the fetch. That message is skipped; the rest of the pass goes on."""
+
+
 def _mark_expired(email: str, snapshot: dict) -> None:
     """Record that this sign-in expired (invalid_grant) and announce it once.
 
@@ -875,6 +918,8 @@ async def _get(http: httpx.AsyncClient, path: str, params: dict | list | None = 
         elif response.status_code in (429, 500, 503) and attempt < 3:
             await asyncio.sleep(1.5 * (attempt + 1))
             continue
+        if response.status_code == 404 and path.startswith("messages/"):
+            raise GmailMessageGone(f"{path}: HTTP 404")
         if response.status_code != 200:
             raise GmailError(f"{path}: HTTP {response.status_code}")
         return response.json()
@@ -1024,11 +1069,23 @@ def header_line(meta: dict, account: str, unread: bool) -> str:
                      meta["subject"], meta["id"]])
 
 
-def _b64(data: str) -> str:
+def _charset(part: dict) -> str:
+    """The charset named on a part's Content-Type, or "" when none is named."""
+    match = re.search(r'(?i)\bcharset\s*=\s*"?([\w.:-]+)', _header(part, "Content-Type"))
+    return match.group(1) if match else ""
+
+
+def _b64(data: str, charset: str = "") -> str:
+    """A body part's text. Gmail sends the part's bytes in its own charset (Latin-1,
+    windows-1252, Shift-JIS...), so decode with that; UTF-8 when none or unknown."""
     try:
-        return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4)).decode("utf-8", "replace")
+        raw = base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
     except Exception:  # noqa: BLE001
         return ""
+    try:
+        return raw.decode(charset or "utf-8", "replace")
+    except LookupError:
+        return raw.decode("utf-8", "replace")
 
 
 def extract_body(payload: dict) -> str:
@@ -1039,14 +1096,16 @@ def extract_body(payload: dict) -> str:
         mime = part.get("mimeType", "")
         data = (part.get("body") or {}).get("data")
         if data and mime == "text/plain":
-            plain.append(_b64(data))
+            plain.append(_b64(data, _charset(part)))
         elif data and mime == "text/html":
-            markup.append(_b64(data))
+            markup.append(_b64(data, _charset(part)))
         for child in part.get("parts") or []:
             walk(child)
 
     walk(payload or {})
-    if plain:
+    # A blank plain alternative beside a real HTML part (common in newsletters and
+    # notifications) must not stand in for the body.
+    if any(p.strip() for p in plain):
         text = "\n".join(plain)
     else:
         text = re.sub(r"(?is)<(script|style).*?</\1>", " ", "\n".join(markup))
@@ -1181,12 +1240,16 @@ async def search_attachments(account: str, terms: list[str], start: float | None
             ids = [str(item["id"]) for item in listing.get("messages", []) if item.get("id")][:limit]
             gate = asyncio.Semaphore(FETCH_CONCURRENCY)
 
-            async def one(message_id: str) -> dict:
+            async def one(message_id: str) -> dict | None:
                 async with gate:
-                    return await _get(http, f"messages/{message_id}", [("format", "full")])
+                    try:
+                        return await _get(http, f"messages/{message_id}", [("format", "full")])
+                    except GmailMessageGone:
+                        return None
 
             messages = await asyncio.gather(*(one(i) for i in ids))
-    found = [m for m in (_attachment_message(account.lower(), message) for message in messages) if m]
+    found = [m for m in (_attachment_message(account.lower(), message)
+                         for message in messages if message is not None) if m]
     return sorted(found, key=lambda m: m["ts"], reverse=True)
 
 
@@ -1249,16 +1312,20 @@ async def _list_ids(http, limit: int, *, query: str = "", unread: bool = False,
 async def _ensure_meta(http, ids: list[str]) -> None:
     account = _current()[0]
     missing = [i for i in ids if (account, i) not in _meta]
+    _touch(_meta, [(account, i) for i in ids])
     gate = asyncio.Semaphore(FETCH_CONCURRENCY)
 
     async def one(message_id: str) -> None:
         async with gate:
-            data = await _get(http, f"messages/{message_id}", [
-                ("format", "metadata"), ("metadataHeaders", "From"),
-                ("metadataHeaders", "To"), ("metadataHeaders", "Subject"),
-                ("metadataHeaders", "Message-ID"), ("metadataHeaders", "In-Reply-To"),
-                # Read by service/mail_auth.py; same gmail.readonly scope, no new consent.
-                ("metadataHeaders", "Authentication-Results")])
+            try:
+                data = await _get(http, f"messages/{message_id}", [
+                    ("format", "metadata"), ("metadataHeaders", "From"),
+                    ("metadataHeaders", "To"), ("metadataHeaders", "Subject"),
+                    ("metadataHeaders", "Message-ID"), ("metadataHeaders", "In-Reply-To"),
+                    # Read by service/mail_auth.py; same gmail.readonly scope, no new consent.
+                    ("metadataHeaders", "Authentication-Results")])
+            except GmailMessageGone:
+                return          # callers skip ids with no metadata
             meta = parse_metadata(data)
             _meta[(account, message_id)] = meta
             _remember_auth(account, message_id, meta)
@@ -1358,19 +1425,25 @@ async def _sync_raw(http, account: str) -> None:
         return
     gate = asyncio.Semaphore(FETCH_CONCURRENCY)
 
-    async def one(message_id: str) -> dict:
+    async def one(message_id: str) -> dict | None:
         async with gate:
-            return await _get(http, f"messages/{message_id}", [("format", "full")])
+            try:
+                return await _get(http, f"messages/{message_id}", [("format", "full")])
+            except GmailMessageGone:
+                return None
 
     messages = await asyncio.gather(*(one(i) for i in missing))
     if not _still_connected():
         return
-    fetched = {i: raw_record(m, account) for i, m in zip(missing, messages)}
+    fetched = {i: raw_record(m, account) for i, m in zip(missing, messages) if m is not None}
     for i, m in zip(missing, messages):
-        _remember_auth(account, i, parse_metadata(m))
-    records = {i: fetched[i] if i in fetched else _with_read_state(known[i], i in unread) for i in ids}
+        if m is not None:
+            _remember_auth(account, i, parse_metadata(m))
+    # A message deleted since the listing has no record: leave it out.
+    records = {i: fetched[i] if i in fetched else _with_read_state(known[i], i in unread)
+               for i in ids if i in fetched or i in known}
     _raw[account] = records
-    email_tools.cache_external_emails(account=account, raw=_RS.join(records[i] for i in ids))
+    email_tools.cache_external_emails(account=account, raw=_RS.join(records.values()))
     _last.setdefault(account, {})["raw"] = time.time()
 
 
@@ -1383,11 +1456,16 @@ async def _sync_raw_pass(http, account: str, ids: list[str], store: dict[str, st
     from service.tools import email_tools
     batch = missing[:CLOUD_RAW_FETCHES_PER_PASS]        # `ids` lists newest first
     fresh: set[str] = set()
+    gone: set[str] = set()
     gate = asyncio.Semaphore(FETCH_CONCURRENCY)
 
     async def one(message_id: str) -> None:
         async with gate:
-            message = await _get(http, f"messages/{message_id}", [("format", "full")])
+            try:
+                message = await _get(http, f"messages/{message_id}", [("format", "full")])
+            except GmailMessageGone:
+                gone.add(message_id)
+                return
         if _still_connected():
             store[message_id] = raw_record(message, account)
             fresh.add(message_id)
@@ -1400,7 +1478,7 @@ async def _sync_raw_pass(http, account: str, ids: list[str], store: dict[str, st
                for i in ids if i in store}
     _raw[account] = records
     email_tools.cache_external_emails(account=account, raw=_RS.join(records.values()))
-    if len(records) == len(ids):
+    if len(records) == len(ids) - len(gone):
         _last.setdefault(account, {})["raw"] = time.time()
 
 

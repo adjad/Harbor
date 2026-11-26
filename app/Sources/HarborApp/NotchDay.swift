@@ -307,6 +307,32 @@ enum DayCalendarState: Equatable {
     }
 }
 
+/// Whether the Day knows what is due: Reminders were read and the workspace
+/// (where "Needs you" comes from) was built. Until then the summary speaks for
+/// the calendar only and never says "nothing is due" or "nothing planned".
+enum DayDueState: Equatable {
+    case read, reading, unread
+
+    /// - Parameters:
+    ///   - reminders: `TodayPlan.access("reminders")`; nil (a service that sends
+    ///     no Reminders health) counts as read, as before.
+    ///   - workspaceRead: the plan carries a workspace.
+    static func of(reminders: SourceAccess?, workspaceRead: Bool) -> DayDueState {
+        guard workspaceRead else { return .unread }
+        switch reminders?.state {
+        case .syncing?: return .reading
+        case .unavailable?: return .unread
+        case .ready?, nil: return .read
+        }
+    }
+
+    var isRead: Bool { self == .read }
+
+    /// Said after the calendar's part while Reminders are still coming in. An
+    /// unread source has its own row saying why, so nothing more is added.
+    var summaryLine: String? { self == .reading ? "Harbor is still reading your reminders." : nil }
+}
+
 /// `GET /assistant/today/week?start=&timezone=` (service/assistant/today_api.py):
 /// seven days from the calendar copy and the planner, read-only. A day whose
 /// calendar isn't current has `ready` false and no numbers.
@@ -1345,7 +1371,8 @@ struct DayTimeline: Equatable {
     /// The Day tab's blurb, at most two short sentences and a tail: what's up
     /// today and why the day is laid out the way it is.
     static func blurb(_ timeline: DayTimeline, needs: [DayNeedInput], isToday: Bool, endOfDay: Double,
-                      clock: (Double) -> String, dayStart: Double? = nil, calendar: DayCalendarState = .read) -> String {
+                      clock: (Double) -> String, dayStart: Double? = nil, calendar: DayCalendarState = .read,
+                      due dueState: DayDueState = .read) -> String {
         // What's already over doesn't shape the rest of the day.
         let items = timeline.items.filter { !$0.past }
         let start = dayStart ?? endOfDay - 86400
@@ -1397,6 +1424,20 @@ struct DayTimeline: Equatable {
             } else {
                 first += ", " + clockAndDue(events.count, due, isToday: isToday) + "."
             }
+        } else if !dueState.isRead {
+            // What's due isn't known yet (Reminders still coming in, or not read):
+            // only the calendar is spoken for, never "nothing is due" or "nothing planned".
+            if !suggestions.isEmpty {
+                first = "I've suggested \(count(suggestions.count)) block\(suggestions.count == 1 ? "" : "s") around your calendar."
+            } else if events.isEmpty && due == 0 {
+                first = isToday ? "Nothing on the calendar for the rest of today." : "Nothing on the calendar that day."
+            } else if due == 0 {
+                first = "\(things(events.count).capitalizedFirst) on the clock\(isToday ? " for the rest of today" : "")."
+            } else {
+                first = clockAndDue(events.count, due, isToday: isToday).capitalizedFirst + "."
+            }
+            if let line = dueState.summaryLine { first += " " + line }
+            return first
         } else if !suggestions.isEmpty {
             first = "Nothing is due. I've suggested \(count(suggestions.count)) block\(suggestions.count == 1 ? "" : "s") around your calendar."
         } else {
@@ -1408,9 +1449,11 @@ struct DayTimeline: Equatable {
                 first = clockAndDue(events.count, due, isToday: isToday).capitalizedFirst + "."
             }
         }
-        if let last = items.map(\.end).max(), last < endOfDay - 2 * hour {
+        // "Clear after" only once what's due is known too.
+        if dueState.isRead, let last = items.map(\.end).max(), last < endOfDay - 2 * hour {
             first += " Clear after " + clock(last) + "."
         }
+        if let line = dueState.summaryLine { first += " " + line }
         return first
     }
 
@@ -1560,7 +1603,12 @@ struct DayTimeline: Equatable {
     /// Always four rows, CAL, MAIL, TEXTS and SOON, so the Brief keeps its shape,
     /// and SCHOOL after CAL when school work is due today or tomorrow.
     /// A source Harbor can't read yet shows a dim row saying so instead of disappearing.
+    /// CAL without a day's load: "Nothing on your calendar" only when the
+    /// calendar was read (`calendarRead`, or its access says ready); while it
+    /// is still coming in, after a read that timed out, or when nothing says
+    /// either way, a dim "not checked yet" line, never an empty calendar.
     static func briefLines(calendar: DayLoad?, calendarUnsynced: Bool = false, calendarAccess: SourceAccess? = nil,
+                           calendarRead: Bool = false,
                            mail: (ready: Bool, needing: [BriefNeed])?,
                            texts: (ready: Bool, needing: [BriefNeed])?,
                            textsNeedAccess: Bool = false,
@@ -1572,8 +1620,10 @@ struct DayTimeline: Equatable {
             lines.append(BriefLine(tag: "CAL", text: calendar.summary, trailing: calendar.next ?? "", source: .calendar))
         } else {
             let unread = calendarAccess.flatMap { $0.readable ? nil : $0 }
-            lines.append(BriefLine(tag: "CAL", text: unread?.headline ?? (calendarUnsynced ? "Reading your calendar…" : "Nothing on your calendar"),
-                                   trailing: "", source: .calendar, muted: calendarUnsynced || unread != nil))
+            let read = !calendarUnsynced && unread == nil && (calendarRead || calendarAccess?.readable == true)
+            let text = unread?.headline ?? (calendarUnsynced ? "Reading your calendar…"
+                : read ? "Nothing on your calendar" : "Calendar hasn't been checked yet")
+            lines.append(BriefLine(tag: "CAL", text: text, trailing: "", source: .calendar, muted: !read))
         }
         // School work due today or tomorrow (StudyDaySummary.line), only when
         // there is some: Study is optional, so the row never says "nothing due".

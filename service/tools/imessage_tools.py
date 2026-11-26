@@ -280,16 +280,19 @@ def contact_name_for_handle(handle: str) -> str:
 
 
 # Digits-only projection of the message cache, for "has this number actually
-# been texted?" checks. Memoized on the cache's identity — stripping every
-# non-digit out of the full history is far too expensive to redo per handle
-# per lookup, and the cache only changes on a sync.
-_digits_blob: tuple[int, str] = (-1, "")
+# been texted?" checks. Memoized on the cache's content and sync generation
+# (a new cache of the same length is still a new cache) and reset by
+# cache_messages: stripping every non-digit out of the full history is far too
+# expensive to redo per handle per lookup. A str caches its own hash, so the
+# key costs nothing after the first lookup.
+_digits_blob: tuple[tuple | None, str] = (None, "")
 
 
 def _messages_digits() -> str:
     global _digits_blob
-    if _digits_blob[0] != len(_lines):
-        _digits_blob = (len(_lines), re.sub(r"\D", "", _lines))
+    key = (_snapshot_generation, len(_lines), hash(_lines))
+    if _digits_blob[0] != key:
+        _digits_blob = (key, re.sub(r"\D", "", _lines))
     return _digits_blob[1]
 
 
@@ -348,9 +351,10 @@ def cache_messages(lines: str, available: bool, reason: str = "", kind: str = ""
     with _snapshot_lock:
         global _lines, _available, _unavailable_reason, _unavailable_kind, _sync_completed
         global _snapshot_generation, _snapshot_captured_at, _publication_expires_monotonic, _issued_snapshot
-        global _records_memo
+        global _records_memo, _digits_blob
         _publication_authority.withdraw()
         _records_memo = None
+        _digits_blob = (None, "")
         _issued_snapshot = None
         _snapshot_generation += 1
         _snapshot_captured_at = time.time()
@@ -398,6 +402,7 @@ def structured_messages_snapshot() -> dict:
 
     records: list[dict] = []
     coverage: dict | None = None
+    acknowledged: dict[str, float] = {}
     malformed = 0
     seen: set[str] = set()
     lines = _lines.split("\n")
@@ -436,6 +441,19 @@ def structured_messages_snapshot() -> dict:
         if coverage is None:
             malformed += 1
             break
+        if item.get("kind") == "acknowledged":
+            # The user's own newest tapback per chat (MessagesReader.readOwnTapbacks):
+            # an answer to the chat, never a line. Only right after coverage, once.
+            chats = item.get("chats")
+            if index != 1 or acknowledged or not isinstance(chats, list):
+                malformed += 1
+                continue
+            for chat in chats[:5000]:
+                at = chat.get("at") if isinstance(chat, dict) else None
+                guid = chat.get("conversation") if isinstance(chat, dict) else None
+                if isinstance(guid, str) and guid and type(at) in (int, float) and math.isfinite(at) and at > 0:
+                    acknowledged[guid] = float(at)
+            continue
         if item.get("kind") != "record" or len(records) >= _STRUCTURED_MAX_RECORDS:
             malformed += 1
             continue
@@ -509,7 +527,16 @@ def structured_messages_snapshot() -> dict:
                           and coverage["attempted"] == coverage["emitted"]
                           and all(row["status"] == "complete" for row in records)
                           else "partial")
-    return {"version": 1, "state": state, "coverage": coverage, "records": records}
+    return {"version": 1, "state": state, "coverage": coverage, "records": records,
+            "acknowledged": acknowledged}
+
+
+def acknowledged_chats() -> dict[str, float]:
+    """Chat GUID -> when the user last reacted there with a tapback; {} when unknown."""
+    try:
+        return dict(structured_messages_snapshot().get("acknowledged") or {})
+    except Exception:  # noqa: BLE001 — no structured feed: no acknowledgements
+        return {}
 
 
 # The last parse and the exact inputs it came from: the cached text (by
@@ -1167,6 +1194,77 @@ def _private_summary_value(body: str) -> bool:
         if len(token) >= 20 and len(set(token.lower())) >= 8:
             return True
     return False
+
+
+# --- on-device redaction: secret VALUES only ---------------------------------------
+#
+# redact_summary_codes (below) is the strict reading for what is SHOWN or may leave
+# the Mac: a whole body that mentions confirm, verify, security, a token or a link
+# becomes a stand-in. Harbor's own on-device reading (the Brief's triage, judge and
+# drafts) needs the words ("could you confirm Thursday?", "the security deposit is
+# due Friday"), so it masks only an actual value: a one-time code, a password or
+# key stated with its value, a provider token, a tokenised link, a card or SSN.
+# Anything carrying a real secret is withheld from the model whole anyway
+# (proactive.triage.raw_secret); this is the second line for what slips through.
+
+_PROVIDER_TOKEN = re.compile(
+    r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{16,}|"
+    r"sk_(?:live|test)_[A-Za-z0-9]{16,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|"
+    r"glpat-[A-Za-z0-9_-]{20,})|-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)")
+# A password or key with its value: "password: Hunter-22", "api key = abcd…". The
+# word stays, the value goes.
+_KEYED_VALUE = re.compile(
+    r"(?P<key>\b(?:password|passcode|passwd|pwd|api[ _-]?key|secret[ _-]?key|access[ _-]?token|"
+    r"auth[ _-]?token|bearer|token)\b\s*(?:is\s*|[:=]\s*|-\s+))(?P<value>[\"'“]?[^\s\"'”]{4,}[\"'”]?)", re.I)
+# A one-time code next to its digits, either order: "your code is 482913",
+# "482913 is your verification code", "PIN 4821".
+_CODE_AFTER = re.compile(
+    r"(?P<key>\b(?:code|passcode|pin|otp)\b[^\n\d]{0,24}?)(?<![\d])(?P<value>\d{4,8}|[A-Z0-9]{2,5}-[A-Z0-9]{2,5})(?![\d])",
+    re.I)
+_CODE_BEFORE = re.compile(r"(?<![\d.,:/])\d{4,8}(?![\d.,:/])(?=[^\n]{0,30}?\b(?:code|passcode|pin|otp)\b)", re.I)
+_BENIGN_CODE = re.compile(r"\b(?:dress|zip|postal|area|promo|discount|coupon|country|source|bar|qr|color|morse)\s+code\b|"
+                          r"\bcode\s+(?:review|freeze|of conduct|base|camp)\b", re.I)
+# A link that carries a token: a query string, a fragment, or a long random path part.
+_LINK = re.compile(r"\b(?P<base>https?://[^\s/?#<>\"']+)(?P<rest>[^\s<>\"']*)", re.I)
+_RANDOM_PART = re.compile(r"(?=[A-Za-z0-9_-]*\d)(?=[A-Za-z0-9_-]*[A-Za-z])[A-Za-z0-9_-]{20,}")
+_SSN_VALUE = re.compile(r"(?<!\d)\d{3}[- ]\d{2}[- ]\d{4}(?!\d)")
+_DIGIT_RUN_VALUE = re.compile(r"(?<![\d])(?:\d[ -]?){12,18}\d(?![\d])")
+
+
+def _luhn_ok(digits: str) -> bool:
+    total = 0
+    for i, ch in enumerate(reversed(digits)):
+        n = int(ch) * (2 if i % 2 else 1)
+        total += n - 9 if n > 9 else n
+    return total % 10 == 0
+
+
+def redact_secret_values(text: str) -> str:
+    """`text` with only secret values masked, for Harbor's on-device reading. The
+    words around them, and every ordinary sentence, stay as written."""
+    text = str(text or "")
+    text = _PROVIDER_TOKEN.sub("[secret omitted]", text)
+    text = _KEYED_VALUE.sub(lambda m: m.group("key") + "[omitted]", text)
+
+    def code_after(m):
+        if _BENIGN_CODE.search(text[max(0, m.start() - 12):m.end("key") + 8]):
+            return m.group(0)
+        return m.group("key") + "[code omitted]"
+    text = _CODE_AFTER.sub(code_after, text)
+    text = _CODE_BEFORE.sub("[code omitted]", text)
+
+    def link(m):
+        rest = m.group("rest")
+        if re.search(r"[?#]", rest) or _RANDOM_PART.search(rest):
+            return m.group("base") + "/[link details omitted]"
+        return m.group(0)
+    text = _LINK.sub(link, text)
+    text = _SSN_VALUE.sub("[number omitted]", text)
+
+    def digits(m):
+        run = re.sub(r"\D", "", m.group(0))
+        return "[number omitted]" if 13 <= len(run) <= 19 and _luhn_ok(run) else m.group(0)
+    return _DIGIT_RUN_VALUE.sub(digits, text)
 
 
 def redact_summary_codes(text: str) -> str:

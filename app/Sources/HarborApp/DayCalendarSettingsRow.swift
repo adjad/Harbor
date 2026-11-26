@@ -33,13 +33,14 @@ struct DayCalendarSettingsRow: View {
         VStack(alignment: .leading, spacing: 8) {
             Toggle(isOn: Binding(get: { enabled }, set: { turn($0) })) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Add Harbor's plan to your calendar").font(.system(size: 14, weight: .medium))
+                    Text("Add Harbor's plan to your calendar").font(.harbor(.callout, on: .window, weight: .medium))
                     Text(enabled
                          ? "Study time, deadlines and to-dos Harbor plans for you are added to the calendar below, "
                            + "and reach Google Calendar if that is one of your accounts. Turning this off removes "
                            + "the upcoming ones Harbor added. Events you made are never touched."
                          : "Off. Harbor's plan stays in Harbor.")
                         .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
             .toggleStyle(.switch)
@@ -52,6 +53,7 @@ struct DayCalendarSettingsRow: View {
             }
             if let message {
                 Text(message).font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .task { load() }

@@ -47,6 +47,40 @@ struct BackendRecoveryState {
     }
 }
 
+/// Restarting Harbor's own service after it dies (swarm #4) and the waits around a
+/// restart (#5, #11). Pure.
+enum BackendRestartPolicy {
+    /// The waits before each restart of a service that died after answering.
+    static let delays: [TimeInterval] = [1, 5, 15]
+    /// Crashes further apart than this start the count again.
+    static let window: TimeInterval = 10 * 60
+    /// How long restart() waits for a start already under way to see the stop.
+    static let startInFlightWait: TimeInterval = 25
+
+    /// The wait before restarting after the `count`th crash in the window, or nil: give up.
+    static func delay(afterCrashes count: Int) -> TimeInterval? {
+        count >= 1 && count <= delays.count ? delays[count - 1] : nil
+    }
+
+    static func recent(_ crashes: [Date], now: Date) -> [Date] {
+        crashes.filter { now.timeIntervalSince($0) >= 0 && now.timeIntervalSince($0) <= window }
+    }
+
+    static func gaveUpReason(status: Int32, logTail: String?) -> String {
+        var reason = "Harbor's service keeps stopping (exit status \(status)), so Harbor stopped restarting it. "
+            + "Retry; if it keeps failing, quit and reopen Harbor."
+        if let logTail, !logTail.isEmpty { reason += " Last log line: " + logTail }
+        return reason
+    }
+
+    /// A receipt that couldn't be published because lsof was slow or missing is just
+    /// not published; only a credential mismatch stops the backend (#11).
+    static func receiptFailureQuarantines(_ error: Error) -> Bool {
+        if case BackendCredentials.Failure.unavailable = error { return false }
+        return true
+    }
+}
+
 @MainActor
 final class BackendManager {
     private var monitor: Task<Void, Never>?
@@ -274,6 +308,8 @@ final class BackendManager {
                     self?.launchEnded(pid: pid, status: status, logURL: logURL, after: logStartOffset)
                 }
             }
+            // A stop or restart while this start read keys or checked the port: launch nothing.
+            guard lifecycle == self.lifecycle else { return }
             // Before the child exists, so no request the gate admits for it carries an older key.
             BackendAppKey.set(appKey)
             try proc.run()
@@ -302,11 +338,18 @@ final class BackendManager {
                 refreshLaunchReceipt(pid: proc.processIdentifier)
                 if unprovenLaunch == proc.processIdentifier { unprovenLaunch = nil }
             }
+            // A stop or restart while this start waited: that one owns the backend now.
+            guard lifecycle == self.lifecycle else { return }
             if healthy, let configDigest, proc.isRunning, enforceCredentialState() {
-                do {
-                    try Self.publishRuntimeReceipt(generation: snapshot.generation, pid: proc.processIdentifier,
-                                                   configDigest: configDigest)
-                } catch {
+                // lsof and its poll run off the main actor (swarm #11): the notch kept
+                // drawing nothing for lsof's whole run on every launch and restart.
+                let generation = snapshot.generation, pid = proc.processIdentifier
+                let published: Result<Void, Error> = await Task.detached(priority: .userInitiated) {
+                    Result { try Self.publishRuntimeReceipt(generation: generation, pid: pid,
+                                                            configDigest: configDigest) }
+                }.value
+                if case .failure(let error) = published,
+                   BackendRestartPolicy.receiptFailureQuarantines(error), lifecycle == self.lifecycle {
                     credentialState.quarantine()
                     proc.terminate()
                 }
@@ -366,12 +409,46 @@ final class BackendManager {
     /// record why and tell the notch (once per launch), so it shows the cause
     /// with Retry instead of a long "Starting Harbor…".
     private func launchEnded(pid: Int32, status: Int32, logURL: URL, after offset: UInt64) {
-        guard unprovenLaunch == pid else { return }
+        guard unprovenLaunch == pid else {
+            serviceEnded(pid: pid, status: status, logURL: logURL, after: offset)
+            return
+        }
         unprovenLaunch = nil
         if process?.processIdentifier == pid, process?.isRunning != true { process = nil }
         let reason = Self.startFailureReason(status: status,
                                              logTail: Self.logText(at: logURL, after: offset).flatMap(Self.lastLogLine))
         NotificationCenter.default.post(name: .harborBackendStartFailed, object: nil, userInfo: ["reason": reason])
+    }
+
+    /// When this manager's own service died after it had answered (a crash, a jetsam
+    /// kill), within BackendRestartPolicy.window.
+    private var crashes: [Date] = []
+
+    /// Harbor's own service ended after it had answered. A stop on purpose detaches the
+    /// child first (detachForStop), and a credential problem blocks recovery, so this
+    /// is a crash: start it again after 1 s, 5 s, 15 s, then stop and say why
+    /// (swarm #4). It used to stay down, with no reminders, Brief or scheduled sends,
+    /// until the person pressed Retry.
+    private func serviceEnded(pid: Int32, status: Int32, logURL: URL, after offset: UInt64) {
+        guard process?.processIdentifier == pid, process?.isRunning != true,
+              everReachable, !portConflict, !credentialState.blocked else { return }
+        process = nil
+        let now = Date()
+        crashes = BackendRestartPolicy.recent(crashes, now: now) + [now]
+        guard let delay = BackendRestartPolicy.delay(afterCrashes: crashes.count) else {
+            let reason = BackendRestartPolicy.gaveUpReason(
+                status: status, logTail: Self.logText(at: logURL, after: offset).flatMap(Self.lastLogLine))
+            NotificationCenter.default.post(name: .harborBackendStartFailed, object: nil, userInfo: ["reason": reason])
+            return
+        }
+        NSLog("%@", "Harbor service: stopped (exit status \(status)); starting it again in \(Int(delay)) s")
+        let lifecycle = self.lifecycle
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            // A quit, a restart or a stop meanwhile owns the backend now.
+            guard let self, lifecycle == self.lifecycle, self.process == nil else { return }
+            await self.startIfNeeded()
+        }
     }
 
     /// A start that stopped before any process was launched. Said the same way as a
@@ -448,8 +525,20 @@ final class BackendManager {
         guard !portConflict else { return }
         backendChanges += 1
         await stopAndWait()
+        await finishStartInFlight()
         await startIfNeeded()
         endBackendChange()
+    }
+
+    /// A start still under way (inside its health wait) when restart() stopped the child
+    /// used to make the restart's own start return at `guard !starting`, and then gave
+    /// up on the dead child: nothing ran until Retry (swarm #5). The stop changed the
+    /// lifecycle, so that start ends at its next check; wait for it, bounded.
+    private func finishStartInFlight() async {
+        let deadline = Date().addingTimeInterval(BackendRestartPolicy.startInFlightWait)
+        while starting, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
     }
 
     private func detachForStop() -> Process? {

@@ -1016,6 +1016,8 @@ async def test_stand_down_says_why(monkeypatch, quiet):
     from service import config
 
     class Client:
+        managed = True      # Harbor's own engine on this Mac
+
         async def loaded_models(self):
             return ["fast-model"]
 
@@ -1791,3 +1793,38 @@ async def test_a_call_that_yields_is_a_recorded_stand_down(ticking, monkeypatch)
     assert runner.skip_tally()["counts"] == {"call_yielded@ac": 1}
     assert await runner.tick(now=NOW + 61) == runner.BUSY_GAP_S
     assert st.health()["last_skip"] == "call_yielded"      # past the 30 s floor, it is kept in meta too
+
+
+def test_old_message_rows_and_decided_suggestions_age_out(tmp_path):
+    st = Store(tmp_path / "age.db")
+    day = 86400.0
+    now = 1_800_000_000.0
+    old = now - 300 * day
+    st.upsert_index([_row(1, ts=old), _row(2, ts=old), _row(3, ts=old), _row(4, ts=now - day), _row(5, ts=old)],
+                    extract.tier, now=old)
+    for key in ("<m1@x>", "<m2@x>", "<m3@x>", "<m4@x>"):
+        st.finish(key, "done")
+    item = {"what": "Pay synthetic", "date_phrase": "Dec 10", "due": "2026-12-10", "precision": "day",
+            "evidence": "due Dec 10", "important": True, "why": "money"}
+    st.add_items("<m2@x>", [item], "v1", now=old)                       # still open: keeps its message
+    st.add_items("<m3@x>", [item], "v1", now=old)
+    decided = st._db.execute("SELECT id FROM items WHERE key='<m3@x>'").fetchone()[0]
+    st.decide(decided, "dismissed")
+    st._db.execute("UPDATE items SET decided=? WHERE id=?", (old, decided))
+    gone = st.prune(messages_before=now - 214 * day, now=now)
+    assert gone == {"messages": 2, "items": 1}       # m1 (no items) and m3 (its item went first)
+    assert st.message("<m1@x>") is None and st.message("<m3@x>") is None
+    assert st.message("<m2@x>") and st.message("<m4@x>")             # open suggestion; recent mail
+    assert st.message("<m5@x>")                                       # still pending: never pruned here
+    assert st._db.execute("SELECT COUNT(*) FROM items").fetchone()[0] == 1
+
+
+def test_the_runner_prunes_once_a_day(tmp_path, monkeypatch):
+    st = Store(tmp_path / "tick.db")
+    calls = []
+    monkeypatch.setattr(st, "prune", lambda **kw: calls.append(kw) or {"messages": 0, "items": 0})
+    runner._prune(st, 1_800_000_000.0)
+    runner._prune(st, 1_800_000_000.0 + 3600)
+    runner._prune(st, 1_800_000_000.0 + 86400 + 1)
+    assert len(calls) == 2
+    assert calls[0]["messages_before"] == 1_800_000_000.0 - (runner.CLOUD_WINDOW_DAYS + 14) * 86400

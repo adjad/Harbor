@@ -118,13 +118,15 @@ struct NotchDayView: View {
     }
 
     /// The day on screen. While a newly picked day loads, the last plan read
-    /// for that day (this Day's visit) or else the day shown before stays up,
-    /// faded and inert, so the panel neither empties nor jumps; the fresh plan
-    /// then fades in and the panel resizes once. A failed read shows its error.
+    /// for that day (this Day's visit, else today's as the last launch kept
+    /// it) or else the day shown before stays up, faded and inert, so the
+    /// panel neither empties nor jumps; the fresh plan then fades in and the
+    /// panel resizes once. A failed read shows its error.
     private var plan: TodayPlan? {
         if let current = today.currentPlan { return current }
         guard today.error.isEmpty else { return nil }
-        return DayPlanHold.pick(cached: dayCache[DayPlanHold.key(day: today.day, zone: today.timezone.identifier)],
+        return DayPlanHold.pick(cached: dayCache[DayPlanHold.key(day: today.day, zone: today.timezone.identifier)]
+                                    ?? today.savedPlan,
                                 previous: heldPlan)
     }
     /// True while `plan` is a held stand-in rather than the shown day's own read.
@@ -143,20 +145,24 @@ struct NotchDayView: View {
     }
 
     var body: some View {
+        // The day's timeline, built once for this update: the week row, the
+        // summary and the agenda all read it (it was built three times).
+        let shown: TodayPlan? = plan
+        let built: DayTimeline? = shown.map { timeline($0) }
         VStack(alignment: .leading, spacing: 10) {
             // The week row comes first, right under the tabs, so it stays level
             // when you switch days: everything that changes with the day (notices,
             // the summary, the agenda) sits below it, and only that moves the
             // panel's height.
-            weekHead
+            weekHead(shown, timeline: built)
             notices
             // The summary runs the panel's whole width, above the halves.
-            dayHead
+            dayHead(shown, timeline: built)
             // In the wide panel, two halves: the left runs in today's order up to
             // and including Old reminders, the right holds what follows. In the
             // normal panel the halves stack with the same spacing as one column.
             DayHalves(sideBySide: halves, gap: Self.halfGap, stackGap: 10) {
-                VStack(alignment: .leading, spacing: 10) { leadHalf }
+                VStack(alignment: .leading, spacing: 10) { leadHalf(shown, timeline: built) }
                     .background(GeometryReader { geo in
                         Color.clear.preference(key: DayHalfHeights.self, value: ["left": geo.size.height])
                     })
@@ -224,6 +230,13 @@ struct NotchDayView: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .transition(.opacity)
             }
+            if holding, let outage = today.outageNotice {
+                // A held day (the last launch's, or the one shown before) while the
+                // service keeps not answering: the loading row's words, above it.
+                Text(outage).font(.harbor(size: 11.5)).foregroundStyle(Theme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .transition(.opacity)
+            }
             if let removed = lastRemoved { removedRow(removed).transition(.opacity) }
             if !today.followsToday { otherDayRow.transition(.opacity) }
             if today.isShowingCurrentDay {
@@ -238,9 +251,9 @@ struct NotchDayView: View {
 
     /// The left half (or the top, in one column): the day's warnings, the
     /// agenda and Old reminders.
-    @ViewBuilder private var leadHalf: some View {
-            if let plan {
-                dayLead(plan)
+    @ViewBuilder private func leadHalf(_ plan: TodayPlan?, timeline: DayTimeline?) -> some View {
+            if let plan, let timeline {
+                dayLead(plan, timeline: timeline)
                     .disabled(today.planIsStale)
                     .transition(.opacity)
             } else if today.error.isEmpty {
@@ -416,9 +429,9 @@ struct NotchDayView: View {
     /// The week row, at the top of the Day. It is there from the first frame
     /// (dates need no plan) and nothing above it changes with the day, so it
     /// holds still while you switch days.
-    @ViewBuilder private var weekHead: some View {
-        if let plan {
-            weekRow(load: holding ? nil : shownLoad(plan, timeline: timeline(plan)))
+    @ViewBuilder private func weekHead(_ plan: TodayPlan?, timeline: DayTimeline?) -> some View {
+        if let plan, let timeline {
+            weekRow(load: holding ? nil : shownLoad(plan, timeline: timeline))
         } else {
             weekRow(load: nil)
         }
@@ -426,9 +439,8 @@ struct NotchDayView: View {
 
     /// The whole width above the halves: why Harbor can't read a source, then the
     /// summary sentence with the all-day items at its right.
-    @ViewBuilder private var dayHead: some View {
-        if let plan {
-            let timeline = timeline(plan)
+    @ViewBuilder private func dayHead(_ plan: TodayPlan?, timeline: DayTimeline?) -> some View {
+        if let plan, let timeline {
             // Calendar's own row would repeat the summary, which says it when
             // Harbor can't read the calendar, with the same Allow… beside it.
             // Until onboarding is done: the one Finish setup row, counting each missing
@@ -458,7 +470,9 @@ struct NotchDayView: View {
         let blurb: String = DayTimeline.blurb(timeline, needs: plan.dayNeeds, isToday: today.isShowingCurrentDay,
                                               endOfDay: today.dayInterval.end.timeIntervalSince1970, clock: today.clock,
                                               dayStart: today.dayInterval.start.timeIntervalSince1970,
-                                              calendar: calendar)
+                                              calendar: calendar,
+                                              due: DayDueState.of(reminders: plan.access("reminders"),
+                                                                  workspaceRead: plan.workspace != nil))
         // The existing fix: Harbor's Calendar permission page, as the access row had it.
         let fix: BriefDetail.Action? = calendar == .unread
             ? (plan.access("calendar")?.fixLink ?? BriefDetail.calendarsAccess) : nil
@@ -593,8 +607,7 @@ struct NotchDayView: View {
         Task { await today.refresh(); model.onResize() }
     }
 
-    @ViewBuilder private func dayLead(_ plan: TodayPlan) -> some View {
-        let timeline = timeline(plan)
+    @ViewBuilder private func dayLead(_ plan: TodayPlan, timeline: DayTimeline) -> some View {
         let unread = unreadAccess(plan)
         if let warning = warningLine(plan, unread: unread) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -2334,17 +2347,36 @@ enum DayCards {
     static var staleReminders = StaleRemindersModel(baseURL: HarborClient.baseURL)
     static let hoursOffer = HoursOfferModel()
     private static var refreshedAt: Date?
+    /// The read in flight, which every caller meanwhile waits on, and whether
+    /// a forced one asked after it began (one more read then follows, not one each).
+    private static var inFlight: Task<Void, Never>?
+    private static var againAfter = false
 
     /// At most once a minute (the old per-tab cadence) unless forced: the loop
-    /// ticks every 30 s, and a tab switch restarts it.
+    /// ticks every 30 s, and a tab switch restarts it. Calls while a read is in
+    /// flight join it: a burst of "changed" notices is one read and one more,
+    /// never one each running side by side.
     static func refresh(force: Bool = false, now: Date = Date()) async {
+        if let running = inFlight {
+            if force { againAfter = true }
+            await running.value
+            return
+        }
         if !force, let last = refreshedAt, now.timeIntervalSince(last) < 60 { return }
         refreshedAt = now
-        await attention.refresh()
-        await staleReminders.refresh()
-        #if !HARBOR_NOTCH_QA
-        await hoursOffer.refresh()
-        #endif
+        let run = Task { @MainActor in
+            repeat {
+                againAfter = false
+                await attention.refresh()
+                await staleReminders.refresh()
+                #if !HARBOR_NOTCH_QA
+                await hoursOffer.refresh()
+                #endif
+            } while againAfter
+        }
+        inFlight = run
+        await run.value
+        inFlight = nil
     }
 
     #if HARBOR_NOTCH_QA

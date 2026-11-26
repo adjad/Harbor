@@ -79,11 +79,14 @@ struct OnboardingTourView: View {
                 Button("Back") { turn(-1) }
                     .buttonStyle(FirstRunButtonStyle())
                     .disabled(page == 0)
+                    .accessibilityHint("Example pages only; nothing is changed")
                 Spacer()
+                // On the last page: back to the first example page. The hint below says setup is untouched.
                 Button(page == OnboardingTour.pages.count - 1 ? "Start over" : "Next") {
                     turn(page == OnboardingTour.pages.count - 1 ? -page : 1)
                 }
                 .buttonStyle(FirstRunButtonStyle())
+                .accessibilityHint("Example pages only; nothing is changed")
             }
         }
         .padding(14)

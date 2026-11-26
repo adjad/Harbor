@@ -393,19 +393,54 @@ def test_two_accounts_one_failing_for_now_waits_only_on_the_healthy_one(monkeypa
     from service.tools import email_tools as mail
     monkeypatch.setattr(mail, "email_sync_state", lambda: "ready")
     offline = "Google could not be reached; try again when online"
+    # Lee failed after the wake (its error is stamped since the gap ended).
     monkeypatch.setattr(mail, "_external_accounts", {
         "sam@example.invalid": {"headers_at": NOW + 2},
-        "lee@example.invalid": {"headers_at": NOW - 9 * HOUR, "headers_error": offline}})
+        "lee@example.invalid": {"headers_at": NOW - 9 * HOUR, "headers_error": offline, "headers_error_at": NOW + 3}})
     assert W._email(NOW, NOW + 5) == ("in", NOW + 2)
     # The healthy one hasn't read yet: waited for (the failing one isn't).
     monkeypatch.setattr(mail, "_external_accounts", {
         "sam@example.invalid": {"headers_at": NOW - 9 * HOUR},
-        "lee@example.invalid": {"headers_at": NOW - 9 * HOUR, "headers_error": offline}})
+        "lee@example.invalid": {"headers_at": NOW - 9 * HOUR, "headers_error": offline, "headers_error_at": NOW + 3}})
     assert W._email(NOW, NOW + 5) == ("waiting", None)
     # Only failing accounts, none read: still waited for, never "in" on old mail.
     monkeypatch.setattr(mail, "_external_accounts", {
-        "lee@example.invalid": {"headers_at": NOW - 9 * HOUR, "headers_error": offline}})
+        "lee@example.invalid": {"headers_at": NOW - 9 * HOUR, "headers_error": offline, "headers_error_at": NOW + 3}})
     assert W._email(NOW, NOW + 5) == ("waiting", None)
+
+
+def test_an_error_from_before_the_gap_is_not_a_failure_in_it(monkeypatch):
+    """Auditor BLOCK on 106b7c64: Lee's last fetch before the sleep failed and the
+    error was kept (and restored at launch). After the wake Sam reads first while
+    Lee's fetch is still in flight: mail must keep waiting for Lee, or the drafts'
+    target is fixed on Lee's old mail."""
+    from service.tools import email_tools as mail
+    monkeypatch.setattr(mail, "email_sync_state", lambda: "ready")
+    offline = "Google could not be reached; try again when online"
+    for stale in ({"headers_error": offline},                                   # restored: no stamp
+                  {"headers_error": offline, "headers_error_at": NOW - 9 * HOUR}):  # stamped before the gap
+        monkeypatch.setattr(mail, "_external_accounts", {
+            "sam@example.invalid": {"headers_at": NOW + 2},
+            "lee@example.invalid": {"headers_at": NOW - 9 * HOUR, **stale}})
+        assert W._email(NOW, NOW + 5) == ("waiting", NOW + 2), stale
+    # Lee's fetch then succeeds: in.
+    monkeypatch.setattr(mail, "_external_accounts", {
+        "sam@example.invalid": {"headers_at": NOW + 2},
+        "lee@example.invalid": {"headers_at": NOW + 4, "headers_error": ""}})
+    assert W._email(NOW, NOW + 5) == ("in", NOW + 4)
+
+
+def test_every_gmail_failure_is_stamped_even_the_same_one_again(monkeypatch):
+    from service.tools import email_tools as mail
+    monkeypatch.setattr(mail, "_recompose_all", lambda: None)
+    monkeypatch.setattr(mail, "_persist_composed_sources", lambda: None)
+    accounts = {"lee@example.invalid": {"headers_error": "offline (invented)", "headers_error_at": NOW - 9 * HOUR}}
+    monkeypatch.setattr(mail, "_external_accounts", accounts)
+    monkeypatch.setattr(mail.time, "time", lambda: NOW + 30)
+    mail.external_email_error("lee@example.invalid", "headers", "offline (invented)")   # the same failure after the wake
+    assert accounts["lee@example.invalid"]["headers_error_at"] == NOW + 30
+    mail.external_email_error("lee@example.invalid", "headers", "")
+    assert accounts["lee@example.invalid"]["headers_error_at"] == 0.0
 
 
 def test_an_offline_mail_account_at_wake_keeps_the_drafts_waiting(store, monkeypatch):

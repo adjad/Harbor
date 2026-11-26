@@ -1224,6 +1224,7 @@ class OMLXClient:
             masker = self.__dict__.get("_fallback_masker")
             if masker is None:
                 masker = self.__dict__["_fallback_masker"] = cloud_mask.Masker()
+            masker.seed_known_names()
         return masker
 
     async def chat(self, model: str, messages: list[dict[str, Any]], **kwargs) -> dict[str, Any]:

@@ -63,36 +63,87 @@ def ensure_cap(path: Path = OMLX_SETTINGS) -> bool:
         if size is not None and size <= CAP_BYTES:
             return False
         cache["ssd_cache_max_size"] = CAP_TEXT
-        tmp = path.with_name(path.name + ".harbor-tmp")
-        tmp.write_text(json.dumps(data, indent=2))
-        os.chmod(tmp, path.stat().st_mode & 0o777)  # holds the api key
-        os.replace(tmp, path)
+        _write_private(path, json.dumps(data, indent=2))
         return True
     except (OSError, ValueError):
         return False
 
 
+# oMLX's paged SSD cache (omlx/cache/paged_ssd_cache.py): one block per
+# <hash>.safetensors in a one-hex-character folder, unfinished writes as
+# <hash>_tmp_<8 hex>.safetensors. Only those are ever swept, so a cache folder
+# pointed at a shared place never loses anything else.
+_BLOCK = re.compile(r"[0-9a-f]{16,128}(_tmp_[0-9a-f]{8})?\.safetensors")
+_BUCKET = re.compile(r"[0-9a-f]")
+
+
+def _write_private(path: Path, text: str) -> None:
+    """Replace `path` through a temp file that is 0600 from the moment it exists.
+
+    settings.json holds the engine's API key: the temp file used to take the
+    umask mode (0644) until a chmod after the write, and a failure between the
+    two left a readable copy behind (pentest #15). A leftover or planted temp
+    name is removed first and never followed.
+    """
+    tmp = path.with_name(path.name + ".harbor-tmp")
+    try:
+        tmp.unlink()
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            os.fchmod(fd, 0o600)
+            data = text.encode("utf-8")
+            while data:
+                data = data[os.write(fd, data):]
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def sweep_stale(root: Path | None = None, *, now: float | None = None,
                 max_age_days: float = MAX_AGE_DAYS) -> tuple[int, int]:
-    """Delete cache files untouched for `max_age_days`. Returns (files, bytes)."""
+    """Delete oMLX cache block files untouched for `max_age_days`. Returns (files, bytes)."""
     if root is None:
         try:
             settings = json.loads(OMLX_SETTINGS.read_text())
         except (OSError, ValueError):
             settings = None
         root = cache_dir(settings)
+    root = Path(root)
+    if not root.is_absolute():
+        return 0, 0          # relative to the backend's cwd: not a place to delete from
     now = time.time() if now is None else now
     cutoff = now - max_age_days * 86400
     files = freed = 0
-    for dirpath, _dirs, names in os.walk(root):
+    try:
+        buckets = [root] + [d for d in root.iterdir() if _BUCKET.fullmatch(d.name) and d.is_dir()
+                            and not d.is_symlink()]
+    except OSError:
+        return 0, 0
+    for folder in buckets:
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            continue
         for name in names:
-            p = Path(dirpath) / name
+            match = _BLOCK.fullmatch(name)
+            if not match:
+                continue
+            p = folder / name
             try:
                 st = p.lstat()
                 if not p.is_file() or p.is_symlink():
                     continue
                 fresh = max(st.st_mtime, st.st_atime)
-                if fresh > (now - _TMP_GRACE_S if name.endswith(".tmp") else cutoff):
+                if fresh > (now - _TMP_GRACE_S if match.group(1) else cutoff):
                     continue
                 p.unlink()
             except OSError:

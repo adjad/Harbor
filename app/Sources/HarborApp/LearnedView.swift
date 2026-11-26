@@ -540,7 +540,7 @@ struct LearnedView: View {
     @ViewBuilder private var content: some View {
         switch model.phase {
         case .loading:
-            ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
+            ProgressView("Loading routines…").frame(maxWidth: .infinity, maxHeight: .infinity)
         case .off:
             message("Learning is off",
                     "Turn on \"Learn my routines\" in Settings and Harbor will start noticing your routines from Calendar, Messages and how you use Harbor. It stays on this Mac.")
@@ -579,7 +579,7 @@ struct LearnedView: View {
                         }.padding(.top, 6)
                     }
                 }
-                if !model.error.isEmpty { Text(model.error).foregroundStyle(.red) }
+                if !model.error.isEmpty { Text(model.error).font(.callout).foregroundStyle(ChatTheme.danger) }
                 Text("Calendar patterns describe scheduled activities. Recorded completions and observed interactions are separate evidence. "
                      + "\"Not true\" stops Harbor from using it for predictions, nudges and answers. "
                      + "To erase everything, use \"Forget what Harbor learned…\" in Settings.")
@@ -691,7 +691,7 @@ struct LearnedView: View {
             HStack {
                 Text(title)
                 Spacer()
-                Text(model.signalState == .saving ? "Pending" : "Unknown").foregroundStyle(.secondary)
+                Text(model.signalState == .saving ? "Saving…" : "Not available yet").foregroundStyle(.secondary)
             }
         }
     }

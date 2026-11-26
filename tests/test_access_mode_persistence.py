@@ -490,9 +490,10 @@ def test_moving_harbor_s_folder_itself_asks_in_every_mode(monkeypatch):
     assert into.tier is policy.Tier.CONFIRM
     shell = policy.decide("shell", {"cmd": "mv ~/.moe ~/.moe.old && mv ~/staged ~/.moe"}, tool="run_shell")
     assert shell.tier is policy.Tier.CONFIRM
-    # A file inside the folder that isn't a guarded one, and reading the folder, don't.
+    # Any other file in the folder asks too since the 2026-11-25 pentest (#1): Harbor's own
+    # folder holds skills and settings that run later. Reading the folder doesn't.
     note = policy.decide("fs_write", {"path": str(MOE_DIR / "notes.txt"), "content": "x"}, tool="write_file")
-    assert note.tier is policy.Tier.ALLOW
+    assert note.tier is policy.Tier.CONFIRM
     listing = policy.decide("fs_read", {"path": str(MOE_DIR)}, tool="list_directory")
     assert listing.tier is policy.Tier.ALLOW
 
