@@ -381,6 +381,23 @@ def mark_sent_reply(*, kind: str, message_id: str = "", account: str = "", subje
         return {"cards": [], "todos": [], "threads": [], "replied": []}
 
 
+async def mark_sent_reply_async(**where) -> dict:
+    """mark_sent_reply for a send path running on the event loop: the bookkeeping
+    (reading the message cache and the Brief's state, writing it) runs in a worker
+    thread, and the "changed" event is published back on the loop, where the hub's
+    queues live. Never raises."""
+    import asyncio
+    empty = {"cards": [], "todos": [], "threads": [], "replied": []}
+    try:
+        changed = await asyncio.to_thread(mark_sent_reply, **{**where, "publish": False})
+        if any(changed.values()):
+            from service.assistant.hub import hub
+            hub.publish_sync({"type": "changed"})
+        return changed
+    except Exception:  # noqa: BLE001 — bookkeeping never turns a sent reply into an error
+        return empty
+
+
 _last_sweep = 0.0
 
 

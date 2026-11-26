@@ -15,8 +15,10 @@ IMPORTANT rules:
   it finishes, and Ask goes first at the next call boundary.
 - Brief resumes on its own: the waiting call goes as soon as Ask is idle.
 - Fairness: a call that has waited MAX_WAIT_S goes anyway, with a log line, so a
-  long chat can't starve a cold start. Each call gets its own wait, so during a
-  long Ask session Brief gets at most one call per MAX_WAIT_S.
+  long chat can't starve a cold start. The slot is global: at most one Brief call
+  goes beside Ask per MAX_WAIT_S, however many are waiting. A caller that only
+  waits (the cycle between items, fair=False) never takes it: past the cap it is
+  told CAPPED and yields.
 - Waiting changes no status. The caller's "updating" stays as it is; a wait is
   never a failure.
 """
@@ -33,7 +35,14 @@ _POLL_S = 0.25
 
 CLEAR = "clear"        # Ask was idle: no wait
 RESUMED = "resumed"    # waited, and Ask went idle
-FAIR = "fair"          # waited MAX_WAIT_S: goes beside Ask
+FAIR = "fair"          # waited MAX_WAIT_S and took the fairness slot: goes beside Ask
+CAPPED = "capped"      # waited MAX_WAIT_S, fair=False: did not take the slot
+
+# When the fairness slot was last taken (monotonic), for the one-per-window rule.
+_last_fair: float | None = None
+# Indirections so tests can drive the gate on a virtual clock.
+_clock = time.monotonic
+_sleep = asyncio.sleep
 
 
 def ask_busy(now: float | None = None) -> bool:
@@ -41,7 +50,7 @@ def ask_busy(now: float | None = None) -> bool:
     if idle.foreground_busy():
         return True
     last = idle.last_turn()
-    now = time.monotonic() if now is None else now
+    now = _clock() if now is None else now
     return last is not None and now - last < GRACE_S
 
 
@@ -49,8 +58,11 @@ def _log(text: str) -> None:
     print(f"[ask_gate] {text}", flush=True)
 
 
-async def wait_for_ask(what: str = "brief", *, clock=time.monotonic, sleep=asyncio.sleep) -> str:
-    """Wait until Ask is idle, at most MAX_WAIT_S. CLEAR, RESUMED or FAIR."""
+async def wait_for_ask(what: str = "brief", *, fair: bool = True, clock=None, sleep=None) -> str:
+    """Wait until Ask is idle. CLEAR, RESUMED, FAIR (took the global fairness slot)
+    or, with fair=False, CAPPED after MAX_WAIT_S."""
+    global _last_fair
+    clock, sleep = clock or _clock, sleep or _sleep
     start = clock()
     if not ask_busy(start):
         return CLEAR
@@ -61,6 +73,12 @@ async def wait_for_ask(what: str = "brief", *, clock=time.monotonic, sleep=async
         if not ask_busy(now):
             _log(f"{what} call resumes after {now - start:.1f} s")
             return RESUMED
-        if now - start >= MAX_WAIT_S:
+        if now - start < MAX_WAIT_S:
+            continue
+        if not fair:
+            _log(f"{what} waited {now - start:.0f} s, the fairness cap: it yields")
+            return CAPPED
+        if _last_fair is None or now - _last_fair >= MAX_WAIT_S:
+            _last_fair = now
             _log(f"{what} call waited {now - start:.0f} s, the fairness cap: it goes beside Ask")
             return FAIR

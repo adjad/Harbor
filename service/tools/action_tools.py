@@ -1362,20 +1362,21 @@ async def reply_to_email(message_id: str, body: str, reply_all: bool = False,
         return _OutboundUnknownResult(
             "Reply outcome unknown — the bridge did not confirm the approved reply. Check Mail before trying again; do not retry automatically.",
             operation="reply_to_email", action_id=res.get("action_id") or "")
-    _answered_in_brief("mail", message_id=expected["message_id"], account=expected["account"],
+    await _answered_in_brief("mail", message_id=expected["message_id"], account=expected["account"],
                        subject=expected["subject"], to=list(expected["to"]) + list(expected["cc"]))
     return make_receipt(expected)
 
 
-def _answered_in_brief(kind: str, **where) -> None:
+async def _answered_in_brief(kind: str, **where) -> None:
     """A verified send answers its thread in the Brief at once (handled.mark_sent_reply:
     mark it replied, retire its reply cards, refresh), whichever path sent it: Ask,
     the task executor, a Brief card or Ask's draft card. A mail reply is found by the
     Message-ID it answered, so one Mail sent to a Reply-To address counts too. A
-    dry run never reaches the send tools. Never fatal."""
+    dry run never reaches the send tools. The work runs off the event loop
+    (handled.mark_sent_reply_async). Never fatal."""
     try:
-        from service.proactive.handled import mark_sent_reply
-        mark_sent_reply(kind=kind, **where)
+        from service.proactive.handled import mark_sent_reply_async
+        await mark_sent_reply_async(kind=kind, **where)
     except Exception:  # noqa: BLE001 — bookkeeping never turns a sent message into an error
         pass
 
@@ -1753,7 +1754,7 @@ async def send_message(to: str, text: str, confirmed_self_send: bool = False,
                    "failed message and choose Send as Text Message." if by_imessage else "")
                 + " Check Messages before trying again; do not retry automatically.")
     if delivery in ("delivered", "sent"):
-        _answered_in_brief("text", handle=to)
+        await _answered_in_brief("text", handle=to)
     if delivery == "delivered":
         return f"Message sent to {display}. Messages shows it as delivered."
     if delivery == "sent":

@@ -363,9 +363,16 @@ def test_a_slow_but_successful_reply_is_cached(isolated, monkeypatch, model):
 def test_a_turn_that_starts_mid_call_lets_it_finish(isolated, monkeypatch, model):
     """Never cancelled mid-request (service/proactive/ask_gate.py): Ask goes first at
     the next call boundary, and the finished reply is kept."""
-    turn = [False]
+    from service import idle
+    monkeypatch.setattr(idle, "_foreground_turns", 0)
+
+    class Turn(list):                 # the fake engine "starts a turn" mid-call
+        def __setitem__(self, index, value):
+            super().__setitem__(index, value)
+            idle.begin_foreground()
+    turn = Turn([False])
     client = use(monkeypatch, FakeClient(["fast"], delay=0.3, turn=turn))
-    assert asyncio.run(G.refresh(NOW, abort=lambda: turn[0])) is True
+    assert asyncio.run(G.refresh(NOW, abort=idle.foreground_busy)) is True
     assert turn[0] and not client.cancelled and G._load()["inbox"]["gist"] == "Mostly school mail"
 
 

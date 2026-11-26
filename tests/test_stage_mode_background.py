@@ -68,7 +68,7 @@ def test_gists_scheduled_call_yields_when_demo_mode_turns_on_mid_call(gists):
     G = gists
     assert G._scheduled_abort() is False
     stage_mode.set_active(True)
-    assert G._scheduled_abort() is True            # _resident_reply's pre-call check stands down
+    assert G._scheduled_abort() is True            # stands down before the call, cancels during it
 
 
 def test_the_cycles_gist_refresh_still_writes_in_demo_mode(gists, monkeypatch):

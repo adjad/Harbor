@@ -805,8 +805,8 @@ async def send_reviewed_reply(envelope: Any, body: Any) -> dict:
                    {**env, "to": fresh["to"], "cc": fresh["cc"], "bcc": fresh["bcc"],
                     "subject": fresh["subject"]}, text, result=result)
     if sent:
-        from service.proactive.handled import mark_sent_reply
-        mark_sent_reply(kind="mail", message_id=env["message_id"], account=env["account"],
+        from service.proactive.handled import mark_sent_reply_async
+        await mark_sent_reply_async(kind="mail", message_id=env["message_id"], account=env["account"],
                         subject=fresh["subject"], to=list(fresh["to"]) + list(fresh["cc"]))
         return {"ok": True, "status": "sent", "result": f"Reply sent to {', '.join(fresh['to'])}.",
                 "to": fresh["to"], "subject": fresh["subject"]}

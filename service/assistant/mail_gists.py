@@ -721,8 +721,9 @@ async def _resident_reply(system: str, material: str, abort, *,
     nothing else but keep-warm models or another app's model on the user's oMLX.app.
     A call waits for Ask before it starts (service/proactive/ask_gate.py). One that is
     running when a turn starts finishes: Ask goes first at the next call boundary.
+    A stop that isn't a turn (Demo mode) still cancels it within 0.5 s.
     """
-    from service import memory_saver
+    from service import idle, memory_saver
     from service.assistant.brief import _c
     from service.config import role_to_model, thinking_kwargs
     from service.inference.remote_policy import remote_only_profile
@@ -781,6 +782,13 @@ async def _resident_reply(system: str, material: str, abort, *,
     deadline = time.monotonic() + _TIMEOUT_S
     try:
         while not request.done():
+            # A turn never cancels a running call (ask_gate). A stop that isn't a turn
+            # (Demo mode turned on, for the scheduled tick) still does, so Demo mode's
+            # hold isn't stretched by a call of up to _TIMEOUT_S.
+            if abort() and not idle.foreground_busy():
+                request.cancel()
+                _stood_down("stopped during the call (not a turn)")
+                return None
             if time.monotonic() >= deadline:
                 request.cancel()
                 raise TimeoutError(f"gist reply took over {_TIMEOUT_S:.0f}s")
@@ -1003,8 +1011,9 @@ def _demo_hold() -> bool:
 
 
 def _scheduled_abort() -> bool:
-    """The scheduled tick's abort: a turn, or Demo mode turned on. Checked before the
-    call; a call already running finishes (service/proactive/ask_gate.py)."""
+    """The scheduled tick's abort: a turn, or Demo mode turned on. Before the call
+    both stand it down. During it only Demo mode cancels it (at the next 0.5 s check);
+    a turn lets it finish (service/proactive/ask_gate.py)."""
     from service import idle
     return idle.foreground_busy() or _demo_hold()
 

@@ -246,26 +246,31 @@ def deterministic_todos(sched: dict, notes: list[dict], now: float, tz: str) -> 
     return out
 
 
-def without_passed_events(todos: dict[str, dict], now: float) -> dict[str, dict]:
+def without_passed_events(todos: dict[str, dict], now: float, tz: str | None = None) -> dict[str, dict]:
     """A to-do read from mail, texts or notes for an event that's over offers nothing to
     fit in. Reminders are settled by their own Keep/Delete question; a Kept one stays."""
     from service.assistant.stale_reminders import passed_date
     return {key: todo for key, todo in todos.items()
             if todo.get("source") in ("calendar", "reminders")
-            or not (passed_date(todo.get("title"), todo.get("due_ts") or now, now) or _event_day_passed(todo, now))}
+            or not (passed_date(todo.get("title"), todo.get("due_ts") or now, now) or _event_day_passed(todo, now, tz))}
 
 
-def _event_day_passed(todo: dict, now: float) -> bool:
+def _event_day_passed(todo: dict, now: float, tz: str | None = None) -> bool:
     """The to-do's own due day is before today and its title names a one-time event
     ("Dinner with Sam", due Monday): the date lives only in due_ts, which passed_date
     never reads as the event's day. Late work and anything still open stay
-    (stale_reminders' own words), and the event's own day still counts as ahead."""
+    (stale_reminders' own words), and the event's own day still counts as ahead.
+    Days are the Brief's own (`tz`), the Mac's only when none is given."""
     from datetime import datetime
 
     from service.assistant import stale_reminders as stale
     due = stale.valid_created_ts(todo.get("due_ts"))
     title = str(todo.get("title") or "")[:300]
-    if due is None or datetime.fromtimestamp(due).date() >= datetime.fromtimestamp(now).date():
+    try:
+        zone = ZoneInfo(tz) if tz else None
+    except Exception:  # noqa: BLE001 — an unreadable zone falls back to the Mac's
+        zone = None
+    if due is None or datetime.fromtimestamp(due, zone).date() >= datetime.fromtimestamp(now, zone).date():
         return False
     return bool(re.search(r"\b" + stale._EVENT, title, re.I)) and not stale._STILL_OPEN.search(title)
 
@@ -275,12 +280,13 @@ def _event_day_passed(todo: dict, now: float) -> bool:
 
 async def _wait_out_turn(abort, patient: bool) -> bool:
     """True to go on. A patient (Analyze now) cycle waits out a user's turn. Any other
-    waits at the Ask gate and goes on once Ask is idle; past its fairness cap it yields."""
+    waits at the Ask gate and goes on once Ask is idle; past its cap it yields (the
+    fairness slot is for a model call, never for this wait)."""
     if not abort():
         return True
     if not patient:
         from service.proactive import ask_gate
-        return await ask_gate.wait_for_ask("cycle") != ask_gate.FAIR and not abort()
+        return await ask_gate.wait_for_ask("cycle", fair=False) == ask_gate.RESUMED and not abort()
     deadline = time.monotonic() + _PATIENT_WAIT_S
     while abort() and time.monotonic() < deadline:
         await asyncio.sleep(1.0)
@@ -1696,7 +1702,7 @@ def snapshot(*, account: str | None = None, now: float | None = None, tz: str | 
         else:
             merged[todo["id"]] = dict(todo)
     done = store.done_todos(now)
-    merged = without_passed_events(merged, now)
+    merged = without_passed_events(merged, now, tz)
     for todo_id_, entry in done.items():
         if todo_id_ in merged:
             merged[todo_id_]["done"] = True

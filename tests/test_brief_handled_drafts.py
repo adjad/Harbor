@@ -233,3 +233,45 @@ def test_a_mail_answer_is_dated_by_its_sent_row(tmp_path):
             {"ts": NOW - 3600, "to": ["someone@example.net"], "subject": "Lunch", "account": "me@example.com"}]
     handled.sweep(s, now=NOW, texts={}, sent=sent, sched=None)
     assert handled.replied_todos(s, NOW)["t-mail"] == NOW - 4 * 86400
+
+
+# --- Auditor notes on 2162c848 --------------------------------------------------------------
+
+def test_send_bookkeeping_runs_off_the_event_loop_and_publishes_on_it(brief, monkeypatch):
+    import threading
+    hub_mod = importlib.import_module("service.assistant.hub")
+    where = {}
+    real = handled.mark_sent_reply
+
+    def tracked(**kw):
+        where["work"] = threading.get_ident()
+        where["publish"] = kw.get("publish")
+        return real(**kw)
+    monkeypatch.setattr(handled, "mark_sent_reply", tracked)
+    monkeypatch.setattr(hub_mod.hub, "publish_sync",
+                        lambda event, **_: where.setdefault("published", (threading.get_ident(), event)))
+
+    async def send():
+        where["loop"] = threading.get_ident()
+        async def bridge(kind, payload, **_):
+            return {"ok": True, "status": "succeeded", "delivery": "sent"}
+        monkeypatch.setattr(action_tools, "app_request", bridge)
+        with action_tools.human_reviewed_content():
+            return await action_tools.send_message(to=HANDLE, text="Yes, see you at 7!")
+    assert asyncio.run(send()).startswith("Message sent to ")
+    assert where["work"] != where["loop"], "the cache read and state write ran on the event loop"
+    assert where["publish"] is False
+    assert where["published"] == (where["loop"], {"type": "changed"})
+    assert brief.cards() == ["c-mail"]
+
+
+@pytest.mark.parametrize("tz, kept", [("UTC", False), ("America/Los_Angeles", True)])
+def test_an_event_day_is_judged_in_the_briefs_time_zone(tz, kept):
+    """Due 2026-11-24 23:30 UTC, now 2026-11-25 00:30 UTC: in UTC the day has
+    passed, in Los Angeles it is still the same afternoon, whatever the Mac's zone."""
+    from datetime import datetime, timezone
+    from service.proactive.cycle import without_passed_events
+    due = datetime(2026, 11, 24, 23, 30, tzinfo=timezone.utc).timestamp()
+    now = datetime(2026, 11, 25, 0, 30, tzinfo=timezone.utc).timestamp()
+    todos = {"dinner": {"title": "Dinner with Sam", "source": "messages", "due_ts": due}}
+    assert ("dinner" in without_passed_events(todos, now, tz)) is kept

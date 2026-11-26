@@ -3,14 +3,20 @@ on timeout. Synthetic script in a temp folder; no real skill runs."""
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import ctypes.util
 import os
 import signal
+import struct
+import subprocess
 import time
 from pathlib import Path
 
 import pytest
 
 from service.skills import tools as skill_tools
+
+_libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
 
 
 def _alive(pid: int) -> bool:
@@ -37,23 +43,45 @@ def _script(folder: Path) -> Path:
     return folder
 
 
-@pytest.fixture(autouse=True)
-def _no_loop_outlives_the_test(tmp_path):
-    yield
+def _started(pid: int) -> float | None:
+    """When process `pid` started (sysctl KERN_PROC_PID), or None if there is none."""
+    mib = (ctypes.c_int * 4)(1, 14, 1, pid)          # CTL_KERN, KERN_PROC, KERN_PROC_PID
+    buf, size = ctypes.create_string_buffer(1024), ctypes.c_size_t(1024)
+    if _libc.sysctl(mib, 4, buf, ctypes.byref(size), None, 0) != 0 or size.value == 0:
+        return None
+    sec, usec = struct.unpack_from("qi", buf.raw, 0)  # kinfo_proc.kp_proc.p_starttime
+    (found,) = struct.unpack_from("i", buf.raw, 40)  # kinfo_proc.kp_proc.p_pid
+    return sec + usec / 1e6 if found == pid else None
+
+
+def _kill_leftovers(folder: Path, since: float) -> None:
+    """Kill what this test's script left running, and nothing else. A pid in its files is
+    ours only while that process started after the test began and no later than the
+    file naming it was written; a later process that reused the number never is."""
     for name in ("child.pid", "parent.pid"):
+        path = folder / name
         try:
-            pid = int((tmp_path / name).read_text())
+            pid, written = int(path.read_text()), path.stat().st_mtime
         except (OSError, ValueError):
             continue
-        if _alive(pid):
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            try:
-                os.waitpid(pid, os.WNOHANG)       # reaped here only if it is ours; launchd otherwise
-            except ChildProcessError:
-                pass
+        started = _started(pid) if pid > 1 else None   # 0 and -1 would signal whole groups
+        if started is None or not since - 1 <= started <= written + 1:
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            continue
+        try:
+            os.waitpid(pid, os.WNOHANG)               # reaped here only if it is ours; launchd otherwise
+        except ChildProcessError:
+            pass
+
+
+@pytest.fixture(autouse=True)
+def _no_loop_outlives_the_test(tmp_path):
+    since = time.time()
+    yield
+    _kill_leftovers(tmp_path, since)
 
 
 def _wait_for(path: Path) -> int:
@@ -98,3 +126,22 @@ def test_timeout_kills_the_tool_and_its_children(tmp_path, monkeypatch):
     out = asyncio.run(run())
     assert "timed out" in out
     assert _gone(int((tmp_path / "parent.pid").read_text()), int((tmp_path / "child.pid").read_text()))
+
+
+def test_cleanup_never_kills_a_process_that_reused_a_recorded_pid(tmp_path):
+    since = time.time()
+    later = subprocess.Popen(["/bin/bash", "-c", "read -t 20 < /dev/zero; true"])   # not ours
+    try:
+        (tmp_path / "child.pid").write_text(str(later.pid))
+        old = since - 60                                # the number was written before it started
+        os.utime(tmp_path / "child.pid", (old, old))
+        _kill_leftovers(tmp_path, since)
+        assert later.poll() is None
+        os.utime(tmp_path / "child.pid", None)          # written after it started: ours, so it goes
+        _kill_leftovers(tmp_path, since)
+        assert later.wait(5) == -signal.SIGKILL
+    finally:
+        if later.poll() is None:
+            later.kill()
+            later.wait()
+

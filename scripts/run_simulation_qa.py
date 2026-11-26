@@ -831,6 +831,8 @@ ADDITIONAL_FULL_TESTS = {
     # over a tiny fake bundle in a temp dir; no signing, keychain or /Applications.
     "tests/test_resign_local_install.py",
     "tests/test_simulation_qa_runner.py",
+    # --changed-since selection on synthetic trees with a stand-in git; release path unchanged.
+    "tests/test_simulation_qa_affected.py",
     "tests/test_think_leak.py",
     "tests/test_timeranges.py",
     "tests/test_today_plan.py",
@@ -1838,6 +1840,11 @@ def _native_gates(build_dir: Path) -> list[tuple[str, list[str]]]:
     ]
 
 
+# The runner's own native gate list. build-support/simulation.py replaces
+# _native_gates with its extended list; --changed-since refuses to run then.
+_CANONICAL_NATIVE_GATES = _native_gates
+
+
 def _run_native_gates(build_dir: Path) -> list[GateResult]:
     results: list[GateResult] = []
     by_name: dict[str, GateResult] = {}
@@ -1949,6 +1956,32 @@ def _selected_tests(profiles: list[str]) -> list[str]:
     return sorted(selected)
 
 
+def _affected_module():
+    try:
+        from scripts import qa_affected
+    except ModuleNotFoundError:  # Direct execution from scripts/ puts that directory first.
+        import qa_affected
+    return qa_affected
+
+
+def _affected_selection(parser: argparse.ArgumentParser, ref: str):
+    """--changed-since: development-only gate selection (see scripts/qa_affected.py)."""
+    global _native_gates
+    if _native_gates is not _CANONICAL_NATIVE_GATES or _selected_tests is not _CANONICAL_SELECTED_TESTS:
+        parser.error("--changed-since is a development aid for scripts/run_simulation_qa.py only; "
+                     "the build pipeline always runs the full profile")
+    module = _affected_module()
+    try:
+        selection = module.select(sys.modules[__name__], ref)
+    except (RuntimeError, ValueError, SyntaxError) as exc:
+        parser.error(f"--changed-since: {exc}")
+    _native_gates = selection.native_gates
+    return selection
+
+
+_CANONICAL_SELECTED_TESTS = _selected_tests
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     choices = ["full", *sorted(PROFILE_TESTS)]
@@ -1989,6 +2022,12 @@ def main() -> int:
         help="Concurrent gate processes (default: one per CPU; 1 runs sequentially).",
     )
     parser.add_argument("--list", action="store_true", help="List selected gates and exit.")
+    parser.add_argument(
+        "--changed-since", metavar="REF",
+        help=("Development rounds only, NEVER a release gate: run just the gates that cover "
+              "files changed since REF (falls back to every gate when unsure). "
+              "Records profile 'affected', which the release pipeline rejects."),
+    )
     args = parser.parse_args()
     if not args.list and args.report is None:
         parser.error("--report is required unless --list is used")
@@ -2003,6 +2042,8 @@ def main() -> int:
     jobs = default_jobs() if args.jobs is None else args.jobs
     if jobs < 1:
         parser.error("--jobs must be at least 1")
+    if args.changed_since is not None and args.profile:
+        parser.error("--changed-since selects its own gates; do not combine it with --profile")
     profiles = args.profile or ["full"]
     expected = args.expected_sha.lower()
     if not re.fullmatch(r"[0-9a-f]{40}", expected):
@@ -2024,11 +2065,21 @@ def main() -> int:
     if dirty and not args.allow_dirty:
         parser.error("candidate Worktree is dirty; exact-SHA verdicts require a clean checkout")
 
-    tests = [] if args.only_native else _selected_tests(profiles)
-    run_native = args.only_native or (
-        not args.skip_native
-        and ("full" in profiles or bool(NATIVE_PROFILES.intersection(profiles)))
-    )
+    selection = None
+    if args.changed_since is not None:
+        selection = _affected_selection(parser, args.changed_since)
+        profiles = ["affected"]
+    if selection is not None:
+        tests = [] if args.only_native else selection.tests
+        run_native = not args.skip_native and bool(selection.native_names)
+    else:
+        tests = [] if args.only_native else _selected_tests(profiles)
+        run_native = args.only_native or (
+            not args.skip_native
+            and ("full" in profiles or bool(NATIVE_PROFILES.intersection(profiles)))
+        )
+    if selection is not None:
+        print("\n".join(_affected_module().describe(selection)), flush=True)
     if args.list:
         for path in tests:
             print(path)
@@ -2050,6 +2101,9 @@ def main() -> int:
         print(f"Simulation QA: {len(tests)} modules"
               f"{' + native gates' if run_native else ''}; {jobs} parallel jobs", flush=True)
     results = _run_gates(tests, run_native, jobs)
+    if selection is not None:
+        print("Slowest gates this run:", flush=True)
+        print("\n".join(_affected_module().slowest(results)), flush=True)
 
     end_sha = _git("rev-parse", "HEAD")
     stable = end_sha == start_sha == expected
@@ -2081,11 +2135,15 @@ def main() -> int:
         "totals": totals,
         "results": [dict(asdict(item), status=_gate_status(item)) for item in results],
     }
+    if selection is not None:
+        report["selection"] = selection.report()
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({key: report[key] for key in (
         "status", "candidate_sha", "sha_stable", "worktree_clean", "totals"
     )}, indent=2))
+    if selection is not None:
+        print(_affected_module().NOT_A_RELEASE_GATE, flush=True)
     return 0 if ok else 1
 
 
