@@ -237,19 +237,6 @@ PROFILE_TESTS = {
         # run_shell's write guard: a Harbor folder and a home in a temp dir. The real-process
         # cases need to apply a sandbox, so they skip inside this profile's own sandbox.
         "tests/test_shell_sandbox.py",
-        # Ideate's bridge: a Python stand-in for Pi over RPC JSONL, tmp_path projects, a stand-in engine;
-        # the real sandbox-exec case skips inside this profile's own sandbox.
-        "tests/test_ideate_bridge.py",
-        # Finding Ideate's model on this Mac and cloning it into Harbor's engine folder (tmp trees only).
-        "tests/test_ideate_model_link.py",
-        # Ideate's residency: a recording stand-in engine client (unload, load, hold, release order).
-        "tests/test_ideate_residency.py",
-        # Ideate's GPU-limit row: source checks that it reaches Terminal only through the code card.
-        "tests/test_ideate_gpu_row.py",
-        # Ideate loops and bash caps: real subprocesses on invented commands in tmp_path, gate verdicts,
-        # prompt budget, and the generated extension's time and output limits (run in node).
-        "tests/test_ideate_loop.py",
-        "tests/test_ideate_bash_caps.py",
         # Brief says "Reading Mail…" while Harbor reads a Mail it opened (MailRecache); synthetic state.
         "tests/test_mail_recache_brief.py",
         # The notch panel takes the keyboard on every asked-for open and every press (source checks).
@@ -283,16 +270,16 @@ PROFILE_TESTS = {
         "tests/test_cloud_key_read.py",
         "tests/test_keychain_rename_copy.py",
         "tests/test_keychain_legacy_guard.py",
+        "tests/test_settings_disconnect_reload.py",
         "tests/test_remote_reasoning_replay.py",
         "tests/test_gemini_provider_and_ttft.py",
         "tests/test_remote_media.py",
+        "tests/test_gemini_inline_cap.py",
         "tests/test_cloud_scale_up_core.py",
         "tests/test_cloud_scale_up_documents_meetings.py",
         "tests/test_cloud_scale_up_repairs.py",
         "tests/test_cloud_probe_openrouter.py",
         "tests/test_cloud_everything_mail_memory.py",
-        "tests/test_gemini_everything_switch.py",
-        "tests/test_gemini_media_signatures.py",
         "tests/test_node_inbox.py",
         "tests/test_assistant_delivery.py",
         "tests/test_calendar_create_interval.py",
@@ -589,6 +576,10 @@ ADDITIONAL_FULL_TESTS = {
     "tests/test_mail_history_regex.py",
     # Mail acts only with proof: injected Sent rows, Contacts and fetched authentication results.
     "tests/test_autoadd_mail_proof.py",
+    # Apple Mail email: known sender, the receiving server's result when present, both yeses.
+    "tests/test_autoadd_apple_mail_proof.py",
+    # Mail closed: the Brief still reads (freshness window, the on-disk index, the Brief's cause).
+    "tests/test_mail_read_closed.py",
     "tests/test_capture_mail_stays_a_card.py",
     "tests/test_mail_auth.py",
     "tests/test_mail_known.py",
@@ -687,8 +678,6 @@ ADDITIONAL_FULL_TESTS = {
     "tests/test_bundled_engine_mode.py",
     # Engine packaging on a synthetic oMLX.app: selection, pruning, pinning, validation.
     "tests/test_engine_packaging.py",
-    # Ideate's harness bundle on a fake Pi release and a fake Node: prune, pin, licences, validate.
-    "tests/test_ideate_harness_bundle.py",
     "tests/test_engine_licenses.py",
     # Pure fake enforcers/tasks, synthetic package bytes and intercepted HTTP.
     # No engine/model/native launch, real provider or host memory probes.
@@ -1057,8 +1046,6 @@ _NATIVE_GATE_DEPENDENCIES = {
     "native/notch-tab-contract": "native/notch-tab-compile",
     "native/know-you-contract": "native/know-you-compile",
     "native/user-hours-contract": "native/user-hours-compile",
-    "native/ideate-contract": "native/ideate-compile",
-    "native/ideate-routing-contract": "native/ideate-routing-compile",
     "native/mail-recache-contract": "native/mail-recache-compile",
     "native/panel-key-contract": "native/panel-key-compile",
     "native/model-use-groups-contract": "native/model-use-groups-compile",
@@ -1355,8 +1342,6 @@ def _native_gates(build_dir: Path) -> list[tuple[str, list[str]]]:
     app_bugs = str(build_dir / "app-bugs")
     study_find = str(build_dir / "study-find")
     notch_tab = str(build_dir / "notch-tab")
-    ideate = str(build_dir / "ideate")
-    ideate_routing = str(build_dir / "ideate-routing")
     mail_recache = str(build_dir / "mail-recache")
     panel_key = str(build_dir / "panel-key")
     model_use_groups = str(build_dir / "model-use-groups")
@@ -1518,27 +1503,6 @@ def _native_gates(build_dir: Path) -> list[tuple[str, list[str]]]:
         ),
         ("native/ask-suggestions-contract", [ask_suggestions]),
         (
-            "native/ideate-compile",
-            [
-                TRUSTED_SWIFTC, "-parse-as-library", "-swift-version", "5",
-                "-module-cache-path", module_cache,
-                "app/Sources/HarborApp/IdeateKind.swift",
-                "app/Sources/HarborApp/IdeateGPULimit.swift",
-                "tests/IdeateChecks.swift", "-o", ideate,
-            ],
-        ),
-        ("native/ideate-contract", [ideate]),
-        (
-            "native/ideate-routing-compile",
-            [
-                TRUSTED_SWIFTC, "-parse-as-library", "-swift-version", "5",
-                "-module-cache-path", module_cache,
-                "app/Sources/HarborApp/IdeateRouting.swift",
-                "tests/IdeateRoutingChecks.swift", "-o", ideate_routing,
-            ],
-        ),
-        ("native/ideate-routing-contract", [ideate_routing]),
-        (
             "native/mail-recache-compile",
             [
                 TRUSTED_SWIFTC, "-parse-as-library", "-swift-version", "5",
@@ -1643,7 +1607,7 @@ def _native_gates(build_dir: Path) -> list[tuple[str, list[str]]]:
                 "app/Sources/HarborApp/StaleReminders.swift",
                 "app/Sources/HarborApp/NeedsYouActions.swift",
                 "app/Sources/HarborApp/Study.swift",
-                "app/Sources/HarborApp/WildcardTabs.swift", "app/Sources/HarborApp/IdeateKind.swift",
+                "app/Sources/HarborApp/WildcardTabs.swift",
                 "tests/NotchTabChecks.swift", "tests/WildcardTabsChecks.swift", "tests/NotchDayChecks.swift",
                 "tests/BriefSummaryChecks.swift", "tests/QuickSettingsChecks.swift",
                 "tests/StaleReminderChecks.swift", "tests/NeedsYouActionChecks.swift",

@@ -13,8 +13,6 @@ import SwiftUI
 @MainActor
 enum NotchQAOnboarding {
     private static var windows: [(String, NSWindow)] = []
-    /// Where the blocked Meet row sits, in points from the top of the You window.
-    private static let blockedRowFromTop: CGFloat = 972
 
     static func run(outDir: URL, offscreen: Bool) {
         URLProtocol.registerClass(NotchQASetup.Refuse.self)
@@ -65,7 +63,6 @@ enum NotchQAOnboarding {
             ("you-personas", { choose(nil) }, false, 940),
             ("you-builder-subtypes", { choose(.builderUI) }, false, 1240),
             ("you-change-list", { choose(.builderLearn) }, true, 1240),
-            ("you-change-list-blocked", { choose(.builderLearn) }, true, 1240),
         ]
         for (name, step, setup, account, height) in scenes {
             let view = FirstRunSetupView(setup: setup, knowYou: knowYou(), google: account, initialStep: step,
@@ -127,18 +124,6 @@ enum NotchQAOnboarding {
                     }
                     try? await Task.sleep(nanoseconds: 800_000_000)
                 }
-                if name == "you-change-list-blocked" {
-                    // Then the blocked Meet row, pressed for real: it says what to do.
-                    let point = NSPoint(x: 120, y: window.frame.height - blockedRowFromTop)
-                    for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
-                        if let event = NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
-                                                          windowNumber: window.windowNumber, context: nil, eventNumber: 2, clickCount: 1, pressure: 1) {
-                            window.sendEvent(event)
-                        }
-                        try? await Task.sleep(nanoseconds: 80_000_000)
-                    }
-                    try? await Task.sleep(nanoseconds: 600_000_000)
-                }
                 guard let view = window.contentView else { continue }
                 view.layoutSubtreeIfNeeded()
                 if let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
@@ -158,7 +143,7 @@ enum NotchQAOnboarding {
     /// The You step's saved choice: a persona and the tabs it suggests, or nothing.
     private static func choose(_ persona: QuaysidePersona?) {
         let defaults = UserDefaults.standard
-        for key in [WildcardTabs.key, QuaysidePersonaStore.personaKey, QuaysidePersonaStore.ideateKindKey] { defaults.removeObject(forKey: key) }
+        for key in [WildcardTabs.key, QuaysidePersonaStore.personaKey] { defaults.removeObject(forKey: key) }
         if let persona { QuaysidePersonaStore.choose(persona) }
     }
 

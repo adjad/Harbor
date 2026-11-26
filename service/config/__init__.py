@@ -1232,65 +1232,14 @@ def cloud_super_model_enabled() -> bool:
             and super_cfg.get("enabled", False) is True)
 
 
-def gemini_everything_connection() -> dict | None:
-    """The saved, enabled Gemini API connection the "Gemini handles everything" switch
-    runs on: {"endpoint": its endpoint config, "model_id", "context_window",
-    "credential_name"}, or None when there is none. Reads config only, never a key."""
-    from service.inference.providers import wire_provider
-    cfg = models_config().get("inference", {})
-    endpoint_cfg = cfg.get("endpoints", {}).get("cloud", {})
-    if not isinstance(endpoint_cfg, dict) or endpoint_cfg.get("enabled", True) is not True:
-        return None
-    settings = cloud_provider_settings()
-    if wire_provider(settings["provider"], settings["base_url"].rstrip("/")) != "gemini":
-        return None
-    model_id = settings["model_id"].strip()
-    if not model_id or not str(endpoint_cfg.get("credential_ref", "")).startswith("keychain:"):
-        return None
-    return {"endpoint": dict(endpoint_cfg), "model_id": model_id,
-            "context_window": settings["context_window"],
-            "credential_name": settings["credential_name"]}
-
-
-def enable_gemini_everything(connection: dict, context_window: int) -> None:
-    """Turn the "Gemini handles everything" switch on: the remote-only profile plus
-    remote_parity on the saved Gemini connection (set_cloud_everything), keeping the
-    Super Model setting it replaces so turning the switch off puts it back. Takes
-    effect when the backend restarts."""
-    super_cfg = models_config().get("inference", {}).get("super_model", {})
-    prior = dict(super_cfg) if isinstance(super_cfg, dict) else {}
-    set_cloud_everything(connection["endpoint"], connection["model_id"], context_window)
-    _save_overlay({"gemini_everything": {"switch": True, "prior_super_model": prior}})
-
-
-def disable_gemini_everything() -> None:
-    """Turn the switch off: no remote-only profile and no remote_parity, so every
-    cloud_everything_active() path is off again after the restart, and the Super
-    Model setting saved when it was turned on is restored. The Gemini connection
-    itself (and any cloud roles) stays as it was."""
-    saved = models_config().get("gemini_everything")
-    # Only a switch that is on has a Super Model setting of its own to give back.
-    prior = (saved.get("prior_super_model")
-             if isinstance(saved, dict) and saved.get("switch") is True else None)
-    update = {"remote_parity": False, "inference": {"remote_only": {"enabled": False}},
-              "gemini_everything": {"switch": False, "prior_super_model": {}}}
-    if isinstance(prior, dict) and prior:
-        update["inference"]["super_model"] = prior
-    _save_overlay(update)
-    from service.config.provider_credentials import forget_reused_keys
-    forget_reused_keys()
-
-
 def disable_cloud_provider() -> None:
     from service.config.provider_credentials import forget_reused_keys
     forget_reused_keys()                      # a removed connection's key is not sent again
     if cloud_everything_enabled():
-        # Back to local models at the next backend restart. The Gemini switch (if it
-        # turned this on) is off with it, and keeps no Super Model setting to restore.
+        # Back to local models at the next backend restart.
         _save_overlay({"remote_parity": False, "inference": {
             "remote_only": {"enabled": False}, "endpoints": {"cloud": {"enabled": False}},
-            "super_model": {"enabled": False}},
-            "gemini_everything": {"switch": False, "prior_super_model": {}}})
+            "super_model": {"enabled": False}}})
         return
     current = models_config().get("inference", {}).get("bindings", {})
     bindings = {}

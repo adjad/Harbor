@@ -250,10 +250,20 @@ struct NotchBriefView: View {
 
     /// What Harbor read to make the Brief, beside Ask about this, short ("Harbor
     /// read 49 · skipped 3 · found 3"); the whole work line is its tooltip.
+    /// With a cloud model the line also names it ("· Gemini 3.8 Flash"), and the
+    /// name stays when the read counts don't fit.
     @ViewBuilder private func workLine(_ proactive: ProactiveState) -> some View {
+        let cloud = model.cloudModel
         if let foot = proactive.footLine {
-            Text(foot).font(.harbor(size: 11.5)).foregroundStyle(Theme.textMuted).lineLimit(1)
-                .help(proactive.workLine ?? foot)
+            let tip = (proactive.workLine ?? foot) + (cloud.map { " · " + $0 } ?? "")
+            ViewThatFits(in: .horizontal) {
+                Text(foot + (cloud.map { " · " + $0 } ?? ""))
+                Text(cloud ?? foot)
+            }
+            .font(.harbor(size: 11.5)).foregroundStyle(Theme.textMuted).lineLimit(1)
+            .help(tip)
+        } else if let cloud {
+            Text(cloud).font(.harbor(size: 11.5)).foregroundStyle(Theme.textMuted).lineLimit(1)
         }
     }
 

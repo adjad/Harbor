@@ -20,22 +20,37 @@ struct NotchTabChecks {
         check(NotchTab.strip(wildcards: WildcardTabs.chosen(defaults: fresh)) == [.ask, .brief, .day, .meet, .study],
               "the strip reads Ask, Brief, Day, Meet, Study until the person chooses")
         check(NotchTab.strip(wildcards: []) == [.ask, .brief, .day], "no wildcards: Ask, Brief, Day")
-        check(NotchTab.strip(wildcards: [.ideate]) == [.ask, .brief, .day, .ideate], "one wildcard")
-        check(NotchTab.strip(wildcards: [.ideate, .study]) == [.ask, .brief, .day, .ideate, .study], "two wildcards keep their order")
-        check(NotchTab.strip(wildcards: [.study, .meet, .ideate]) == [.ask, .brief, .day, .study, .meet], "never more than two wildcards")
+        check(NotchTab.strip(wildcards: [.study]) == [.ask, .brief, .day, .study], "one wildcard")
+        check(NotchTab.strip(wildcards: [.study, .meet]) == [.ask, .brief, .day, .study, .meet], "two wildcards keep their order")
         check(NotchTab.strip(wildcards: [.ask, .research, .meet, .meet]) == [.ask, .brief, .day, .meet],
               "only wildcard tabs join, each once")
         check(NotchTab.strip.first == .ask && NotchTab.strip.count >= 3 && NotchTab.strip.count <= 5, "the live strip is three to five tabs")
         check(NotchTab.strip(wildcards: [.meet, .study]).map(\.shortcutDigit).prefix(3) == ["1", "2", "3"], "⌘1 to ⌘3 are fixed")
         check(NotchTab.strip.enumerated().allSatisfy { $0.element.shortcutDigit == Character(String($0.offset + 1)) },
               "⌘ digits follow the live strip")
-        check(!NotchTab.ideate.showsDay && !NotchTab.ideate.hasPrompt && NotchTab.ideate.stripTab == .ideate
-              && NotchTab.ideate.title == "Ideate" && NotchTab.ideate.rawValue == 6, "Ideate is last, with no prompt field")
         check(NotchTab.strip(wildcards: [.meet]).map(\.title) == ["Ask", "Brief", "Day", "Meet"], "tab titles")
         // A tab that is not in the strip has no digit, and a remembered one opens Ask.
         check(NotchTab.allCases.filter { !NotchTab.strip.contains($0) }.allSatisfy { $0.shortcutDigit == nil },
               "a tab outside the strip has no ⌘ digit")
         check(!NotchTab.strip.contains(.research) && NotchTab.research.shortcutDigit == nil, "Research is out of the strip")
+        // A build with no on-device engine: Meet leaves the strip, the rest keep their keys.
+        NotchTab.meetHidden = true
+        check(NotchTab.strip == [.ask, .brief, .day, .study] && NotchTab.meet.shortcutDigit == nil
+              && NotchTab.day.shortcutDigit == "3", "no engine: the strip reads Ask, Brief, Day, Study")
+        NotchTab.meetHidden = false
+        check(NotchTab.strip.contains(.meet) && NotchTab.strip.last == .study, "Meet is back once the flag is clear")
+        check(NotchTab.meetHiddenReason.contains("cloud model that takes audio"),
+              "the hidden-Meet reason names the cloud route too")
+        // Meet's opening paragraph: local says nothing leaves; cloud names the provider.
+        let local = MeetingCopy.home(hearsCallAudio: false, cloudProvider: nil)
+        check(local.contains("on this Mac") && local.hasSuffix("nothing leaves your Mac."),
+              "on-device Meet says nothing leaves the Mac")
+        let cloud = MeetingCopy.home(hearsCallAudio: true, cloudProvider: "OpenRouter")
+        check(cloud.contains("sends the audio to OpenRouter") && !cloud.contains("nothing leaves")
+              && cloud.contains("sound this Mac plays"),
+              "cloud Meet says the audio goes to the provider and never claims it stays")
+        check(MeetingCopy.home(hearsCallAudio: false, cloudProvider: "") == local,
+              "an empty provider reads as on-device")
         check(NotchTab.research.stripTab == .ask && NotchTab.day.stripTab == .day, "Research shows as Ask in the strip")
         check(NotchTab.brief.showsDay && NotchTab.day.showsDay && !NotchTab.ask.showsDay && !NotchTab.research.showsDay,
               "Brief and Day show the day; Ask and Research take a prompt")
@@ -65,7 +80,7 @@ struct NotchTabChecks {
               "a clock that moved back a little keeps the last tab")
 
         let wide = NotchTab.strip(wildcards: [.meet, .study])
-        let narrow = NotchTab.strip(wildcards: [.ideate])
+        let narrow = NotchTab.strip(wildcards: [.meet])
         check(memory.tabForOpening(current: .study, byHover: true, at: closed.addingTimeInterval(60), strip: wide) == .study,
               "a wildcard still in the strip is remembered")
         check(memory.tabForOpening(current: .study, byHover: true, at: closed.addingTimeInterval(60), strip: narrow) == .ask,

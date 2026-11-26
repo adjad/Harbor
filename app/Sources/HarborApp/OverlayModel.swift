@@ -257,6 +257,9 @@ final class OverlayModel: ObservableObject {
     @Published private(set) var modelMemory: ModelMemory?
     // First-run setup at the top of Ask. Its readiness lives on the app's one
     // SetupGuideModel, which Settings › Models › Setup shares.
+    /// The cloud model every answer comes from ("Gemini 3.8 Flash"), shown in
+    /// Ask and Brief; nil when Harbor answers on this Mac.
+    @Published var cloudModel: String?
     @Published var setupCard: NotchSetupCard = .hidden { didSet { if setupCard != oldValue { onResize() } } }
     // Whether Harbor's own service answers (BackendManager's reachability watch).
     // False shows "Harbor service isn't running" with Retry instead of a green dot.
@@ -973,46 +976,6 @@ final class OverlayModel: ObservableObject {
         // Part of a command that could still be one of several ("/re"): keep the
         // list showing rather than sending a fragment to the model.
         if !NotchCommand.suggestions(for: prompt, includeCorpus: debugMode, includeScreen: screenCommandAvailable).isEmpty { return }
-        // A complex coding request goes to Ideate when it is in the strip; a
-        // question, a one-liner or anything with an attachment stays here.
-        // Pure and instant (IdeateRouting.swift); `/ideate x` forces it and
-        // `/ask x` or `ask: x` keeps it in Ask.
-        let ideateOn = NotchTab.strip.contains(.ideate)
-        if ideateOn, NotchCommand.isBareIdeate(prompt) { input = ""; tab = .ideate; return }
-        if !researchMode, !hasAttachment {
-            let routing = IdeateRoute.classify(prompt, ideateEnabled: ideateOn)
-            if case .ideate = routing, !IdeateModel.shared.canStart {
-                // Ideate is busy with another build, or can't run on this Mac yet: answer here
-                // rather than drop it.
-                showTransientNotice(IdeateModel.shared.isActive
-                                    ? "Ideate is busy with another build, so Ask is answering this one."
-                                    : "Ideate can't run here yet, so Ask is answering this one.",
-                                    duration: 6, info: true)
-            } else if case .ideate = routing {
-                input = ""
-                let typed = prompt
-                IdeateModel.shared.start(prompt: IdeateRoute.promptBody(prompt), kind: IdeateModel.shared.kind,
-                                         onRefused: { [weak self] why in
-                    // Ideate refused it (busy, model missing, not answering): the prompt comes
-                    // back to Ask's box, so nothing the person typed is lost.
-                    guard let self else { return }
-                    if self.input.isEmpty { self.input = typed }
-                    if self.tab == .ideate { self.tab = .ask }
-                    self.showTransientNotice("Ideate couldn't start that: \(why) It's back in Ask.",
-                                             duration: 8, info: true)
-                })
-                showTransientNotice(IdeateRoute.handoffLine(routing), duration: 6, info: true)
-                tab = .ideate
-                return
-            }
-            if NotchCommand.routePrefix(prompt) != nil {
-                // "/ask x", or "/ideate x" that Ask answers (Ideate off, busy or unavailable):
-                // the model gets the question, not the prefix.
-                prompt = IdeateRoute.promptBody(prompt)
-                // "/ask" or "ask:" alone: nothing to send, so keep it in the box.
-                guard !prompt.isEmpty else { return }
-            }
-        }
         guard !corpusBusy else {
             showTransientNotice("Stop the corpus run before asking another question.")
             return
@@ -1320,7 +1283,6 @@ final class OverlayModel: ObservableObject {
         case .research: HarborRouter.shared.open(.research)
         case .meet: HarborRouter.shared.open(.today(focus: .plan))
         case .study: HarborRouter.shared.open(.today(focus: .plan))
-        case .ideate: HarborRouter.shared.open(.today(focus: .plan))
         }
     }
 

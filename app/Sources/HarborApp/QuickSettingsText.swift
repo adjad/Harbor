@@ -118,17 +118,33 @@ enum QuickSettingsSection: String, CaseIterable, Identifiable {
     }
 
     func save(in defaults: UserDefaults = .standard) { defaults.set(rawValue, forKey: Self.defaultsKey) }
+
+    /// The sections offered. With no model on this Mac (everything on the cloud, or an
+    /// Intel build with no engine) Power has nothing to cap or unload, so it is left out.
+    static func shown(localEngine: Bool) -> [QuickSettingsSection] {
+        localEngine ? allCases : allCases.filter { $0 != .power }
+    }
 }
 
 /// Quick settings' one-line descriptions. Each keeps the states the service can
 /// be in (waiting for confirmation, not confirmed) instead of guessing "off".
 enum QuickSettingsText {
+    /// No model runs on this Mac: every answer comes from a remote model (remote-only),
+    /// or this is an Intel build whose engine isn't available (no Intel Mac runs the
+    /// built-in engine; unknown counts as absent there). Power and Auto-unload hide then.
+    static func noLocalEngine(remoteOnly: Bool, compiledForIntel: Bool, engineAvailable: Bool?) -> Bool {
+        remoteOnly || (compiledForIntel && engineAvailable != true)
+    }
+
+    static let modelProviderHelp = "Where Harbor's AI runs. Switching needs that provider's key; "
+        + "Harbor restarts on it, and Ask and Brief show the new model."
+
     /// The notch's Setup row: always there, unlike the menu bar's two-day Change Setup….
     static let setupHelp = "Open setup again to change permissions, Google, About you or open at login. "
         + "Your model stays as it is."
 
     /// The Extra tabs row's tooltip. Its title, subtitle and state line are WildcardTabs'.
-    static let tabsHelp = "Choose up to two of Study, Meet and Ideate to sit after Ask, Brief and Day. "
+    static let tabsHelp = "Choose Study, Meet, both or neither to sit after Ask, Brief and Day. "
         + "Your choice stays on this Mac."
 
         /// Full access's line: a status word ("On" shows amber) and the rest.
@@ -369,6 +385,12 @@ enum RoleModelChoices {
     ]
     /// Roles whose model no chat role can use.
     static let nonChatRoles = ["embedding", "reranker"]
+
+    /// A role answers on the cloud model: saved for it, or "everything" saved (the
+    /// Intel build and Settings' Everything put all of Harbor there).
+    static func onCloud(_ role: String, savedCloudRoles: Set<String>) -> Bool {
+        savedCloudRoles.contains("everything") || savedCloudRoles.contains(role)
+    }
 
     static func isChatModel(_ id: String, roles: [String: String] = [:]) -> Bool {
         let name = id.lowercased()

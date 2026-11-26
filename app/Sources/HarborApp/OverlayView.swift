@@ -129,7 +129,18 @@ struct OverlayView: View {
     }
     /// Brief or Day in two columns, in the wider panel.
     private var panelIsWide: Bool { wideChosen && panelCanWiden }
-    private var isNotch: Bool { layout.style == .notch }
+    /// Bars flush with the top edge (a notch's, and the notchless pill) show only
+    /// the small marks; a monitor's capsule also carries the orb and chevron.
+    private var isSlimBar: Bool { layout.style != .floating }
+    /// Bottom padding that sets a mark of `item` pt in the bar: a notch's own
+    /// offset, or centred in the notchless sliver.
+    private func markInset(notch: CGFloat, floating: CGFloat, item: CGFloat) -> CGFloat {
+        switch layout.style {
+        case .notch: return notch
+        case .menuBar: return max(((layout.barSize.height - item) / 2).rounded(), 0)
+        case .floating: return floating
+        }
+    }
 
     /// Brief and Day under the fixed header: as tall as their content until the
     /// panel would pass the screen's bottom (SurfaceLayout.maxPanelHeight), then
@@ -356,17 +367,10 @@ struct OverlayView: View {
                            cap: layout.studyContentCap(headerHeight: headerHeight))
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.top, SurfaceLayout.tabTopPadding)
-        case .ideate:
-            // Like Study: stops at half the screen and scrolls inside itself.
-            NotchIdeateView(ideate: IdeateModel.shared, wide: panelIsWide,
-                            cap: layout.studyContentCap(headerHeight: headerHeight),
-                            onResize: { model.onResize() })
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.top, SurfaceLayout.tabTopPadding)
         case .research:
             if model.showingResearch {
                 ResearchView(model: researchModel, compact: true,
-                             onBack: { model.returnToChat() })
+                             onBack: { model.returnToChat() }, cloudModel: model.cloudModel)
             } else {
                 transientNotice
                 promptArea
@@ -383,15 +387,16 @@ struct OverlayView: View {
         }
     }
 
-    // Collapsed with nothing drawn: a built-in display without a notch, or a notch
-    // behind a full-screen app (the hybrid notch). Its status is on the menu-bar
+    // Collapsed with nothing drawn: a notch, or a notchless display's pill, behind
+    // a full-screen app (the hybrid notch). Its status is on the menu-bar
     // icon (AppDelegate.updateMenuBarStatus), and the window ignores the mouse.
     private var hiddenBar: some View {
         Color.clear.frame(width: layout.barSize.width, height: layout.barSize.height)
             .accessibilityHidden(true)
     }
 
-    // Collapsed: a black bar that wraps the notch on a notched MacBook; on a
+    // Collapsed: a black bar that wraps the notch on a notched MacBook; a black
+    // pill in the menu bar's centre on a notchless built-in display; on a
     // monitor, a small capsule under the menu bar. Hover to open.
     private var notchBar: some View {
         ZStack(alignment: .bottom) {
@@ -399,7 +404,7 @@ struct OverlayView: View {
             if model.isProcessing || model.phase == .streaming {
                 Circle().fill(.white.opacity(0.9))
                     .frame(width: 4, height: 4)
-                    .padding(.bottom, 5)
+                    .padding(.bottom, markInset(notch: 5, floating: 5, item: 4))
                     .opacity(!reduceMotion && breathe ? 0.3 : 1)
                     .animation(reduceMotion ? nil : .easeInOut(duration: 1).repeatForever(autoreverses: true), value: breathe)
                     .accessibilityHidden(true)
@@ -407,31 +412,32 @@ struct OverlayView: View {
                 // Ready while notifications are off: a still, quiet dot until the
                 // panel is opened (AppDelegate.tellReady, readyLineSeen).
                 HStack(spacing: 6) {
-                    if !isNotch { HarborOrb(resting: true).scaleEffect(0.7) }
+                    if !isSlimBar { HarborOrb(resting: true).scaleEffect(0.7) }
                     Circle().fill(Theme.good.opacity(0.75)).frame(width: 5, height: 5)
                 }
-                .padding(.bottom, isNotch ? 5 : 8)
+                .padding(.bottom, markInset(notch: 5, floating: 8, item: 5))
                 .accessibilityLabel("Harbor is ready")
-            } else if model.setupCard != .later, todayModel.isShowingCurrentDay, todayCount > 0 {
+            } else if layout.style != .menuBar, model.setupCard != .later, todayModel.isShowingCurrentDay, todayCount > 0 {
                 // What's due today or overdue, from the day's last load (it loads only
                 // while Brief or Day is open, so the bar never triggers a load).
                 HStack(spacing: 6) {
-                    if !isNotch { HarborOrb(resting: true).scaleEffect(0.7) }
+                    if !isSlimBar { HarborOrb(resting: true).scaleEffect(0.7) }
                     Text("\(todayCount)").font(.harbor(.caption, weight: .bold)).foregroundStyle(.black)
                         .padding(.horizontal, 5).frame(minWidth: 14, minHeight: 13)
                         .background(Capsule().fill(.white))
                 }
-                .padding(.bottom, isNotch ? 3 : 8)
+                .padding(.bottom, markInset(notch: 3, floating: 8, item: 13))
                 .accessibilityLabel(todayCount == 1 ? "1 thing is due today" : "\(todayCount) things are due today")
-            } else if model.setupCard == .later {
-                // Setup was set aside and Harbor still can't answer.
+            } else if layout.style != .menuBar, model.setupCard == .later {
+                // Setup was set aside and Harbor still can't answer. (The notchless sliver is
+                // too thin for the count or this mark: it shows only the small dots.)
                 HStack(spacing: 6) {
-                    if !isNotch { HarborOrb(resting: true).scaleEffect(0.7) }
+                    if !isSlimBar { HarborOrb(resting: true).scaleEffect(0.7) }
                     Text("!").font(.harbor(.caption, weight: .heavy)).foregroundStyle(Theme.warn)
                 }
-                .padding(.bottom, isNotch ? 3 : 8)
+                .padding(.bottom, markInset(notch: 3, floating: 8, item: 13))
                 .accessibilityLabel("Harbor isn't set up yet")
-            } else if !isNotch {
+            } else if !isSlimBar {
                 HStack(spacing: 8) {
                     HarborOrb(resting: true).scaleEffect(0.7)
                     Image(systemName: "chevron.down")
@@ -641,7 +647,6 @@ struct OverlayView: View {
         case .research: return "Open the research library (⌘O)"
         case .meet: return "Open the Harbor window (⌘O)"
         case .study: return "Open the Harbor window (⌘O)"
-        case .ideate: return "Open the Harbor window (⌘O)"
         }
     }
 
@@ -908,7 +913,8 @@ struct OverlayView: View {
     private var inputRow: some View {
         HStack(spacing: 10) {
             TextField(model.voice.isActive ? model.voice.placeholder
-                      : model.researchMode ? "What would you like to research?" : "Ask anything…",
+                      : model.researchMode ? "What would you like to research?"
+                      : model.cloudModel.map { "Ask anything · \($0)" } ?? "Ask anything…",
                       text: $model.input, axis: .vertical)
                 .textFieldStyle(.plain)
                 .font(.harbor(.input))
