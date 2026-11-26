@@ -25,10 +25,12 @@ each account's `fingerprint` of its current token (a salted SHA-256, never the
 token): `read` returns only an item whose token matches it, from either name,
 and drops a cached token that no longer matches. A stale item is never used.
 
-Nothing here runs `security` on the event loop except one bounded first read
-of an account (LOOP_TIMEOUT_S; cached afterwards, and skipped while another
-call holds the module lock). Writes, deletes and copies run on a worker thread
-(gmail_source.keychain_sync), never under gmail.json's lock.
+Nothing here runs `security` on the event loop: a read there that misses the
+cache answers None and starts the read on a worker thread, so a later call
+finds it cached. Writes, deletes and copies run on a worker thread
+(gmail_source.keychain_sync), never under gmail.json's lock, and no lock here
+is held while a `security` process runs except the one that keeps them one at
+a time.
 
 Like service/config/keychain_legacy.py, this starts `/usr/bin/security`: the
 token is read from its stdout and written through `security -i`'s stdin, so it
@@ -73,6 +75,12 @@ MOVE_HOLD_S = 600.0
 READ_HOLD_S = 30.0
 
 _lock = threading.RLock()
+# Held across each `security` process, so calls on one item still happen one at a
+# time; _lock guards only the in-memory state below and is never held while a
+# process runs. A locked Keychain can keep `security` waiting up to TIMEOUT_S for
+# the login password, and the cache checks gmail_source makes under its own lock
+# (cached, verified, needs_adopt) must not wait that long.
+_io_lock = threading.Lock()
 _cache: dict[str, str] = {}           # address -> token confirmed in Keychain this run
 _adopt: set[str] = set()              # found only under the other app's name; copy it to ours
 # Cached tokens known to be current: written by this run, or read against the
@@ -173,20 +181,33 @@ def read(email: str, want: str | None = None) -> str | None:
     file has none yet, as written by the first Keychain build). None when no
     item matches or Keychain can't be read right now. Cached after the first
     read; a failed read is not retried for READ_HOLD_S, so status polls don't
-    keep asking. On the event loop it never waits for another Keychain call
-    (it answers None and the caller tries later)."""
+    keep asking. On the event loop it runs no process and waits for no lock:
+    a cache miss answers None and reads on a worker thread (_read_soon)."""
     email = email.strip().lower()
-    if not _lock.acquire(blocking=not on_loop()):
+    if on_loop():
+        if not _lock.acquire(blocking=False):
+            return None
+        try:
+            if _current(_cache.get(email), want):
+                return _cache[email]
+        finally:
+            _lock.release()
+        _read_soon(email, want)
         return None
-    try:
+    with _lock:
         if _current(_cache.get(email), want):
             return _cache[email]
-        _cache.pop(email, None)
-        _verified.discard(email)
-        failed = _read_failed.get(email)
-        if failed is not None and time.monotonic() - failed < READ_HOLD_S:
-            return None
-        found = None
+    _io_lock.acquire()
+    try:
+        with _lock:
+            if _current(_cache.get(email), want):
+                return _cache[email]       # read by the call this one waited for
+            _cache.pop(email, None)
+            _verified.discard(email)
+            failed = _read_failed.get(email)
+            if failed is not None and time.monotonic() - failed < READ_HOLD_S:
+                return None
+        found, adopt = None, False
         try:
             mine = _read(email)
             if _current(mine, want):
@@ -195,22 +216,48 @@ def read(email: str, want: str | None = None) -> str | None:
                 for other in OTHER_SERVICES:
                     theirs = _read(email, other)
                     if _current(theirs, want):
-                        found = theirs
-                        _adopt.add(email)
+                        found, adopt = theirs, True
                         break
         except Unavailable:
-            _read_failed[email] = time.monotonic()
+            with _lock:
+                _read_failed[email] = time.monotonic()
             return None
-        _read_failed.pop(email, None)
-        if found is not None:
-            _cache[email] = found
-            if want is None:
-                _verified.discard(email)
-            else:
-                _verified.add(email)
+        with _lock:
+            _read_failed.pop(email, None)
+            if adopt:
+                _adopt.add(email)
+            if found is not None:
+                _cache[email] = found
+                if want is None:
+                    _verified.discard(email)
+                else:
+                    _verified.add(email)
         return found
     finally:
-        _lock.release()
+        _io_lock.release()
+
+
+_reading: set[tuple[str, str | None]] = set()
+
+
+def _read_soon(email: str, want: str | None) -> None:
+    """Read one account on a worker thread (once at a time per account), for a
+    read the event loop could not make itself."""
+    key = (email, want)
+    with _lock:
+        if key in _reading:
+            return
+        _reading.add(key)
+
+    def work():
+        try:
+            read(email, want)
+        except Exception:  # noqa: BLE001 — a failed read is held like any other
+            pass
+        finally:
+            with _lock:
+                _reading.discard(key)
+    threading.Thread(target=work, name="google-token-read", daemon=True).start()
 
 
 def adopt_pending() -> None:
@@ -243,9 +290,10 @@ def _store(email: str, token: str) -> bool:
     email = email.strip().lower()
     if not token or not _SAFE.fullmatch(token):
         return False
-    with _lock:
-        if _cache.get(email) == token and email not in _adopt and email in _verified:
-            return True
+    with _io_lock:
+        with _lock:
+            if _cache.get(email) == token and email not in _adopt and email in _verified:
+                return True
         command = f"add-generic-password -U -s {SERVICE} -a {account_name(email)} -w {token}\n"
         try:
             # `security -i` reads its command from stdin: the token never reaches argv.
@@ -255,17 +303,18 @@ def _store(email: str, token: str) -> bool:
             confirmed = False
         finally:
             del command
-        if not confirmed:
-            if email not in _adopt:
-                _cache.pop(email, None)
-            _move_failed_at = time.monotonic()
-            return False
-        _cache[email] = token
-        _verified.add(email)
-        _adopt.discard(email)
-        _read_failed.pop(email, None)
-        _move_failed_at = None
-        return True
+        with _lock:
+            if not confirmed:
+                if email not in _adopt:
+                    _cache.pop(email, None)
+                _move_failed_at = time.monotonic()
+                return False
+            _cache[email] = token
+            _verified.add(email)
+            _adopt.discard(email)
+            _read_failed.pop(email, None)
+            _move_failed_at = None
+            return True
 
 
 def delete(email: str) -> bool:
@@ -274,11 +323,12 @@ def delete(email: str) -> bool:
     if on_loop():
         return False
     email = email.strip().lower()
-    with _lock:
-        _cache.pop(email, None)
-        _verified.discard(email)
-        _adopt.discard(email)
-        _read_failed.pop(email, None)
+    with _io_lock:
+        with _lock:
+            _cache.pop(email, None)
+            _verified.discard(email)
+            _adopt.discard(email)
+            _read_failed.pop(email, None)
         try:
             result = _run(["delete-generic-password", "-s", SERVICE, "-a", account_name(email)])
         except Unavailable:

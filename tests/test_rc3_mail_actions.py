@@ -51,7 +51,7 @@ def test_forward_finds_its_message_the_way_triage_does_and_checks_before_send():
     script = _function(SCRIPTS, "forwardEmail")
     assert script.index('set mbx to mailbox "INBOX" of acct') < script.index('set mbx to mailbox "Inbox" of acct')
     assert script.index('error "\\(messageNotFound)"') < script.index("set fwd to forward theMsg")
-    guard = 'if (send) is not true then error "\\(sendNotAccepted)"'
+    guard = "if sendAnswer is not true then"
     for check in ("set visible of fwd to true", "set originalContent to (content of fwd)",
                   "\\(forwardLostOriginal)", "\\(forwardRecipientsChanged)", "\\(forwardIdentityChanged)",
                   "close fwd saving no", "set receipt to {"):
@@ -67,11 +67,16 @@ def test_forward_finds_its_message_the_way_triage_does_and_checks_before_send():
 
 def test_send_and_forward_treat_a_false_answer_from_mail_as_a_failure():
     # Mail's `send` answers a boolean and raises nothing when it refuses.
-    guard = 'if (send) is not true then error "\\(sendNotAccepted)"'
-    for name, target in (("sendEmail", "tell newMsg"), ("forwardEmail", "tell fwd")):
+    guards = {"sendEmail": ("tell newMsg", 'if (send) is not true then error "\\(sendNotAccepted)"'),
+              "forwardEmail": ("set sendAnswer to (send)", "if sendAnswer is not true then")}
+    for name, (target, guard) in guards.items():
         script = _function(SCRIPTS, name)
         assert target in script and script.index(target) < script.index(guard), name
         assert not any(line.strip() == "send" for line in script.splitlines()), name
+    # A forward Mail refused is closed unsent, and the error says so.
+    forward = _function(SCRIPTS, "forwardEmail")
+    after = forward[forward.index("if sendAnswer is not true then"):]
+    assert after.index("close fwd saving no") < after.index('error "\\(forwardSendNotAccepted)"')
     wording = re.search(r'static let sendNotAccepted = "([^"]+)"', SCRIPTS).group(1)
     assert "check Mail before retrying" in wording
 

@@ -213,7 +213,7 @@ def setup(google, monkeypatch):     # noqa: F811
     monkeypatch.setattr(fetch, "_transport", httpx.MockTransport(web))
 
     async def resolver(host):
-        return {"news.example.org": ["93.184.216.34"]}.get(host) or (_ for _ in ()).throw(OSError())
+        return {"news.example.org": ["93.184.216.34"], "media.example.org": ["93.184.216.34"]}.get(host) or (_ for _ in ()).throw(OSError())
     monkeypatch.setattr(fetch, "resolver", resolver)
 
     app = FastAPI()
@@ -617,7 +617,7 @@ C = {"id": "canvas:4242", "url": f"{HOST}/courses/4242"}
     ("Practice Test", "/pages/p", "quiz"),
     ("Final Exam info", "/pages/f", "quiz"),
     ("Unit test 2", "/discussion_topics/4", "quiz"),
-    ("Notes", "/pages/midterm-2-study-guide", "quiz"),
+    ("Week 9", "/pages/midterm-2", "quiz"),
     ("Notes", "/pages/final_exam_logistics", "quiz"),
     ("Course Evaluation", "/pages/eval", "survey"),
     ("End of term survey", "/pages/s", "survey"),
@@ -668,7 +668,7 @@ def test_rule_one_items_are_listed_as_cant_open_and_add_refuses_them():
     assert [(i["via"], i["reason"]) for i in items] == [("none", "quiz")]
 
 
-@pytest.mark.parametrize("title", ["MidtermReview", "finalexam", "PracticeQuiz", "quiz3", "Exam2", "popquiz"])
+@pytest.mark.parametrize("title", ["MidtermExam", "finalexam", "PracticeQuiz", "quiz3", "Exam2", "popquiz"])
 def test_rule_one_catches_words_run_together(title):
     got = find.classify({"url": f"{HOST}/courses/4242/pages/p", "title": title}, C)
     assert got["via"] == "none" and got["reason"] == "quiz"
@@ -844,6 +844,199 @@ def test_a_later_refused_copy_of_an_item_wins_over_an_innocent_first():
     items = find.resolve([{"url": url, "title": "Week 4 reading", "type": "Page"},
                           {"url": url, "title": "Take the quiz", "type": "Quiz"}], course=C, sources=[])
     assert [(i["via"], i.get("reason")) for i in items] == [("none", "quiz")]
+
+
+# --- preparing for a midterm or final -------------------------------------------------
+
+@pytest.mark.parametrize("title, path", [
+    ("Midterm review", "/pages/midterm-review"),
+    ("Midterm review slides", "/pages/midterm-review-slides"),
+    ("Final study guide", "/pages/final-study-guide"),
+    ("Final Study-Guide", "/discussion_topics/12"),
+    ("Mid-term lecture notes", "/pages/mid-term-notes"),
+    ("Mid term outline", "/pages/o"),
+    ("MidtermReview", "/pages/w9"),
+    ("Finals week syllabus", "/pages/s2"),
+    ("Notes", "/pages/midterm-2-study-guide"),
+])
+def test_preparing_for_a_midterm_or_final_is_read(title, path):
+    got = find.classify({"url": f"{HOST}/courses/4242{path}", "title": title}, C)
+    assert (got["via"], got.get("reason")) == ("browser", None)
+
+
+@pytest.mark.parametrize("title", [
+    "Midterm", "Final", "Mid term", "Midterm exam review slides", "Final exam study guide", "Midterm review quiz",
+    "Practice test review", "Midterm review answers", "Final review solutions", "Midterm review scores",
+    "Final grade review", "Midterm review attempt", "Retake: midterm review", "Final notes submission",
+    "Midterm review: start here", "Submit midterm notes", "Graded final outline", "Timed midterm review",
+    "Join the midterm review meeting", "midtermexam slides",
+])
+def test_everything_that_could_start_or_show_an_assessment_is_still_refused(title):
+    got = find.classify({"url": f"{HOST}/courses/4242/pages/p", "title": title}, C)
+    assert got["via"] == "none" and got["kind"] == "other" and got["reason"]
+
+
+def test_only_the_title_earns_the_exception_never_the_address():
+    got = find.classify({"url": f"{HOST}/courses/4242/pages/midterm-review", "title": "Week 9"}, C)
+    assert (got["via"], got["reason"]) == ("none", "quiz")
+
+
+@pytest.mark.parametrize("typ, reason", [("Quiz", "quiz"), ("New Quiz", "quiz"), ("quiz_lti", "quiz"),
+                                         ("Assessment", "quiz"), ("Assignment", "assignment"),
+                                         ("Assignment submission", "submission"), ("Submission", "submission")])
+@pytest.mark.parametrize("url", [f"{HOST}/courses/4242/modules/items/50", f"{HOST}/courses/4242/pages/review",
+                                 "https://news.example.org/review",
+                                 f"https://docs.google.com/document/d/{DOC_ID}/edit"])
+def test_a_quiz_or_submission_page_type_is_refused_whatever_the_title(url, typ, reason):
+    got = find.classify({"url": url, "title": "Midterm review slides", "type": typ}, C)
+    assert (got["via"], got["kind"], got["reason"]) == ("none", "other", reason)
+
+
+def test_the_exception_reaches_drive_and_web_links():
+    drive_link = find.classify({"url": f"https://docs.google.com/presentation/d/{DOC_ID}/edit",
+                                "title": "Midterm review slides"}, C)
+    web = find.classify({"url": "https://notes.example.org/final-review", "title": "Final review notes"}, C)
+    assert (drive_link["via"], web["via"]) == ("drive", "web")
+    assert find.classify({"url": "https://us02web.zoom.us/j/1", "title": "Final review notes"}, C)["via"] == "none"
+
+
+# --- a teacher's outside links in Modules ------------------------------------------------
+
+def _module_link(url, title="Water cycle reading", typ="ExternalUrl"):
+    return {"url": url, "title": title, "type": typ}
+
+
+@pytest.mark.parametrize("url, saved", [
+    ("https://notes.example.org/water", "https://notes.example.org/water"),
+    ("http://notes.example.org/water", "https://notes.example.org/water"),
+    ("HTTP://Notes.Example.Org:80/water?page=2", "https://notes.example.org/water?page=2"),
+])
+def test_an_outside_module_link_is_offered_with_a_question(url, saved):
+    items = find.resolve([_module_link(url)], course=C, sources=[])
+    assert [(i["url"], i["via"], i.get("ask"), i.get("reason")) for i in items] == [(saved, "web", "external", None)]
+
+
+@pytest.mark.parametrize("url", [
+    "ftp://notes.example.org/water", "mailto:teacher@example.org", "javascript:alert(1)", "file:///etc/hosts",
+    "http://notes.example.org:8080/water", "http://127.0.0.1/water", "http://localhost/water",
+    "http://printer.local/water", "http://user:pw@notes.example.org/water",
+])
+def test_only_public_http_and_https_outside_links_are_offered(url):
+    assert find.resolve([_module_link(url)], course=C, sources=[]) == []
+
+
+@pytest.mark.parametrize("url, title", [
+    ("https://notes.example.org/water", "Water quiz"),
+    ("https://notes.example.org/water", "Midterm"),
+    ("http://us02web.zoom.us/j/1", "Water cycle reading"),
+    ("https://notes.example.org/submit", "Water cycle reading"),
+])
+def test_an_outside_module_link_keeps_the_never_open_rule(url, title):
+    items = find.resolve([_module_link(url, title)], course=C, sources=[])
+    assert [(i["via"], i.get("ask")) for i in items] == [("none", None)] and items[0]["reason"]
+
+
+def test_the_question_survives_a_plain_copy_of_the_same_link():
+    url = "https://notes.example.org/water"
+    items = find.resolve([{"url": url, "title": "Water"}, _module_link(url, "Syllabus")], course=C, sources=[])
+    assert [i.get("ask") for i in items] == ["external"]
+
+
+def test_a_web_link_found_elsewhere_asks_nothing_and_plain_http_stays_out():
+    items = find.resolve([{"url": "https://notes.example.org/a", "title": "A"},
+                          {"url": "http://notes.example.org/b", "title": "B"}], course=C, sources=[])
+    assert [(i["url"], "ask" in i) for i in items] == [("https://notes.example.org/a", False)]
+
+
+def test_an_outside_link_hidden_behind_a_module_item_stays_refused():
+    items = find.resolve([_module_link(f"{HOST}/courses/4242/modules/items/61")], course=C, sources=[])
+    assert [(i["via"], i["reason"]) for i in items] == [("none", "outside")]
+
+
+def test_a_confirmed_http_link_is_read_over_https_without_cookies(setup):
+    setup.web[("news.example.org", "/rivers")] = httpx.Response(
+        200, headers={"content-type": "text/html", "set-cookie": "a=1"},
+        text="<title>Rivers</title><p>Cities grew on rivers.</p>")
+    found = setup.client.post("/study/find/resolve", json={"course_id": COURSE["id"], "links": [
+        _module_link("http://news.example.org/rivers", "Rivers")]}).json()["items"]
+    assert found[0]["ask"] == "external"
+    body = add(setup, [{"url": found[0]["url"], "title": "Rivers", "kind": found[0]["kind"]}]).json()
+    assert body["failed"] == [] and "Cities grew on rivers." in setup.store.source(body["added"][0]["id"])["text"]
+
+
+# --- caption and transcript files ------------------------------------------------------
+
+VTT = ("WEBVTT\n\nNOTE made by a tool\n\n1\n00:00:00.000 --> 00:00:02.000\n<v Speaker>Rivers carry silt.\n\n"
+       "00:00:02.000 --> 00:00:04.000\nRivers carry silt.\nCities grew &amp; spread.\n")
+SRT = "1\r\n00:00:00,000 --> 00:00:02,000\r\n<i>Rivers carry silt.</i>\r\n\r\n2\r\n00:00:02,000 --> 00:00:04,000\r\nCities grew.\r\n"
+
+
+@pytest.mark.parametrize("url, title", [
+    ("https://media.example.org/week3.vtt", "Week 3 recording"),
+    ("https://media.example.org/week3.SRT", "Week 3"),
+    ("https://media.example.org/week3-transcript.txt", "Week 3"),
+    ("https://media.example.org/w3.txt", "Lecture 3 captions"),
+    ("https://video.kaltura.com/files/w3.vtt", "Lecture 3"),
+])
+def test_a_public_caption_or_transcript_file_is_offered_with_a_question(url, title):
+    items = find.resolve([{"url": url, "title": title}], course=C, sources=[])
+    assert [(i["via"], i["kind"], i.get("ask")) for i in items] == [("web", "article", "transcript")]
+
+
+@pytest.mark.parametrize("url, title", [
+    ("https://www.youtube.com/watch?v=abc123", "Lecture 3 recording"),
+    ("https://video.kaltura.com/media/w3", "Lecture 3 transcript"),
+])
+def test_a_recording_with_no_caption_file_stays_a_link(url, title):
+    items = find.resolve([{"url": url, "title": title}], course=C, sources=[])
+    assert [(i["via"], i["kind"], i.get("ask")) for i in items] == [("none", "video", None)]
+
+
+def test_other_text_files_and_canvas_hosted_captions_are_not_transcripts():
+    plain = find.classify({"url": "https://media.example.org/readme.txt", "title": "Setup"}, C)
+    canvas = find.classify({"url": f"{HOST}/courses/4242/files/7", "title": "week3.vtt"}, C)
+    assert "ask" not in plain and "ask" not in canvas and canvas["via"] == "browser"
+
+
+@pytest.mark.parametrize("url, title", [
+    ("https://media.example.org/quiz-3.vtt", "Week 3"),
+    ("https://media.example.org/w3.vtt", "Midterm"),
+    ("https://media.example.org/w3.vtt?token=abc", "Lecture 3"),
+])
+def test_a_transcript_keeps_the_never_open_rule(url, title):
+    assert find.classify({"url": url, "title": title}, C)["via"] == "none"
+
+
+@pytest.mark.parametrize("media, body, said", [
+    ("text/vtt", VTT, "Rivers carry silt.\nCities grew & spread."),
+    ("application/x-subrip", SRT, "Rivers carry silt.\nCities grew."),
+    ("application/octet-stream", SRT, "Rivers carry silt.\nCities grew."),
+    ("text/plain", "Today: rivers and the cities on them.", "Today: rivers and the cities on them."),
+])
+def test_a_confirmed_transcript_is_saved_as_its_spoken_text(setup, media, body, said):
+    setup.web[("media.example.org", "/w3.vtt")] = httpx.Response(200, headers={"content-type": media}, text=body)
+    reply = add(setup, [{"url": "https://media.example.org/w3.vtt", "title": "Lecture 3", "kind": "article"}]).json()
+    assert reply["failed"] == []
+    assert setup.store.source(reply["added"][0]["id"])["text"] == said
+
+
+@pytest.mark.parametrize("media, body", [
+    ("text/html", "<html><body>Please sign in</body></html>"),
+    ("text/plain", "<!DOCTYPE html><title>Sign in</title>"),
+    ("application/octet-stream", "PK\x03\x04 a zip, say"),
+    ("video/mp4", "not text"),
+    ("text/vtt", "WEBVTT\n\nNOTE nothing said\n"),
+])
+def test_a_transcript_link_that_is_not_one_is_not_saved(setup, media, body):
+    setup.web[("media.example.org", "/w3.vtt")] = httpx.Response(200, headers={"content-type": media}, text=body)
+    reply = add(setup, [{"url": "https://media.example.org/w3.vtt", "title": "Lecture 3", "kind": "article"}]).json()
+    assert reply["added"] == [] and reply["failed"][0]["code"] in ("not_text", "empty")
+
+
+def test_caption_types_are_taken_only_for_a_transcript_link(setup):
+    setup.web[("media.example.org", "/page")] = httpx.Response(200, headers={"content-type": "text/vtt"}, text=VTT)
+    reply = add(setup, [{"url": "https://media.example.org/page", "title": "Rivers", "kind": "article"}]).json()
+    assert reply["added"] == [] and reply["failed"][0]["code"] == "not_text"
 
 
 # --- a deck never stays "reading" ---------------------------------------------------

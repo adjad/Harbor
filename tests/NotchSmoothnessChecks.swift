@@ -1,13 +1,14 @@
 import Combine
 import Foundation
-import SwiftUI
 
 /// What keeps the notch smooth without changing what it shows:
 /// - a reply's inline Markdown is parsed once per piece of text and remembered
-///   (MarkdownView.inlineCached), and the remembered text is the same styled text;
+///   (MarkdownInline.cached, which MarkdownView draws from), and the remembered text is the same styled text;
 /// - the Ask field's text sends a change to the rest of the panel only when it
 ///   goes blank or stops being blank (AskInputText.blankChanges), never per key.
-/// Compiled with MarkdownView, Math, Theme and AskInputText only; no window.
+/// Compiled with MarkdownInline and AskInputText only: no SwiftUI, so no macro
+/// plugins (which a standalone gate cannot load inside Simulation QA), no window.
+/// Block parsing is MarkdownChecks' (scripts/test_markdown_contract.sh).
 @main
 struct NotchSmoothnessChecks {
     @MainActor static func main() {
@@ -25,15 +26,15 @@ struct NotchSmoothnessChecks {
             "Line one\nLine two with  two spaces",
         ]
         for s in samples {
-            let parsed = MarkdownView.inlineParsed(s)
-            let first = MarkdownView.inlineCached(s)
-            let second = MarkdownView.inlineCached(s)
+            let parsed = MarkdownInline.parsed(s)
+            let first = MarkdownInline.cached(s)
+            let second = MarkdownInline.cached(s)
             check(first == parsed, "first cached parse equals the parse: \(s.debugDescription)")
             check(second == parsed, "remembered parse equals the parse: \(s.debugDescription)")
         }
-        let refused = MarkdownView.inlineCached("A [shortcut](shortcuts://run-shortcut?name=Invented) is only its label.")
+        let refused = MarkdownInline.cached("A [shortcut](shortcuts://run-shortcut?name=Invented) is only its label.")
         check(refused.runs.allSatisfy { $0.link == nil }, "a shortcuts: link stays refused through the cache")
-        let kept = MarkdownView.inlineCached("A [safe link](https://example.com/notes) here.")
+        let kept = MarkdownInline.cached("A [safe link](https://example.com/notes) here.")
         check(kept.runs.contains { $0.link?.host == "example.com" }, "a web link stays a link through the cache")
 
         // A redraw of a settled reply reads remembered text: far cheaper than parsing.
@@ -43,17 +44,11 @@ struct NotchSmoothnessChecks {
         func time(_ body: () -> Void) -> Double {
             let t0 = Date(); body(); return Date().timeIntervalSince(t0)
         }
-        let uncached = time { for _ in 0..<3 { for p in paragraphs { _ = MarkdownView.inlineParsed(p) } } }
-        for p in paragraphs { _ = MarkdownView.inlineCached(p) }
-        let cached = time { for _ in 0..<3 { for p in paragraphs { _ = MarkdownView.inlineCached(p) } } }
+        let uncached = time { for _ in 0..<3 { for p in paragraphs { _ = MarkdownInline.parsed(p) } } }
+        for p in paragraphs { _ = MarkdownInline.cached(p) }
+        let cached = time { for _ in 0..<3 { for p in paragraphs { _ = MarkdownInline.cached(p) } } }
         print(String(format: "inline Markdown, 900 pieces: parsed %.1f ms, remembered %.1f ms", uncached * 1000, cached * 1000))
         check(cached < uncached * 0.5, "remembered inline text costs under half a parse")
-
-        // Blocks are still the same blocks.
-        let reply = "Two things:\n- **first** item\n- [second](https://example.com)\n\nThen a paragraph."
-        let blocks = MarkdownView(text: reply).cachedBlocks()
-        check(blocks.map(\.kind) == [.paragraph, .list, .paragraph],
-              "a line, a list and a paragraph parse as three blocks")
 
         // The Ask field's text: one change out per blank/not-blank flip.
         let input = AskInputText()

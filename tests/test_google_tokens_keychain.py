@@ -429,7 +429,8 @@ def test_a_sign_in_saved_on_the_event_loop_moves_to_keychain_on_a_worker(keychai
     assert seen and set(seen) == {"gmail-keychain-sync"}                    # never the loop's thread
 
 
-def test_a_read_on_the_event_loop_never_waits_for_another_keychain_call(keychain):
+@pytest.mark.parametrize("lock", ["_lock", "_io_lock"])
+def test_a_read_on_the_event_loop_never_waits_for_another_keychain_call(keychain, lock):
     import threading
     import time as clock
     write_file(G.CONFIG_PATH, old_file((ANN, TOKEN_A)))
@@ -438,7 +439,7 @@ def test_a_read_on_the_event_loop_never_waits_for_another_keychain_call(keychain
     held, release = threading.Event(), threading.Event()
 
     def busy():
-        with T._lock:
+        with getattr(T, lock):
             held.set()
             release.wait(5)
     worker = threading.Thread(target=busy)

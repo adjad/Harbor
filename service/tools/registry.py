@@ -593,8 +593,14 @@ def model_schema(name: str, description: str, parameters: dict) -> dict:
         # parameters included: nothing else would tell the model their rules.
         if name in SHORT:
             description = SHORT[name]
-            parameters = _strip_parameter_descriptions(
-                parameters, KEEP_PARAMETER_PROSE.get(name, frozenset()))
+            return {"type": "function",
+                    "function": {"name": name, "description": description,
+                                 "parameters": _strip_parameter_descriptions(
+                                     parameters, KEEP_PARAMETER_PROSE.get(name, frozenset()))}}
+    # Every other schema is a copy too: a caller that edits what it was handed
+    # (adds a property, drops a required key) must never reach the registry, or
+    # the next turn's model sees, and dispatch validates against, the edit.
+    parameters = copy.deepcopy(parameters)
     return {"type": "function",
             "function": {"name": name, "description": description, "parameters": parameters}}
 

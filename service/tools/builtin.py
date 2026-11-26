@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import codecs
 import os
+import stat
 import shutil
 import subprocess
 import time
@@ -733,6 +734,11 @@ def write_file(path: str, content: str) -> str:
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content)
+        # Overwriting keeps a file's mode; new text in a file that was executable
+        # must not be left runnable (candidate review #2 of the 2026-11-25 pentest).
+        mode = p.stat().st_mode
+        if mode & 0o111:
+            os.chmod(p, stat.S_IMODE(mode) & ~0o111)
         return f"wrote {len(content)} chars to {p}"
     except Exception as e:  # noqa: BLE001
         return f"(error writing {p}: {e})"

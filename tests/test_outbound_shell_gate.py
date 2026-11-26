@@ -21,6 +21,7 @@ import pytest
 from service.safety import grants, policy
 
 _REAL_CHECK = grants.check   # the full_access fixture stubs it out
+from service.tools import action_tools as A  # noqa: E402
 from service.tools.action_tools import confirm_preview
 from tests.test_model_led_integration import (  # noqa: F401  (pytest fixture)
     DISCOVERY_TOOL, Approval, call, run, synthetic)
@@ -191,7 +192,8 @@ def test_cards_show_file_writes_moves_and_forwards(tmp_path):
                                                 "note": "FYI"})
     # An ID Harbor has not read: the card says so, and still shows the rest.
     assert forward == ("Forward message <m1>\n(Harbor couldn't find this email in the mail it has read, "
-                       "so it can't show the subject or sender.)\nTo: a@example.com\n\nNote:\nFYI")
+                       "so it can't show the subject or sender.)\nTo: a@example.com\n\nNote:\nFYI\n\n"
+                       + A.FORWARD_NOTE_IS_PLAIN)
 
 
 def _header(ts, sender, address, message_id, subject, account="Work"):
@@ -217,7 +219,8 @@ def test_a_forward_card_names_the_email_it_forwards(monkeypatch):
         assert card == ("Email: Your prescription is ready\n"
                         "From: Corner Pharmacy <rx@pharmacy.example>\n"
                         f"Date: {when:%a %b %-d, %Y %-I:%M %p}\n"
-                        f"Forward message {message_id}\nTo: a@example.com\n\n(no note)")
+                        f"Forward message {message_id}\nTo: a@example.com\n\n"
+                        "(no note: the original goes with its formatting and attachments)")
     # The row two lines away is a different email, and the card says which.
     assert "Email: Your October statement\nFrom: North Bank" in confirm_preview(
         "forward_email", {"message_id": "<st-9@bank.example>", "to": "a@example.com"})

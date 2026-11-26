@@ -179,6 +179,7 @@ PROFILE_TESTS = {
         "tests/test_action_tools_sanitize.py",
         # Forward through the sandbox Mail app behind the real outbox; never real Mail.
         "tests/test_mail_forward.py",
+        "tests/test_mail_forward_known_issues.py",
         "tests/test_event_move.py",
         "tests/test_cancel_reaches_mac_apps.py",
         "tests/test_outbound_content_provenance.py",
@@ -212,6 +213,16 @@ PROFILE_TESTS = {
         "tests/test_security_fix_approver_scope.py",
         "tests/test_security_fix_shell_engine_ports.py",
         "tests/test_security_fix_untrusted_mailbox.py",
+        "tests/test_security_fix_skill_scopes.py",
+        "tests/test_security_fix_code_run_places.py",
+        "tests/test_security_fix_shell_code_run.py",
+        "tests/test_security_fix_skill_md_size.py",
+        "tests/test_security_fix_audit_rotation.py",
+        "tests/test_security_fix_resident_reply_conditions.py",
+        "tests/test_security_fix_contacts_not_untrusted.py",
+        "tests/test_security_fix_workspace_credentials.py",
+        "tests/test_security_fix_keychain_locks.py",
+        "tests/test_security_fix_gmail_file_lock.py",
         # The user's access choice survives a restart; boots under tmp_path only.
         "tests/test_access_mode_persistence.py",
         "tests/test_always_confirm_grants.py",
@@ -973,6 +984,12 @@ ADDITIONAL_FULL_TESTS = {
     "tests/test_brief_items_accuracy.py",
     # Background mail model calls stand down off this Mac: fake clients only.
     "tests/test_background_model_stays_local.py",
+    # Day card refresh never drops a forced read: the real DayCards with stub models.
+    "tests/test_day_cards_refresh_native.py",
+    # bug-sweep-2: a Mail body snapshot does not outlive its test (conftest hold)
+    "tests/test_raw_mail_state_isolation.py",
+    # bug-sweep-2: a test's config overlay does not outlive it (conftest)
+    "tests/test_user_config_overlay_isolation.py",
 }
 # Integrated runtime contracts are mandatory; missing files fail selection.
 MINI_RUNTIME_INTEGRATION_TESTS = {
@@ -1041,6 +1058,7 @@ _NATIVE_GATE_DEPENDENCIES = {
     "native/relaunch-speed-contract": "native/relaunch-speed-compile",
     "native/swarm-lifecycle-contract": "native/swarm-lifecycle-compile",
     "native/notch-smoothness-contract": "native/notch-smoothness-compile",
+    "native/app-bugs-contract": "native/app-bugs-compile",
 }
 
 
@@ -1792,7 +1810,7 @@ def _native_gates(build_dir: Path) -> list[tuple[str, list[str]]]:
                 "app/Sources/HarborApp/PortGuard.swift", "app/Sources/HarborApp/BackendOwnership.swift",
                 "app/Sources/HarborApp/BackendTrust.swift", "app/Sources/HarborApp/HarborClient.swift",
                 "app/Sources/HarborApp/AgentSend.swift", "app/Sources/HarborApp/AssistantDelivery.swift",
-                "app/Sources/HarborApp/ResultPost.swift",
+                "app/Sources/HarborApp/ResultPost.swift", "app/Sources/HarborApp/ResearchExportName.swift",
                 "tests/SwarmLifecycleChecks.swift", "-o", str(build_dir / "swarm-lifecycle"),
             ],
         ),
@@ -1802,9 +1820,8 @@ def _native_gates(build_dir: Path) -> list[tuple[str, list[str]]]:
             [
                 TRUSTED_SWIFTC, "-parse-as-library", "-swift-version", "5",
                 "-module-cache-path", module_cache,
-                "app/Sources/HarborApp/MarkdownView.swift", "app/Sources/HarborApp/Math.swift",
-                "app/Sources/HarborApp/Theme.swift", "app/Sources/HarborApp/AskInputText.swift",
-                "app/Sources/HarborApp/ScriptRunner.swift",
+                # Plain Foundation/Combine sources only: no SwiftUI macro plugins.
+                "app/Sources/HarborApp/MarkdownInline.swift", "app/Sources/HarborApp/AskInputText.swift",
                 "tests/NotchSmoothnessChecks.swift", "-o", str(build_dir / "notch-smoothness"),
             ],
         ),

@@ -1,5 +1,5 @@
 import Combine
-import SwiftUI
+import Foundation
 
 /// The Ask field's text (OverlayModel.input), in an object of its own so a key
 /// typed redraws only what reads it (AskInputScope), not the whole panel.
@@ -19,13 +19,4 @@ final class AskInputText: ObservableObject {
     var blankChanges: AnyPublisher<Bool, Never> {
         $text.map(Self.isBlank).removeDuplicates().dropFirst().eraseToAnyPublisher()
     }
-}
-
-/// Draws `content` again whenever the Ask field's text changes, and nothing
-/// else does: the panel around it observes OverlayModel, which sends a change
-/// only when the text's blankness does (OverlayModel.input).
-struct AskInputScope<Content: View>: View {
-    @ObservedObject var text: AskInputText
-    @ViewBuilder let content: () -> Content
-    var body: some View { content() }
 }

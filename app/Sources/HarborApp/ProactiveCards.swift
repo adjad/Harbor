@@ -100,9 +100,11 @@ final class ProactiveActions: ObservableObject {
     /// the result of a send. Not published: each composer observes its own.
     private(set) var replyModels: [String: BriefReplyModel] = [:]
 
-    /// Threads answered from the Brief with a send the service verified: the
-    /// row leaves once its reply is closed, ahead of the next cycle reading
-    /// Sent (BriefReplied). Forgotten when the Brief stops listing the thread.
+    /// Threads answered from the Brief with a send the service verified, keyed
+    /// on the thread and the message answered (BriefReplied.key): the row
+    /// leaves once its reply is closed, ahead of the next cycle reading Sent,
+    /// and comes back when a newer message arrives. Forgotten when the Brief
+    /// stops listing that thread and message.
     @Published private(set) var repliedThreads: Set<String> = []
     /// Told about each verified send from the Brief, for the service's "mark
     /// replied" route once it exists (email_reply_api.py); the local hide above
@@ -111,7 +113,7 @@ final class ProactiveActions: ObservableObject {
 
     /// A reply from the Brief was sent and verified (BriefReplyModel's onSent).
     func markReplied(_ thread: ProactiveThread) {
-        repliedThreads.insert(thread.id)
+        repliedThreads.insert(BriefReplied.key(id: thread.id, receivedTs: thread.receivedTs))
         Self.onReplySent?(thread)
     }
 
@@ -144,12 +146,15 @@ final class ProactiveActions: ObservableObject {
 
     /// Forget replies to threads the Brief no longer lists, so one that can't
     /// be reached never keeps the panel open. A send still out is kept.
-    func pruneReplies(keeping listed: Set<String>) {
+    /// `answered` is the listed threads' BriefReplied keys: a reply to an
+    /// older message of a thread still listed is forgotten too. Without it,
+    /// only threads that left the list are.
+    func pruneReplies(keeping listed: Set<String>, answered: Set<String>? = nil) {
         if let id = replying, !listed.contains(id) { replying = nil }
         for (id, kept) in replyModels where !listed.contains(id) && kept.phase != .sending {
             replyModels[id] = nil
         }
-        repliedThreads.formIntersection(listed)
+        repliedThreads = BriefReplied.kept(repliedThreads, listed: listed, answered: answered)
     }
 
     func draft(_ card: ProactiveCard) -> String { drafts[card.id] ?? card.action?.draft ?? "" }
@@ -414,7 +419,7 @@ struct ProactiveBriefSection: View, Equatable {
     /// thread's trailing ×; shared with the Top 3's Needs you rows.
     @ObservedObject var itemActions: NeedsYouActionsModel = NotchBriefView.needsYouActions
     /// The rest of today's calendar, for the calendar line.
-    var events: [(start: Double, title: String)] = []
+    var events: [BriefEvents.Row] = []
     /// Today's all-day events, and how many timed ones have already ended, so
     /// the calendar line reads the same day the cards do (BriefPlate.calendarLine).
     var allDayEvents: [String] = []
@@ -462,8 +467,7 @@ struct ProactiveBriefSection: View, Equatable {
                 && a.allDayEvents == b.allDayEvents && a.endedEvents == b.endedEvents && a.scrollCap == b.scrollCap
                 && a.coverage == b.coverage && a.wide == b.wide && a.schoolRows == b.schoolRows
                 && a.studyCards == b.studyCards && a.dueSoon == b.dueSoon
-                && a.events.count == b.events.count
-                && zip(a.events, b.events).allSatisfy { $0.start == $1.start && $0.title == $1.title }
+                && BriefEvents.same(a.events, b.events)
                 && a.proactive == b.proactive
         }
     }
@@ -537,8 +541,8 @@ struct ProactiveBriefSection: View, Equatable {
         let shown = proactive.only(chosen)
         zones(shown)
         // Every account's threads, not only the chosen chip's.
-        .onChange(of: proactive.threads.map(\.id), initial: true) { _, listed in
-            actions.pruneReplies(keeping: Set(listed))
+        .onChange(of: proactive.threads.map { BriefReplied.key(id: $0.id, receivedTs: $0.receivedTs) }, initial: true) { _, answered in
+            actions.pruneReplies(keeping: Set(proactive.threads.map(\.id)), answered: Set(answered))
         }
         .task(id: actions.shouldPoll(proactive)) {
             // While the engine reads, follow its progress; stop once it's done.
@@ -2104,7 +2108,8 @@ struct ProactiveBriefSection: View, Equatable {
     private func listedThreads(_ shown: ProactiveState, cards: [ProactiveCard]) -> [ProactiveThread] {
         let open = shown.orderedThreads.filter {
             !itemActions.isHidden($0.actionRow)
-                && BriefReplied.listed(id: $0.id, replied: actions.repliedThreads, replying: actions.replying)
+                && BriefReplied.listed(id: $0.id, receivedTs: $0.receivedTs, replied: actions.repliedThreads,
+                                    replying: actions.replying)
         }
         return ProactiveState.threads(open, coveredBy: cards)
     }

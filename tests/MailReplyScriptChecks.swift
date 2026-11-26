@@ -117,10 +117,23 @@ enum MailReplyScriptChecks {
             guard let range = script.range(of: text) else { fatalError("Missing forward contract: \(text)") }
             return range.lowerBound
         }
+        // A forward that Mail refuses to send is closed, not left open on screen.
+        let forwardSend = "set sendAnswer to (send)"
+        let forwardGuard = "if sendAnswer is not true then"
         for forward in [forwardWithNote, forwardBare] {
-            require(forward.contains(sendGuard) && !hasBareSend(forward), "A forward ignores Mail's false result")
-            require(forward.range(of: "tell fwd", options: .backwards)!.lowerBound < at(forward, sendGuard),
-                    "Send must resolve against the forwarded message")
+            require(forward.contains(forwardSend) && !hasBareSend(forward), "A forward ignores Mail's false result")
+            require(forward.range(of: "tell fwd", options: .backwards)!.lowerBound < at(forward, forwardSend)
+                    && at(forward, forwardSend) < at(forward, forwardGuard),
+                    "Send must resolve against the forwarded message, and its answer be checked")
+            require(at(forward, forwardGuard) < forward.range(of: "close fwd saving no", options: .backwards)!.lowerBound
+                    && forward.range(of: "close fwd saving no", options: .backwards)!.lowerBound
+                        < at(forward, "error \"\(MailActionScript.forwardSendNotAccepted)\""),
+                    "A forward Mail refused to send is left open")
+            // Every check before send says so by its number, and only those do.
+            let numbered = forward.components(separatedBy: " number \(MailActionScript.checkedBeforeSendNumber)").count - 1
+            require(numbered == (forward == forwardWithNote ? 9 : 6), "A check before send is not marked")
+            require(!forward.contains("\(MailActionScript.forwardSendNotAccepted)\" number"),
+                    "A refused send must not claim it was stopped before send")
             require(at(forward, MailActionScript.messageNotFound) < at(forward, "forward theMsg"),
                     "A forward must find its message first")
             require(!forward.contains("inbox of acct"), "An account has no inbox property; the lookup would find nothing")
@@ -136,10 +149,10 @@ enum MailReplyScriptChecks {
             for check in ["sender of fwd", "address of every to recipient of fwd",
                           MailActionScript.forwardRecipientsChanged, MailActionScript.forwardIdentityChanged,
                           "set receipt to {"] {
-                require(at(forward, check) < at(forward, sendGuard), "Checked after send: \(check)")
+                require(at(forward, check) < at(forward, forwardGuard), "Checked after send: \(check)")
             }
-            require(at(forward, "close fwd saving no") < at(forward, sendGuard), "A failed check leaves the forward open")
-            require(at(forward, sendGuard) < at(forward, "return receipt"), "A receipt is returned before Mail accepted the send")
+            require(at(forward, "close fwd saving no") < at(forward, forwardGuard), "A failed check leaves the forward open")
+            require(at(forward, forwardGuard) < at(forward, "return receipt"), "A receipt is returned before Mail accepted the send")
         }
         require(forwardWithNote.contains("set desiredNote to \"For you\""), "Missing forward note")
         require(at(forwardWithNote, "set content of fwd to desiredNote & return & return & originalContent") <
@@ -148,6 +161,23 @@ enum MailReplyScriptChecks {
         require(forwardWithNote.contains("((length of desiredNote) + (length of originalContent))"),
                 "A note that replaced the original would be sent alone")
         require(!forwardBare.contains("set content of fwd"), "A forward without a note must leave the content alone")
+        require(at(forwardWithNote, "count of mail attachments of theMsg") < at(forwardWithNote, "forward theMsg"),
+                "A note on an email with attachments must stop before the forward opens")
+        require(!forwardBare.contains("mail attachments"), "A forward without a note keeps its attachments")
+        for (message, check) in [(MailActionScript.messageNotFound, "not_found"),
+                                 (MailActionScript.forwardLostOriginal, "lost_original"),
+                                 (MailActionScript.forwardRecipientsChanged, "recipients_changed"),
+                                 (MailActionScript.forwardIdentityChanged, "identity_changed"),
+                                 (MailActionScript.forwardNoteDropsAttachments, "note_drops_attachments")] {
+            let told = MailActionScript.preSendCheck(code: MailActionScript.checkedBeforeSendNumber, message: message)
+            require(told["refusal"] as? String == "checked_before_send" && told["check"] as? String == check,
+                    "A check before send is not passed on: \(check)")
+            require(MailActionScript.preSendCheck(code: -1712, message: message).isEmpty,
+                    "Only the checks' own number counts")
+        }
+        require(MailActionScript.preSendCheck(code: MailActionScript.checkedBeforeSendNumber,
+                                              message: MailActionScript.forwardSendNotAccepted).isEmpty,
+                "A refused send is never proof nothing was sent")
         require(forwardBare.contains("set approvedAddresses to {\"first@example.com\", \"second@example.com\"}"),
                 "The approved recipients are not checked")
         let escapedForward = MailActionScript.forwardEmail(messageID: "a\"b\\c", account: "Work \"two\"",

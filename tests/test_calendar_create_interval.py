@@ -4,6 +4,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import datetime
 import json
+import os
 import time
 from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
@@ -36,7 +37,7 @@ def _los_angeles(monkeypatch):
             # Pin the wall clock so fixture dates never drift into the past.
             fixed = NOW.replace(tzinfo=ZoneInfo("America/Los_Angeles")).timestamp()
             local_zone.setattr(time, "time", lambda: fixed)
-            yield
+            yield local_zone
     finally:
         time.tzset()
 
@@ -299,14 +300,18 @@ async def test_calendar_approval_binds_start_across_zone_change(
             assert action["args"]["when_iso"] == "2036-09-28T18:00:00-07:00"
         else:
             assert action["preview"].count("PDT-0700") == 4
-        monkeypatch.setenv("TZ", zone_after)
+        # The zone change belongs to the _los_angeles context, which unsets TZ again on
+        # exit. Set on the test's own monkeypatch it was undone last, back to the
+        # context's value, and America/Los_Angeles stayed in TZ for every later file.
+        zone["patch"].setenv("TZ", zone_after)
         time.tzset()
         return True
 
     approver = type("Approver", (), {"confirm": AsyncMock(side_effect=approve)})()
     request = AsyncMock(return_value={"ok": True, "source_id": "fixture-native"})
     monkeypatch.setattr(outbox, "request", request)
-    with _los_angeles(monkeypatch):
+    zone = {}
+    with _los_angeles(monkeypatch) as zone["patch"]:
         await loop.run_agent(ScriptedClient(), "fixture-model",
             [{"role": "user", "content": "Add a fixture event in Calendar."}],
             AsyncMock(), approver, tools=["add_calendar_event"],
@@ -338,3 +343,13 @@ def test_a_named_calendar_date_is_temporal_grammar_not_unexplained_prose(text):
 def test_a_bare_may_is_a_verb_not_a_month():
     from service.tasks.compiler import reminder_request_clauses
     assert reminder_request_clauses("Remind me may to study") == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("zone_after", ["America/New_York"])
+async def test_a_zone_change_mid_approval_does_not_outlive_the_test(monkeypatch, zone_after):
+    monkeypatch.delenv("TZ", raising=False)          # as at launch: no TZ override
+    with pytest.MonkeyPatch.context() as held:
+        await test_calendar_approval_binds_start_across_zone_change(held, zone_after, False, 1)
+    assert "TZ" not in os.environ
+

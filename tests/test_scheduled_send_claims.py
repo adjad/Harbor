@@ -406,3 +406,41 @@ def test_a_failing_pass_is_contained(monkeypatch):
     async def go():
         await scheduler._start_scheduled_sends()     # no exception escapes the task
     asyncio.run(go())
+
+
+def test_shutdown_cancels_and_awaits_a_running_sends_pass(monkeypatch):
+    """Quitting cancels scheduler.run(); a sends pass it started in the background
+    must be cancelled and finish unwinding before run() returns, not outlive it."""
+    import asyncio
+    from service.assistant import scheduler
+
+    events = []
+
+    async def hung():
+        try:
+            await asyncio.Event().wait()             # Mail never answers
+        except asyncio.CancelledError:
+            events.append("send cancelled")
+            raise
+        finally:
+            events.append("send unwound")
+    monkeypatch.setattr(scheduler, "_fire_scheduled_sends", hung)
+    monkeypatch.setattr(scheduler, "_sends_task", None)
+
+    class Blocked:                                   # holds run() at its first await
+        name = "synthetic"
+        async def poll(self):
+            await asyncio.Event().wait()
+    monkeypatch.setattr(scheduler, "_connectors", [Blocked()])
+
+    async def go():
+        sends = scheduler._start_scheduled_sends()
+        loop = asyncio.get_running_loop().create_task(scheduler.run())
+        await asyncio.sleep(0.01)
+        assert not sends.done()
+        loop.cancel()
+        await asyncio.gather(loop, return_exceptions=True)
+        assert sends.cancelled()
+        assert events == ["send cancelled", "send unwound"]
+        assert scheduler._sends_task is None
+    asyncio.run(asyncio.wait_for(go(), 5))

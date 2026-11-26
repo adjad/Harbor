@@ -2978,6 +2978,8 @@ class GoogleConnectAndErase(unittest.TestCase):
         self.assertEqual(next(r for r in G.status()["accounts"] if r["email"] == email)["note"], "")
 
     def test_new_sign_in_switches_workspace_on_and_erase_removes_it(self):
+        # The Workspace server is running: its credential files exist only then.
+        self.enterContext(patch.object(self.W, "_server_live", lambda: True))
         email, _ = self.finish([G.SCOPE, G.CALENDAR_SCOPE, *self.W.WORKSPACE_SCOPES])
         # On for every new account: its refresh token is copied for the server.
         self.assertTrue(G.connected_accounts()[email]["workspace"])

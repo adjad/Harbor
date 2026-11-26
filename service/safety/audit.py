@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import stat
 import threading
 import time
 from pathlib import Path
@@ -12,27 +13,47 @@ from service.paths import MOE_DIR, private_append_text
 
 AUDIT_DIR = MOE_DIR
 AUDIT_LOG = AUDIT_DIR / "audit.jsonl"
-# Rotated once it passes this size: audit.jsonl becomes audit.jsonl.1 (one older
-# generation, replaced each time), so the log no longer grows without end (swarm #37).
-# Both live in ~/.moe, which /resetharbor erases whole.
-MAX_BYTES = 20 * 1024 * 1024
 _warned = False
+# Past this size the log moves to audit.jsonl.1, and older generations shift up
+# to audit.jsonl.<KEEP_GENERATIONS>; the oldest is dropped. Several are kept so a
+# burst of actions can't push the record of an earlier one out (candidate review #4).
+ROTATE_BYTES = 8 * 1024 * 1024
+KEEP_GENERATIONS = 5
 _rotate_lock = threading.Lock()
+
+
+def _rotate() -> None:
+    """Shift the generations up when the log is past ROTATE_BYTES. Never follows a
+    link: renames and unlinks act on the names themselves."""
+    try:
+        info = os.lstat(AUDIT_LOG)
+    except OSError:
+        return
+    if not stat.S_ISREG(info.st_mode) or info.st_size < ROTATE_BYTES:
+        return
+    with _rotate_lock:
+        try:
+            if os.lstat(AUDIT_LOG).st_size < ROTATE_BYTES:
+                return                                  # another thread rotated it
+            name = AUDIT_LOG.name
+            oldest = AUDIT_LOG.with_name(f"{name}.{KEEP_GENERATIONS}")
+            try:
+                os.unlink(oldest)
+            except FileNotFoundError:
+                pass
+            for n in range(KEEP_GENERATIONS - 1, 0, -1):
+                src = AUDIT_LOG.with_name(f"{name}.{n}")
+                try:
+                    os.replace(src, AUDIT_LOG.with_name(f"{name}.{n + 1}"))
+                except FileNotFoundError:
+                    pass
+            os.replace(AUDIT_LOG, AUDIT_LOG.with_name(f"{name}.1"))
+        except OSError:
+            pass                                       # keep appending to the current one
 
 
 def rotated(path: Path) -> Path:
     return path.with_name(path.name + ".1")
-
-
-def _rotate_if_needed(path: Path, max_bytes: int) -> None:
-    with _rotate_lock:
-        try:
-            info = os.lstat(path)
-        except FileNotFoundError:
-            return
-        if info.st_size < max_bytes or not os.path.isfile(path) or os.path.islink(path):
-            return
-        os.replace(path, rotated(path))
 
 
 def tail_lines(limit: int, path: Path | None = None, *, block: int = 64 * 1024) -> list[str]:
@@ -79,7 +100,7 @@ def audit(event: str, **fields) -> None:
     try:
         from service.safety.redaction import scrub_obj
         rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "event": event, **scrub_obj(fields)}
-        _rotate_if_needed(AUDIT_LOG, MAX_BYTES)
+        _rotate()
         private_append_text(AUDIT_LOG, json.dumps(rec, default=str) + "\n")
     except Exception as exc:  # noqa: BLE001
         global _warned

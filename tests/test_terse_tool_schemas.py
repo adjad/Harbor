@@ -199,3 +199,20 @@ def test_model_led_discovery_schemas_follow_terse_mode(monkeypatch):
     monkeypatch.setenv("HARBOR_TERSE_TOOL_SCHEMAS", "1")
     assert spec.schema() == tool_schemas(["send_email"])[0]
     assert spec.schema()["function"]["description"] != REGISTRY["send_email"].description
+
+
+@pytest.mark.parametrize("terse", ["1", "0"])
+def test_a_tool_without_a_terse_line_is_handed_out_as_a_copy(monkeypatch, terse):
+    # use_skill, skill and MCP tools have no SHORT entry. Their emitted schema used to
+    # be the registry's own dict, so a caller's edit (here, a probe property) stayed
+    # in the registry for every later turn and for dispatch's validation.
+    registered = Tool("zz_copy_probe", "A synthetic skill tool.",
+                      {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
+                      "skill_tool", lambda **_: "")
+    monkeypatch.setitem(REGISTRY, "zz_copy_probe", registered)
+    monkeypatch.setenv(FLAG, terse)
+    out = tool_schemas(["zz_copy_probe"])[0]["function"]["parameters"]
+    out["properties"]["__probe__"] = {}
+    out["required"].append("__probe__")
+    assert registered.parameters == {"type": "object", "properties": {"name": {"type": "string"}},
+                                     "required": ["name"]}

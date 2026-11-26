@@ -80,6 +80,8 @@ def scratch_dir(skill_dir: Path) -> Path:
 # what stays readable is OS and application code, which holds nothing personal.
 _READ_DENY_ROOTS = [
     "/Users", "/Volumes", "/private/tmp", "/private/var/root",
+    # Every app's per-user temp and cache folders; a tool's own temp is its scratch.
+    "/private/var/folders",
 ]
 
 # Read-denied even when a broader scope is granted. A tool given ~/Documents
@@ -140,7 +142,7 @@ def build_profile(skill_dir: Path, read_scopes: list[Path],
         *(f'(allow file-write* (subpath "{_q(p)}"))' for p in scratches),
         *(f'(allow file-write* (subpath "{_q(p)}"))' for p in write_scopes),
         # --- reads: deny the user-data roots, re-allow declared scopes ---
-        *(f'(deny file-read* (subpath "{_q(Path(p))}"))' for p in _READ_DENY_ROOTS),
+        *(f'(deny file-read* (subpath "{_q(p)}"))' for p in _spellings(_READ_DENY_ROOTS)),
         f'(allow file-read* (subpath "{_q(skill_dir.resolve())}"))',
         *(f'(allow file-read* (subpath "{_q(p)}"))' for p in scratches),
         *(f'(allow file-read* (subpath "{_q(p)}"))' for p in readable),
@@ -152,17 +154,45 @@ def build_profile(skill_dir: Path, read_scopes: list[Path],
     from service.paths import MOE_DIR
     never = [Path(raw.replace("~", str(home), 1)) for raw in _NEVER_READ]
     never += [MOE_DIR / name for name in _NEVER_READ_HARBOR]
-    for p in dict.fromkeys(never):
+    for p in dict.fromkeys(_spellings(never)):
         lines.append(f'(deny file-read* (subpath "{_q(p)}"))')
         lines.append(f'(deny file-write* (subpath "{_q(p)}"))')
     # Never writable, whatever scope was granted (a scope of ~ covers them): every
     # skill's folder, this skill's included, and the record of what was approved.
     from service.skills import SKILLS_DIR
     from service.skills.trust import TRUST_PATH
-    for p in dict.fromkeys([skill_dir.resolve(), Path(skill_dir), SKILLS_DIR, TRUST_PATH]):
+    # Nor Harbor's folder (all of it but this tool's scratch) or a place whose files
+    # run as code later, whatever scope reached it (candidate review #1).
+    from service.safety.policy import _code_exec_roots
+    protected = [MOE_DIR, home / ".moe", *_code_exec_roots()]
+    for p in dict.fromkeys(_spellings(protected)):
+        lines.append(f'(deny file-write* (subpath "{_q(p)}"))')
+    lines += [f'(allow file-write* (subpath "{_q(p)}"))' for p in scratches]
+    for p in dict.fromkeys(_spellings([skill_dir, SKILLS_DIR, TRUST_PATH])):
         lines.append(f'(deny file-write* (subpath "{_q(Path(p))}"))')
     lines.extend(_NETWORK_DENY)
+    # Harbor's and the engines' ports on every address, not only loopback: either
+    # may listen on this Mac's LAN address too (candidate review #4).
+    from service.safety import shell_sandbox
+    try:
+        ports = dict.fromkeys([*shell_sandbox.harbor_ports(), *shell_sandbox.engine_ports()])
+    except Exception:  # noqa: BLE001 - the loopback deny above still applies
+        ports = {}
+    lines += [f'(deny network-outbound (remote ip "*:{port}"))' for port in ports]
     return "\n".join(lines) + "\n"
+
+
+def _spellings(paths) -> list[Path]:
+    """Each path as written and resolved: a deny for one spelling of a linked path
+    does not cover the other."""
+    out: list[Path] = []
+    for p in paths:
+        out.append(Path(p))
+        try:
+            out.append(Path(p).resolve())
+        except (OSError, RuntimeError):
+            pass
+    return list(dict.fromkeys(out))
 
 
 def wrap_argv(argv: list[str], profile_path: Path) -> list[str]:

@@ -16,17 +16,18 @@ audit_mod = importlib.import_module("service.safety.audit")  # not service.safet
 def test_the_audit_log_rotates_at_its_limit(tmp_path, monkeypatch):
     log = tmp_path / "audit.jsonl"
     monkeypatch.setattr(audit_mod, "AUDIT_LOG", log)
-    monkeypatch.setattr(audit_mod, "MAX_BYTES", 400)
+    monkeypatch.setattr(audit_mod, "ROTATE_BYTES", 400)
     for i in range(40):
         audit_mod.audit("tool", tool="example_tool", n=i)
     assert log.stat().st_size < 400 + 200, "the live file stays near the limit"
     older = audit_mod.rotated(log)
     assert older.exists() and older.stat().st_mode & 0o077 == 0
-    # One older generation only: nothing else piles up beside it.
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["audit.jsonl", "audit.jsonl.1"]
+    # Older generations stop at KEEP_GENERATIONS: nothing else piles up beside them.
+    names = sorted(p.name for p in tmp_path.iterdir())
+    assert names[0] == "audit.jsonl" and len(names) <= 1 + audit_mod.KEEP_GENERATIONS
     # The newest lines come back in order, across the rotation when needed.
     live = len(log.read_text().splitlines())
-    want = live + 2    # reaches back into the rotated file
+    want = min(live + 2, live + len(audit_mod.rotated(log).read_text().splitlines()))    # reaches back into the rotated file
     tail = [json.loads(line)["n"] for line in audit_mod.tail_lines(want, log)]
     assert tail == list(range(40 - want, 40))
 

@@ -12,13 +12,24 @@ from service.memory.store import SessionStore
 
 @pytest.fixture()
 def loaded_bundled_skills(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    # load() also registers the skills' tools and use_skill into the process-wide
+    # tool registry. Left there, every later test file saw them as built-ins (the
+    # schema budget, the tool-pair and toolbench registry checks), so restore it.
+    import service.tools  # noqa: F401  (registers every built-in first)
+    from service.mcp import TOOL_PARTS
+    from service.skills import tools as skill_tools
+    from service.tools.registry import REGISTRY
     original = skills.all_skills()
+    saved = (dict(REGISTRY), dict(TOOL_PARTS), set(skill_tools._registered))
     monkeypatch.setattr(skills, "SKILLS_DIR", tmp_path / "user-skills")
     loaded = skills.load()
     try:
         yield loaded
     finally:
         skills._skills = original
+        REGISTRY.clear(), REGISTRY.update(saved[0])
+        TOOL_PARTS.clear(), TOOL_PARTS.update(saved[1])
+        skill_tools._registered.clear(), skill_tools._registered.update(saved[2])
 
 
 def test_harbor_ships_workflows_a_tool_skill_and_a_style_skill(loaded_bundled_skills) -> None:
@@ -317,3 +328,18 @@ def test_a_failed_migration_still_loads_every_skill(loaded_bundled_skills, monke
         raise RuntimeError("unexpected")
     monkeypatch.setattr(skills, "_retire_toggle_copies", boom)
     assert {"humanizer", "interview-me"} <= set(skills.load())
+
+
+def test_loading_skills_leaves_the_tool_registry_as_it_found_it(request) -> None:
+    import service.tools  # noqa: F401
+    from service.tools.registry import REGISTRY
+    before = dict(REGISTRY)
+
+    def check():                                      # finalizers run last-in first-out:
+        assert dict(REGISTRY) == before               # this one after the fixture's teardown
+    request.addfinalizer(check)
+    request.getfixturevalue("loaded_bundled_skills")
+    # Another file may already have registered the bundled skills' tools; whatever
+    # load() adds here is a skill tool, and the finalizer checks it is gone again.
+    added = set(REGISTRY) - set(before)
+    assert all(REGISTRY[name].category == "skill_tool" for name in added)

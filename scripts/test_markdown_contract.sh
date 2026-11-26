@@ -14,6 +14,7 @@ swiftc ${swiftc_nested_sandbox_flags[@]+"${swiftc_nested_sandbox_flags[@]}"} -pa
     "$project_root/app/Sources/HarborApp/Theme.swift" \
     "$project_root/app/Sources/HarborApp/Math.swift" \
     "$project_root/app/Sources/HarborApp/MarkdownView.swift" \
+    "$project_root/app/Sources/HarborApp/MarkdownInline.swift" \
     "$project_root/tests/MarkdownChecks.swift" \
     -o "$markdown_scratch/markdown-checks"
 

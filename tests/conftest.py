@@ -89,3 +89,61 @@ def isolated_credential_quarantine(tmp_path, monkeypatch):
     gate = quarantine.RecoveryGate(home=lambda: tmp_path)
     gate.callbacks.append(credentials._VALUES.clear)
     monkeypatch.setattr(quarantine, "_gate", gate)
+
+
+# What email_tools.cache_raw_emails publishes: the current Mail body snapshot and its
+# stamps. Tests across many files call it for real; without this the last snapshot
+# stayed live for every later file, and a mail answer there described another
+# fixture's coverage. Held only once the module is loaded (a test that imports it
+# fresh starts from its defaults anyway).
+_RAW_MAIL_STATE = ("_raw_emails", "_raw_emails_at", "_raw_reference_scan", "_raw_mail_snapshot",
+                   "_raw_snapshot_generation", "_swift_raw", "_native_raw_at",
+                   "_raw_publication_clock", "_raw_publication_monotonic")
+
+
+@pytest.fixture(autouse=True)
+def raw_mail_snapshot_does_not_outlive_the_test(monkeypatch):
+    mail = sys.modules.get("service.tools.email_tools")
+    if mail is not None:
+        for name in _RAW_MAIL_STATE:
+            if hasattr(mail, name):
+                monkeypatch.setattr(mail, name, getattr(mail, name))
+
+
+@pytest.fixture(autouse=True)
+def own_user_config_overlay(tmp_path, monkeypatch):
+    # config.set_role / set_behavior_enabled write ~/.moe/config.yaml, which in a run is
+    # one file for the whole session: a role or switch one test changed (a synthetic
+    # "fast" model, behavior learning off) became every later test's configuration.
+    # Each test gets its own overlay, empty as on a new install.
+    config = sys.modules.get("service.config")
+    if config is None:
+        yield
+        return
+    def clear():
+        for name in ("_user_overlay", "_effective_config", "models_config"):
+            cached = getattr(config, name, None)
+            if cached is not None and hasattr(cached, "cache_clear"):
+                cached.cache_clear()
+    monkeypatch.setattr(config, "USER_CONFIG", tmp_path / "user-config" / "config.yaml")
+    clear()
+    yield
+    clear()
+
+
+@pytest.fixture(autouse=True)
+def behavior_runtime_does_not_outlive_the_test(monkeypatch):
+    # get_runtime() starts the process-wide BehaviorRuntime on first use. One a test
+    # started stayed installed for every later file, so their calls went to that live
+    # runtime instead of the stores they set up (a Google Calendar erase found nothing).
+    runtime = sys.modules.get("service.assistant.behavior_runtime")
+    if runtime is not None and hasattr(runtime, "_runtime"):
+        monkeypatch.setattr(runtime, "_runtime", runtime._runtime)
+        yield
+        return
+    yield
+    # First imported during this test (a file run in its own process): the module
+    # started with no runtime, so that is what the next test gets.
+    runtime = sys.modules.get("service.assistant.behavior_runtime")
+    if runtime is not None and getattr(runtime, "_runtime", None) is not None:
+        runtime._runtime = None

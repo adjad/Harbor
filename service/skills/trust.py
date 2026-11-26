@@ -64,6 +64,8 @@ def _skill_md_bytes(raw: bytes) -> bytes:
 
 
 _LINKED_TREE_FILES = 2000
+# A larger SKILL.md is refused at load (skills._parse) and hashed whole here.
+_SKILL_MD_LIMIT = 1 << 20
 
 
 def _file_digest(path: Path) -> bytes:
@@ -150,9 +152,9 @@ def fingerprint(skill_dir: Path) -> str:
                 inner = b"unreadable"
             files.append((rel.as_posix(), b"symlink:" + target + b"\0" + hashlib.sha256(inner).digest()))
         elif path.is_file():
-            if rel.as_posix() == "SKILL.md":
+            if rel.as_posix() == "SKILL.md" and path.stat().st_size <= _SKILL_MD_LIMIT:
                 # Small and parsed for the on/off flag; read through the same guard.
-                files.append((rel.as_posix(), _skill_md_bytes(_read_small(path))))
+                files.append((rel.as_posix(), _skill_md_bytes(_read_small(path, _SKILL_MD_LIMIT))))
             else:
                 files.append((rel.as_posix(), b"sha256:" + _file_digest(path)))
     for name, data in sorted(files):

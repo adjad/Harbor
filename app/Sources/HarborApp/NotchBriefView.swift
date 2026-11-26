@@ -266,13 +266,13 @@ struct NotchBriefView: View {
     }
 
     /// Calendar events still to come or under way today, soonest first.
-    private func restOfToday(_ plan: TodayPlan) -> [(start: Double, title: String)] {
+    private func restOfToday(_ plan: TodayPlan) -> [BriefEvents.Row] {
         let now = today.now.timeIntervalSince1970
         return plan.displayBlocks
             .filter { ($0.kind == "calendar" || $0.kind == "manual") && !DayTimeline.isPlaceholderEvent($0.title)
                 && ($0.end ?? $0.start + 1800) > now }
             .sorted { $0.start < $1.start }
-            .map { (start: $0.start, title: DayTimeline.eventTitle($0.title)) }
+            .map { (start: $0.start, end: $0.end, title: DayTimeline.eventTitle($0.title)) }
     }
 
     /// Today's all-day events by title, for the calendar line.

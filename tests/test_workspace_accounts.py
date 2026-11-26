@@ -56,6 +56,8 @@ class WorkspaceAccounts(unittest.TestCase):
         self.assertEqual(W.route_arguments({"properties": {"q": {}}}, {"q": 1}), {"q": 1})
 
     def test_sync_writes_private_files_only_for_switched_on_accounts(self):
+        # While the server runs; with it stopped there are no files (2026-11-25 fix).
+        self.enterContext(patch.object(W, "_server_live", lambda: True))
         self.account(ME, True)
         self.account(GUEST, False)
         self.creds.mkdir(parents=True)

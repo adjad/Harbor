@@ -486,7 +486,12 @@ enum OutboundSender {
                 let reason = code == -1743
                     ? "Mail Automation access isn't granted — allow it in System Settings › Privacy & Security › Automation"
                     : (err[NSAppleScript.errorMessage] as? String ?? "Mail refused the forward")
-                post(actionId: actionId, ok: false, error: reason, extra: refusal(code))
+                // A stop at one of the script's own checks before `send` is
+                // proof nothing went out, like the automation refusal.
+                let checked = MailActionScript.preSendCheck(
+                    code: code, message: err[NSAppleScript.errorMessage] as? String ?? "")
+                post(actionId: actionId, ok: false, error: reason,
+                     extra: refusal(code).merging(checked) { current, _ in current })
                 return
             }
             guard let receipt = MailActionScript.decodeForward(out) else {

@@ -946,25 +946,33 @@ def _chain_sigterm(loop: asyncio.AbstractEventLoop) -> None:
 
 
 async def _until_quit(events):
-    """Yield from the async generator `events` until quitting starts, then close it."""
+    """Yield from the async generator `events` until quitting starts, then close it.
+
+    A client that goes away cancels this generator while it waits; the pending
+    `following` step is cancelled and awaited first, so `events` is no longer running
+    when it is closed (aclose on a running generator raises RuntimeError and would
+    leave its hub queue behind)."""
     quitting = asyncio.ensure_future(_quit_signal().wait())
+    following = None
     try:
         while True:
             following = asyncio.ensure_future(events.__anext__())
             done, _ = await asyncio.wait({following, quitting}, return_when=asyncio.FIRST_COMPLETED)
             if following not in done:
-                following.cancel()
-                await asyncio.gather(following, return_exceptions=True)
                 return
             try:
                 item = following.result()
             except StopAsyncIteration:
                 return
+            following = None
             yield item
             if quitting.done():
                 return
     finally:
         quitting.cancel()
+        if following is not None and not following.done():
+            following.cancel()
+            await asyncio.gather(following, return_exceptions=True)
         await events.aclose()
 
 

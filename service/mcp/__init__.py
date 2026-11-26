@@ -115,6 +115,14 @@ class MCPServer:
             self.error = f"{command} isn't installed or isn't on PATH"
             return False
 
+        if self.name == _WORKSPACE_SERVER:
+            # Its credential files exist only while it runs (service/google_workspace.py).
+            try:
+                from service import google_workspace
+                await asyncio.to_thread(google_workspace.start_server_credentials)
+            except Exception as e:  # noqa: BLE001
+                self.error = f"couldn't prepare its sign-ins: {type(e).__name__}"
+                return False
         args = [str(a) for a in (self.config.get("args") or [])]
         env = {**_inherited_env(self.config), **{str(k): str(v)
                                                  for k, v in (self.config.get("env") or {}).items()
@@ -196,6 +204,9 @@ class MCPServer:
                 if not fut.done():
                     fut.set_exception(RuntimeError(f"the {self.name} MCP server stopped"))
             self._pending.clear()
+            if self.name == _WORKSPACE_SERVER and self.proc is not None and self.proc.returncode is not None:
+                # The server died on its own: its sign-in files go with it.
+                await _retire_workspace_credentials()
 
     async def _send(self, payload: dict) -> None:
         if not (self.proc and self.proc.stdin):
@@ -229,6 +240,7 @@ class MCPServer:
         if self._reader:
             self._reader.cancel()
             self._reader = None
+        had_proc = self.proc is not None
         if self.proc and self.proc.returncode is None:
             try:
                 self.proc.terminate()
@@ -239,6 +251,19 @@ class MCPServer:
                 except Exception:  # noqa: BLE001
                     pass
         self.proc = None
+        if self.name == _WORKSPACE_SERVER and had_proc:
+            await _retire_workspace_credentials()
+
+
+_WORKSPACE_SERVER = "google_workspace"
+
+
+async def _retire_workspace_credentials() -> None:
+    try:
+        from service import google_workspace
+        await asyncio.to_thread(google_workspace.stop_server_credentials)
+    except Exception as e:  # noqa: BLE001 — the next start sweeps them
+        print(f"[google_workspace] sign-in files not cleared: {type(e).__name__}", flush=True)
 
 
 def _render_content(result: dict) -> str:

@@ -2355,7 +2355,10 @@ enum DayCards {
     /// At most once a minute (the old per-tab cadence) unless forced: the loop
     /// ticks every 30 s, and a tab switch restarts it. Calls while a read is in
     /// flight join it: a burst of "changed" notices is one read and one more,
-    /// never one each running side by side.
+    /// never one each running side by side. The read clears `inFlight` itself,
+    /// right after its last `againAfter` check with no suspension between, so a
+    /// forced call can never join a read that has already decided to stop (it
+    /// starts a fresh one instead, and the rows are never left stale for a minute).
     static func refresh(force: Bool = false, now: Date = Date()) async {
         if let running = inFlight {
             if force { againAfter = true }
@@ -2373,10 +2376,10 @@ enum DayCards {
                 await hoursOffer.refresh()
                 #endif
             } while againAfter
+            inFlight = nil
         }
         inFlight = run
         await run.value
-        inFlight = nil
     }
 
     #if HARBOR_NOTCH_QA

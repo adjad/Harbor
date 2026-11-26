@@ -15,13 +15,15 @@ IMPORTANT rules (an outbound kind of its own):
 - No cookies (a fresh client per hop, its jar never reused), no auth, no Referer, no proxy
   from the environment, a generic User-Agent.
 - MAX_BYTES per page (streamed; the rest is never downloaded), ITEM_S per item, at most
-  CONCURRENCY at a time; text/html or text/plain only.
+  CONCURRENCY at a time; text/html or text/plain only (a caption or transcript link takes the
+  caption text types instead, never a web page).
 - The text is untrusted data. Nothing about a page is logged except the status and host.
 """
 from __future__ import annotations
 
 import asyncio
 import contextvars
+import html
 import ipaddress
 import logging
 import re
@@ -42,6 +44,9 @@ USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.
 ACCEPT = "text/html,application/xhtml+xml;q=0.9,text/plain;q=0.8,application/pdf;q=0.7"
 TYPES = ("text/html", "application/xhtml+xml", "text/plain", "application/pdf")
 PDF = "application/pdf"
+# Also taken when the link is a caption or transcript file (find.is_transcript), and only then.
+CAPTION_TYPES = ("text/plain", "text/vtt", "text/srt", "text/x-srt", "application/x-subrip",
+                 "application/octet-stream")
 PDF_MAX_BYTES = 15 * 1024 * 1024    # a public PDF (notes, a paper, a chapter)
 PDF_TEXT_S = 30.0                     # its text is read in a sandboxed child process
 
@@ -199,13 +204,14 @@ for _name in ("httpx", "httpcore"):
         logging.getLogger(_name).addFilter(_QuietHttpx())
 
 
-async def _one_hop(url: str) -> tuple[httpx.Response | None, bytes, str]:
+async def _one_hop(url: str, captions: bool = False) -> tuple[httpx.Response | None, bytes, str]:
     """(response, body, location). location is set (and body empty) for a redirect."""
     _QUIET.set(True)      # this task's context only (fetch_article runs in its own task)
     host, url = check_url(url)
     address = await resolve(host)
     # identity: a compressed body would be inflated before the size cap counts it.
-    headers = {"Host": host, "User-Agent": USER_AGENT, "Accept": ACCEPT, "Accept-Language": "en",
+    accept = "text/vtt,text/plain;q=0.9,*/*;q=0.1" if captions else ACCEPT
+    headers = {"Host": host, "User-Agent": USER_AGENT, "Accept": accept, "Accept-Language": "en",
                "Accept-Encoding": "identity"}
     async with httpx.AsyncClient(transport=_transport, trust_env=False, follow_redirects=False,
                                  timeout=httpx.Timeout(ITEM_S, connect=10.0)) as client:
@@ -224,8 +230,8 @@ async def _one_hop(url: str) -> tuple[httpx.Response | None, bytes, str]:
             if (response.headers.get("content-encoding") or "identity").strip().lower() not in ("identity", ""):
                 raise FetchError("not_text")       # asked for identity: a compressed reply is refused
             media = (response.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
-            if media not in TYPES:
-                raise FetchError("not_text")
+            if media not in (CAPTION_TYPES if captions else TYPES):
+                raise FetchError("not_text")       # for a transcript, a web page is a sign-in page
             cap = PDF_MAX_BYTES if media == PDF else MAX_BYTES
             declared = response.headers.get("content-length")
             if declared and declared.isdigit() and int(declared) > cap:
@@ -242,10 +248,10 @@ async def _one_hop(url: str) -> tuple[httpx.Response | None, bytes, str]:
             await response.aclose()
 
 
-async def _fetch(url: str) -> dict:
+async def _fetch(url: str, captions: bool = False) -> dict:
     for _ in range(MAX_REDIRECTS + 1):
         try:
-            response, body, location = await _one_hop(url)
+            response, body, location = await _one_hop(url, captions)
         except FetchError:
             raise
         except httpx.TimeoutException:
@@ -261,6 +267,11 @@ async def _fetch(url: str) -> dict:
             url = location
             continue
         media = (response.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+        if captions:
+            text = transcript(body, media, response)[:TEXT_CHARS]
+            if not text.strip():
+                raise FetchError("empty")
+            return {"url": url, "title": "", "text": text}
         if media == PDF:
             if not body.startswith(b"%PDF-"):
                 raise FetchError("not_text")
@@ -291,6 +302,37 @@ async def pdf_text(data: bytes) -> str:
     return text
 
 
+_TIMING = re.compile(r"\d{1,2}:\d{2}(?::\d{2})?[.,]\d{1,3}[ \t]*-->[ \t]*\d")
+
+
+def transcript(body: bytes, media: str, response: httpx.Response) -> str:
+    """A caption or transcript file's spoken lines: WebVTT and SubRip lose their timings, cue
+    numbers, notes, styles and tags; a plain transcript is kept. The text is untrusted data."""
+    if b"\x00" in body[:4096] and (response.charset_encoding or "").lower() not in ("utf-16", "utf-32"):
+        raise FetchError("not_text")
+    text = _decode(body, response).lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+    timed = text.startswith("WEBVTT") or _TIMING.search(text) is not None
+    if media == "application/octet-stream" and not timed:
+        raise FetchError("not_text")           # an unnamed download counts only when it has cue timings
+    if not timed:
+        if text.lstrip()[:200].lower().startswith(("<!doctype", "<html")):
+            raise FetchError("not_text")
+        return text.strip()
+    lines: list[str] = []
+    for block in re.split(r"\n[ \t]*\n", text):
+        cue = block.strip().split("\n")
+        first = next((i for i, line in enumerate(cue) if _TIMING.search(line)), None)
+        if first is None:
+            continue                           # the header, NOTE, STYLE and REGION blocks
+        for line in cue[first + 1:]:
+            if _TIMING.search(line):
+                continue
+            said = html.unescape(re.sub(r"<[^<>]*>", "", line)).strip()
+            if said and (not lines or lines[-1] != said):     # rolling captions repeat a line
+                lines.append(said)
+    return "\n".join(lines)
+
+
 def _decode(body: bytes, response: httpx.Response) -> str:
     charset = response.charset_encoding
     if not charset:
@@ -303,11 +345,12 @@ def _decode(body: bytes, response: httpx.Response) -> str:
         return body.decode("utf-8", errors="replace")
 
 
-async def fetch_article(url: str, *, timeout_s: float = ITEM_S) -> dict:
-    """{"url" (after redirects), "title", "text"} for one public page; FetchError otherwise."""
+async def fetch_article(url: str, *, timeout_s: float = ITEM_S, captions: bool = False) -> dict:
+    """{"url" (after redirects), "title", "text"} for one public page, or for one caption or
+    transcript file (``captions``); FetchError otherwise."""
     try:
         # Its own task, so the quiet-httpx flag stays in that task's context.
-        return await asyncio.wait_for(asyncio.ensure_future(_fetch(url)), max(1.0, min(float(timeout_s), ITEM_S)))
+        return await asyncio.wait_for(asyncio.ensure_future(_fetch(url, captions)), max(1.0, min(float(timeout_s), ITEM_S)))
     except (TimeoutError, asyncio.TimeoutError):
         raise FetchError("timeout") from None
 

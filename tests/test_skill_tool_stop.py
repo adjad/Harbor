@@ -20,9 +20,13 @@ def _alive(pid: int) -> bool:
     return True
 
 
+# A child that hangs with the shell alone: Simulation QA's sandbox refuses to run
+# /bin/sleep, and /dev/fd (process substitution), and macOS's bash 3.2 has no coproc.
+# A builtin loop in a backgrounded subshell (a fork of bash, no exec) runs until it is
+# killed; each test kills it within about a second.
 def _script(folder: Path) -> Path:
     (folder / "run.sh").write_text(
-        "#!/bin/bash\nsleep 30 &\necho $! > child.pid\necho $$ > parent.pid\nwait\n")
+        "#!/bin/bash\n( while :; do :; done ) &\necho $! > child.pid\necho $$ > parent.pid\nwait\n")
     return folder
 
 

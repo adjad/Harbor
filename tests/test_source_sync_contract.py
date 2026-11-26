@@ -25,6 +25,10 @@ from service.tools import imessage_tools as M, notes_tools as N
 class SourceSyncContract(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.enterContext(patch.object(scheduler, "_sync_status", {}))
+        # "Still syncing after launch" lasts SYNC_STALL_S from launch, then a source that
+        # never reported counts as stalled. Launch is when scheduler was imported, which in
+        # a long run was minutes before this test: each test here is a fresh launch.
+        self.enterContext(patch.object(scheduler, "STARTED_AT", time.time()))
         self.enterContext(patch.multiple(E, _headers_sync_generation=0,
                                        _headers="", _headers_at=0, _history="", _history_at=0,
                                        _email_available=None, _email_sync_pending=False,

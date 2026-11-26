@@ -21,6 +21,7 @@ struct StudyFindChecks {
         target()
         guardRules()
         types()
+        asking()
         titles()
         tabClaim()
         closingGate()
@@ -109,7 +110,26 @@ struct StudyFindChecks {
             ("Discussion: framing", "https://canvas.example.edu/courses/1/discussion_topics/7", "Discussion", false),
             ("Worked examples", "https://canvas.example.edu/courses/1/pages/worked-examples", "Page", false),
             ("Reading: Chapter 2", "https://canvas.example.edu/courses/1/files/12/preview", nil, false),
-            ("Midterm review", "https://canvas.example.edu/courses/1/pages/midterm-review", "Page", true),
+            ("Midterm review", "https://canvas.example.edu/courses/1/pages/midterm-review", "Page", false),
+            ("Midterm review slides", "https://canvas.example.edu/courses/1/pages/midterm-review-slides", "Page", false),
+            ("Final study guide", "https://canvas.example.edu/courses/1/pages/final-study-guide", "Page", false),
+            ("Mid-term lecture notes", "https://canvas.example.edu/courses/1/pages/mid-term-notes", "Page", false),
+            ("Final outline", "https://canvas.example.edu/courses/1/discussion_topics/3", "Discussion", false),
+            ("Midterm", "https://canvas.example.edu/courses/1/pages/midterm", "Page", true),
+            ("Final", "https://canvas.example.edu/courses/1/pages/week-15", "Page", true),
+            ("Week 9", "https://canvas.example.edu/courses/1/pages/midterm", "Page", true),
+            ("Midterm review quiz", "https://canvas.example.edu/courses/1/pages/a", "Page", true),
+            ("Midterm exam review slides", "https://canvas.example.edu/courses/1/pages/a", "Page", true),
+            ("Practice test review", "https://canvas.example.edu/courses/1/pages/a", "Page", true),
+            ("Midterm review answers", "https://canvas.example.edu/courses/1/pages/a", "Page", true),
+            ("Final review: your results", "https://canvas.example.edu/courses/1/pages/a", "Page", true),
+            ("Midterm review attempt", "https://canvas.example.edu/courses/1/pages/a", "Page", true),
+            ("Final notes submission", "https://canvas.example.edu/courses/1/pages/a", "Page", true),
+            ("Midterm review: start here", "https://canvas.example.edu/courses/1/pages/a", "Page", true),
+            ("Midterm review slides", "https://canvas.example.edu/courses/1/modules/items/20", "Quiz", true),
+            ("Final study guide", "https://canvas.example.edu/courses/1/modules/items/21", "Assignment", true),
+            ("Lecture notes", "https://canvas.example.edu/courses/1/modules/items/22", "Assignment submission", true),
+            ("Review notes", "https://canvas.example.edu/courses/1/modules/items/23", "New Quiz", true),
             ("Quiz 3", "https://canvas.example.edu/courses/1/modules/items/9", "Quiz", true),
             ("Essay 1", "https://canvas.example.edu/courses/1/modules/items/10", "Assignment", true),
             ("Unit 2 tool", "https://canvas.example.edu/courses/1/modules/items/11", "ExternalTool", true),
@@ -122,7 +142,8 @@ struct StudyFindChecks {
             ("Hand in lab 2", "https://example.com/b", nil, true),
             ("Homework 2", "https://www.webassign.net/web/Student/x", nil, true),
             ("Final Exam Info", "https://canvas.example.edu/courses/1/pages/info", "Page", true),
-            ("MidtermReview", "https://canvas.example.edu/courses/1/pages/x", "Page", true),
+            ("MidtermReview", "https://canvas.example.edu/courses/1/pages/x", "Page", false),
+            ("MidtermExam", "https://canvas.example.edu/courses/1/pages/x", "Page", true),
             ("notes", "https://canvas.example.edu/courses/1/pages/finalexam-notes", "Page", true),
             ("Sign-in sheet", "https://example.com/a", nil, true),
             ("Quiz3", "https://example.com/q", nil, true),
@@ -143,6 +164,31 @@ struct StudyFindChecks {
               "survey reason")
         check(StudyFindGuard.fullyDecoded("a%2520b") == "a b", "decoded until stable")
         check(StudyFindGuard.fullyDecoded("a%zz") == nil, "a broken escape won't decode")
+    }
+
+    // MARK: - Outside links ask first
+
+    static func asking() {
+        var asking = StudyFindAsking()
+        var selected: Set<String> = ["f_plain"]
+        asking.tap("f_out", asks: true, selected: &selected)
+        check(asking.pending == "f_out" && !selected.contains("f_out"), "ticking an outside link only asks")
+        check(!asking.mayAdd("f_out", asks: true), "nothing is added before the yes")
+        asking.answer("f_other", yes: true, selected: &selected)
+        check(asking.pending == "f_out" && selected == ["f_plain"], "a yes for another item counts for nothing")
+        asking.answer("f_out", yes: false, selected: &selected)
+        check(asking.pending == nil && selected == ["f_plain"], "no leaves it out")
+        asking.tap("f_out", asks: true, selected: &selected)
+        asking.answer("f_out", yes: true, selected: &selected)
+        check(selected.contains("f_out") && asking.mayAdd("f_out", asks: true), "yes ticks that one link")
+        asking.tap("f_second", asks: true, selected: &selected)
+        check(asking.pending == "f_second" && !asking.mayAdd("f_second", asks: true), "each link has its own question")
+        asking.tap("f_out", asks: true, selected: &selected)
+        check(!selected.contains("f_out") && !asking.mayAdd("f_out", asks: true), "unticking forgets the yes")
+        asking.tap("f_plain", asks: false, selected: &selected)
+        check(!selected.contains("f_plain"), "a plain row just unticks")
+        asking.tap("f_plain", asks: false, selected: &selected)
+        check(selected.contains("f_plain") && asking.mayAdd("f_plain", asks: false), "and ticks again with no card")
     }
 
     // MARK: - Module item types

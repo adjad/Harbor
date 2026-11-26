@@ -7,7 +7,8 @@ import SwiftUI
 #endif
 
 // A standalone synthetic fixture: compile with the real Theme.swift,
-// Math.swift, ScriptRunner.swift, MarkdownView.swift and Chat/ChatTheme.swift.
+// Math.swift, ScriptRunner.swift, MarkdownView.swift, MarkdownInline.swift and
+// Chat/ChatTheme.swift.
 // Only ChatOrb is mounted: no Markdown actions, Harbor launcher or backend.
 // Set HARBOR_ORB_QA_OUT, or the fixture bundle's HarborOrbQAOutputDirectory key,
 // to a disposable output directory before launching it normally.

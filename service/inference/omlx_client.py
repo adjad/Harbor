@@ -1220,10 +1220,10 @@ class OMLXClient:
             return None
         masker = cloud_mask.masker_for(cloud_mask.current_conversation())
         if masker is None:
-            # No conversation bound (a background call): one mapping per client.
-            masker = self.__dict__.get("_fallback_masker")
-            if masker is None:
-                masker = self.__dict__["_fallback_masker"] = cloud_mask.Masker()
+            # No conversation bound (a background call): a mapping for this call
+            # only. Each call masks and unmasks with the one it got here, so no
+            # value is held between unrelated calls (candidate review #4).
+            masker = cloud_mask.Masker()
             masker.seed_known_names()
         return masker
 

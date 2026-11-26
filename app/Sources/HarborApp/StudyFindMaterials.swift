@@ -785,11 +785,15 @@ struct StudyFoundItem: Decodable, Equatable, Identifiable, Sendable {
     /// A lecture recording the server lists by title and link only: it can be
     /// added as a video source but is never opened (it launches an outside tool).
     let recording: Bool
+    /// "external" for a teacher's outside link in Modules, "transcript" for a
+    /// public caption or transcript file: each is read only after its own card
+    /// (StudyFindAsking). Nil for everything else.
+    var ask: String?
 
-    enum CodingKeys: String, CodingKey { case id, kind, title, url, via, known, reason, recording }
+    enum CodingKeys: String, CodingKey { case id, kind, title, url, via, known, reason, recording, ask }
 
     init(id: String, kind: String, title: String, url: String, via: String, known: Bool, reason: String? = nil,
-         recording: Bool = false) {
+         recording: Bool = false, ask: String? = nil) {
         self.id = id
         self.kind = kind
         self.title = StudyFindText.cleanTitle(title)
@@ -798,6 +802,7 @@ struct StudyFoundItem: Decodable, Equatable, Identifiable, Sendable {
         self.known = known
         self.reason = reason
         self.recording = recording
+        self.ask = ask
     }
 
     init(from decoder: Decoder) throws {
@@ -810,6 +815,7 @@ struct StudyFoundItem: Decodable, Equatable, Identifiable, Sendable {
         known = ((try? c.decodeIfPresent(Bool.self, forKey: .known)) ?? nil) ?? false
         reason = ((try? c.decodeIfPresent(String.self, forKey: .reason)) ?? nil)?.lowercased()
         recording = ((try? c.decodeIfPresent(Bool.self, forKey: .recording)) ?? nil) ?? false
+        ask = ((try? c.decodeIfPresent(String.self, forKey: .ask)) ?? nil)?.lowercased()
     }
 
     var host: String { URL(string: url)?.host?.lowercased() ?? "" }
@@ -1042,6 +1048,21 @@ enum StudyFindText {
 
     static let recordingLabel = "Recording · link only"
 
+    /// The row note and the card for an item that is read only after a yes.
+    static func asksFirst(_ ask: String) -> String {
+        (ask == "transcript" ? "Transcript" : "Outside link") + " · asks first"
+    }
+    static func askTitle(_ host: String, ask: String) -> String {
+        "Read this \(ask == "transcript" ? "transcript" : "link") from \(host)?"
+    }
+    static func askBody(_ host: String, ask: String) -> String {
+        "When you press Add, Harbor downloads this \(ask == "transcript" ? "text file" : "page") from \(host) over "
+            + "https, without your cookies or sign-in, and never fills in or sends a form. Your Study model sees its "
+            + "title and address first, and a redirect is followed only to another public https page."
+    }
+    static let askYes = "Read it"
+    static let askNo = "Not this one"
+
     /// The row note for an item Harbor never opens because it sounds important.
     static func notOpened(_ reason: String) -> String { "Not opened: \(reason)" }
     static func kindName(_ kind: String) -> String {
@@ -1127,6 +1148,7 @@ final class StudyFindRun: ObservableObject {
     /// Item id → the text Harbor read from that course page.
     @Published private(set) var texts: [String: String] = [:]
     @Published var selected: Set<String> = []
+    @Published private(set) var asking = StudyFindAsking()
     @Published private(set) var note: String?
     @Published private(set) var result: StudyFindAddResult?
     @Published private(set) var counts: StudyFindCounts?
@@ -1223,6 +1245,7 @@ final class StudyFindRun: ObservableObject {
         items = []
         texts = [:]
         selected = []
+        asking = StudyFindAsking()
         note = nil
         result = nil
         counts = nil
@@ -1268,6 +1291,7 @@ final class StudyFindRun: ObservableObject {
         items = []
         texts = [:]
         selected = []
+        asking = StudyFindAsking()
         note = nil
         result = nil
         tabsOpened = 0
@@ -1472,8 +1496,9 @@ final class StudyFindRun: ObservableObject {
                 // Re-checked before anything read from the landed page is
                 // used: this course, and not a tool or quiz launch page (its
                 // links and frames are ignored too).
+                // With the item's title, so a review page keeps its exception once it lands.
                 guard t.allows(landed.url), !t.isLaunchPage(landed.url),
-                      StudyFindGuard.refusal(title: "", url: landed.url, type: nil) == nil else { continue }
+                      StudyFindGuard.refusal(title: item.title, url: landed.url, type: nil) == nil else { continue }
                 c.pagesRead += 1
                 if landed.truncated { c.truncated += 1 }
                 counts = c
@@ -1703,6 +1728,7 @@ final class StudyFindRun: ObservableObject {
         for item in found {
             if let i = index[item.id] {
                 if item.known { items[i].known = true }
+                if item.ask != nil { items[i].ask = item.ask }
             } else {
                 index[item.id] = items.count
                 items.append(item)
@@ -1710,9 +1736,10 @@ final class StudyFindRun: ObservableObject {
         }
     }
 
-    /// The walk is over: tick everything that can be added.
+    /// The walk is over: tick everything that can be added without asking.
     private func settle() {
-        selected = Set(items.filter { blocker($0) == nil }.map(\.id))
+        asking = StudyFindAsking()
+        selected = Set(items.filter { blocker($0) == nil && $0.ask == nil }.map(\.id))
         step = ""
         phase = .found
     }
@@ -1740,16 +1767,24 @@ final class StudyFindRun: ObservableObject {
     /// The list group an item shows under: refused items all go under "Can't open".
     func group(_ item: StudyFoundItem) -> String {
         if item.reason != nil || important[item.id] != nil { return "other" }
-        if item.recording { return "video" }
+        if item.recording || item.ask == "transcript" { return "video" }
         return StudyFindText.order.contains(item.kind) ? item.kind : "other"
     }
 
     func toggle(_ item: StudyFoundItem) {
         guard blocker(item) == nil else { return }
-        if selected.contains(item.id) { selected.remove(item.id) } else { selected.insert(item.id) }
+        asking.tap(item.id, asks: item.ask != nil, selected: &selected)
     }
 
-    var chosen: [StudyFoundItem] { items.filter { selected.contains($0.id) && blocker($0) == nil } }
+    /// An outside link's card was answered.
+    func answer(_ item: StudyFoundItem, yes: Bool) {
+        guard phase == .found, blocker(item) == nil else { return }
+        asking.answer(item.id, yes: yes, selected: &selected)
+    }
+
+    var chosen: [StudyFoundItem] {
+        items.filter { selected.contains($0.id) && blocker($0) == nil && asking.mayAdd($0.id, asks: $0.ask != nil) }
+    }
 
     // MARK: Add
 
@@ -2009,6 +2044,7 @@ private struct StudyFindCard: View {
             .studyReportsHeight(onResize)
             .onAppear { run.setFinished(onFinished) }
             .onChange(of: run.phase) { _, _ in onResize() }
+            .onChange(of: run.asking.pending) { _, _ in onResize() }
         }
     }
 
@@ -2177,10 +2213,31 @@ private struct StudyFindCard: View {
                 ForEach(expanded.contains(kind) ? rows : Array(rows.prefix(Self.rows))) { item in
                     StudyFoundRow(item: item, checked: run.selected.contains(item.id),
                                   blocker: run.blocker(item)) { run.toggle(item) }
+                    if run.asking.pending == item.id { askCard(item) }
                 }
             }
         }
         .padding(.horizontal, -8)
+    }
+
+    /// One outside link's own question, under its row.
+    private func askCard(_ item: StudyFoundItem) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(StudyFindText.askTitle(item.host, ask: item.ask ?? "")).font(.harbor(.footnote, weight: .medium))
+                .foregroundStyle(Theme.textPrimary).fixedSize(horizontal: false, vertical: true)
+                .accessibilityAddTraits(.isHeader)
+            Text(StudyFindText.askBody(item.host, ask: item.ask ?? "")).font(.harbor(.caption)).foregroundStyle(Theme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 6) {
+                StudyChrome.pill(StudyFindText.askYes, primary: true) { set { run.answer(item, yes: true) } }
+                    .accessibilityLabel("Read it from \(item.host)")
+                StudyChrome.pill(StudyFindText.askNo) { set { run.answer(item, yes: false) } }
+                Spacer(minLength: 0)
+            }
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.05)))
+        .padding(.horizontal, 8).padding(.bottom, 2)
     }
 
     private var adding: some View {
@@ -2266,7 +2323,8 @@ extension StudyFindRun {
     func reopenList() {
         guard phase == .done else { return }
         result = nil
-        selected = Set(items.filter { blocker($0) == nil }.map(\.id))
+        asking = StudyFindAsking()
+        selected = Set(items.filter { blocker($0) == nil && $0.ask == nil }.map(\.id))
         phase = .found
     }
 }
@@ -2324,7 +2382,8 @@ private struct StudyFoundRow: View {
                     }
                 }
                 .layoutPriority(1)
-                if let note = blocker ?? (item.recording && !item.known ? StudyFindText.recordingLabel : nil) {
+                if let note = blocker ?? (item.recording && !item.known ? StudyFindText.recordingLabel : nil)
+                    ?? item.ask.flatMap({ checked ? nil : StudyFindText.asksFirst($0) }) {
                     Spacer(minLength: 4)
                     Text(note).font(.harbor(.caption, weight: .medium)).foregroundStyle(Theme.textMuted)
                         .lineLimit(1).fixedSize()

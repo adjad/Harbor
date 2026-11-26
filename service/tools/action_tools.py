@@ -98,6 +98,11 @@ def _script_files_preview(args: dict) -> str:
     return "".join(parts)
 
 
+# Mail keeps only the text when a note is set above a forward (AppleScript can't
+# insert one into the rich original), so the card says so before approval.
+FORWARD_NOTE_IS_PLAIN = ("With a note, Mail sends this forward as plain text: the original's "
+                         "formatting isn't kept, and an email with attachments can't be "
+                         "forwarded with a note.")
 _FORWARD_NOT_FOUND = ("(Harbor couldn't find this email in the mail it has read, "
                       "so it can't show the subject or sender.)")
 
@@ -258,7 +263,8 @@ def confirm_preview(tool: str, args: dict) -> str | None:
         return ("".join(f"{line}\n" for line in about)
                 + f"Forward message {args.get('message_id', '?')}\n"
                 + ("" if about else _FORWARD_NOT_FOUND + "\n") + f"To: {to}"
-                + (f"\n\nNote:\n{_clip_preview(note)}" if note else "\n\n(no note)"))
+                + (f"\n\nNote:\n{_clip_preview(note)}\n\n{FORWARD_NOTE_IS_PLAIN}" if note
+                   else "\n\n(no note: the original goes with its formatting and attachments)"))
     if tool in ("send_message", "draft_message"):
         to = _card_recipient(str(args.get("to", "")),
                              bound=_bound_handle(args) if tool == "send_message" else "",

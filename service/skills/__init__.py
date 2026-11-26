@@ -81,6 +81,7 @@ _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", re.S)
 # 20-page procedure has to be split; silently truncating is better than blowing
 # the context budget, and the cap is generous enough that no reasonable skill
 # hits it.
+MAX_SKILL_MD_BYTES = 1 << 20
 MAX_BODY_CHARS = 6000
 
 # Always-on style skills that shape only the messages Harbor writes for the user
@@ -171,6 +172,13 @@ def _parse(path: Path, *, bundled: bool = False) -> Skill | None:
     """Parse one SKILL.md. A broken skill is reported, never raised — one bad
     file in the folder must not take down skill loading for the rest."""
     try:
+        size = path.stat().st_size
+        if size > MAX_SKILL_MD_BYTES:
+            # Refused whole rather than read in part: a part that is never read
+            # could change unseen (candidate review #4 of the 2026-11-25 pentest).
+            return Skill(path.parent.name, "", "", path.parent, enabled=False, bundled=bundled,
+                         error=f"SKILL.md is too large ({size // 1024} KB; the limit is "
+                               f"{MAX_SKILL_MD_BYTES // 1024} KB)")
         raw = path.read_text(errors="replace")
     except Exception as e:  # noqa: BLE001
         return Skill(path.parent.name, "", "", path.parent,

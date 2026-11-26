@@ -1157,6 +1157,13 @@ _SHELL_STARTUP_FILES = (".zshrc", ".zshenv", ".zprofile", ".zlogin", ".zlogout",
                         ".bashrc", ".bash_login", ".bash_logout", ".profile", ".inputrc")
 
 
+_EDITOR_STARTUP = (".vimrc", ".gvimrc", ".exrc", ".vim", ".config/nvim", ".emacs", ".emacs.d",
+                   ".nanorc", ".config/helix")
+# Python runs these at every interpreter start: .pth files (an `import` line in
+# one is executed) and sitecustomize / usercustomize, in any site-packages.
+_PYTHON_STARTUP = re.compile(r"/site-packages/(?:[^/]+\.pth|(?:site|user)customize\.py)$")
+
+
 def _code_exec_roots() -> list[Path]:
     from service.safety import shell_sandbox
     home = Path.home()
@@ -1165,6 +1172,14 @@ def _code_exec_roots() -> list[Path]:
              home / ".config" / "fish", home / ".config" / "git", home / ".gitconfig",
              home / "Library" / "Application Support" / "com.apple.backgroundtaskmanagementagent"]
     roots += [home / name for name in _SHELL_STARTUP_FILES]
+    # Folders on PATH a user (or Homebrew) can write: a file there runs whenever
+    # its name is typed. Services and Folder Action Scripts run from Finder and
+    # the Services menu; editor startup files run when the editor opens
+    # (candidate review #2).
+    roots += [home / ".local" / "bin", home / "bin", Path("/opt/homebrew/bin"), Path("/usr/local/bin"),
+              home / "Library" / "Services", home / "Library" / "Scripts" / "Folder Action Scripts",
+              Path("/Library/Scripts/Folder Action Scripts")]
+    roots += [home / name for name in _EDITOR_STARTUP]
     try:
         roots += shell_sandbox.protected_roots()
     except Exception:  # noqa: BLE001 — the fixed list still applies
@@ -1207,7 +1222,7 @@ def code_exec_path_hit(args: dict, tool: str | None = None) -> str | None:
             if p not in above_home and any(r.startswith(p + "/") for r in roots):
                 return operand
             # A repository's own hooks and config run on the next git command.
-            if _GIT_CODE.search(p):
+            if _GIT_CODE.search(p) or _PYTHON_STARTUP.search(p):
                 return operand
     return None
 
@@ -1488,6 +1503,50 @@ def shell_secret_hit(args: dict) -> str | None:
             cmd = _grep_file_operands(cmd)
             return next((hit for form in _quote_forms(cmd) if (hit := hit_in(form))), None)
     return next((hit for form in shell_forms(args) if (hit := hit_in(form))), None)
+
+
+# Shell text that writes a place whose files run as code later: the shell-side
+# counterpart of code_exec_path_hit (candidate review #3). By name, so `cd ~ &&
+# echo >> .zprofile` counts; a validated read-only command (cat, ls) never does.
+_SHELL_CODE_RUN = [re.compile(p) for p in (
+    r"(?<![\w.-])\.(?:zshrc|zshenv|zprofile|zlogin|zlogout|bash_profile|bashrc|bash_login|bash_logout"
+    r"|profile|inputrc|gitconfig|vimrc|gvimrc|exrc|emacs|nanorc)(?![\w-])",
+    r"\bLaunch(?:Agents|Daemons)\b", r"\bbackgroundtaskmanagementagent\b",
+    r"\.config/(?:fish|git|nvim|helix)\b", r"(?<![\w-])\.(?:emacs\.d|vim)/",
+    r"\bLibrary/Services\b", r"Folder Action Scripts", r"(?<![\w-])\.local/bin\b",
+    r"(?:~|\$HOME|\$\{HOME\})/bin\b", r"(?<![\w-])\.moe/skills\b",
+    r"\.git/(?:hooks|config|modules/)", r"site-packages/[^\s'\"]*\.pth\b", r"\b(?:site|user)customize\.py\b",
+    r"\bgit\s+config\b(?!\s+(?:--get|--list|-l)\b)", r"\blaunchctl\s+(?:load|bootstrap|enable|submit)\b",
+    # A PATH folder named as an argument or a redirection target, not run from.
+    r"(?:>>?\s*|\s)[\"']?(?:/opt/homebrew/bin|/usr/local/bin)(?:/|(?![\w-]))",
+)]
+
+
+_SHELL_COMPOUND = re.compile(r"[;&|<>`\n]|\$\(")
+_PLAIN_READS = frozenset({"cat", "ls", "head", "tail", "less", "more", "wc", "stat", "file", "grep",
+                          "diff", "md5", "shasum"})
+
+
+def shell_code_exec_hit(args: dict) -> str | None:
+    """The code-run-later place a shell-category call writes, or None."""
+    cmd = str(args.get("cmd") or "")
+    if not args.get("script") and len(cmd) <= SHELL_TEXT_LIMIT:
+        if read_only_shell_argv(cmd) is not None:
+            return None
+        # One plain read of these files (no redirection, pipe, chaining or
+        # substitution) writes nothing.
+        if not _SHELL_COMPOUND.search(cmd):
+            try:
+                first = shlex.split(cmd)[:1]
+            except ValueError:
+                first = []
+            if first and first[0].rsplit("/", 1)[-1] in _PLAIN_READS:
+                return None
+    for form in shell_forms(args):
+        for pattern in _SHELL_CODE_RUN:
+            if (m := pattern.search(form)):
+                return m.group(0).strip(" >\"'")
+    return None
 
 
 # First words that make a scoped "always allow" a blanket one: an interpreter
@@ -4122,7 +4181,8 @@ def _decide(category: str, args: dict, tool: str | None = None) -> Decision:
     # A file change in a place whose files run later as code (_code_exec_roots):
     # computed before grants, so no Always allow and no access mode skips it.
     persists = (code_exec_path_hit(args, tool)
-                if category in ("fs_write", "fs_delete") and not secret else None)
+                if category in ("fs_write", "fs_delete") and not secret
+                else shell_code_exec_hit(args) if category == "shell" else None)
     # A Mac setting switched off that cuts the network, a device or a
     # protection (_TOGGLE_OFF_CUTS). A grant on "wifi" was given for a call the
     # user saw, not for every future Wi-Fi off.
@@ -4428,10 +4488,19 @@ UNTRUSTED_CONTENT_TOOLS = frozenset({"clipboard_read", "list_running_apps", "har
 _NON_CONTENT_READS = frozenset({"pwd", "echo", "whoami", "uname", "ls", "wc"})
 
 
+# The user's own Contacts, looked up on this Mac: names, numbers, addresses and
+# birthdays the user saved, not text someone else wrote. They don't count as an
+# untrusted read, though they share messages_read with Messages bodies, which do.
+OWN_DATA_READ_TOOLS = frozenset({"lookup_contact", "list_contacts", "contact_dates"})
+
+
 def turn_reads_untrusted(tool: str, category: str, args: dict) -> bool:
     """Whether running this call puts outside text into the turn. Every shell
     or AppleScript call does, except a validated pwd/echo/whoami/uname/ls/wc:
-    a full-access shell can print any file, page or message."""
+    a full-access shell can print any file, page or message. A local Contacts
+    lookup (OWN_DATA_READ_TOOLS) does not."""
+    if tool in OWN_DATA_READ_TOOLS:
+        return False
     if category in UNTRUSTED_CONTENT_CATEGORIES or tool in UNTRUSTED_CONTENT_TOOLS:
         return True
     if category != "shell":

@@ -53,6 +53,11 @@ class ReminderCreation(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.store._db.close)
         self.enterContext(patch.object(A, "assistant_store", self.store))
         self.enterContext(patch.object(scheduler, "_sync_status", {}))
+        # get_upcoming merges Day's plan, which reads the process-wide store, not the
+        # one patched above: another test's rows there (a due reminder, an event) were
+        # counted here. Day's plan is empty in this fixture.
+        from service.assistant import day_agenda
+        self.enterContext(patch.object(day_agenda, "snapshot_fn", lambda day, tz: {}))
         scheduler.record_sync("calendar", 1, {"authorized": True})
         scheduler.record_sync("reminders", 0, {"authorized": True})
         self.publish = self.enterContext(patch.object(hub, "publish", new_callable=AsyncMock))

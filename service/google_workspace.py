@@ -403,12 +403,22 @@ def credentials_path(email: str) -> Path:
     return CREDENTIALS_DIR / f"{email.strip().lower()}.json"
 
 
+# The server's credential files live only while the server runs. workspace-mcp
+# reads its sign-ins from files (WORKSPACE_MCP_CREDENTIALS_DIR), not from the
+# Keychain, so the refresh tokens are written there when it starts, from the
+# account store (whose tokens live in the Keychain), and removed when it stops
+# or its process ends; the next start sweeps any a crash left behind. The server
+# also writes to them (a refreshed token, scopes it added on demand), so before
+# a file goes, what changed is folded back into the account store.
 def _write_credentials(email: str, item: dict) -> None:
-    CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
-    os.chmod(CREDENTIALS_DIR, 0o700)
+    _private_dir()
     path = credentials_path(email)
     tmp = path.with_suffix(".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "w") as handle:
         json.dump({"token": None, "refresh_token": item.get("refresh_token", ""),
                    "token_uri": TOKEN_URI, "client_id": item.get("client_id", ""),
@@ -417,12 +427,113 @@ def _write_credentials(email: str, item: dict) -> None:
     tmp.replace(path)
 
 
+def _private_dir() -> None:
+    CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
+    for folder in (CREDENTIALS_DIR.parent, CREDENTIALS_DIR):
+        info = os.lstat(folder)
+        if not os.path.isdir(folder) or os.path.islink(folder) or info.st_uid != os.getuid():
+            raise OSError(f"{folder} is not a private folder of this user's")
+        os.chmod(folder, 0o700, follow_symlinks=False)
+
+
+def _read_private(path: Path) -> dict | None:
+    """One credential file the server may have rewritten; never through a link."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        import stat as _stat
+        if not _stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = -1
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    return data if isinstance(data, dict) else None
+
+
+def _collect_server_changes() -> None:
+    """Fold a newer refresh token or added scopes the server wrote into the account
+    store (and so into the Keychain). Values are compared, never logged."""
+    if not CREDENTIALS_DIR.is_dir():
+        return
+    from service import gmail_source
+    current = gmail_source.connected_accounts()
+    updates: dict[str, dict] = {}
+    for path in CREDENTIALS_DIR.glob("*.json"):
+        email = path.stem.lower()
+        item = current.get(email)
+        data = _read_private(path)
+        if item is None or data is None:
+            continue
+        change: dict = {}
+        token = data.get("refresh_token")
+        if isinstance(token, str) and token and token != item.get("refresh_token"):
+            change["refresh_token"] = token
+        scopes = data.get("scopes")
+        if isinstance(scopes, list):
+            known = list(item.get("scopes") or [])
+            added = [s for s in scopes if isinstance(s, str) and s not in known]
+            if added:
+                change["scopes"] = known + added
+        if change:
+            updates[email] = change
+    if updates:
+        gmail_source.adopt_workspace_updates(updates)
+
+
+def _clear_credentials() -> None:
+    if not CREDENTIALS_DIR.is_dir() or CREDENTIALS_DIR.is_symlink():
+        return
+    for path in CREDENTIALS_DIR.iterdir():
+        if path.is_file() or path.is_symlink():
+            path.unlink(missing_ok=True)
+    try:
+        CREDENTIALS_DIR.rmdir()
+    except OSError:
+        pass
+
+
+def _server_live() -> bool:
+    server = manager.servers.get(SERVER)
+    return bool(server is not None and server.running)
+
+
+def start_server_credentials() -> None:
+    """Before the server starts: keep what a crashed run changed, sweep its files,
+    then write a fresh file for each switched-on account."""
+    _collect_server_changes()
+    _clear_credentials()
+    from service import gmail_source
+    accounts = gmail_source.connected_accounts()
+    for email, item in accounts.items():
+        if item.get("workspace"):
+            _write_credentials(email.lower(), item)
+
+
+def stop_server_credentials() -> None:
+    """After the server stops or dies: keep what it changed, then remove its files."""
+    _collect_server_changes()
+    _clear_credentials()
+
+
 def sync_credentials(accounts: dict[str, dict], *, refresh: tuple[str, ...] = ()) -> None:
     """Make the credentials folder match the switched-on connected accounts.
 
-    A file the server already holds is kept (it may carry scopes the server
-    added on demand) unless the account just signed in again (`refresh`).
-    Accounts that are switched off or gone lose their file."""
+    Only while the server runs: then a file the server holds is kept (it may
+    carry scopes the server added on demand) unless the account just signed in
+    again (`refresh`), and accounts switched off or gone lose their file. While
+    it isn't running there are no files at all: what a crashed run left is
+    folded back and swept."""
+    if not _server_live():
+        _collect_server_changes()
+        _clear_credentials()
+        return
     wanted = {email.lower(): item for email, item in accounts.items() if item.get("workspace")}
     for email, item in wanted.items():
         if email in refresh or not credentials_path(email).exists():

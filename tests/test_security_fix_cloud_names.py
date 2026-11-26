@@ -96,3 +96,20 @@ def test_an_empty_name_list_is_cached_only_briefly(monkeypatch):
     monkeypatch.setattr(cloud_mask, "_names_cache", (stamp - cloud_mask._EMPTY_NAMES_TTL_S - 1, names))
     cloud_mask.known_names()
     assert len(calls) == 2
+
+
+def test_each_background_cloud_call_gets_its_own_mapping():
+    from service.inference.omlx_client import OMLXClient
+
+    class Remote:
+        managed = False
+        endpoint_name = "fixture_cloud"
+        base_url = "https://cloud.example.invalid/v1"
+
+    client = Remote()
+    first = OMLXClient._cloud_masker(client)
+    masked = first.mask("write to fixture.person@example.invalid")
+    second = OMLXClient._cloud_masker(client)
+    assert second is not first and len(second) == 0
+    # A placeholder from one call means nothing to the next: no value carried across.
+    assert second.unmask(masked) == masked

@@ -203,8 +203,9 @@ async def act_asked(request: Request):
 
 @router.get("")
 def proactive(account: str | None = None):
+    from service.proactive import handled
     from service.proactive.cycle import snapshot
-    return snapshot(account=account)
+    return handled.with_replied_labels(snapshot(account=account))
 
 
 @router.post("/analyze")

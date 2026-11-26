@@ -50,6 +50,29 @@ def _automation_refusal(event_type: str, result) -> str | None:
             "System Settings > Privacy & Security > Automation, then try again.")
 
 
+# A forward stops at one of its own checks before Mail's `send`
+# (MailActionScript.preSendCheck): the app names which, never Mail's text, and
+# the words below are written here. Nothing was sent, so the result is
+# not_attempted rather than unknown. Every other failure stays unknown.
+_CHECKED_BEFORE_SEND = "checked_before_send"
+_PRE_SEND_CHECKS = {
+    "not_found": "Harbor couldn't find that email in Mail's inbox (it may have been moved), so nothing was sent.",
+    "lost_original": "Mail didn't keep the original email in the forward, so nothing was sent.",
+    "recipients_changed": "Mail changed the forward's recipients, so nothing was sent.",
+    "identity_changed": "Mail picked a sending address outside the email's account, so nothing was sent.",
+    "note_drops_attachments": ("Mail drops an email's attachments when a note is added to the forward, "
+                               "so nothing was sent. Forward it without a note to keep them."),
+}
+
+
+def _pre_send_refusal(event_type: str, result) -> str | None:
+    if not (event_type == "forward_email" and isinstance(result, dict) and result.get("ok") is False
+            and "status" not in result and result.get("refusal") == _CHECKED_BEFORE_SEND):
+        return None
+    check = result.get("check")
+    return _PRE_SEND_CHECKS.get(check) if type(check) is str else None
+
+
 def _reminder_base_action_id(event_type: str, payload: dict) -> str | None:
     try:
         semantic = json.dumps({"type": event_type, "payload": payload},
@@ -273,10 +296,11 @@ async def _request(event_type: str, payload: dict,
             # generic native failure cannot prove an external send did not run.
             if (not isinstance(result, dict) or result.get("ok") is not True
                     or ("status" in result and result["status"] != "succeeded")):
-                refused = _automation_refusal(event_type, result)
+                refused = _automation_refusal(event_type, result) or _pre_send_refusal(event_type, result)
                 if refused:
                     # The event reached the app, but macOS stopped the app's
-                    # first request to Mail or Messages, so no send began.
+                    # first request to Mail or Messages, or the forward stopped
+                    # at one of its own checks before `send`: no send began.
                     return {"ok": False, "status": "not_attempted", "dispatch_started": False,
                             "action_id": action_id, "error": refused}
                 return {"ok": False, "status": "unknown", "dispatch_started": dispatch_started,

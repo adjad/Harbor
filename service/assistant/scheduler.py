@@ -177,124 +177,129 @@ async def _age_out_only(behavior_runtime) -> None:
 
 
 async def run() -> None:
-    while True:
-        # server-side connectors (none today)
-        for c in _connectors:
+    try:
+        while True:
+            # server-side connectors (none today)
+            for c in _connectors:
+                try:
+                    items = await c.poll()
+                    assistant_store.sync_source(c.name, items)
+                except Exception:  # noqa: BLE001 — a connector must never break the loop
+                    pass
+            # fire any due reminders
             try:
-                items = await c.poll()
-                assistant_store.sync_source(c.name, items)
-            except Exception:  # noqa: BLE001 — a connector must never break the loop
+                for note in due_reminders(assistant_store):
+                    await hub.publish(note)
+            except Exception:  # noqa: BLE001
                 pass
-        # fire any due reminders
-        try:
-            for note in due_reminders(assistant_store):
-                await hub.publish(note)
-        except Exception:  # noqa: BLE001
-            pass
-        # Behavior learning (on by default; off via Settings or HARBOR_BEHAVIOR=0):
-        # ingest/mine/nudge on its own internal cadence; never raises. A tick
-        # can take seconds (mining, phrasing), so it runs as a background
-        # task and never delays reminders, the brief or scheduled sends; at
-        # most one runs at a time.
-        try:
-            _start_behavior_tick()
-        except Exception:  # noqa: BLE001 — never break the loop
-            pass
-        # The Daily Summary, twice a day: one morning run and one evening run
-        # (config.get_daily_summary_times), each caught up on the first tick
-        # after a launch or wake that missed it. The brief is a deterministic
-        # render (no generation — see brief._generate_brief), but composing it
-        # asks the Swift app for current Calendar, Reminders, Mail and Messages
-        # reads, and a user's own mail/message question waits on those too. So
-        # it runs as a single-flight background task that never starts while
-        # the user is waiting or chatting (brief_pace) and stands down if they
-        # start a turn mid-run (_start_daily_brief).
-        #
-        # _fire_scheduled_sends below is deliberately NOT gated: it does no
-        # model work, and a send the user scheduled for 6pm should go at 6pm
-        # whether or not they happen to be typing.
-        try:
-            _start_daily_brief() or _start_day_one_recompose()
-        except Exception:  # noqa: BLE001 — never break the loop
-            pass
-        try:
-            _start_scheduled_sends()         # background, single-flight: a hung send app
-        except Exception:  # noqa: BLE001  # never holds up the rest of this tick
-            pass
-        # Codex task monitoring is a read-only local poll. It establishes a
-        # baseline on first use, then publishes only terminal transitions or a
-        # one-time stalled alert; ordinary progress commentary stays quiet.
-        try:
-            await _poll_codex()
-        except Exception:  # noqa: BLE001 — Codex may not be installed/open yet
-            pass
-        # Proactive attention: notice a commitment in a text that is not on the calendar.
-        # Mode defaults to "shadow" (records, does nothing); "live" is the user's choice.
-        # No model is involved, so it needs no foreground gate.
-        try:
-            from service.assistant.attention_runner import schedule_tick
-            schedule_tick()                  # background, single-flight: never awaited here
-        except Exception:  # noqa: BLE001 — must never break the scheduler loop
-            pass
-        try:
-            from service.assistant.day_plan_email import schedule_tick
-            schedule_tick()
-        except Exception:  # optional daily self-plan delivery never delays the loop
-            pass
-        # The Brief's MAIL and TEXTS overviews (mail_gists.py): one bounded
-        # background model call at a time, only while nobody is waiting, and
-        # only for a source whose mail or texts changed, once the chat has gone
-        # quiet (brief_pace).
-        try:
-            from service.assistant import mail_gists
-            mail_gists.schedule_tick()
-        except Exception:  # noqa: BLE001 — a missing gist falls back to a plain sentence
-            pass
-        # The proactive engine (service/proactive/cycle.py): triage, judge and
-        # prepare "Before you ask" cards on the resident model, single-flight,
-        # only while nobody is waiting or chatting, never alongside a gist call,
-        # with a minimum gap between builds. By day the model builds it about four
-        # times, across the working hours (brief_pace.automatic_plan). Otherwise, about
-        # hourly, at the first tick the Mac has sat idle 10 min, it regenerates
-        # the whole Brief (cards, then every gist) when something changed:
-        # cycle.idle_refresh. Coming back to a stale Brief (a relaunch, an
-        # unpark, the notch opening) regenerates it once on the resident model:
-        # proactive/return_refresh.
-        try:
-            from service.proactive import cycle as proactive_cycle
-            proactive_cycle.schedule_tick()
-        except Exception:  # noqa: BLE001 — the Brief keeps its last cards
-            pass
-        # Mail memory (service/mail_memory): walks 90 days of mail one email per tick,
-        # only while nobody is waiting, for long-term reminders; the Brief shows the
-        # important ones (importance.py).
-        try:
-            from service.mail_memory import runner as mail_memory
-            mail_memory.schedule_tick()
-        except Exception:  # noqa: BLE001 — never break the scheduler loop
-            pass
-        # Reads new saved Mail attachments, one file per run (off by default, no model).
-        try:
-            from service import attachment_index
-            attachment_index.schedule_tick()
-        except Exception:  # noqa: BLE001 — never break the scheduler loop
-            pass
-        # The chief-of-staff loop (service/assistant/checkin.py): carry
-        # unfinished tasks onto today each morning, and in the evening ask how
-        # the day went, once, when the app is listening. No model, no sends.
-        try:
-            await _checkin_tick()
-        except Exception:  # noqa: BLE001 — never break the scheduler loop
-            pass
-        # Whether the user is away and whether the Mac is on battery, for the
-        # GPU caps, plus a GPU baseline for the look each capped request takes
-        # (power_tier): read off the loop here.
-        try:
-            from service.inference.power_tier import refresh_away
-            await asyncio.to_thread(refresh_away)
-        except Exception:  # noqa: BLE001 — never break the scheduler loop
-            pass
-        await asyncio.sleep(TICK_S)
+            # Behavior learning (on by default; off via Settings or HARBOR_BEHAVIOR=0):
+            # ingest/mine/nudge on its own internal cadence; never raises. A tick
+            # can take seconds (mining, phrasing), so it runs as a background
+            # task and never delays reminders, the brief or scheduled sends; at
+            # most one runs at a time.
+            try:
+                _start_behavior_tick()
+            except Exception:  # noqa: BLE001 — never break the loop
+                pass
+            # The Daily Summary, twice a day: one morning run and one evening run
+            # (config.get_daily_summary_times), each caught up on the first tick
+            # after a launch or wake that missed it. The brief is a deterministic
+            # render (no generation — see brief._generate_brief), but composing it
+            # asks the Swift app for current Calendar, Reminders, Mail and Messages
+            # reads, and a user's own mail/message question waits on those too. So
+            # it runs as a single-flight background task that never starts while
+            # the user is waiting or chatting (brief_pace) and stands down if they
+            # start a turn mid-run (_start_daily_brief).
+            #
+            # _fire_scheduled_sends below is deliberately NOT gated: it does no
+            # model work, and a send the user scheduled for 6pm should go at 6pm
+            # whether or not they happen to be typing.
+            try:
+                _start_daily_brief() or _start_day_one_recompose()
+            except Exception:  # noqa: BLE001 — never break the loop
+                pass
+            try:
+                _start_scheduled_sends()         # background, single-flight: a hung send app
+            except Exception:  # noqa: BLE001  # never holds up the rest of this tick
+                pass
+            # Codex task monitoring is a read-only local poll. It establishes a
+            # baseline on first use, then publishes only terminal transitions or a
+            # one-time stalled alert; ordinary progress commentary stays quiet.
+            try:
+                await _poll_codex()
+            except Exception:  # noqa: BLE001 — Codex may not be installed/open yet
+                pass
+            # Proactive attention: notice a commitment in a text that is not on the calendar.
+            # Mode defaults to "shadow" (records, does nothing); "live" is the user's choice.
+            # No model is involved, so it needs no foreground gate.
+            try:
+                from service.assistant.attention_runner import schedule_tick
+                schedule_tick()                  # background, single-flight: never awaited here
+            except Exception:  # noqa: BLE001 — must never break the scheduler loop
+                pass
+            try:
+                from service.assistant.day_plan_email import schedule_tick
+                schedule_tick()
+            except Exception:  # optional daily self-plan delivery never delays the loop
+                pass
+            # The Brief's MAIL and TEXTS overviews (mail_gists.py): one bounded
+            # background model call at a time, only while nobody is waiting, and
+            # only for a source whose mail or texts changed, once the chat has gone
+            # quiet (brief_pace).
+            try:
+                from service.assistant import mail_gists
+                mail_gists.schedule_tick()
+            except Exception:  # noqa: BLE001 — a missing gist falls back to a plain sentence
+                pass
+            # The proactive engine (service/proactive/cycle.py): triage, judge and
+            # prepare "Before you ask" cards on the resident model, single-flight,
+            # only while nobody is waiting or chatting, never alongside a gist call,
+            # with a minimum gap between builds. By day the model builds it about four
+            # times, across the working hours (brief_pace.automatic_plan). Otherwise, about
+            # hourly, at the first tick the Mac has sat idle 10 min, it regenerates
+            # the whole Brief (cards, then every gist) when something changed:
+            # cycle.idle_refresh. Coming back to a stale Brief (a relaunch, an
+            # unpark, the notch opening) regenerates it once on the resident model:
+            # proactive/return_refresh.
+            try:
+                from service.proactive import cycle as proactive_cycle
+                proactive_cycle.schedule_tick()
+            except Exception:  # noqa: BLE001 — the Brief keeps its last cards
+                pass
+            # Mail memory (service/mail_memory): walks 90 days of mail one email per tick,
+            # only while nobody is waiting, for long-term reminders; the Brief shows the
+            # important ones (importance.py).
+            try:
+                from service.mail_memory import runner as mail_memory
+                mail_memory.schedule_tick()
+            except Exception:  # noqa: BLE001 — never break the scheduler loop
+                pass
+            # Reads new saved Mail attachments, one file per run (off by default, no model).
+            try:
+                from service import attachment_index
+                attachment_index.schedule_tick()
+            except Exception:  # noqa: BLE001 — never break the scheduler loop
+                pass
+            # The chief-of-staff loop (service/assistant/checkin.py): carry
+            # unfinished tasks onto today each morning, and in the evening ask how
+            # the day went, once, when the app is listening. No model, no sends.
+            try:
+                await _checkin_tick()
+            except Exception:  # noqa: BLE001 — never break the scheduler loop
+                pass
+            # Whether the user is away and whether the Mac is on battery, for the
+            # GPU caps, plus a GPU baseline for the look each capped request takes
+            # (power_tier): read off the loop here.
+            try:
+                from service.inference.power_tier import refresh_away
+                await asyncio.to_thread(refresh_away)
+            except Exception:  # noqa: BLE001 — never break the scheduler loop
+                pass
+            await asyncio.sleep(TICK_S)
+    finally:
+        # Shutdown cancels this task; a scheduled-sends pass it started must not
+        # outlive it (a send mid-flight while the service tears down).
+        await _stop_scheduled_sends()
 
 
 async def _poll_codex() -> None:
@@ -360,6 +365,16 @@ def _start_scheduled_sends() -> asyncio.Task | None:
         return None
     _sends_task = asyncio.get_running_loop().create_task(_fire_scheduled_sends_quietly())
     return _sends_task
+
+
+async def _stop_scheduled_sends() -> None:
+    """Cancel a running scheduled-sends pass and wait for it to finish unwinding."""
+    global _sends_task
+    task, _sends_task = _sends_task, None
+    if task is None or task.done():
+        return
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
 
 
 async def _fire_scheduled_sends_quietly() -> None:

@@ -191,6 +191,18 @@ _RECORDING = re.compile(r"(?<![a-z])(?:recordings?|recorded (?:lecture|class|ses
                         r"lecture videos?|class videos?)(?![a-z])", re.I)
 
 
+_SAYS_TRANSCRIPT = re.compile(r"(?<![a-z])(?:transcripts?|captions?|subtitles?)(?![a-z])", re.I)
+
+
+def is_transcript(path: str, title: str) -> bool:
+    """A caption file (.vtt, .srt), or a .txt whose name or title says it is a transcript."""
+    name = unquote(path).lower().rsplit("/", 1)[-1]
+    if name.endswith((".vtt", ".srt")):
+        return True
+    words = re.sub(r"[_.+-]", " ", f"{title} {name}")
+    return name.endswith(".txt") and _SAYS_TRANSCRIPT.search(words) is not None
+
+
 def _reason(hint: str, title: str) -> str:
     """Why a same-course module item is never opened, for the "Can't open" list."""
     text = f"{hint} {title}".lower()
@@ -208,13 +220,13 @@ def _reason(hint: str, title: str) -> str:
 # enrolment, a live meeting, account or settings), by its words in the title or the url. When in
 # doubt, refused: such an item is listed as "Can't open" with its reason, never opened.
 _IMPORTANT = [
-    ("quiz", r"tests?|quiz(?:zes)?|exams?|examinations?|mid-?terms?|finals?|assessments?|"
+    ("quiz", r"tests?|quiz(?:zes)?|exams?|examinations?|mid[- ]?terms?|finals?|assessments?|"
              r"pre-?tests?|post-?tests?|unit tests?|placement"),
     ("survey", r"surveys?|polls?|questionnaires?|course evaluations?|evaluations?|evals?|feedback forms?|forms?"),
     ("graded", r"graded|proctor(?:ed|ing|u|io)?|respondus|lockdown|honorlock|examity|examsoft|"
                r"gradescope|turnitin|for credit|points? possible"),
     ("submission", r"submissions?|submit|uploads?|turn in|hand in|dropbox"),
-    ("start", r"attempts?|start|begin|resume|take (?:the )?\w+|launch"),
+    ("start", r"attempts?|retake|start|begin|resume|take (?:the )?\w+|launch"),
     ("timed", r"timed|timer|time limit|due in \d+"),
     ("payment", r"pay(?:ment|ments)?|checkout|purchase|buy|billing|invoice|tuition|enrol(?:l|ls|lment|ment)?s?|"
                 r"register|registration|subscribe"),
@@ -228,6 +240,35 @@ _RUN_TOGETHER = re.compile(r"(?:final|midterm|practice|pop|unit|chapter|weekly)(
 _SECRET_KEY = re.compile(r"(?:^|[_-])(?:token|sig|signature|auth|apikey|api_key|key|session|sid|otp|code|"
                          r"nonce|jwt|ticket|reset|verify|confirm|login|magic|hash|secret|password)(?:$|[_-])")
 _IMPORTANT_RE = [(label, re.compile(rf"(?<![a-z])(?:{words})(?![a-z])", re.I)) for label, words in _IMPORTANT]
+# The one exception: "midterm" and "final" name what an item is about, so a title that also says it is
+# preparation for one is read. Every other word above still refuses it (quiz, test, exam, attempt,
+# submission…), and so does a title that speaks of what came back: answers, results, scores, grades.
+_PREPARES = re.compile(r"(?<![a-z])(?:review|study[ -]?guides?|notes|slides|outlines?|syllabus|lectures?)(?![a-z])",
+                       re.I)
+_CAME_BACK = re.compile(r"(?<![a-z])(?:answers?|solutions?|results?|scores?|grades?|responses?)(?![a-z])", re.I)
+_MIDTERM_OR_FINAL = re.compile(r"(?<![a-z])(?:mid[- ]?terms?|finals?)(?![a-z])", re.I)
+
+
+def _split_words(text: str) -> str:
+    return re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", re.sub(r"[/_+.=&?-]", " ", text))   # MidtermReview -> words
+
+
+def preparatory(title: str) -> bool:
+    """Whether the TITLE says this is preparation (the url's words never count for this)."""
+    words = _split_words(title or "")
+    return bool(_PREPARES.search(words)) and not _CAME_BACK.search(words)
+
+
+def _type_refusal(hint: str) -> str | None:
+    """A quiz or an assignment submission is refused by its page type, whatever its title says."""
+    kind = hint.replace(" ", "")
+    if "quiz" in kind or "assessment" in kind:
+        return "quiz"
+    if "submission" in kind:
+        return "submission"
+    return "assignment" if kind == "assignment" else None
+
+
 # Sites whose links are forms, polls, quizzes, payments or meetings, whatever the page is called.
 _IMPORTANT_HOSTS = (
     ("survey", ("forms.gle", "forms.office.com", "forms.microsoft.com", "typeform.com", "jotform.com",
@@ -262,6 +303,8 @@ def important(title: str, url: str = "") -> str | None:
             return label
     words = f"{title or ''} " + re.sub(r"[/_+.=&?-]", " ", path)
     words = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", words)       # MidtermReview, Week3Quiz -> words
+    if preparatory(title):
+        words = _MIDTERM_OR_FINAL.sub(" ", words)
     if _RUN_TOGETHER.search(words):
         return "quiz"
     for label, pattern in _IMPORTANT_RE:
@@ -274,17 +317,43 @@ def classify(link: dict, course: dict | None = None) -> dict:
     """``_classify``, then the user's rule: a readable link (or a refused course item) whose title
     or url sounds like a test, quiz or anything important becomes "other"/"none" with a reason."""
     got = _classify(link, course)
+    by_type = _type_refusal(_hint(link))
+    if by_type:
+        return {"key": got["key"], "kind": "other", "via": "none", "file_id": None, "url": got["url"],
+                "reason": by_type}
     if got["kind"] == "other" and not got.get("reason"):
         return got
     if got["via"] == "none" and got["kind"] != "other":
         return got          # a title-only video is never opened anyway
     title = str((link or {}).get("title") or "") if isinstance(link, dict) else ""
     raw = link.get("url") if isinstance(link, dict) and isinstance(link.get("url"), str) else ""
-    reason = important(title, raw) or important("", got.get("url") or "")
+    reason = important(title, raw) or important(title, got.get("url") or "")
     if reason is None:
         return got
     return {"key": got["key"], "kind": "other", "via": "none", "file_id": None, "url": got["url"],
             "reason": got.get("reason") or reason}
+
+
+def _hint(link) -> str:
+    """The Canvas type label the app read for a link, as lower-case letters and spaces."""
+    kind = link.get("type") if isinstance(link, dict) else None
+    return re.sub(r"[^a-z ]", "", str(kind or "").lower()).strip()
+
+
+_OUTSIDE_HINTS = frozenset({"externalurl", "external url", "external link"})
+
+
+def _over_https(url: str) -> str:
+    """A teacher's http link, read over https (the only way Harbor fetches). Another port stays as it is,
+    and so is refused."""
+    try:
+        parts = urlsplit(url.strip())
+        if parts.scheme.lower() != "http" or parts.port not in (None, 80) or "@" in parts.netloc:
+            return url
+    except ValueError:
+        return url
+    netloc = parts.netloc[:-3] if parts.netloc.endswith(":80") else parts.netloc
+    return urlunsplit(("https", netloc, parts.path, parts.query, ""))
 
 
 def _classify(link: dict, course: dict | None = None) -> dict:
@@ -293,12 +362,14 @@ def _classify(link: dict, course: dict | None = None) -> dict:
     form), else the canonical url. Browser kinds only for the course's own Canvas origin and
     /courses/<its number>/ (pages, discussion_topics, assignments, files, modules/items)."""
     url = link.get("url") if isinstance(link, dict) else None
-    hint = re.sub(r"[^a-z ]", "", str((link or {}).get("type") or "").lower()).strip()
+    hint = _hint(link)
     title = str((link or {}).get("title") or "")
     none = {"kind": "other", "via": "none", "file_id": None}
     if not isinstance(url, str) or not url.strip() or len(url) > 4000:
         return none | {"key": str(url or ""), "url": str(url or "")}
-    url = canonical(url)
+    # A link the teacher added to Modules: offered one at a time, behind the app's card naming its host.
+    outside = hint in _OUTSIDE_HINTS
+    url = canonical(_over_https(url) if outside else url)
     try:
         parts = urlsplit(url)
         host = (parts.hostname or "").lower()
@@ -332,9 +403,12 @@ def _classify(link: dict, course: dict | None = None) -> dict:
         elif re.fullmatch(r"/modules/items/\d+", rest):
             # An item that launches an external tool or a quiz must never be opened: Canvas would
             # post the student's identity to the tool's site (or start the quiz).
+            # An outside link behind /modules/items/<n> stays refused: Canvas names its host only on the
+            # item's own page, which loads the site, so there is no host to ask about first.
             if hint not in SAFE_ITEM_HINTS or _TOOL_TITLE.search(title):
                 # The user's one exception: a lecture recording is kept as a video source by its
                 # title and link. It is never opened (opening it would launch the tool).
+                # Link only: its captions sit inside that signed-in tool, with no file on a read path.
                 if (_RECORDING.search(title) and _reason(hint, title) in ("tool", "unknown")
                         and important(title) is None):
                     return {"key": url, "kind": "video", "via": "none", "file_id": None, "url": url,
@@ -347,7 +421,15 @@ def _classify(link: dict, course: dict | None = None) -> dict:
                       "lti": "tool"}.get(segment)
             return refused | ({"reason": reason} if reason and re.fullmatch(r"/[a-z_]+/\d+", rest) else {})
         return {"key": url, "kind": kind, "via": "browser", "file_id": None, "url": url}
-    if _host_is(host, _VIDEO_HOSTS):
+    # A public caption or transcript file is read as text, behind the app's card naming its host.
+    if is_transcript(parts.path, title) and not _host_is(host, _CANVAS_HOSTS + ("google.com",)):
+        try:
+            fetch.check_url(url)
+        except fetch.FetchError:
+            pass
+        else:
+            return {"key": url, "kind": "article", "via": "web", "file_id": None, "url": url, "ask": "transcript"}
+    if _host_is(host, _VIDEO_HOSTS):       # link only: the host serves no caption file without its player
         return {"key": url, "kind": "video", "via": "none", "file_id": None, "url": url}
     if _host_is(host, _CANVAS_HOSTS) or _host_is(host, ("google.com",)) and host != "sites.google.com":
         return none | {"key": url, "url": url}
@@ -356,7 +438,8 @@ def _classify(link: dict, course: dict | None = None) -> dict:
     except fetch.FetchError:
         return none | {"key": url, "url": url}
     kind = "pdf" if parts.path.lower().endswith(".pdf") else "article"
-    return {"key": url, "kind": kind, "via": "web", "file_id": None, "url": url}
+    return {"key": url, "kind": kind, "via": "web", "file_id": None, "url": url} | (
+        {"ask": "external"} if outside else {})
 
 
 def item_id(key: str) -> str:
@@ -401,7 +484,9 @@ def resolve(links: list[dict], *, course: dict | None, sources: list[dict]) -> l
     graded = [(link, classify(link, course)) for link in links]
     # The same item listed twice (an innocent title, then "Take the quiz"): any refusal wins.
     refusals = {g["key"]: (link, g) for link, g in graded if g["kind"] == "other" and g.get("reason")}
-    graded = [refusals.get(g["key"], (link, g)) for link, g in graded]
+    # …and a copy that has to ask wins over a plain one, so a Modules link never loses its question.
+    asks = {g["key"]: (link, g) for link, g in graded if g.get("ask")}
+    graded = [refusals.get(g["key"]) or asks.get(g["key"]) or (link, g) for link, g in graded]
     for link, got in graded:
         if got["key"] in seen:
             continue
@@ -416,7 +501,7 @@ def resolve(links: list[dict], *, course: dict | None, sources: list[dict]) -> l
             continue
         title = " ".join(str(link.get("title") or "").split())[:300]
         # A same-course page named like navigation ("Syllabus", "Home") is still that course's page.
-        if title and _JUNK_TITLE.match(title) and got["via"] not in ("drive", "browser"):
+        if title and _JUNK_TITLE.match(title) and got["via"] not in ("drive", "browser") and not got.get("ask"):
             continue
         if got["via"] == "browser":
             if browser >= MAX_BROWSER:
@@ -429,7 +514,8 @@ def resolve(links: list[dict], *, course: dict | None, sources: list[dict]) -> l
         seen.add(got["key"])
         items.append({"id": item_id(got["key"]), "kind": got["kind"], "title": title or got["url"],
                       "url": got["url"], "via": got["via"], "known": got["key"] in known}
-                     | ({"recording": True} if got.get("recording") else {}))
+                     | ({"recording": True} if got.get("recording") else {})
+                     | ({"ask": got["ask"]} if got.get("ask") else {}))
     return items
 
 
@@ -498,7 +584,8 @@ async def _one(item: dict, got: dict, can_read: bool, deadline: float) -> tuple[
         return fields, read
     if got["via"] == "web":
         try:
-            page = await fetch.fetch_article(got["url"], timeout_s=min(fetch.ITEM_S, left))
+            captions = {"captions": True} if got.get("ask") == "transcript" else {}
+            page = await fetch.fetch_article(got["url"], timeout_s=min(fetch.ITEM_S, left), **captions)
         except fetch.FetchError as exc:
             raise _Failed(exc.code, exc.message) from None
         if "://" in title or title.startswith("www."):
@@ -706,8 +793,9 @@ JUDGE_SYSTEM = (
     "course, to read it as study material. Harbor downloads it with no sign-in, no cookies and no clicks. "
     "SAFE only when it is plainly a public reading resource for the course: a news or magazine article, a "
     "blog post, an encyclopedia or reference page, a paper, a government or university page, or a PDF of "
-    "notes, slides, a reading or a book chapter. NOT SAFE when it signs in, starts, submits, pays, "
-    "registers, joins a meeting, or is a form, survey, quiz, test or exam; a file-sharing, download or "
+    "notes, slides, a reading, a book chapter or a lecture's captions. NOT SAFE when it signs in, starts, submits, pays, "
+    "registers, joins a meeting, or is a form, survey, quiz, test or exam (a study guide, review notes "
+    "or slides that prepare for a midterm or final are reading material, not the exam); a file-sharing, download or "
     "software page; a link with a one-time token, a tracking, unsubscribe or redirect link; social media; "
     "ads or shopping; adult or harmful content; or anything unrelated to the course or that looks "
     "suspicious. When in doubt, NOT SAFE. For EVERY item (each starts with \"Item <id>:\") return its "
@@ -731,7 +819,8 @@ def judge_prompt(course: dict, web: list[tuple[dict, dict]]) -> tuple[str, dict]
         raw_title = raw_title.split("?", 1)[0]
         title = generate._data(raw_title, 300, max_passes=8)
         where = generate._data(f"{parts.hostname or ''}{parts.path}"[:500], 500, max_passes=8)
-        lines.append(f"Item {iid}: {title}\n  address: {where}\n  kind: {got['kind']}")
+        kind = "transcript" if got.get("ask") == "transcript" else got["kind"]
+        lines.append(f"Item {iid}: {title}\n  address: {where}\n  kind: {kind}")
     block = generate._data("\n".join(lines), 1200 * (len(web) + 1), max_passes=8)
     return f"{generate._OPEN}\n{block}\n{generate._CLOSE}", ids
 

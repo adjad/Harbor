@@ -823,8 +823,36 @@ extension ProactiveState {
 /// the list once its reply is closed: while the reply is open its row stays,
 /// showing "Sent ✓". Only a send the service verified marks it.
 enum BriefReplied {
-    static func listed(id: String, replied: Set<String>, replying: String?) -> Bool {
-        !replied.contains(id) || replying == id
+    /// What a reply answered: the thread and its latest message. A text
+    /// conversation keeps its id, so a new message from the same person (a
+    /// later received_ts) is a new key and shows again.
+    static func key(id: String, receivedTs: Double?) -> String {
+        id + "|" + (receivedTs.map { String($0) } ?? "")
+    }
+
+    static func listed(id: String, receivedTs: Double?, replied: Set<String>, replying: String?) -> Bool {
+        !replied.contains(key(id: id, receivedTs: receivedTs)) || replying == id
+    }
+
+    /// The replied keys still worth keeping: those the Brief lists now
+    /// (`answered`), or, without that, those whose thread is still listed.
+    static func kept(_ replied: Set<String>, listed: Set<String>, answered: Set<String>?) -> Set<String> {
+        if let answered { return replied.intersection(answered) }
+        return replied.filter { key in
+            guard let bar = key.lastIndex(of: "|") else { return listed.contains(key) }
+            return listed.contains(String(key[..<bar]))
+        }
+    }
+}
+
+/// The rest of today's calendar as the Brief's section is given it, and
+/// whether two lists read the same: every field, so a moved end time redraws
+/// the section without waiting on the next minute or plan load. Day blocks
+/// carry no location, so there is none to compare.
+enum BriefEvents {
+    typealias Row = (start: Double, end: Double?, title: String)
+    static func same(_ a: [Row], _ b: [Row]) -> Bool {
+        a.count == b.count && zip(a, b).allSatisfy { $0.start == $1.start && $0.end == $1.end && $0.title == $1.title }
     }
 }
 

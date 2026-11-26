@@ -254,6 +254,31 @@ enum MailActionScript {
     /// Raised before `send` when Mail picked a sending address outside the account that holds the email.
     static let forwardIdentityChanged = "Mail selected a sending identity outside the email's account. Nothing sent."
 
+    /// Raised before the forward window opens when a note would replace an email
+    /// that has attachments: setting a forward's content drops them.
+    static let forwardNoteDropsAttachments = "Mail would drop this email's attachments if a note is added. Nothing sent."
+    /// Raised after Mail answered false to a forward's `send`; the unsent window is closed first.
+    static let forwardSendNotAccepted = "Mail did not accept the forward for sending and its window was closed; check Mail's Outbox before retrying."
+
+    /// The error number every check the forward script makes before `send`
+    /// raises (and nothing else in it), so the app can tell the backend that
+    /// nothing was sent: OutboundSender passes `preSendCheck` on.
+    static let checkedBeforeSendNumber = 9301
+    private static let preSendChecks: [(String, String)] = [
+        (messageNotFound, "not_found"), (forwardLostOriginal, "lost_original"),
+        (forwardRecipientsChanged, "recipients_changed"), (forwardIdentityChanged, "identity_changed"),
+        (forwardNoteDropsAttachments, "note_drops_attachments"),
+    ]
+
+    /// What the backend is told about a forward that stopped at one of its own
+    /// checks before `send`: which check (never Mail's text). Empty for any
+    /// other error, which stays an unknown outcome.
+    static func preSendCheck(code: Int, message: String) -> [String: Any] {
+        guard code == checkedBeforeSendNumber,
+              let check = preSendChecks.first(where: { $0.0 == message })?.1 else { return [:] }
+        return ["refusal": "checked_before_send", "check": check]
+    }
+
     /// The fields of the receipt a forward script returns after Mail accepted
     /// the send, in order. service/tools/action_tools.py reads it.
     static let forwardFields = ["message_id", "account", "from", "to", "subject"]
@@ -265,7 +290,13 @@ enum MailActionScript {
     /// visible and given a moment before its content is read, because Mail can
     /// hand back an empty body otherwise. A forward whose original is empty, or
     /// whose note replaced the original instead of sitting above it, is closed
-    /// unsaved before `send`, so a note can never go out alone. The recipients
+    /// unsaved before `send`, so a note can never go out alone. Without a note
+    /// the content is never touched, so the original's formatting and
+    /// attachments go as Mail forwards them; a note replaces the content with
+    /// text (the formatting is lost), so a note on an email with attachments
+    /// is refused before the window opens. Every check before `send` raises
+    /// `checkedBeforeSendNumber`; a false answer to `send` closes the unsent
+    /// window. The recipients
     /// and the sending address are read back and checked before `send`. Only
     /// after Mail answers true to `send` does the script return its receipt
     /// (`forwardFields`); anything else is an error.
@@ -276,12 +307,16 @@ enum MailActionScript {
         let wanted = "\"\(escape(messageID))\""
         let recipients = recipientLines("to", to).map { "            " + $0 }.joined(separator: "\n")
         let approved = "{" + to.map { "\"\(escape($0))\"" }.joined(separator: ", ") + "}"
+        // Setting a forward's content keeps only its text: with a note, an email
+        // with attachments is refused before the window opens, not sent without them.
+        let attachmentCheck = note.isEmpty ? "" :
+            "if (count of mail attachments of theMsg) > 0 then error \"\(forwardNoteDropsAttachments)\" number \(checkedBeforeSendNumber)"
         let content = note.isEmpty ? "" : """
                 set desiredNote to "\(escape(note))"
                 set content of fwd to desiredNote & return & return & originalContent
                 set renderedContent to (content of fwd) as text
-                if (length of renderedContent) < ((length of desiredNote) + (length of originalContent)) then error "\(forwardLostOriginal)"
-                if not my exactReplyValue(text 1 thru (length of desiredNote) of renderedContent, desiredNote) then error "\(forwardLostOriginal)"
+                if (length of renderedContent) < ((length of desiredNote) + (length of originalContent)) then error "\(forwardLostOriginal)" number \(checkedBeforeSendNumber)
+                if not my exactReplyValue(text 1 thru (length of desiredNote) of renderedContent, desiredNote) then error "\(forwardLostOriginal)" number \(checkedBeforeSendNumber)
         """
         return """
         \(MailReplyScript.exactValueHandler)
@@ -307,8 +342,9 @@ enum MailActionScript {
                     end try
                 end if
             end repeat
-            if theMsg is missing value then error "\(messageNotFound)"
-            if not my exactReplyValue((message id of theMsg) as text, \(wanted)) then error "\(messageNotFound)"
+            if theMsg is missing value then error "\(messageNotFound)" number \(checkedBeforeSendNumber)
+            if not my exactReplyValue((message id of theMsg) as text, \(wanted)) then error "\(messageNotFound)" number \(checkedBeforeSendNumber)
+            \(attachmentCheck)
             set fwd to forward theMsg with opening window
             try
                 -- As with a reply: a visible window, then a moment, before
@@ -316,21 +352,21 @@ enum MailActionScript {
                 set visible of fwd to true
                 delay 1
                 set originalContent to (content of fwd) as text
-                if (length of originalContent) is 0 then error "\(forwardLostOriginal)"
+                if (length of originalContent) is 0 then error "\(forwardLostOriginal)" number \(checkedBeforeSendNumber)
                 tell fwd
         \(recipients)
                 end tell
         \(content)
                 set fromAddress to extract address from (sender of fwd)
                 ignoring case
-                    if fromAddress is not in sourceAddresses then error "\(forwardIdentityChanged)"
+                    if fromAddress is not in sourceAddresses then error "\(forwardIdentityChanged)" number \(checkedBeforeSendNumber)
                 end ignoring
                 set toAddresses to address of every to recipient of fwd
                 set approvedAddresses to \(approved)
-                if (count of toAddresses) is not (count of approvedAddresses) then error "\(forwardRecipientsChanged)"
+                if (count of toAddresses) is not (count of approvedAddresses) then error "\(forwardRecipientsChanged)" number \(checkedBeforeSendNumber)
                 ignoring case
                     repeat with wantedAddress in approvedAddresses
-                        if (contents of wantedAddress) is not in toAddresses then error "\(forwardRecipientsChanged)"
+                        if (contents of wantedAddress) is not in toAddresses then error "\(forwardRecipientsChanged)" number \(checkedBeforeSendNumber)
                     end repeat
                 end ignoring
                 set receipt to {(message id of theMsg) as text, theAcct as text, fromAddress as text, toAddresses, (subject of fwd) as text}
@@ -341,8 +377,16 @@ enum MailActionScript {
                 error problem number code
             end try
             tell fwd
-                if (send) is not true then error "\(sendNotAccepted)"
+                set sendAnswer to (send)
             end tell
+            -- Mail answers false without raising when it refuses: the forward
+            -- is still open and unsent, so close it rather than leave it.
+            if sendAnswer is not true then
+                try
+                    close fwd saving no
+                end try
+                error "\(forwardSendNotAccepted)"
+            end if
             return receipt
         end tell
         """

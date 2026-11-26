@@ -243,11 +243,14 @@ enum StudyFindGuard {
 
     /// Why this item is never opened or added, or nil.
     static func refusal(title: String, url: String, type: String?) -> String? {
+        // The page type decides first: a quiz or a submission is refused whatever it is called.
         if let type {
-            if StudyFindRules.isLaunchType(type) { return "sounds like a test or quiz" }
-            if StudyFindRules.typeKey(type) == "assignment" { return "submission or upload" }
+            let key = StudyFindRules.typeKey(type)
+            if StudyFindRules.isLaunchType(type) || key.contains("quiz") { return "sounds like a test or quiz" }
+            if key == "assignment" || key.contains("submission") { return "submission or upload" }
         }
-        if let reason = words(in: title) { return reason }
+        let prepares = preparatory(title)
+        if let reason = words(in: title, preparatory: prepares) { return reason }
         guard let c = URLComponents(string: url.trimmingCharacters(in: .whitespacesAndNewlines)) else {
             return "unknown address"
         }
@@ -259,7 +262,39 @@ enum StudyFindGuard {
         // An address that won't decode cleanly is refused, never read raw.
         guard let path = fullyDecoded(c.percentEncodedPath),
               let query = fullyDecoded(c.percentEncodedQuery ?? "") else { return "unknown address" }
-        return words(in: path + " " + query)
+        return words(in: path + " " + query, preparatory: prepares)
+    }
+
+    /// The one exception to the test words: "midterm" and "final" name what an
+    /// item is about, so a TITLE that also says it is preparation for one is not
+    /// refused for them. Every other rule still applies (quiz, test, exam,
+    /// attempt, submission…), and a title that speaks of what came back
+    /// (answers, results, scores, grades) gets no exception. As find.preparatory.
+    private static let prepWords: Set<String> = ["review", "notes", "slides", "outline", "outlines", "syllabus",
+                                                 "lecture", "lectures", "studyguide", "studyguides"]
+    private static let cameBackWords: Set<String> = ["answer", "answers", "solution", "solutions", "result", "results",
+                                                     "score", "scores", "grade", "grades", "response", "responses"]
+    private static let midtermOrFinal: Set<String> = ["midterm", "midterms", "final", "finals"]
+
+    static func preparatory(_ title: String) -> Bool {
+        let tokens = tokenize(title).tokens
+        let set = Set(tokens)
+        let studyGuide = zip(tokens, tokens.dropFirst()).contains { $0 == "study" && ($1 == "guide" || $1 == "guides") }
+        return (studyGuide || !prepWords.isDisjoint(with: set)) && cameBackWords.isDisjoint(with: set)
+    }
+
+    /// camelCase apart ("MidtermReview" → "Midterm Review"), then every
+    /// non-letter is a space: "sign-in", "log_in", "turn/in" are phrases too.
+    private static func tokenize(_ text: String) -> (lower: String, tokens: [String]) {
+        var spaced = ""
+        var previous: Character = " "
+        for ch in text {
+            if ch.isUppercase, previous.isLowercase { spaced.append(" ") }
+            spaced.append(ch)
+            previous = ch
+        }
+        let lower = spaced.lowercased()
+        return (lower, lower.split(whereSeparator: { !($0.isASCII && $0.isLetter) }).map(String.init))
     }
 
     /// Percent-decoded until it stops changing (at most 4 rounds); nil when it
@@ -286,18 +321,21 @@ enum StudyFindGuard {
         ("mid term", "sounds like a test or quiz"), ("final exam", "sounds like a test or quiz"),
     ]
 
-    private static func words(in text: String) -> String? {
-        // camelCase apart ("MidtermReview" → "Midterm Review"), then every
-        // non-letter is a space: "sign-in", "log_in", "turn/in" are phrases too.
-        var spaced = ""
-        var previous: Character = " "
-        for ch in text {
-            if ch.isUppercase, previous.isLowercase { spaced.append(" ") }
-            spaced.append(ch)
-            previous = ch
+    private static func words(in text: String, preparatory: Bool) -> String? {
+        let split = tokenize(text)
+        let lower = split.lower
+        var tokens = split.tokens
+        if preparatory {
+            var kept: [String] = []
+            for token in tokens {
+                if (token == "term" || token == "terms"), kept.last == "mid" {
+                    kept.removeLast()
+                    continue
+                }
+                if !midtermOrFinal.contains(token) { kept.append(token) }
+            }
+            tokens = kept
         }
-        let lower = spaced.lowercased()
-        let tokens = lower.split(whereSeparator: { !($0.isASCII && $0.isLetter) }).map(String.init)
         guard !tokens.isEmpty else { return nil }
         let set = Set(tokens)
         for rule in wordRules where !rule.words.isDisjoint(with: set) { return rule.reason }
@@ -365,6 +403,40 @@ enum StudyFindRules {
         }
         return t
     }
+}
+
+/// Found links that are read only after their own yes (`ask` from the server:
+/// a teacher's outside link in Modules). They are never ticked for the student:
+/// ticking one puts up its card, and only that card's yes ticks it. Unticking
+/// forgets the yes.
+struct StudyFindAsking: Equatable, Sendable {
+    private(set) var confirmed: Set<String> = []
+    /// The one item whose card is up.
+    private(set) var pending: String?
+
+    /// A tap on a row that can be ticked.
+    mutating func tap(_ id: String, asks: Bool, selected: inout Set<String>) {
+        if selected.contains(id) {
+            selected.remove(id)
+            confirmed.remove(id)
+        } else if asks, !confirmed.contains(id) {
+            pending = pending == id ? nil : id
+        } else {
+            selected.insert(id)
+        }
+    }
+
+    /// The card's answer, for the item it names.
+    mutating func answer(_ id: String, yes: Bool, selected: inout Set<String>) {
+        guard pending == id else { return }
+        pending = nil
+        guard yes else { return }
+        confirmed.insert(id)
+        selected.insert(id)
+    }
+
+    /// Whether Add may send this item.
+    func mayAdd(_ id: String, asks: Bool) -> Bool { !asks || confirmed.contains(id) }
 }
 
 enum StudyFindTabCloser {

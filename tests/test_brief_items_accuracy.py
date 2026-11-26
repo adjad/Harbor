@@ -512,14 +512,64 @@ def test_answered_thread_retires_task_and_read_cards_but_keeps_the_todo_marked(t
     assert changed["todos"] == ["t-confirm"], "a confirm is answered by the reply"
     assert changed["replied"] == ["t-form"]
     assert s.state()["cards"] == []
-    todo = next(t for t in s.state()["todos"] if t["id"] == "t-form")
-    assert todo["replied_label"].startswith("you replied ")
+    assert set(handled.replied_todos(s, now)) == {"t-form"}
+    shown = handled.with_replied_labels({"todos": s.state()["todos"]}, store=s, now=now)
+    todo = next(t for t in shown["todos"] if t["id"] == "t-form")
+    assert todo["due_label"].startswith("you replied ")
     assert "t-form" not in s.done_todos(now)
     suppressed = s.suppressed_fingerprints()
     assert "ask:form" not in suppressed and f"{ref}:h9" not in suppressed, "the to-do's content stays shown"
     assert "c-task" in s.decisions()["dismissed"]
     # A second sweep changes nothing more.
     assert handled.retire(s, answered={ref}, now=now + 60)["replied"] == []
+
+
+
+def test_replied_label_rides_in_the_due_text_the_rows_already_show(tmp_path):
+    from service.proactive import handled
+    s, now, ref = _task_store(tmp_path)
+    handled.retire(s, answered={ref}, now=now)
+    snap = {"todos": [{"id": "t-form", "title": "Send Dana the signed form", "due_label": "Fri", "done": False},
+                      {"id": "t-form-done", "title": "x", "due_label": "", "done": True},
+                      {"id": "t-other", "title": "Pack for the trip", "due_label": "", "done": False}],
+            "cards": []}
+    out = handled.with_replied_labels(snap, store=s, now=now)
+    by_id = {t["id"]: t for t in out["todos"]}
+    assert by_id["t-form"]["due_label"] == "Fri · " + handled.replied_label(now)
+    assert by_id["t-other"]["due_label"] == ""
+    assert snap["todos"][0]["due_label"] == "Fri", "the snapshot passed in is not changed"
+    # Applying it twice does not repeat the label.
+    again = handled.with_replied_labels(out, store=s, now=now)
+    assert again["todos"][0]["due_label"] == by_id["t-form"]["due_label"]
+
+
+def test_replied_marks_are_pruned_by_age(tmp_path):
+    from service.proactive import handled
+    s, now, _ref = _task_store(tmp_path)
+    with s._lock:
+        data = s._read("decisions.json")
+        data["replied_todos"] = {"t-old": now - handled.REPLIED_KEEP_S - 60, "t-new": now - 3600, "t-bad": "x"}
+        s._write("decisions.json")
+    assert set(handled.replied_todos(s, now)) == {"t-new"}, "an old mark no longer labels its to-do"
+    assert handled.prune_replied(s, now) == 2
+    assert set(s._read("decisions.json")["replied_todos"]) == {"t-new"}
+    # Marking a new one prunes as it writes.
+    with s._lock:
+        s._read("decisions.json")["replied_todos"]["t-old"] = now - handled.REPLIED_KEEP_S - 60
+        s._write("decisions.json")
+    handled._mark_todo_replied(s, "t-form", now)
+    assert set(s._read("decisions.json")["replied_todos"]) == {"t-new", "t-form"}
+
+
+def test_replied_labels_never_break_the_snapshot():
+    from service.proactive import handled
+
+    class Broken:
+        def _read(self, name):
+            raise OSError("disk")
+
+    snap = {"todos": [{"id": "t-1", "due_label": ""}]}
+    assert handled.with_replied_labels(snap, store=Broken()) is snap
 
 
 def test_reply_title_covers_confirm_and_let_know_but_not_send():

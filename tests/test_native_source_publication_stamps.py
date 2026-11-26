@@ -13,6 +13,10 @@ from tests.test_message_content import record, v3_carrier
 
 @pytest.fixture
 def sources(monkeypatch, tmp_path):
+    # Reloading the source modules re-registers their tools: new Tool objects, placed
+    # at the end of the registry. Left that way for every later file, routing there
+    # changed (message tools offered for "zip up taxes.txt"). The registry is put back.
+    from service.tools.registry import REGISTRY
     from service.tools import cache_store
     saved = {}
     monkeypatch.setattr(cache_store, "load", lambda name: saved.get(name, ""))
@@ -21,6 +25,7 @@ def sources(monkeypatch, tmp_path):
     from service.tools import notes_tools, imessage_tools, browser_history_tools
     modules = dict(notes=notes_tools, messages=imessage_tools, browser=browser_history_tools)
     # Reinitialize only these source modules against the fake empty cache.
+    saved_registry = dict(REGISTRY)
     for module in modules.values():
         importlib.reload(module)
     now = [1800000000.0, 10000.0]
@@ -51,7 +56,9 @@ def sources(monkeypatch, tmp_path):
     getters = dict(notes=notes_tools.raw_notes_snapshot,
                    messages=imessage_tools.behavior_messages_snapshot_with_receipt,
                    browser=browser_history_tools.current_browser_snapshot)
-    return modules, now, advance, publish, getters
+    yield modules, now, advance, publish, getters
+    REGISTRY.clear()
+    REGISTRY.update(saved_registry)
 
 
 @pytest.mark.parametrize("name", ["notes", "messages", "browser"])
@@ -338,3 +345,14 @@ def test_two_native_preparations_and_planning_reader_do_not_poison_shared_live_c
     for name in ("notes", "messages"):
         fresh = modules[name].prepare_publication_witness(getters[name]())
         assert fresh is not None and fresh.current()
+
+
+def test_the_reload_leaves_the_tool_registry_as_it_found_it(request):
+    from service.tools.registry import REGISTRY
+    before = list(REGISTRY.items())
+
+    def check():                          # registered first, so it runs after the fixture's teardown
+        assert list(REGISTRY.items()) == before
+    request.addfinalizer(check)
+    request.getfixturevalue("sources")
+    assert list(REGISTRY.items()) != before          # the reload did re-register

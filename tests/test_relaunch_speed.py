@@ -73,6 +73,39 @@ def test_a_waiting_stream_ends_promptly_when_quitting_starts():
     assert closed == [True], "the wrapped generator's own cleanup (the hub's unsubscribe) runs"
 
 
+def test_a_client_that_goes_away_mid_wait_closes_the_stream_at_once():
+    """Crash, Force Quit or a dropped connection: the response task is cancelled while
+    the wrapper waits for the next event. The pending step is cancelled first, so the
+    hub's own cleanup (its unsubscribe) runs now and no RuntimeError comes out of aclose."""
+    closed = []
+
+    async def waiting():
+        try:
+            yield "hello"
+            await asyncio.sleep(3600)
+            yield "never"
+        finally:
+            closed.append(True)
+
+    async def run():
+        got = []
+
+        async def consume():
+            async for item in main._until_quit(waiting()):
+                got.append(item)
+
+        consumer = asyncio.create_task(consume())
+        await asyncio.sleep(0.05)
+        consumer.cancel()
+        outcome = (await asyncio.gather(consumer, return_exceptions=True))[0]
+        return got, outcome, list(closed)
+
+    got, outcome, closed_now = asyncio.run(run())
+    assert got == ["hello"]
+    assert isinstance(outcome, asyncio.CancelledError), repr(outcome)
+    assert closed_now == [True], "the wrapped generator is closed as the client goes, not later"
+
+
 def test_a_stream_that_finishes_by_itself_is_passed_through_whole():
     async def three():
         for i in range(3):

@@ -168,6 +168,10 @@ def test_daily_source_readiness_never_reads_history(sources, monkeypatch):
 def test_history_can_neither_make_mail_ready_nor_hold_it_back(sources, monkeypatch):
     # No live header sync yet: a full history cache must not count as ready.
     monkeypatch.setattr(E, "_headers_sync_generation", 0)
+    # cache_history_headers also stamps these; restored after, so a later file's mail
+    # answers don't carry this fixture's "Work" history freshness.
+    for name in ("_swift_history", "_history_at", "_native_history_at"):
+        monkeypatch.setattr(E, name, getattr(E, name))
     E.cache_history_headers(E._history)
     assert E._headers_sync_generation == 0
     assert E.email_sync_state() == "syncing"
@@ -191,3 +195,12 @@ def test_brief_module_does_not_reference_history():
         for name in names:
             assert not re.search(rf"\b{name}\b", source), \
                 f"{Path(module.__file__).name} references {name}"
+
+
+def test_the_history_fixture_leaves_mail_globals_as_it_found_them(sources, monkeypatch):
+    names = ("_history", "_swift_history", "_history_at", "_native_history_at", "_headers_sync_generation")
+    before = {name: getattr(E, name) for name in names}
+    with pytest.MonkeyPatch.context() as inner:
+        test_history_can_neither_make_mail_ready_nor_hold_it_back(sources, inner)
+    assert {name: getattr(E, name) for name in names} == before
+

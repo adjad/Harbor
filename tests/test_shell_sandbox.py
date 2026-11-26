@@ -258,7 +258,8 @@ def test_the_profile_names_each_folder_as_written_and_as_it_resolves(world, monk
     # Harbor's own service and the local engines (pentest #21), and no other local port.
     net = [line for line in lines if line.startswith("(deny network-outbound")]
     expected = [8765, *(p for p in shell_sandbox.engine_ports() if p != 8765)]
-    assert net == [f'(deny network-outbound (remote ip "localhost:{port}"))' for port in expected]
+    assert net == ([f'(deny network-outbound (remote ip "localhost:{port}"))' for port in expected]
+                   + [f'(deny network-outbound (remote ip "*:{port}"))' for port in shell_sandbox.engine_ports()])
     assert lines[-len(net):] == net
     assert all(line.startswith(("(deny file-write* ", "(deny file-mount ")) for line in lines[2:-len(net)])
 

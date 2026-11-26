@@ -6,6 +6,7 @@ project_root=$(cd "$(dirname "$0")/.." && pwd)
 today_scratch=$(mktemp -d "${TMPDIR:-/tmp}/harbor-today-contract.XXXXXX")
 trap 'rm -rf "$today_scratch"' EXIT
 export HARBOR_HOME="$today_scratch/state"
+export HARBOR_TODAY_SCRATCH="$today_scratch"
 swiftc ${swiftc_nested_sandbox_flags[@]+"${swiftc_nested_sandbox_flags[@]}"} -parse-as-library -swift-version 5 \
     -module-cache-path "$today_scratch/module-cache" \
     "$project_root/app/Sources/HarborApp/DiagnosticReport.swift" \

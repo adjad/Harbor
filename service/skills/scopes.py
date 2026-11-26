@@ -33,6 +33,32 @@ _REFUSED_ROOTS = {
 }
 
 
+def _protected_places() -> list[Path]:
+    from service.paths import MOE_DIR
+    from service.safety.policy import _code_exec_roots
+    places = [MOE_DIR, Path.home() / ".moe", *_code_exec_roots()]
+    out: list[Path] = []
+    for place in places:
+        out.append(Path(place))
+        try:
+            out.append(Path(place).resolve())
+        except (OSError, RuntimeError):
+            pass
+    return list(dict.fromkeys(out))
+
+
+def _code_run_overlap(path: Path) -> str:
+    home = Path.home()
+    for place in _protected_places():
+        if path == place or path.is_relative_to(place):
+            return str(place)
+        # Containing one counts, but home and the folders above it hold them all
+        # and are refused (or allowed) by the rules below.
+        if place.is_relative_to(path) and path not in (home, *home.parents):
+            return str(place)
+    return ""
+
+
 def _refused(path: Path) -> str:
     home = Path.home()
     if path in _REFUSED_ROOTS:
@@ -42,6 +68,14 @@ def _refused(path: Path) -> str:
                 "specific folder the tool needs (e.g. ~/Downloads)")
     if path == home.parent:                     # /Users
         return "every user's home folder is too broad to grant"
+    # Harbor's own folder and the places whose files run as code later (login
+    # items, shell startup files, git config, the app bundle): a scope that is
+    # one, sits inside one, or contains one is refused. A skill granted
+    # ~/Library could otherwise plant a LaunchAgent, and one granted ~/.moe
+    # could rewrite grants or other skills (candidate review #1).
+    hit = _code_run_overlap(path)
+    if hit:
+        return f"{path} reaches {hit}, where files run as code later or Harbor keeps its own data"
     # A scope INSIDE a system root is fine (/usr/local/share/x); a scope that
     # IS one, or contains one, is not.
     for root in _REFUSED_ROOTS:

@@ -125,11 +125,33 @@ def _retire_card_keep_todo(store, card: dict, now: float) -> None:
     store.remove_card(card["id"])
 
 
-def replied_todos(store) -> dict[str, float]:
-    """To-do id -> when the user answered the thread it came from."""
+# How long a to-do keeps "you replied <Day>": a weekday name stops meaning
+# anything after a week, so older marks are dropped from decisions.json.
+REPLIED_KEEP_S = 7 * 86400.0
+
+
+def replied_todos(store, now: float | None = None) -> dict[str, float]:
+    """To-do id -> when the user answered the thread it came from (the last week only)."""
     value = store._read("decisions.json").get("replied_todos")
-    return {k: float(v) for k, v in value.items() if isinstance(v, (int, float))} \
+    cutoff = (time.time() if now is None else now) - REPLIED_KEEP_S
+    return {k: float(v) for k, v in value.items() if isinstance(v, (int, float)) and float(v) >= cutoff} \
         if isinstance(value, dict) else {}
+
+
+def prune_replied(store, now: float | None = None) -> int:
+    """Drops replied_todos marks older than REPLIED_KEEP_S (and malformed ones); returns how many."""
+    cutoff = (time.time() if now is None else now) - REPLIED_KEEP_S
+    with store._lock:
+        data = store._read("decisions.json")
+        value = data.get("replied_todos")
+        if not isinstance(value, dict):
+            return 0
+        stale = [k for k, v in value.items() if not isinstance(v, (int, float)) or float(v) < cutoff]
+        for key in stale:
+            del value[key]
+        if stale:
+            store._write("decisions.json")
+        return len(stale)
 
 
 def _mark_todo_replied(store, todo_id: str, now: float) -> None:
@@ -139,6 +161,34 @@ def _mark_todo_replied(store, todo_id: str, now: float) -> None:
             data["replied_todos"] = {}
         data["replied_todos"][todo_id] = now
         store._write("decisions.json")
+    prune_replied(store, now)
+
+
+def with_replied_labels(snap: dict, store=None, now: float | None = None) -> dict:
+    """The Brief snapshot with "you replied <Day>" in each open replied to-do's
+    due text, the line the Brief and Day rows already show ("Fri · you replied
+    Tue", or the label alone). Never raises: on any doubt the snapshot is unchanged."""
+    try:
+        if store is None:
+            from service.proactive.store import store as default_store
+            store = default_store()
+        when = replied_todos(store, now)
+        if not when or not isinstance(snap, dict):
+            return snap
+        todos = []
+        for todo in snap.get("todos") or []:
+            at = when.get(todo.get("id")) if isinstance(todo, dict) else None
+            if at is None or todo.get("done"):
+                todos.append(todo)
+                continue
+            label = replied_label(at)
+            due = str(todo.get("due_label") or "").strip()
+            if label not in due:
+                due = f"{due} · {label}" if due else label
+            todos.append({**todo, "due_label": due})
+        return {**snap, "todos": todos}
+    except Exception:  # noqa: BLE001 — the label is a nicety; the Brief must load
+        return snap
 
 
 def replied_label(at: float) -> str:
@@ -235,17 +285,11 @@ def retire(store, *, answered: set[str], sched: dict | None = None, now: float |
             kept.add(todo["id"])
     marked_todos = []
     if kept:
-        already = replied_todos(store)
+        already = replied_todos(store, now)
         for todo_id in sorted(kept - done_ids):
             if todo_id not in already:
                 _mark_todo_replied(store, todo_id, now)
                 marked_todos.append(todo_id)
-        when = replied_todos(store)
-        with store._lock:
-            fresh = store.state()
-            fresh["todos"] = [{**t, "replied_label": replied_label(when.get(t.get("id"), now))}
-                              if t.get("id") in kept else t for t in fresh.get("todos") or []]
-            store._write("state.json")
     threads = state.get("threads") or []
     marked = [t["id"] for t in threads if t.get("id", "").removeprefix("thread:") in answered and not t.get("replied")]
     if marked:

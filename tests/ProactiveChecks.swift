@@ -423,12 +423,33 @@ struct ProactiveChecks {
         check(!BriefBuilding.calendarPending(building: false, buildingFor: ["calendar"], late: ["email"]),
               "Calendar in, only Mail late: the plain calendar line")
 
-        check(BriefReplied.listed(id: "thread:a", replied: [], replying: nil), "an unanswered thread is listed")
-        check(BriefReplied.listed(id: "thread:a", replied: ["thread:a"], replying: "thread:a"),
+        let askedAt = BriefReplied.key(id: "thread:a", receivedTs: 1_800_000_000)
+        check(BriefReplied.listed(id: "thread:a", receivedTs: 1_800_000_000, replied: [], replying: nil),
+              "an unanswered thread is listed")
+        check(BriefReplied.listed(id: "thread:a", receivedTs: 1_800_000_000, replied: [askedAt], replying: "thread:a"),
               "a thread answered from the Brief stays while its reply shows Sent")
-        check(!BriefReplied.listed(id: "thread:a", replied: ["thread:a"], replying: nil),
+        check(!BriefReplied.listed(id: "thread:a", receivedTs: 1_800_000_000, replied: [askedAt], replying: nil),
               "then it leaves the list once the reply is closed")
-        check(BriefReplied.listed(id: "thread:b", replied: ["thread:a"], replying: nil), "other threads stay")
+        check(BriefReplied.listed(id: "thread:b", receivedTs: 1_800_000_000, replied: [askedAt], replying: nil),
+              "other threads stay")
+        check(BriefReplied.listed(id: "thread:a", receivedTs: 1_800_000_600, replied: [askedAt], replying: nil),
+              "a new message in the same text conversation shows again after a reply")
+        let laterAt = BriefReplied.key(id: "thread:a", receivedTs: 1_800_000_600)
+        check(BriefReplied.kept([askedAt], listed: ["thread:a"], answered: [laterAt]).isEmpty,
+              "the reply to the older message is forgotten once a newer one is listed")
+        check(BriefReplied.kept([askedAt], listed: ["thread:a"], answered: [askedAt]) == [askedAt],
+              "the reply is kept while the message it answered is still the listed one")
+        check(BriefReplied.kept([askedAt], listed: ["thread:a"], answered: nil) == [askedAt]
+                && BriefReplied.kept([askedAt], listed: ["thread:b"], answered: nil).isEmpty,
+              "without keys, a reply is kept exactly while its thread is listed")
+        let standup: [BriefEvents.Row] = [(start: 1_800_003_600, end: 1_800_005_400, title: "Team standup")]
+        check(BriefEvents.same(standup, [(start: 1_800_003_600, end: 1_800_005_400, title: "Team standup")]),
+              "the same events read the same")
+        check(!BriefEvents.same(standup, [(start: 1_800_003_600, end: 1_800_007_200, title: "Team standup")]),
+              "a moved end time redraws the Brief's section")
+        check(!BriefEvents.same(standup, [(start: 1_800_003_600, end: nil, title: "Team standup")]),
+              "an end time dropped redraws it too")
+        check(!BriefEvents.same(standup, []), "an event gone redraws it")
         let todayKey = BriefHold.key(day: "2027-01-15", zone: "America/Los_Angeles")
         check(BriefHold.pick(current: "fresh", held: (todayKey, "held"), key: todayKey, failed: false) == "fresh",
               "the current plan always wins")

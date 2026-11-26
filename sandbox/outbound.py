@@ -330,6 +330,11 @@ class OutboundConsumer:
         if original is None:
             return False, ("couldn't find that message in the inbox — it may "
                            "have been moved or is older than the synced window"), {}
+        if note and original.get("attachments"):
+            # As MailActionScript: a note would drop the attachments, so it stops first.
+            return False, ("Mail would drop this email's attachments if a note is added. "
+                           "Nothing sent."), {"refusal": "checked_before_send",
+                                              "check": "note_drops_attachments"}
         identity = self.world.state["persona"]["identity_emails"]
         sender = next((a for a in original["to"] + original["cc"] if a in identity),
                       identity[0] if identity else "me@sandbox.harbor.test")

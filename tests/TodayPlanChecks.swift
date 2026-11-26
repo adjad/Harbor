@@ -1013,7 +1013,11 @@ struct TodayPlanChecks {
     static func cacheFirstChecks() async throws {
         let zone = TimeZone(identifier: "America/Los_Angeles")!
         var now = instant("2026-10-22T19:00:00Z")   // 12:00 PM on 2026-10-22 there
-        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("harbor-day-cache-\(UUID().uuidString)")
+        // Under the scratch folder scripts/test_today_contract.sh makes (the QA
+        // sandbox denies the system temporary folder); the system one only when run by hand.
+        let scratch = ProcessInfo.processInfo.environment["HARBOR_TODAY_SCRATCH"].flatMap { $0.isEmpty ? nil : $0 }
+        let base = scratch.map { URL(fileURLWithPath: $0, isDirectory: true) } ?? FileManager.default.temporaryDirectory
+        let folder = base.appendingPathComponent("harbor-day-cache-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: folder) }
         let cache = DayPlanDiskCache(url: folder.appendingPathComponent(DayPlanDiskCache.fileName))

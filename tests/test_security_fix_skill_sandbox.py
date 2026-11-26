@@ -46,8 +46,24 @@ def test_scratch_is_its_own_folder_and_the_shared_temp_is_gone(skill):
     profile = sandbox.build_profile(skill, [], [])
     scratch = sandbox.scratch_dir(skill)
     assert f'(allow file-write* (subpath "{scratch}"))' in profile
-    assert "/private/var/folders" not in profile
+    # The shared temp root itself (the per-user T folder, $TMPDIR's parent) is never
+    # granted, for reading or writing. Under Simulation QA the skill and Harbor's folder
+    # live inside it, so only their own subfolders may be allowed, nothing above them.
+    shared = _shared_temp_root()
+    for line in profile.splitlines():
+        if line.startswith("(allow file-") and '(subpath "' in line:
+            granted = Path(line.split('(subpath "', 1)[1].split('"', 1)[0])
+            assert not (shared == granted or shared.is_relative_to(granted)), line
+    assert '(deny file-read* (subpath "/private/var/folders"))' in profile
     assert skill not in scratch.parents and scratch != skill
+
+
+def _shared_temp_root() -> Path:
+    temp = Path(os.environ.get("TMPDIR") or tempfile.gettempdir()).resolve()
+    for folder in (temp, *temp.parents):
+        if folder.name == "T" and folder.parent.parent.parent.name == "folders":
+            return folder                     # /private/var/folders/<xx>/<id>/T
+    return temp.parent
 
 
 def test_no_launch_services_apple_events_or_new_jobs(skill):

@@ -471,13 +471,30 @@ def test_actual_http_reminder_compound_cannot_complete_only_the_reminder(
 @pytest.mark.parametrize("read_first", [True, False])
 def test_actual_http_complete_read_and_future_reminder_keep_both_actions(
         successful_reminder_endpoint, monkeypatch, companion, tool, arguments, read_first):
+    from service import main
+    from service.safety.policy import OWN_DATA_READ_TOOLS
     reminder = "Remind me to reply to Dan tomorrow"
     text = f"{companion}; {reminder}" if read_first else f"{reminder}; {companion}"
     decision = route(text)
     assert {"reply_to_email", "send_email", "send_message"}.isdisjoint(decision.tool_subset)
+    cards = []
+
+    async def approve(self, action):
+        cards.append(action.get("tool"))
+        return True
+
+    monkeypatch.setattr(main.InteractiveApprover, "confirm", approve)
     test_actual_http_reminder_compound_cannot_complete_only_the_reminder(
         successful_reminder_endpoint, monkeypatch, text, tool, arguments,
         reminder_title="reply to Dan", read_alternatives=True)
+    # Once mail, activity or calendar text has been read in the turn, the reminder
+    # asks first (2026-11-25 pentest #22); a Contacts lookup is the user's own data
+    # and asks nothing. Nothing else ever gets a card here.
+    assert set(cards) <= {"add_reminder"}
+    if tool in OWN_DATA_READ_TOOLS:
+        assert cards == []
+    elif read_first:
+        assert cards == ["add_reminder"]
 
 
 @pytest.mark.parametrize("send,body", [

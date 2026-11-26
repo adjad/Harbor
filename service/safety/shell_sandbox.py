@@ -192,6 +192,11 @@ def build_profile() -> str:
         lines += [f'(deny {what} (literal "{_q(path)}"))' for path in parents]
     ports = dict.fromkeys([*harbor_ports(), *engine_ports()])
     lines += [f'(deny network-outbound (remote ip "localhost:{port}"))' for port in ports]
+    # An engine may listen on this Mac's LAN address too, which "localhost" does not
+    # cover; SBPL names no host but localhost or "*", so the engine ports are denied
+    # on every address (candidate review #4). A remote service on one of these
+    # port numbers is unreachable from run_shell as a result.
+    lines += [f'(deny network-outbound (remote ip "*:{port}"))' for port in engine_ports()]
     return "\n".join(lines) + "\n"
 
 

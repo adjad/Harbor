@@ -42,3 +42,19 @@ def test_an_unreadable_config_still_denies_the_fixed_ports(monkeypatch):
     monkeypatch.setattr(config, "omlx_base_url", boom)
     monkeypatch.setattr(config, "local_provider_settings", boom)
     assert {8765, 8000, BUNDLED_PORT} <= _denied(shell_sandbox.build_profile())
+
+
+def test_engine_ports_are_denied_on_every_address_not_only_loopback(configured):
+    profile = shell_sandbox.build_profile()
+    for port in (8000, BUNDLED_PORT, 8123, 8799):
+        # The engine may listen on this Mac's LAN address too; "*" covers every address.
+        assert f'(deny network-outbound (remote ip "*:{port}"))' in profile, port
+
+
+def test_skill_tools_cannot_reach_an_engine_on_a_lan_address(tmp_path, configured):
+    from service.skills import sandbox
+    folder = tmp_path / "skills" / "fixture"
+    folder.mkdir(parents=True)
+    profile = sandbox.build_profile(folder, [], [])
+    for port in (8000, BUNDLED_PORT, 8765):
+        assert f'(deny network-outbound (remote ip "*:{port}"))' in profile, port

@@ -52,15 +52,16 @@ Each account's refresh token lives in the login Keychain
 marks the account `refresh_token_store: "keychain"`. A token written by an
 older build is moved there once, and leaves the file only after Keychain reads
 it back. When Keychain is unavailable the token stays in the file, as before,
-and the next save or launch tries again. (The Workspace server's per-account
-credential files, google_workspace.CREDENTIALS_DIR, still hold a copy: the
-server reads only files.)
+and the next save or launch tries again. (The Workspace server reads only files: its
+per-account copies, google_workspace.CREDENTIALS_DIR, exist only while that
+server runs, and anything it changed in them comes back here before they go.)
 """
 from __future__ import annotations
 
 import asyncio
 import base64
 import contextlib
+import fcntl
 import hashlib
 import html
 import inspect
@@ -280,6 +281,51 @@ def _read_file() -> dict:
         return {}
 
 
+# Harbor and Quayside share gmail.json. Each read-modify-write of it (and the
+# replace of its shared temp file) holds this advisory lock, taken after
+# _history_config_lock and never across a Keychain call, so neither app writes
+# from a copy the other has just replaced. A plain read needs no lock: the file
+# only ever changes by an atomic rename.
+FILE_LOCK_WAIT_S = 2.0
+
+
+@contextlib.contextmanager
+def _file_lock():
+    """Hold gmail.json.lock (0600, never followed through a link). If the other
+    app keeps it past FILE_LOCK_WAIT_S, or it can't be opened, go on without it:
+    the write itself is still atomic, it just may overwrite a newer one."""
+    fd = None
+    try:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(CONFIG_PATH.with_name(CONFIG_PATH.name + ".lock"),
+                     os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        deadline = time.monotonic() + FILE_LOCK_WAIT_S
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    print("[gmail] gmail.json is still locked by another app; writing anyway", flush=True)
+                    os.close(fd)
+                    fd = None
+                    break
+                time.sleep(0.02)
+    except OSError as exc:
+        if fd is not None:
+            os.close(fd)
+            fd = None
+        print(f"[gmail] could not lock gmail.json: {type(exc).__name__}", flush=True)
+    try:
+        yield
+    finally:
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
 def _write_file(data: dict) -> None:
     MOE_DIR.mkdir(parents=True, exist_ok=True)
     tmp = CONFIG_PATH.with_suffix(".tmp")
@@ -349,7 +395,7 @@ def keychain_sync() -> None:
         stored = {email: token for email, token in pending.items()
                   if google_tokens.store(email, token)}
         if stored:
-            with _history_config_lock:
+            with _history_config_lock, _file_lock():
                 current = _read_file()
                 changed = False
                 for item, email in _token_slots(current):
@@ -468,7 +514,9 @@ def _save_config(cfg: dict, *, forget: set[str] | frozenset[str] = frozenset()) 
     removes it, and its Keychain item is deleted once the file no longer
     names it."""
     forget = {email.strip().lower() for email in forget}
-    with _history_config_lock:
+    # Nothing in this block starts a Keychain process: google_tokens.cached,
+    # verified and needs_adopt read only its in-memory state.
+    with _history_config_lock, _file_lock():
         _withdraw_history_configuration()
         old = _read_file()
         out = json.loads(json.dumps(cfg))
@@ -1906,6 +1954,28 @@ def _workspace_consent() -> list[str]:
         return []
 
 
+def adopt_workspace_updates(updates: dict[str, dict]) -> int:
+    """Keep what the Workspace server changed in its own credential copies: a
+    newer refresh token (saved to Keychain like any other) or scopes it added on
+    demand. Only for accounts still connected; values are never logged."""
+    changed = 0
+    with revocation():
+        cfg = load_config()
+        accounts = connected_accounts(cfg)
+        for email, change in updates.items():
+            item = accounts.get(email.strip().lower())
+            if item is None:
+                continue
+            new = {k: v for k, v in change.items() if k in ("refresh_token", "scopes") and v}
+            if new:
+                accounts[email.strip().lower()] = {**item, **new}
+                changed += 1
+        if changed:
+            _save_config({"client_id": cfg.get("client_id", ""),
+                          "client_secret": cfg.get("client_secret", ""), "accounts": accounts})
+    return changed
+
+
 def set_workspace(account: str, enabled: bool) -> dict:
     """Switch one connected account's Workspace tools on or off. On, for an
     account whose sign-in lacks the Workspace scopes, the answer says to
@@ -2053,7 +2123,7 @@ async def disconnect(account: str = "") -> dict:
             _save_config({"client_id": cfg.get("client_id", ""), "client_secret": cfg.get("client_secret", ""),
                           "accounts": accounts}, forget=forget)
         else:
-            with _history_config_lock:
+            with _history_config_lock, _file_lock():
                 CONFIG_PATH.unlink(missing_ok=True)
                 _observe_history_config({})
                 _pending_deletes.update(forget & marked)
