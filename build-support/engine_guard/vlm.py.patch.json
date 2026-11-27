@@ -1,7 +1,7 @@
 {
   "path": "omlx/engine/vlm.py",
-  "input_sha256": "dfac8750ad70a624b36fa0107aed8896e8c2e7eb7a3984ec56da53ed42b826fb",
-  "output_sha256": "4e069f24f6a55c60526e6f3128e00d2d197c884f0a8814f6d684411e26b3e67f",
+  "input_sha256": "0b83ca1916a6fe11748047fa6b5ac10f272ba77cb2017481d032d695721f7816",
+  "output_sha256": "1182d6a346428274da90e73435b7c2e25c5c1c2e8abbec866953ceb9e82ca04b",
   "edits": [
     {
       "old": "from ..patches.gemma4_audio import apply_gemma4_audio_patch\n",

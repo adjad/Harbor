@@ -2044,16 +2044,21 @@ struct ProactiveBriefSection: View, Equatable {
         let from: String = done ? "" : todoSub(todo)
         let overdue: Bool = todo.dueLabel.lowercased().contains("overdue")
         let help: String = [todo.title, todo.dueLabel, todoSub(todo)].filter { !$0.isEmpty }.joined(separator: "\n")
-        return HStack(alignment: .firstTextBaseline, spacing: 7) {
+        return BriefRowLine(spacing: 7, titleMin: BriefRowLine.titleMin) {
             Text(todoTitle(todo)).font(.harbor(size: 13.5))
                 .foregroundStyle(done ? Theme.textMuted : Theme.textPrimary)
                 .strikethrough(done, color: Theme.textMuted)
-                .lineLimit(1).layoutPriority(1)
+                .lineLimit(1)
+                .layoutValue(key: BriefRowLine.Part.self, value: .title)
             if !due.isEmpty {
                 Text(due).font(.harbor(size: 11.5)).foregroundStyle(overdue ? Theme.warn : Theme.textMuted)
-                    .lineLimit(1).fixedSize()
+                    .lineLimit(1)
+                    .layoutValue(key: BriefRowLine.Part.self, value: .fixed)
             }
-            if !from.isEmpty { subText(from).lineLimit(1) }
+            if !from.isEmpty {
+                subText(from).lineLimit(1).clipped()
+                    .layoutValue(key: BriefRowLine.Part.self, value: .extra)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .help(help)
@@ -2182,10 +2187,17 @@ struct ProactiveBriefSection: View, Equatable {
         return HStack(alignment: .firstTextBaseline, spacing: 8) {
             Image(systemName: DayTimeline.sourceSymbol(thread.source))
                 .font(.harbor(size: 11)).foregroundStyle(hot ? Theme.textSecondary : Theme.textMuted).frame(width: 15)
-            Text(thread.shownWho.isEmpty ? "Someone" : thread.shownWho).font(.harbor(size: 13, weight: .semibold))
-                .foregroundStyle(hot ? Theme.textPrimary : Theme.textSecondary).lineLimit(1).layoutPriority(1)
-            Text(thread.line).font(.harbor(size: 13)).foregroundStyle(hot ? Theme.textSecondary : Theme.textMuted).lineLimit(1)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            // The sender first; what it is about only when a readable part of it fits (it is
+            // in the tooltip either way), never a one-letter sliver.
+            BriefRowLine(spacing: 8, titleMin: 0) {
+                Text(thread.shownWho.isEmpty ? "Someone" : thread.shownWho).font(.harbor(size: 13, weight: .semibold))
+                    .foregroundStyle(hot ? Theme.textPrimary : Theme.textSecondary).lineLimit(1)
+                    .layoutValue(key: BriefRowLine.Part.self, value: .title)
+                Text(thread.line).font(.harbor(size: 13)).foregroundStyle(hot ? Theme.textSecondary : Theme.textMuted)
+                    .lineLimit(1).clipped()
+                    .layoutValue(key: BriefRowLine.Part.self, value: .extra)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
             threadBadge(hot)
             Text(timeLabel(thread.receivedTs)).font(.harbor(size: 10, design: .monospaced))
                 .foregroundStyle(Theme.textMuted).lineLimit(1).fixedSize()
@@ -2687,6 +2699,103 @@ private extension StudyBriefCard.Action {
         switch self {
         case .open: return "Open it in Study (⌘5)"
         case .review: return "Make flash cards from these slides, in Study (⌘5)"
+        }
+    }
+}
+
+/// One Brief list line: a title, an optional fixed part (a to-do's due word) and an optional
+/// extra part (who a to-do is from; what a mail is about), on one baseline.
+///
+/// The title gets `titleMin` (or its whole width, if shorter) before anything else; the fixed
+/// part then keeps its whole width where it fits; the title grows into what is left; the extra
+/// part shows only when its whole text, or at least `extraMin`, fits in the rest, so it is
+/// never squeezed to a stray letter. Left out, it is placed at zero width (it is `clipped()`,
+/// so nothing draws) and the row's tooltip still has it.
+struct BriefRowLine: Layout {
+    enum Role { case title, fixed, extra }
+    struct Part: LayoutValueKey { static let defaultValue: Role = .title }
+
+    var spacing: CGFloat
+    var titleMin: CGFloat
+    var extraMin: CGFloat = BriefRowLine.extraMin
+
+    /// About 23 characters of a 13.5 pt title.
+    static var titleMin: CGFloat { 150 * Theme.textScale }
+    /// About 8 characters of the 11 pt muted text.
+    static var extraMin: CGFloat { 48 * Theme.textScale }
+
+    struct Widths: Equatable { var title: CGFloat; var fixed: CGFloat; var extra: CGFloat }
+
+    /// The widths for `width` (nil: everything whole). Pure, so it can be checked on its own.
+    static func widths(width: CGFloat?, spacing: CGFloat, titleMin: CGFloat, extraMin: CGFloat,
+                       title: CGFloat, fixed: CGFloat?, extra: CGFloat?) -> Widths {
+        guard let width else { return Widths(title: title, fixed: fixed ?? 0, extra: extra ?? 0) }
+        let gapFixed: CGFloat = fixed == nil ? 0 : spacing
+        let reserved = min(title, titleMin)
+        let fixedW = fixed.map { min($0, max(0, width - reserved - gapFixed)) } ?? 0
+        let titleW = max(0, min(title, width - fixedW - gapFixed))
+        var extraW: CGFloat = 0
+        if let extra {
+            let room = width - titleW - fixedW - gapFixed - spacing
+            if room >= min(extra, extraMin) { extraW = min(extra, room) }
+        }
+        return Widths(title: titleW, fixed: fixedW, extra: extraW)
+    }
+
+    private func roles(_ subviews: Subviews) -> (title: LayoutSubview?, fixed: LayoutSubview?, extra: LayoutSubview?) {
+        var t: LayoutSubview?, f: LayoutSubview?, e: LayoutSubview?
+        for sub in subviews {
+            switch sub[Part.self] {
+            case .title: t = t ?? sub
+            case .fixed: f = f ?? sub
+            case .extra: e = e ?? sub
+            }
+        }
+        return (t, f, e)
+    }
+
+    private func plan(_ proposal: ProposedViewSize, _ subviews: Subviews) -> Widths {
+        let r = roles(subviews)
+        return Self.widths(width: proposal.width, spacing: spacing, titleMin: titleMin, extraMin: extraMin,
+                           title: r.title?.sizeThatFits(.unspecified).width ?? 0,
+                           fixed: r.fixed?.sizeThatFits(.unspecified).width,
+                           extra: r.extra?.sizeThatFits(.unspecified).width)
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let r = roles(subviews)
+        let w = plan(proposal, subviews)
+        var total = w.title
+        if r.fixed != nil { total += spacing + w.fixed }
+        if r.extra != nil, w.extra > 0 { total += spacing + w.extra }
+        // Tall enough for every part on the shared baseline.
+        let dims = [(r.title, w.title), (r.fixed, w.fixed), (r.extra, w.extra)].compactMap { part, width in
+            part?.dimensions(in: ProposedViewSize(width: width, height: nil))
+        }
+        let top = dims.map { $0[VerticalAlignment.firstTextBaseline] }.max() ?? 0
+        let height = dims.map { top - $0[VerticalAlignment.firstTextBaseline] + $0.height }.max() ?? 0
+        return CGSize(width: proposal.width.map { min($0, total) } ?? total, height: height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let r = roles(subviews)
+        let w = plan(ProposedViewSize(width: bounds.width, height: bounds.height), subviews)
+        let parts: [(LayoutSubview?, CGFloat)] = [(r.title, w.title), (r.fixed, w.fixed), (r.extra, w.extra)]
+        // One shared first-text baseline, like an HStack(alignment: .firstTextBaseline).
+        let baselines = parts.compactMap { part, width -> CGFloat? in
+            guard let sub = part else { return nil }
+            return sub.dimensions(in: ProposedViewSize(width: width, height: nil))[VerticalAlignment.firstTextBaseline]
+        }
+        let top = baselines.max() ?? 0
+        var x = bounds.minX
+        for (index, (part, width)) in parts.enumerated() {
+            guard let sub = part else { continue }
+            let size = ProposedViewSize(width: width, height: nil)
+            let baseline = sub.dimensions(in: size)[VerticalAlignment.firstTextBaseline]
+            let shown = width > 0
+            if index > 0 && shown { x += spacing }
+            sub.place(at: CGPoint(x: x, y: bounds.minY + top - baseline), anchor: .topLeading, proposal: size)
+            if shown { x += width }
         }
     }
 }

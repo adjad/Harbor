@@ -8,10 +8,10 @@ import Darwin
 /// own default (a smaller share of memory) when it is 0. When the limit is below 90%, Ideate's
 /// big model has little room to read a prompt, so the tab offers the command.
 ///
-/// Harbor never runs it: the command is shown as a `bash` block, which goes through the same
-/// "Run this script in Terminal?" card as any code block (whole command shown, Cancel is the
-/// default, nothing runs before the second press). Terminal asks for the password; Harbor never
-/// sees or stores it, and nothing makes the change permanent (it resets when the Mac restarts).
+/// Harbor never runs it by itself: the tab shows the whole command, and its Run in Terminal button
+/// first swaps the row's buttons for a confirmation (Cancel is the default); only the second
+/// press opens it in a Terminal window (ScriptRunner, as a `.command` file: no Apple Events).
+/// Terminal asks for the password; Harbor never sees or stores it, and nothing makes the change permanent (it resets when the Mac restarts).
 /// Pure apart from `read()`.
 struct IdeateGPULimit: Equatable {
     /// The engine's ceiling share (MEMORY_CEILING_SHARE in service/engine/manager.py).
@@ -31,13 +31,15 @@ struct IdeateGPULimit: Equatable {
 
     var command: String { "sudo sysctl iogpu.wired_limit_mb=\(neededMB)" }
 
-    /// The block MarkdownView draws with its Copy and Run in Terminal buttons.
+    /// The command as a bash block, for answers that quote it.
     var codeBlock: String { "```bash\n\(command)\n```" }
 
     static let title = "Ideate needs more memory for the GPU"
     static let detail = "Run one command in Terminal to allow it. macOS asks for your password there, "
         + "and Harbor never sees it. It resets when you restart the Mac."
     static let skipNote = "Skip, and Ideate keeps to small steps."
+    static let confirmNote = "It opens in a new Terminal window, which asks for your Mac password. "
+        + "Harbor never sees it."
     static let raised = "GPU memory raised for Ideate. It resets when you restart the Mac."
 
     /// What this Mac says now. Reading needs no password.

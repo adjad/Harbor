@@ -347,6 +347,23 @@ async def accept_loaded(engine, check, cleanup):
         raise
 
 
+def _mark_unloading(pool, model_id, task):
+    """oMLX 0.8.4 keeps unloading models as {model_id: teardown task} (0.8.3: a set)."""
+    marks = pool._unloading_models
+    if isinstance(marks, dict):
+        marks.setdefault(model_id, task)
+    else:
+        marks.add(model_id)
+
+
+def _clear_unloading(pool, model_id):
+    marks = pool._unloading_models
+    if isinstance(marks, dict):
+        marks.pop(model_id, None)
+    else:
+        marks.discard(model_id)
+
+
 async def unload_bound(pool, model_id, busy_error, expected=None, *, local_only=False):
     """Retain the selected owner through deferred stop and cancellation.
 
@@ -382,7 +399,6 @@ async def unload_bound(pool, model_id, busy_error, expected=None, *, local_only=
             marker = {"count": 0, "owned": model_id not in pool._unloading_models}
             state["markers"][model_id] = marker
         marker["count"] += 1
-        pool._unloading_models.add(model_id)
 
         async def teardown():
             async with state["lock"]:
@@ -391,6 +407,7 @@ async def unload_bound(pool, model_id, busy_error, expected=None, *, local_only=
                     **({"local_only": True} if local_only else {}))
 
         task = asyncio.create_task(teardown())
+        _mark_unloading(pool, model_id, task)
         record = {"entry": entry, "engine": engine, "model_id": model_id, "task": task}
         state["tasks"][key] = record
     else:
@@ -413,7 +430,7 @@ async def unload_bound(pool, model_id, busy_error, expected=None, *, local_only=
             if not marker["count"]:
                 del state["markers"][model_id]
                 if marker["owned"]:
-                    pool._unloading_models.discard(model_id)
+                    _clear_unloading(pool, model_id)
     if cancelled:
         raise asyncio.CancelledError
 

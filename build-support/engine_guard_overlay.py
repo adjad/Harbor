@@ -17,6 +17,17 @@ TARGETS = {"omlx/process_memory_enforcer.py", "omlx/engine_pool.py", "omlx/serve
            # Threadgroup-limit guard and the MTP fallback (omlx/harbor_kernel_guard.py).
            "omlx/__init__.py", "omlx/patches/gemma4_verify_kernel.py",
            "omlx/patches/gemma4_verify_attention.py", "omlx/patches/mlx_lm_mtp/batch_generator.py"}
+# oMLX 0.8.4 loads a SpecPrefill draft model in three places (specprefill/draft.py
+# attach_specprefill_draft), each behind the guard:
+#   - engine/batched.py BatchedEngine.start() and engine/vlm.py VLMBatchedEngine.start():
+#     every engine the pool creates in _load_engine is wrapped by harbor_guard.bind_start (three
+#     call sites in the engine_pool.py patch), so a start, lazy or direct, passes the guard's
+#     load check first.
+#   - engine_pool.py get_engine -> _attach_specprefill_draft (new in 0.8.4: a draft added to an
+#     already loaded engine): inside `async with self._lock:`, whose first statement is the
+#     patched harbor_guard.require_admission (engine_pool.py.patch.json, edit 2).
+# Neither oMLX nor the guard counts the draft's own bytes at admission, as on 0.8.3. Harbor's
+# profiles never set a draft.
 ADDITION = "omlx/harbor_guard.py"
 # Whole new engine files: installed path -> overlay source.
 ADDITIONS = {ADDITION: "proof.py", "omlx/harbor_encoders.py": "encoders.py",

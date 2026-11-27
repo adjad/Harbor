@@ -821,6 +821,40 @@ class BoundUnloadTests(unittest.TestCase):
         return SimpleNamespace(_entries={"model": entry}, _unloading_models=set(),
                                _stop_and_unload_engine=teardown, _current_model_memory=50)
 
+    def test_oMLX_084_dict_of_teardown_tasks(self):
+        """oMLX 0.8.4 keeps {model_id: task}: the mark holds the teardown task while it runs, a
+        second unload of the same model is still refused as busy, and the mark is cleared after."""
+        async def exercise():
+            engine = self.engine()
+            entry = SimpleNamespace(engine=engine)
+            seen = []
+            pool = self.pool(entry, None)
+            pool._unloading_models = {}
+            async def teardown(model_id, *, _harbor_expected):
+                seen.append(pool._unloading_models.get(model_id))
+                with self.assertRaises(self.busy):
+                    await self.proof.unload_bound(pool, "model", self.busy)
+                await _harbor_expected[1].stop()
+            pool._stop_and_unload_engine = teardown
+            await self.proof.unload_bound(pool, "model", self.busy)
+            self.assertIsInstance(seen[0], asyncio.Task)
+            self.assertEqual(engine.stops, 1)
+            self.assertEqual(pool._unloading_models, {})
+        asyncio.run(exercise())
+
+    def test_oMLX_084_a_mark_it_did_not_set_is_left(self):
+        async def exercise():
+            engine = self.engine()
+            entry = SimpleNamespace(engine=engine)
+            async def teardown(model_id, *, _harbor_expected):
+                await _harbor_expected[1].stop()
+            pool = self.pool(entry, teardown)
+            foreign = object()
+            pool._unloading_models = {"model": foreign}
+            await self.proof.unload_bound(pool, "model", self.busy, (entry, engine))
+            self.assertIs(pool._unloading_models["model"], foreign)
+        asyncio.run(exercise())
+
     def test_runtime_registry_reset_between_scheduling_and_selection_stops_original(self):
         async def exercise():
             engine, replacement = self.engine(), self.engine()

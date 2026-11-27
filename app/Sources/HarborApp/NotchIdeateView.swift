@@ -20,6 +20,8 @@ struct NotchIdeateView: View {
     @State private var followUp = ""
     /// "Show the command" was pressed on the GPU row.
     @State private var gpuCommandShown = false
+    /// "Run in Terminal" was pressed once: the row asks before anything runs.
+    @State private var gpuConfirming = false
     @FocusState private var promptFocused: Bool
     @FocusState private var followUpFocused: Bool
 
@@ -50,7 +52,8 @@ struct NotchIdeateView: View {
     private var branches: Branches {
         Branches(mode: mode.rawValue, rows: ideate.timeline.rows.count, earlier: ideate.timeline.earlier > 0,
                  approvals: ideate.approvals.count, files: ideate.files.count, message: ideate.message != nil,
-                 gpu: (ideate.showsGPULimit ? 1 : 0) + (gpuCommandShown ? 2 : 0) + (ideate.gpuRaised ? 4 : 0))
+                 gpu: (ideate.showsGPULimit ? 1 : 0) + (gpuCommandShown ? 2 : 0) + (ideate.gpuRaised ? 4 : 0)
+                    + (gpuConfirming ? 8 : 0))
     }
 
     private enum Mode: Int { case unavailable, home, running, done, failed }
@@ -157,45 +160,120 @@ struct NotchIdeateView: View {
         prompt = ""
     }
 
-    /// macOS keeps the GPU to less memory than the engine's ceiling. The command only runs
-    /// through the code block's own "Run this script in Terminal?" card (Cancel first), and
-    /// Terminal asks for the password, never Harbor. Skip keeps the smaller budget.
+    /// macOS keeps the GPU to less memory than the engine's ceiling. The command is shown in
+    /// full, wrapped to the page; "Run in Terminal" first swaps the row's buttons for a
+    /// confirmation in place (Cancel is the default), and only its second button hands the
+    /// command to Terminal, which asks for the password, never Harbor. Skip keeps the smaller
+    /// budget. Every state change is in `branches`, so the panel refits instead of drawing
+    /// one state over another.
     private var gpuRow: some View {
         let limit = ideate.gpuLimit
         let open = gpuCommandShown || ideate.qaShowsGPUCommand
         return VStack(alignment: .leading, spacing: 8) {
             Label(IdeateGPULimit.title, systemImage: "memorychip")
                 .font(.harbor(.callout, weight: .semibold)).foregroundStyle(Theme.textPrimary)
+                .fixedSize(horizontal: false, vertical: true)
             Text(IdeateGPULimit.detail)
                 .font(.harbor(.footnote)).foregroundStyle(Theme.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
             if open {
-                // The code block's own Copy and Run in Terminal buttons, and its confirming card.
-                MarkdownView(text: limit.codeBlock)
+                gpuCommandBox(limit.command)
             }
-            HStack(spacing: 8) {
-                if !open {
-                    pill("Show the command", icon: "terminal", filled: false) { gpuCommandShown = true }
-                }
-                pill("Skip", icon: "xmark", filled: false) {
-                    gpuCommandShown = false
-                    ideate.skipGPULimit()
-                }
-                .help(IdeateGPULimit.skipNote)
+            if open && gpuConfirming {
+                gpuConfirm(limit.command)
+            } else {
+                gpuButtons(open: open, command: limit.command)
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(10)
         .background(RoundedRectangle(cornerRadius: 10).fill(Theme.chipFill))
-        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.chipStroke, lineWidth: 1))
+        .overlay(RoundedRectangle(cornerRadius: 10)
+            .stroke(gpuConfirming ? Theme.bad : Theme.chipStroke, lineWidth: 1))
+        .onExitCommand { gpuConfirming = false }
         .notchPageTask(id: open) {
             // While the command is open, look again every few seconds: the row goes once
             // Terminal has raised the limit.
             while open && !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 3_000_000_000)
                 ideate.refreshGPULimit()
-                if !ideate.gpuLimit.isLow { gpuCommandShown = false; break }
+                if !ideate.gpuLimit.isLow { gpuCommandShown = false; gpuConfirming = false; break }
             }
         }
+    }
+
+    /// The whole command, wrapped (never clipped) inside the page's width.
+    private func gpuCommandBox(_ command: String) -> some View {
+        Text(command)
+            .font(.harbor(size: 12, design: .monospaced)).foregroundStyle(Theme.textPrimary)
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(8)
+            .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.06)))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.chipStroke, lineWidth: 1))
+            .accessibilityLabel("The command: \(command)")
+    }
+
+    /// Show / Copy / Run in Terminal, and Skip. Wraps onto a second line on a narrow page.
+    private func gpuButtons(open: Bool, command: String) -> some View {
+        let skip = pill("Skip", icon: "xmark", filled: false) {
+            gpuCommandShown = false
+            gpuConfirming = false
+            ideate.skipGPULimit()
+        }
+        .help(IdeateGPULimit.skipNote)
+        return ViewThatFits(in: .horizontal) {
+            HStack(spacing: 8) { gpuActions(open: open, command: command); skip }
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) { gpuActions(open: open, command: command) }
+                skip
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func gpuActions(open: Bool, command: String) -> some View {
+        if open {
+            pill("Copy", icon: "doc.on.doc", filled: false) { ScriptRunner.copy(command) }
+            pill("Run in Terminal", icon: "terminal", filled: false) { gpuConfirming = true }
+        } else {
+            pill("Show the command", icon: "terminal", filled: false) { gpuCommandShown = true }
+        }
+    }
+
+    /// Takes the buttons' place in the row: nothing runs before the second press.
+    private func gpuConfirm(_ command: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Run this command in Terminal?")
+                .font(.harbor(.footnote, weight: .semibold)).foregroundStyle(Theme.textPrimary)
+                .fixedSize(horizontal: false, vertical: true)
+            Text(IdeateGPULimit.confirmNote)
+                .font(.harbor(.footnote)).foregroundStyle(Theme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                Button("Cancel") { gpuConfirming = false }
+                    .buttonStyle(.plain)
+                    .keyboardShortcut(.defaultAction)
+                    .font(.harbor(.footnote, weight: .medium)).foregroundStyle(Theme.textPrimary)
+                    .padding(.horizontal, 12).padding(.vertical, 6)
+                    .background(Capsule().fill(Theme.chipFill))
+                    .overlay(Capsule().stroke(Theme.chipStroke, lineWidth: 1))
+                    .fixedSize()
+                    .accessibilityLabel("Cancel, do not run the command")
+                Button("Run in Terminal") {
+                    gpuConfirming = false
+                    ScriptRunner.runInTerminalConfirmed(.terminal(interpreter: nil, ext: "sh"), code: command)
+                }
+                .buttonStyle(.plain)
+                .font(.harbor(.footnote, weight: .medium)).foregroundStyle(.black)
+                .padding(.horizontal, 12).padding(.vertical, 6)
+                .background(Capsule().fill(Theme.bad))
+                .fixedSize()
+                .accessibilityLabel("Run in Terminal, run the command")
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var modelNote: some View {
