@@ -190,7 +190,7 @@ def test_settings_can_switch_mail_facts_and_forget_what_harbor_learned_from_mail
         assert part in message, part
     # The Settings page still shows the row, and the routines forget is a different button.
     settings = _read("SettingsView.swift")
-    assert "MailMemorySettingsRow()" in settings
+    assert "MailMemorySettingsRow(" in settings   # Intel passes cloud: (MailMemorySettingsRow(cloud: noLocalEngine))
     assert 'Button("Forget what Harbor learned…", role: .destructive)' in settings
 
 

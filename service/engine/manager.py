@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
 import threading
 import os
 import secrets
@@ -121,32 +120,6 @@ def _saved_model_dirs(settings: dict) -> list[str]:
     return [d for d in saved if isinstance(d, str) and d] if isinstance(saved, list) else []
 
 
-# Folders where this Mac's own oMLX models usually live, relative to the home folder. The built-in
-# engine lists these beside its own folder, so every model already on the Mac can be picked in
-# Settings, not only the ones Harbor downloaded (user request 2026-11-21: "include all models for use
-# even when using the bundled engine"). Fixed paths on purpose: Harbor never reads ~/.omlx/settings.json
-# (it holds the user's key) to learn where oMLX keeps them. oMLX keeps the first copy of an id, and
-# Harbor's own folder comes first, so a model Harbor manages always wins over a same-named one here.
-USER_MODEL_DIRS = ("Desktop/OMLX_Model_Files", "Documents/OMLX_Model_Files", ".omlx/models")
-
-
-def user_model_dirs(home: Path | None = None, own: Path | None = None) -> list[Path]:
-    """The USER_MODEL_DIRS that exist as real folders (no shortcuts), never Harbor's own folder."""
-    home = Path.home() if home is None else home
-    found: list[Path] = []
-    for rel in USER_MODEL_DIRS:
-        path = home / rel
-        try:
-            if path.is_symlink() or not path.is_dir():
-                continue
-        except OSError:
-            continue
-        if own is not None and path.resolve() == own.resolve():
-            continue
-        found.append(path)
-    return found
-
-
 def engine_settings(port: int, api_key: str, model_dirs: Sequence[Path],
                     user_dirs: Sequence[str] = ()) -> dict:
     """The keys Harbor owns. oMLX fills in every other default on first start.
@@ -168,70 +141,26 @@ def engine_settings(port: int, api_key: str, model_dirs: Sequence[Path],
 
 # oMLX's memory guard tiers (process_memory_enforcer.py). oMLX starts on "balanced",
 # which keeps up to 8 GB free and refuses Gemma loads on a 24 GB Mac with other apps
-# open. Harbor's engine uses "custom" with its ceiling pinned at 90% of this Mac's memory
-# (the user, 2026-11-21: "raise ceiling to 90% of the devices memory"). Before that it
-# used "aggressive", whose dynamic ceiling followed free memory (15.9 GB on a 24 GB Mac
-# with apps open) and left Ideate's 15 GB model almost no room to read a prompt.
+# open; Harbor's engine starts on "aggressive" instead.
 MEMORY_GUARD_TIERS = frozenset({"safe", "balanced", "aggressive", "custom"})
-MEMORY_GUARD_TIER = "custom"
-MEMORY_CEILING_SHARE = 0.90
+MEMORY_GUARD_TIER = "aggressive"
 _ENGINE_DEFAULT_TIER = "balanced"
-# Tiers an earlier Harbor wrote itself; a record naming one of these, with the settings still
-# on it, is Harbor's own choice and moves to the current one.
-_EARLIER_HARBOR_TIERS = frozenset({"aggressive"})
 
 
-def physical_memory_bytes() -> int:
-    try:
-        return int(os.sysconf("SC_PAGE_SIZE")) * int(os.sysconf("SC_PHYS_PAGES"))
-    except (ValueError, OSError, AttributeError):
-        return 0
-
-
-def ceiling_gb(total_bytes: int) -> float:
-    """90% of the Mac's memory in GB, rounded down to 0.1 GB. Pure."""
-    return math.floor(max(0, total_bytes) * MEMORY_CEILING_SHARE / 1024**3 * 10) / 10
-
-
-def harbor_memory(total_bytes: int) -> dict:
-    """The memory keys Harbor owns: the custom tier and its ceiling. Pure. oMLX refuses a
-    custom tier with no ceiling, so a Mac whose memory can't be read gets "aggressive"."""
-    ceiling = ceiling_gb(total_bytes)
-    if ceiling <= 0:
-        return {"memory_guard_tier": "aggressive"}
-    return {"memory_guard_tier": MEMORY_GUARD_TIER, "memory_guard_custom_ceiling_gb": ceiling}
-
-
-def memory_guard(existing: dict, already_set: bool, recorded: dict | None = None,
-                 total_bytes: int | None = None) -> dict | None:
+def memory_guard(existing: dict, already_set: bool) -> dict | None:
     """The memory section Harbor writes, or None to leave the existing one alone. Pure.
 
-    - No tier (or one oMLX can't read) gets Harbor's.
-    - oMLX's own first-start "balanced" is moved to Harbor's once; after that "balanced" is
-      the user's choice.
-    - A tier Harbor wrote itself (the record names it and the settings are still on it) is
-      moved to Harbor's current one: an earlier Harbor's "aggressive", or a custom ceiling for a
-      different amount of memory.
-    - Anything else the user picked ("safe", their own "custom" ceiling, "aggressive" with
-      no record of Harbor writing it) is kept, with every other memory key.
+    No tier (or one oMLX can't read) gets Harbor's. oMLX's own first-start "balanced" is
+    moved to Harbor's once; after that "balanced" is the user's choice. "safe", "custom"
+    (with its ceiling) and "aggressive" are always kept, with every other memory key.
     """
-    total = physical_memory_bytes() if total_bytes is None else total_bytes
-    target = harbor_memory(total)
     memory = existing.get("memory")
     memory = memory if isinstance(memory, dict) else {}
     tier = memory.get("memory_guard_tier")
     tier = tier.lower() if isinstance(tier, str) else None
-    if tier not in MEMORY_GUARD_TIERS or (tier == _ENGINE_DEFAULT_TIER and not already_set):
-        return {**memory, **target}
-    recorded_tier = (recorded or {}).get("memory_guard_tier")
-    if already_set and tier == recorded_tier:
-        if tier in _EARLIER_HARBOR_TIERS:
-            return {**memory, **target}
-        if tier == MEMORY_GUARD_TIER and memory.get("memory_guard_custom_ceiling_gb") == \
-                (recorded or {}).get("memory_guard_custom_ceiling_gb") and \
-                memory.get("memory_guard_custom_ceiling_gb") != target["memory_guard_custom_ceiling_gb"]:
-            return {**memory, **target}
-    return None
+    if tier in MEMORY_GUARD_TIERS and (tier != _ENGINE_DEFAULT_TIER or already_set):
+        return None
+    return {**memory, "memory_guard_tier": MEMORY_GUARD_TIER}
 
 
 def read_settings(path: Path) -> dict:
@@ -472,18 +401,12 @@ class EngineManager:
         merged = merge_owned(existing, engine_settings(
             self.port, self.api_key, self.model_dirs(), user_dirs=_saved_model_dirs(existing)))
         record = self.layout.memory_guard_record
-        recorded = read_settings(record) if record.exists() else None
-        memory = memory_guard(existing, already_set=record.exists(), recorded=recorded)
+        memory = memory_guard(existing, already_set=record.exists())
         if memory is not None:
             merged["memory"] = memory
         _write_private(self.layout.settings_path, json.dumps(merged, indent=2))
-        # The record is what Harbor last wrote, so a later Harbor can tell its own choice
-        # from one the user made in the admin UI.
-        if memory is not None or not record.exists():
-            written = {key: memory[key] for key in ("memory_guard_tier", "memory_guard_custom_ceiling_gb")
-                       if memory is not None and key in memory} or harbor_memory(physical_memory_bytes())
-            if recorded != written:
-                _write_private(record, json.dumps(written))
+        if not record.exists():
+            _write_private(record, json.dumps({"memory_guard_tier": MEMORY_GUARD_TIER}))
         # Before the engine starts: it reads model_settings.json once, at startup.
         from . import profiles
         profiles.seed(self.layout.base_path / "model_settings.json",

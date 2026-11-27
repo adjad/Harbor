@@ -2,16 +2,15 @@ import Foundation
 
 /// The notch panel's tabs. Ask is the conversation; Brief is what's going on,
 /// read only; Day is the rest of today, hour by hour; Meet listens to a meeting
-/// and writes its notes; Study keeps school work and makes study material;
-/// Ideate builds small projects from an idea. Meet, Study and Ideate are the
-/// wildcard tabs: the person picks up to two (WildcardTabs).
+/// and writes its notes; Study keeps school work and makes study material.
+/// Meet and Study are the wildcard tabs: the person picks which (WildcardTabs).
 /// Research is not in the
 /// strip: it is a mode of Ask (`/research`, a job opened from the window, New
 /// research), reached through `.research` and left by choosing a tab.
 ///
 /// Pure logic, checked by tests/NotchTabChecks.swift without the app.
 enum NotchTab: Int, CaseIterable, Equatable {
-    case ask, brief, day, research, meet, study, ideate
+    case ask, brief, day, research, meet, study
 
     /// Ask, Brief and Day, always.
     static let fixedStrip: [NotchTab] = [.ask, .brief, .day]
@@ -20,8 +19,17 @@ enum NotchTab: Int, CaseIterable, Equatable {
     /// and the wildcard tabs the person chose (Meet and Study until they choose).
     static var strip: [NotchTab] { strip(wildcards: WildcardTabs.chosen()) }
 
-    /// The strip for a given choice of wildcard tabs. Pure.
-    static func strip(wildcards: [NotchTab]) -> [NotchTab] { fixedStrip + WildcardTabs.validated(wildcards) }
+    /// The strip for a given choice of wildcard tabs, without Meet while it is hidden. Pure.
+    static func strip(wildcards: [NotchTab]) -> [NotchTab] {
+        fixedStrip + WildcardTabs.validated(wildcards).filter { !(meetHidden && $0 == .meet) }
+    }
+
+    /// Takes Meet out of the strip. Nothing sets it today: on a build with no
+    /// on-device engine (the Intel preview) meetings are heard by the chosen cloud
+    /// model, and when that model can't hear audio the service refuses the start
+    /// with a plain reason, which the Meet tab shows (AppDelegate, at launch).
+    nonisolated(unsafe) static var meetHidden = false
+    static let meetHiddenReason = "Meeting notes need a model that can hear audio: Harbor's on-device engine, or a cloud model that takes audio."
 
     var title: String {
         switch self {
@@ -31,7 +39,6 @@ enum NotchTab: Int, CaseIterable, Equatable {
         case .research: return "Research"
         case .meet: return "Meet"
         case .study: return "Study"
-        case .ideate: return "Ideate"
         }
     }
 
@@ -48,6 +55,23 @@ enum NotchTab: Int, CaseIterable, Equatable {
 
     /// Ask and Research have the prompt field; the cursor goes there when they open.
     var hasPrompt: Bool { self == .ask || self == .research }
+}
+
+/// The Meet tab's opening paragraph. `cloudProvider` is who hears the audio besides
+/// this Mac (GET /meetings `audio_destination`), nil on the on-device engine.
+enum MeetingCopy {
+    static func home(hearsCallAudio: Bool, cloudProvider: String?) -> String {
+        let source = hearsCallAudio
+            ? "Harbor listens through the microphone and to the sound this Mac plays, so a call on headphones is heard too. It"
+            : "Harbor listens through the microphone. To hear the other side of a call on headphones, turn on Screen Recording for Harbor first. It"
+        let after = "When you stop, it writes a summary, the decisions, the action items and a follow-up. "
+        guard let provider = cloudProvider, !provider.isEmpty else {
+            return source + " writes the words down on this Mac. " + after
+                + "No audio is kept and nothing leaves your Mac."
+        }
+        return source + " sends the audio to \(provider), where the model you chose writes the words down. " + after
+            + "The audio and the transcript are sent to \(provider); Harbor keeps no audio, only the text."
+    }
 }
 
 /// What fills the open panel under its header. Tabs sit side by side, in strip

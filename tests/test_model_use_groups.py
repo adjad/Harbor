@@ -1,12 +1,11 @@
-"""Settings › Models: two menus (General use, Coding) that save several roles at once, and a
-built-in engine that lists every model already on the Mac. Invented model ids; no live server."""
+"""Settings › Models: two menus (General use, Coding) that save several roles at once.
+Invented model ids; no live server. (Intel: no built-in engine, so its model-folder listing is not carried.)"""
 from pathlib import Path
 
 import pytest
 import yaml
 
 from service import config
-from service.engine import manager as engine_manager
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -61,35 +60,3 @@ def test_gemma_harbor_stays_default_and_no_thinking_capable():
     assert "Gemma-Wisp" in models["no_thinking_capable"]
     text = (ROOT / "app/Sources/HarborApp/QuickSettingsText.swift").read_text()
     assert 'static let codingFirst = ["Qwen3.5-9B-oQ4e-mtp"]' in text
-
-
-def test_user_model_dirs_are_the_existing_real_folders(tmp_path):
-    home = tmp_path / "home"
-    (home / "Desktop/OMLX_Model_Files").mkdir(parents=True)
-    (home / ".omlx/models").mkdir(parents=True)
-    elsewhere = tmp_path / "elsewhere"
-    elsewhere.mkdir()
-    (home / "Documents").mkdir()
-    (home / "Documents/OMLX_Model_Files").symlink_to(elsewhere)      # a shortcut: left out
-    found = engine_manager.user_model_dirs(home)
-    assert found == [home / "Desktop/OMLX_Model_Files", home / ".omlx/models"]
-    # Harbor's own folder is never listed twice.
-    assert engine_manager.user_model_dirs(home, own=home / ".omlx/models") == [home / "Desktop/OMLX_Model_Files"]
-    assert engine_manager.user_model_dirs(tmp_path / "nobody") == []
-
-
-def test_harbors_own_folder_comes_first_so_its_copy_wins(tmp_path):
-    layout = engine_manager.EngineLayout(tmp_path / "code", tmp_path / "data")
-    user = tmp_path / "Desktop/OMLX_Model_Files"
-    m = engine_manager.EngineManager(layout, api_key="k" * 40, extra_model_dirs=[user])
-    settings = engine_manager.engine_settings(m.port, m.api_key, m.model_dirs())
-    assert settings["model"]["model_dirs"] == [str(layout.models_dir), str(user)]
-    assert settings["model"]["model_dir"] == str(layout.models_dir)      # downloads still land in Harbor's
-
-
-def test_the_runtime_engine_gets_the_user_folders_and_never_reads_omlx_settings():
-    runtime = (ROOT / "service/engine/runtime.py").read_text()
-    assert "extra_model_dirs=user_model_dirs(own=layout.models_dir)" in runtime
-    source = (ROOT / "service/engine/manager.py").read_text()
-    dirs = source[source.index("USER_MODEL_DIRS = "):source.index("def engine_settings(")]
-    assert "settings.json\"" not in dirs and "read_settings" not in dirs and "open(" not in dirs

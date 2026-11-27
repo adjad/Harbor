@@ -2,7 +2,7 @@ import Foundation
 
 /// The notch's kept tab pages (NotchDeckState) and when a kept page's own
 /// "shown" and "hidden" work runs (NotchPageLifecycle). Plain Foundation:
-/// compiled with NotchTab, WildcardTabs, IdeateKind and NotchPageDeckState
+/// compiled with NotchTab, WildcardTabs and NotchPageDeckState
 /// only, no SwiftUI and no window. The real panel's behaviour (Brief's and
 /// Day's hooks on every switch, timing, memory) is in NotchMotionChecks.
 @main
@@ -57,7 +57,7 @@ struct NotchPageDeckChecks {
         // A wildcard tab turned off goes once it is out of sight.
         deck.show(.tab(.meet), layout: narrow, strip: strip, animated: false)
         check(deck.mounted.contains(.meet), "Meet kept")
-        let noMeet: [NotchTab] = [.ask, .brief, .day, .study, .ideate]
+        let noMeet: [NotchTab] = [.ask, .brief, .day, .study]
         deck.show(.tab(.meet), layout: narrow, strip: noMeet, animated: false)
         check(deck.mounted.contains(.meet), "Meet stays while it is still in front")
         deck.show(.tab(.ask), layout: narrow, strip: noMeet, animated: false)

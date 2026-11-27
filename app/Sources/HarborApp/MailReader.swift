@@ -65,6 +65,7 @@ private final class MailIdentityCaptureOrder {
 final class MailReader {
     private var timer: Timer?
     private let dbReader = MailDBReader()
+    private let indexPostThrottle = MailIndexPostThrottle()
 
     // 200 (not 25) so a full day's mail is actually covered, not just the
     // newest handful — a summary of "today" needs everything from today, not
@@ -1207,6 +1208,15 @@ final class MailReader {
                         return
                     }
                     let generation = captured.generation
+                    // Intel: ten years of history is not read and sent again while Mail's index is
+                    // unchanged (MailIndexPostThrottle); the history generation is part of the key.
+                    let signature = MailIndexPostThrottle.signature(paths: self.dbReader.indexFiles())
+                        + ["generation|\(generation)"]
+                    if self.indexPostThrottle.shouldSkip(signature) {
+                        self.noteMailRead(live: live)   // unchanged since the last post: still a read
+                        if !live { self.considerOpeningMail(failure: nil) }
+                        return
+                    }
                     var indexRead = self.dbReader.readHeadersAndHistory()
                     var closedFailure: (kind: String, reason: String)?
                     if indexRead == nil {
@@ -1233,7 +1243,10 @@ final class MailReader {
                         // last posted, so the next walk must not stitch onto it.
                         self.post(headers: headers, available: true, reason: "",
                                   readSource: live ? "mail_fetch" : "local_index", history: history,
-                                  historyGeneration: generation)
+                                  historyGeneration: generation) { [weak self] in
+                            // Only a history the service took counts: one refused or sent before it was up is read again.
+                            self?.indexPostThrottle.recordPost(signature)
+                        }
                         // The index holds only what Mail fetched before it closed: open it
                         // hidden for a live read once none is fresh (MailRecache).
                         if !live { self.considerOpeningMail(failure: nil) }
@@ -1706,10 +1719,11 @@ final class MailReader {
 
     private func post(headers: String, available: Bool, reason: String,
                       readSource: String, history: String? = nil,
-                      historyGeneration: UInt64? = nil) {
+                      historyGeneration: UInt64? = nil, historyDelivered: (() -> Void)? = nil) {
         // The launch header read has reached a terminal state, so the history
         // walk may start (see syncHistory).
         markHeadersCompleted()
+        if readSource != "local_index" && readSource != "mail_fetch" { indexPostThrottle.reset() }
         if available { noteMailRead(live: readSource == "mail_app" || readSource == "mail_fetch") }
         let url = HarborClient.baseURL.appendingPathComponent("assistant/sync/emails")
         var req = URLRequest(url: url)
@@ -1736,7 +1750,11 @@ final class MailReader {
         req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
         if history != nil {
             if !historyState.replace(generation: historyGeneration, enqueue: {
-                URLSession.shared.dataTask(with: req).resume()
+                // `historyDelivered` only when the service took this history (HTTP 2xx).
+                URLSession.shared.dataTask(with: req) { _, response, error in
+                    if error == nil, let code = (response as? HTTPURLResponse)?.statusCode,
+                       (200..<300).contains(code) { historyDelivered?() }
+                }.resume()
             }) {
                 // Preserve successful header readiness independently when an
                 // identity/source observation superseded the history read.

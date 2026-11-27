@@ -38,6 +38,7 @@ final class MailDBReader {
     }
 
     /// The index and its write-ahead log: their modification times show Mail writing (fetching).
+    /// Also the key of Intel's `MailIndexPostThrottle`.
     func indexFiles() -> [String] {
         guard let path = indexPath ?? envelopeIndexPath() else { return [] }
         return [path, path + "-wal"]
@@ -67,6 +68,14 @@ final class MailDBReader {
         return Self.closedReadFailure(mailDirectoryExists: exists, listErrno: listErrno, hasIndex: hasIndex)
     }
 
+    /// Whether macOS lets Harbor list Mail's folder: Full Disk Access is on. A cheap
+    /// probe (one opendir), asked before choosing how to read Mail.
+    func canListMailFolder() -> Bool {
+        guard let dir = opendir(mailDirectory) else { return false }
+        closedir(dir)
+        return true
+    }
+
     /// The rule behind closedReadFailure(), from what the file system said.
     ///
     /// - IMPORTANT: Full Disk Access only when macOS refused the folder (EPERM,
@@ -80,8 +89,7 @@ final class MailDBReader {
         guard mailDirectoryExists else { return notConfigured }
         if listErrno == EPERM {
             return (kind: "full_disk_access",
-                    reason: "Harbor reads Mail while Mail is open. Open Mail, or give Harbor Full Disk Access "
-                        + "to read it when Mail is closed.")
+                    reason: MailReadPlan.openMailOrFullDiskAccess)
         }
         if listErrno != 0 {
             return (kind: "", reason: "Harbor couldn't open Mail's folder. Open Mail, and Harbor will read it from there.")
@@ -96,16 +104,17 @@ final class MailDBReader {
     // Matches MailReader's own constants so the two paths produce
     // comparably-scoped output regardless of which one answers a given tick.
     private let headerLimitPerAccount = 200
-    private let historyCutoffDays = 730
+    // Intel (cloud model): the whole history (MailHistoryWindow, end of this file).
+    private let historyCutoffDays = MailHistoryWindow.days
     // Safety ceiling on total rows fetched in one query — this is a single
     // indexed SQL scan (milliseconds), not the multi-minute AppleScript batch
     // walk it replaces, so there's no real cost pressure to keep this tight;
     // it exists purely so a truly enormous mailbox can't produce an
     // unbounded payload.
-    private let totalRowCap = 30000
+    private let totalRowCap = MailHistoryWindow.totalRows
     // Same per-account ceiling as MailReader.historyCap, so either history
     // source reports truncation for the same account at the same depth.
-    private let historyCap = 12000
+    private let historyCap = MailHistoryWindow.perAccount
 
     /// Mail's "V<N>" data folders, highest N first. Pure.
     static func versionFoldersNewestFirst(_ entries: [String]) -> [String] {
@@ -580,6 +589,164 @@ enum AccountLabelCache {
 
     static func stored() -> [String: String] {
         UserDefaults.standard.dictionary(forKey: key) as? [String: String] ?? [:]
+    }
+}
+
+
+// MARK: - How Mail is read
+
+/// What macOS says about Harbor scripting Mail (Automation).
+enum MailAutomationState: String, Equatable {
+    /// Allowed, answered live or remembered from the last time Mail was open.
+    case granted
+    /// Turned off for Harbor in System Settings.
+    case denied
+    /// No answer on record: never asked, or Mail has not been open since a reset.
+    case unknown
+}
+
+/// The one way Harbor reads Mail on a scan, decided from three facts. Pure, so every
+/// combination is checked without Mail or a Mac that has it.
+///
+/// - Mail open and Automation allowed: AppleScript (headers, bodies, accounts).
+/// - Mail's folder readable (Full Disk Access): the on-disk index, headers only,
+///   no launch. Senders, subjects, dates and read state; no bodies.
+/// - Folder unreadable, Mail closed, Automation allowed: open Mail hidden (no
+///   window shown, not brought forward), then AppleScript as above.
+/// - Anything else: no read, and the one sentence that says why and what fixes it.
+///
+/// Mail is opened only on `.openHiddenThenAppleScript`, and Harbor never asks for
+/// Automation here (Harbor's setup asks); a denied or unanswered one never opens Mail.
+enum MailReadPlan: Equatable {
+    case appleScript
+    case openHiddenThenAppleScript
+    case localIndex
+    case cannotRead(kind: String, reason: String)
+
+    /// Full Disk Access users get Mail's saved index without opening Mail. Set true
+    /// to open Mail hidden for them too whenever Automation is allowed, which also
+    /// gets bodies and mail newer than the index (Mail only fetches while open).
+    static let openHiddenWithFullDiskAccess = false
+
+    static let openMailOrFullDiskAccess =
+        "Harbor can't read Apple Mail: open Mail once, or allow Full Disk Access for Harbor in "
+        + "System Settings > Privacy & Security."
+    static let automationOff =
+        "Harbor can't read Apple Mail: Automation for Mail is off for Harbor. Turn on Mail for Harbor in "
+        + "System Settings > Privacy & Security > Automation, or allow Full Disk Access there."
+    static let automationOffOnly =
+        "Harbor can't read Apple Mail: Automation for Mail is off for Harbor. Turn on Mail for Harbor in "
+        + "System Settings > Privacy & Security > Automation."
+    static let automationUnasked =
+        "Harbor can't read Apple Mail: Mail is open, but Harbor hasn't been allowed to read it yet. "
+        + "Open Harbor's Settings, choose Permissions… under Privacy, and click Allow next to Mail & Notes."
+    static let automationUnaskedClosed =
+        "Harbor can't read Apple Mail: Harbor hasn't been allowed to read it yet. "
+        + "Open Harbor's Settings, choose Permissions… under Privacy, and click Allow next to Mail & Notes."
+    static let couldNotOpen =
+        "Harbor couldn't open Mail in the background. Open Mail once, and Harbor will read it from there."
+
+    /// - Parameters:
+    ///   - mailOpen: Mail is running (a script would not launch it).
+    ///   - automation: the live answer when Mail is open, else the last one remembered.
+    ///   - folderReadable: Full Disk Access lets Harbor list ~/Library/Mail.
+    ///   - failure: MailDBReader.closedReadFailure(), for reads that fail for other reasons.
+    static func decide(mailOpen: Bool, automation: MailAutomationState, folderReadable: Bool,
+                       failure: (kind: String, reason: String),
+                       openHiddenWithFullDiskAccess: Bool = MailReadPlan.openHiddenWithFullDiskAccess) -> MailReadPlan {
+        if mailOpen && automation == .granted { return .appleScript }
+        if folderReadable {
+            if !mailOpen && automation == .granted && openHiddenWithFullDiskAccess {
+                return .openHiddenThenAppleScript
+            }
+            return .localIndex
+        }
+        // No Full Disk Access from here on.
+        if failure.kind == "mail_not_configured" { return .cannotRead(kind: failure.kind, reason: failure.reason) }
+        if !mailOpen && automation == .granted { return .openHiddenThenAppleScript }
+        let fdaDenied = failure.kind == "full_disk_access"
+        switch automation {
+        case .denied:
+            return .cannotRead(kind: "mail_automation", reason: fdaDenied ? automationOff : automationOffOnly)
+        case .unknown where mailOpen:
+            return .cannotRead(kind: "mail_automation", reason: automationUnasked)
+        case .unknown:
+            // Closed, no answer on record: opening Mail once lets Harbor learn it.
+            return fdaDenied ? .cannotRead(kind: "full_disk_access", reason: openMailOrFullDiskAccess)
+                             : .cannotRead(kind: failure.kind, reason: failure.reason)
+        case .granted:
+            // Mail is open and Automation is allowed: handled above.
+            return .appleScript
+        }
+    }
+
+    /// The only place Mail is launched: the launcher runs on `.openHiddenThenAppleScript`
+    /// and never otherwise. Returns whether Mail is open and ready to script.
+    static func openIfPlanned(_ plan: MailReadPlan, launcher: () -> Bool) -> Bool {
+        guard plan == .openHiddenThenAppleScript else { return plan == .appleScript }
+        return launcher()
+    }
+}
+
+/// How far back this reader goes. The on-device model needed small windows; the Intel
+/// build's cloud model holds about a million tokens, so there it reads (practically) the
+/// whole history: ten years, with ceilings that keep one sync a sane size. Kept in this
+/// file because the reader is also compiled on its own for its checks.
+enum MailHistoryWindow {
+    #if arch(x86_64)
+    static let days = 3650, perAccount = 50_000, totalRows = 120_000
+    #else
+    static let days = 730, perAccount = 12_000, totalRows = 30_000
+    #endif
+}
+
+/// Intel only: with Mail closed the index is read on the 5-minute sync. Ten years of
+/// history is not read and sent again while the index files are unchanged; a post is
+/// still made at least every `maxSkip` seconds, so a restarted backend is refilled.
+final class MailIndexPostThrottle {
+    #if arch(x86_64)
+    static let enabledByDefault = true
+    #else
+    static let enabledByDefault = false
+    #endif
+    private let lock = NSLock()
+    private var lastSignature: [String]?
+    private var lastPost: Date?
+    private let enabled: Bool
+    private let maxSkip: TimeInterval
+
+    init(enabled: Bool = MailIndexPostThrottle.enabledByDefault, maxSkip: TimeInterval = 1800) {
+        self.enabled = enabled
+        self.maxSkip = maxSkip
+    }
+
+    /// Path, modification time and size of each file; a missing file reads as absent.
+    static func signature(paths: [String]) -> [String] {
+        paths.map { path in
+            let attributes = try? FileManager.default.attributesOfItem(atPath: path)
+            let modified = (attributes?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+            let size = (attributes?[.size] as? NSNumber)?.int64Value ?? -1
+            return "\(path)|\(modified)|\(size)"
+        }
+    }
+
+    func shouldSkip(_ signature: [String], now: Date = Date()) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard enabled, !signature.isEmpty, let last = lastSignature, let at = lastPost else { return false }
+        return last == signature && now.timeIntervalSince(at) < maxSkip
+    }
+
+    func recordPost(_ signature: [String], now: Date = Date()) {
+        lock.lock(); defer { lock.unlock() }
+        lastSignature = signature
+        lastPost = now
+    }
+
+    /// Another source posted mail since: the next index read must post again.
+    func reset() {
+        lock.lock(); defer { lock.unlock() }
+        lastSignature = nil
+        lastPost = nil
     }
 }
 

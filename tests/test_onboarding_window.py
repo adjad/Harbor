@@ -834,6 +834,26 @@ def test_ask_always_asks_the_service_even_after_setup_said_no_model():
     assert "choose a model in Settings › Models" in send
 
 
+def test_intel_key_only_setup_is_gated_on_the_signal():
+    """The one-field OpenRouter key step shows only through
+    IntelCloudPreset.offersKeyOnlySetup (Intel build and no engine), reuses the
+    Cloud form's credential name and request body, and uses no remote-only env."""
+    sources = _sources()
+    first_run = sources["FirstRunSetupView.swift"]
+    gate = first_run.index("IntelKeyCard(setup: setup)")
+    assert "IntelCloudPreset.offersKeyOnlySetup(status: setup.status)" in first_run[gate - 200:gate]
+    assert "Harbor can't set this up on its own" in first_run[gate:gate + 400]  # the else branch stays
+    preset = sources["IntelCloudPreset.swift"]
+    assert "compiledForIntel && engineAvailable == false" in preset
+    assert "#if arch(x86_64)" in preset
+    assert "CloudConnection.newCredentialName()" in preset and "CloudConnection.requestBody(" in preset
+    assert 'static let modelID = "google/gemini-3.8-flash"' in preset
+    assert "HARBOR_REMOTE_ONLY" not in preset
+    settings = sources["SettingsView.swift"]
+    assert "CloudConnection.newCredentialName()" in settings and "CloudConnection.requestBody(" in settings
+    assert "IntelCloudPreset.offersKeyOnlySetup(" in _body(settings, "func preselectIntelPreset")
+
+
 def test_a_yes_from_macos_counts_before_the_status_catches_up():
     """2026-11-18, the owner on 0.1.7 build 45: Allow on Reminders, the request
     answered YES, but EKEventStore.authorizationStatus still said notDetermined in

@@ -568,7 +568,7 @@ enum Harness {
                 m.collapsed = false
                 try await rig.open()
             }
-            for tab in [NotchTab.ask, .brief, .day, .meet, .study, .ideate, .ask] {
+            for tab in [NotchTab.ask, .brief, .day, .meet, .study, .ask] {
                 m.tab = tab
                 try await rig.settle()
             }

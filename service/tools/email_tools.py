@@ -226,7 +226,17 @@ def cache_history_headers(history: str) -> None:
 # Provider snapshots are separate from native Mail snapshots. A failed refresh
 # must preserve the last bytes and their original age, including after restart.
 _external_accounts: dict[str, dict] = {}
-_EXTERNAL_MAX_AGE = 300.0
+# How often the readers fetch recent headers: MailReader's timer and
+# gmail_source.HEADERS_EVERY.
+_HEADERS_INTERVAL = 300.0
+# How long a read counts as current: two intervals, so a sync that lands a minute
+# or two late (a busy Mac, a slow account) does not turn a healthy source stale
+# between ticks. With the limit equal to the interval, any delay did.
+_EXTERNAL_MAX_AGE = 2 * _HEADERS_INTERVAL
+# How old a read may be before a question asks the app for a new one. Shorter than
+# the window above on purpose: a person asking should get mail no older than one
+# interval, while the Brief and the warnings tolerate a late tick.
+_SYNC_REQUEST_AGE = _HEADERS_INTERVAL
 # Header history is read every 30 minutes (MailReader's history timer, gmail_source's
 # HISTORY_EVERY), so judging it by the 5-minute limit above made day and period
 # summaries carry a "newer messages may be missing" caveat for 25 of every 30
@@ -913,7 +923,8 @@ def email_freshness_warning(account: str | None = None, *, part: str = "headers"
     if part == "raw" and (scan_warning := _raw_scan_warning(account)):
         warnings.append(scan_warning)
     for item in details:
-        if item["fresh"] or part == "history" and item["source"] == "gmail" and external_recent_complete(item["account"]):
+        if (item["fresh"]
+                or part == "history" and item["source"] == "gmail" and external_recent_complete(item["account"])):
             continue
         last = (datetime.fromtimestamp(item["last_success"]).strftime("%b %-d, %-I:%M %p")
                 if item["last_success"] else "unknown")
@@ -2070,6 +2081,13 @@ def _raw_ready() -> bool:
     return bool(_raw_emails.strip()) or any(item.get("raw") is not None for item in _external_accounts.values())
 
 
+def _older_than_request_age(row: dict) -> bool:
+    """A Mail read inside the freshness window but older than one interval: current
+    for the Brief, yet a question still asks for a newer one."""
+    age = row.get("age_seconds")
+    return age is None or age > _SYNC_REQUEST_AGE
+
+
 async def _ensure_email_cache(*, want_raw: bool = False,
                               timeout_seconds: float = 2.5) -> None:
     """If the cache isn't ready, ask the Harbor app to sync Mail NOW and wait
@@ -2098,7 +2116,8 @@ async def _ensure_email_cache(*, want_raw: bool = False,
                 external_email_error(address, part, "Google refresh is unavailable; showing the last available cache")
     sources = email_source_details(part="raw" if want_raw else "headers")
     refresh_local = (
-        any(not row["fresh"] for row in sources) or
+        any(not row["fresh"] or (row["source"] != "gmail" and _older_than_request_age(row))
+            for row in sources) or
         (not sources and (_email_read_source == "local_index" or bool(_swift_raw if want_raw else _swift_headers))))
     generation = _headers_sync_generation
     raw_generation = _raw_snapshot_generation

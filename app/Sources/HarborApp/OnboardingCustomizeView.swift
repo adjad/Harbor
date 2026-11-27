@@ -1,7 +1,7 @@
 import SwiftUI
 
 // Setup's "You" step: who the person is, so the notch shows the tabs that suit
-// them. One local choice that drives only the tab strip and the Ideate variant
+// them. One local choice that drives only the tab strip
 // (WildcardTabs.swift). Skipping keeps what the strip already is (Meet and
 // Study). It asks for no permission, and Meet's microphone is left for the
 // moment a meeting starts.
@@ -10,7 +10,6 @@ struct OnboardingCustomizeStep: View {
     @State private var group: QuaysidePersonaGroup?
     @State private var persona: QuaysidePersona?
     @State private var tabs: [NotchTab]
-    @State private var kind: IdeateKind
     @State private var changing = false
     /// Set when a third tab is pressed at the cap; cleared by the next change.
     @State private var blockedNote: String?
@@ -20,7 +19,6 @@ struct OnboardingCustomizeStep: View {
         _persona = State(initialValue: saved)
         _group = State(initialValue: saved?.group)
         _tabs = State(initialValue: WildcardTabs.chosen())
-        _kind = State(initialValue: QuaysidePersonaStore.ideateKind())
     }
 
     var body: some View {
@@ -116,7 +114,6 @@ struct OnboardingCustomizeStep: View {
             if changing { changeList }
             if tabs.contains(.study) { note("cloud", WildcardTabs.studyDisclosure) }
             if tabs.contains(.meet) { note("mic.slash", WildcardTabs.meetNote) }
-            if tabs.contains(.ideate) { note("folder", WildcardTabs.ideateNote) }
         }
         .padding(.horizontal, 14).padding(.vertical, 12)
         .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.04)))
@@ -153,25 +150,8 @@ struct OnboardingCustomizeStep: View {
                 Text(note).font(.system(size: 11.5, weight: .medium)).foregroundStyle(Theme.warn)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            if tabs.contains(.ideate) { ideateVariants }
         }
         .padding(.top, 2)
-    }
-
-    private var ideateVariants: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Ideate is set up for").font(.system(size: 12, weight: .medium)).padding(.top, 6)
-            HStack(spacing: 6) {
-                ForEach(IdeateKind.allCases, id: \.self) { option in
-                    Button(option.title) {
-                        kind = option
-                        QuaysidePersonaStore.setIdeateKind(option)
-                    }
-                    .buttonStyle(FirstRunButtonStyle(primary: kind == option))
-                    .accessibilityAddTraits(kind == option ? [.isButton, .isSelected] : .isButton)
-                }
-            }
-        }
     }
 
     private func note(_ symbol: String, _ text: String) -> some View {
@@ -187,7 +167,6 @@ struct OnboardingCustomizeStep: View {
         blockedNote = nil
         QuaysidePersonaStore.choose(leaf)
         tabs = WildcardTabs.chosen()
-        if let suggested = leaf.ideateKind { kind = suggested }
     }
 
     /// A press either changes the tabs or, at the cap, says what to do: never nothing.

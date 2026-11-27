@@ -1,17 +1,15 @@
 import Foundation
 
 // Customize Harbor: who the person is picks the notch's wildcard tabs (the
-// strip is always Ask, Brief and Day, then at most two of Meet, Study and
-// Ideate) and, for someone who builds things, the Ideate variant.
+// strip is always Ask, Brief and Day, then Meet, Study, both or neither).
+// This Intel build has no Ideate tab.
 //
 // Pure logic and a UserDefaults-backed store, Foundation only, so
-// tests/WildcardTabsChecks.swift compiles it with NotchTab.swift and
-// IdeateKind.swift and no app. Nothing here reads anything from the Mac or the
-// service; the persona is one local choice that drives only the tab strip and
-// the Ideate defaults.
+// tests/WildcardTabsChecks.swift compiles it with NotchTab.swift and no app. Nothing here reads anything from the Mac or the
+// service; the persona is one local choice that drives only the tab strip.
 
 extension Notification.Name {
-    /// Posted each time the wildcard tabs or the Ideate variant change, so the
+    /// Posted each time the wildcard tabs change, so the
     /// open strip and quick settings redraw at once.
     static let harborWildcardTabsChanged = Notification.Name("harbor.wildcardTabsChanged")
 }
@@ -95,33 +93,18 @@ enum QuaysidePersona: String, CaseIterable, Equatable {
         }
     }
 
-    /// The wildcard tabs suggested for this answer: at most two, from Meet,
-    /// Study and Ideate, in the order they sit in the strip.
+    /// The wildcard tabs suggested for this answer: at most two, from Meet
+    /// and Study, in the order they sit in the strip.
     var suggestedTabs: [NotchTab] {
         let tabs: [NotchTab]
         switch self {
         case .studentHighSchool, .studentCollege: tabs = [.study]
         case .studentGrad: tabs = [.study, .meet]
-        case .builderUI, .builderDebug, .builderGeneral, .builderElse: tabs = [.ideate]
-        case .builderLearn: tabs = [.ideate, .study]
+        case .builderLearn: tabs = [.study]
         case .meetings, .manager: tabs = [.meet]
-        case .creator: tabs = [.ideate]
-        case .home, .basics: tabs = []
+        case .builderUI, .builderDebug, .builderGeneral, .builderElse, .creator, .home, .basics: tabs = []
         }
         return WildcardTabs.validated(tabs)
-    }
-
-    /// The Ideate variant this answer starts with; nil when Ideate isn't suggested.
-    var ideateKind: IdeateKind? {
-        switch self {
-        case .builderUI: return .ui
-        case .builderDebug: return .debug
-        case .builderLearn: return .learn
-        case .builderGeneral: return .general
-        case .builderElse: return .script
-        case .creator: return .general
-        default: return nil
-        }
     }
 }
 
@@ -130,7 +113,7 @@ enum WildcardTabs {
     static let key = "harbor.wildcardTabs"
     static let maxCount = 2
     /// The tabs that can be wildcards, in the order the Change row lists them.
-    static let candidates: [NotchTab] = [.study, .meet, .ideate]
+    static let candidates: [NotchTab] = [.study, .meet]
     /// What a Mac that never chose has had all along (Meet, then Study).
     static let defaultTabs: [NotchTab] = [.meet, .study]
 
@@ -139,7 +122,6 @@ enum WildcardTabs {
         switch tab {
         case .meet: return "meet"
         case .study: return "study"
-        case .ideate: return "ideate"
         default: return nil
         }
     }
@@ -200,7 +182,6 @@ enum WildcardTabs {
         case .day: return "Your day hour by hour, with to-dos placed on the timeline."
         case .meet: return "Notes from a meeting as you listen: a summary, decisions and action items."
         case .study: return "School work in one place, with study guides and quizzes made from it."
-        case .ideate: return "Describe a small project and Harbor builds it in its own folder, asking before anything risky."
         }
     }
 
@@ -209,7 +190,6 @@ enum WildcardTabs {
         switch tab {
         case .study: return "School work, guides and quizzes"
         case .meet: return "Meeting notes and action items"
-        case .ideate: return "Build a small project from an idea"
         default: return ""
         }
     }
@@ -222,8 +202,6 @@ enum WildcardTabs {
     /// Meet asks for nothing here: the microphone belongs to the moment a meeting starts.
     static let meetNote = "Meet asks for nothing now. It listens only when you start it, and the microphone has to be allowed first."
 
-    static let ideateNote = "Ideate builds in its own folder and asks before anything risky."
-
     // MARK: The words and the choice, shared by quick settings and the You step
 
     /// The row's title, in quick settings and in the You step.
@@ -232,7 +210,7 @@ enum WildcardTabs {
     /// What the row does and its limit.
     static let rowSubtitle = "Add up to 2 tabs next to Ask, Brief and Day"
 
-    /// Which are on: "Study and Meet are on", "Ideate is on", "None added yet".
+    /// Which are on: "Study and Meet are on", "Meet is on", "None added yet".
     static func stateLine(_ current: [NotchTab]) -> String {
         let names = validated(current).map(\.title)
         switch names.count {
@@ -275,36 +253,19 @@ enum WildcardTabs {
         if !now.contains(tab) && !canAdd(tab, to: now) { return Press(tabs: now, blockedNote: blockedNote(for: tab)) }
         return Press(tabs: toggled(tab, in: now), blockedNote: nil)
     }
-
-    static func ideateIsOn(defaults: UserDefaults = .standard) -> Bool {
-        chosen(defaults: defaults).contains(.ideate)
-    }
 }
 
-/// The saved persona and Ideate variant. `harbor.ideate.kind` is the key the
-/// Ideate model reads, so the variant set here is the one a new project uses.
+/// The saved persona.
 enum QuaysidePersonaStore {
     static let personaKey = "harbor.persona"
-    static let ideateKindKey = "harbor.ideate.kind"
 
     static func persona(defaults: UserDefaults = .standard) -> QuaysidePersona? {
         defaults.string(forKey: personaKey).flatMap(QuaysidePersona.init(rawValue:))
     }
 
-    static func ideateKind(defaults: UserDefaults = .standard) -> IdeateKind {
-        defaults.string(forKey: ideateKindKey).flatMap(IdeateKind.init(rawValue:)) ?? IdeateKind.defaultKind
-    }
-
-    static func setIdeateKind(_ kind: IdeateKind, defaults: UserDefaults = .standard) {
-        defaults.set(kind.rawValue, forKey: ideateKindKey)
-        NotificationCenter.default.post(name: .harborWildcardTabsChanged, object: nil)
-    }
-
-    /// Saves the persona and applies what it suggests: the wildcard tabs, and
-    /// the Ideate variant when it has one.
+    /// Saves the persona and applies the wildcard tabs it suggests.
     static func choose(_ persona: QuaysidePersona, defaults: UserDefaults = .standard) {
         defaults.set(persona.rawValue, forKey: personaKey)
-        if let kind = persona.ideateKind { defaults.set(kind.rawValue, forKey: ideateKindKey) }
         WildcardTabs.set(persona.suggestedTabs, defaults: defaults)
     }
 }
