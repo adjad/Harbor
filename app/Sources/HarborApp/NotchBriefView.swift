@@ -24,8 +24,8 @@ private extension Theme {
 /// never a model call. Refresh composes the scheduled brief now, which "Ask
 /// about this" continues from.
 struct NotchBriefView: View {
-    @ObservedObject var model: OverlayModel
-    @ObservedObject var today: TodayModel
+    @NotchPageObserved var model: OverlayModel
+    @NotchPageObserved var today: TodayModel
     /// The open tile; one at a time. None shows the Top 3.
     @State var open: BriefTile? = nil
     @FocusState private var focused: BriefTile?
@@ -124,11 +124,11 @@ struct NotchBriefView: View {
         // row goes if its retries run out; else every two minutes).
         // Brief opened: a stale mail cache is read now (MailReader; with Google off it may open Mail
         // hidden, MailRecache), so Brief isn't left with no mail just because Gmail is off.
-        .onAppear { NotificationCenter.default.post(name: MailReader.briefOpened, object: nil) }
+        .onNotchPageShown { NotificationCenter.default.post(name: MailReader.briefOpened, object: nil) }
         // The Brief is always today, whatever day Day is showing (Day gets its day back).
-        .onAppear { pinToToday() }
-        .onChange(of: today.followsToday) { _, _ in pinToToday() }
-        .task(id: today.isShowingCurrentDay && composedBrief == nil) {
+        .onNotchPageShown { pinToToday() }
+        .onNotchPageChange(of: today.followsToday) { pinToToday() }
+        .notchPageTask(id: today.isShowingCurrentDay && composedBrief == nil) {
             guard today.isShowingCurrentDay, composedBrief == nil else { return }
             while !Task.isCancelled {
                 await today.refreshBriefSchedule()

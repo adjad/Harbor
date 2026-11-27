@@ -463,7 +463,34 @@ def _writing_style_block() -> str:
         return ""
 
 
-def draft_prompt(row: dict, earlier: list[dict] | None = None, calendar: str = "") -> tuple[str, str]:
+def _dates_note(row: dict, now: float | None = None, tz: str | None = None) -> str:
+    """For an email from an earlier day, the dates its "today" and "tomorrow"
+    meant, written by code (the Brief's own note, prepare.dates_note)."""
+    from service.proactive import prepare
+    try:
+        if tz is None:
+            from service.proactive.cycle import _zone
+            tz = _zone()
+        return prepare.dates_note({"item": {"received_ts": row.get("ts")}},
+                                  time.time() if now is None else now, tz)
+    except Exception:  # noqa: BLE001 - no note: the draft still writes
+        return ""
+
+
+def _stale_draft(draft: str, row: dict, now: float | None = None, tz: str | None = None) -> bool:
+    from service.proactive import prepare
+    try:
+        if tz is None:
+            from service.proactive.cycle import _zone
+            tz = _zone()
+        return prepare.stale_relative_day(draft, {"item": {"received_ts": row.get("ts")}},
+                                          time.time() if now is None else now, tz)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def draft_prompt(row: dict, earlier: list[dict] | None = None, calendar: str = "", *,
+                 now: float | None = None, tz: str | None = None) -> tuple[str, str]:
     """(system, material) for the draft call. The thread is fenced as untrusted data.
     The oldest history is dropped first when the model's window is tight."""
     from service.memory.identity import identity_prompt_block
@@ -496,6 +523,9 @@ def draft_prompt(row: dict, earlier: list[dict] | None = None, calendar: str = "
                      if not history else
                      "The text of this email isn't available. Keep the reply short and general; never "
                      "invent details the subject and earlier messages don't state.")
+    dates = _dates_note(row, now, tz)
+    if dates:
+        parts.append(dates)
     parts.append("Write the user's reply now.")
     return system, "\n\n".join(parts)
 
@@ -659,6 +689,12 @@ async def draft_reply(reply_ref: Any) -> dict:
     row, earlier, calendar = await _thread_for_draft(row)
     system, material = draft_prompt(row, earlier, calendar)
     draft = _fix_greeting(clean_draft(await _model_reply(system, material)), row)
+    if draft and _stale_draft(draft, row):
+        # "See you at 5 today" about an earlier day's email: asked once more,
+        # and if it still says so the person gets an empty box, not a wrong day.
+        again = _fix_greeting(clean_draft(await _model_reply(
+            system, material + "\n\nYour last reply said today, tonight or tomorrow. Name the day instead.")), row)
+        draft = "" if _stale_draft(again, row) else again
     out = {**_envelope_view(ref, row), "draft": draft}
     if not draft:
         out["draft_error"] = "Harbor couldn't draft this one. Write your reply below."

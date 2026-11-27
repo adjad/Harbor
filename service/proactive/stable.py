@@ -81,9 +81,23 @@ def _fresh_enough(card: dict, since: float, now: float) -> bool:
     return now - seen <= MISSING_GRACE_S
 
 
+def _stale_reply(card: dict, item: dict | None, now: float, tz: str | None) -> bool:
+    """A reply card that must not stand: the time it is about is over
+    (expires_ts), or its draft says "today" or "tomorrow" about a message from
+    an earlier day."""
+    end = card.get("expires_ts")
+    if isinstance(end, (int, float)) and end <= now:
+        return True
+    if tz is None or item is None:
+        return False
+    from service.proactive import prepare
+    draft = str((card.get("action") or {}).get("draft") or "")
+    return prepare.stale_relative_day(draft, {"item": item}, now, tz)
+
+
 def carry(previous: list[dict], fresh: list[dict], *, items: dict[str, dict], withheld: set[str],
           gone: set[str], suppressed: set[str], done_todos: set[str], now: float, since: float,
-          limit: int) -> list[dict]:
+          limit: int, tz: str | None = None) -> list[dict]:
     """The cards to show: every earlier card whose ask still stands (refreshed
     from this cycle's card for the same item when there is one), then this
     cycle's new cards, alerts first and replies before the rest, cut to `limit`.
@@ -95,6 +109,9 @@ def carry(previous: list[dict], fresh: list[dict], *, items: dict[str, dict], wi
     done_todos  to-do ids marked done.
     since       when the earlier cards were last known good (for a source that
                 is missing now, the grace runs from here).
+    tz          the Brief's zone: with it, a reply card drafted on the day its
+                message arrived ("see you at 5 today") is not kept once that
+                day has passed.
     """
     fresh_by_ref = {card_ref(c): c for c in fresh if card_ref(c)}
     kept: list[dict] = []
@@ -113,6 +130,8 @@ def carry(previous: list[dict], fresh: list[dict], *, items: dict[str, dict], wi
         due = old.get("due_ts")
         if isinstance(due, (int, float)) and due <= now and method not in _REPLY_METHODS:
             continue                     # past due: at most an overdue to-do
+        if method in _REPLY_METHODS and _stale_reply(old, item, now, tz):
+            continue                     # its meeting is over, or its draft's "today" has passed
         if item is None:
             # The source is not in this read: a short gap is a flaky read (a
             # failed fetch, a sync in progress), a long one means it is gone.

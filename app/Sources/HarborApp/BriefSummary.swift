@@ -1106,6 +1106,22 @@ enum BriefReady {
         return line
     }
 
+    /// What a reply answers, on one line ("Community meeting — “Can you come Thursday at 5?”"),
+    /// shown above its drafted reply; nil when the engine sent none.
+    static func contextLine(_ context: String) -> String? {
+        let line = context.split(whereSeparator: { $0.isWhitespace || $0.isNewline }).joined(separator: " ")
+        return line.isEmpty ? nil : line
+    }
+
+    /// How VoiceOver reads it.
+    static func contextSpoken(_ line: String) -> String { "They wrote: " + line }
+
+    /// A row's muted line: for a reply, what it answers; else the card's own detail.
+    static func rowDetail(context: String, sendsDraft: Bool, otherwise: String) -> String {
+        guard sendsDraft, let line = contextLine(context) else { return otherwise }
+        return line
+    }
+
     /// A drafted reply as one quoted line: its lines joined, blank ones and
     /// runs of spaces gone. Nil for an empty draft.
     static func draftQuote(_ draft: String) -> String? {

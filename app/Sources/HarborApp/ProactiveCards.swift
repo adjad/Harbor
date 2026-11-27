@@ -1133,11 +1133,14 @@ struct ProactiveBriefSection: View, Equatable {
     /// any other card does what its large card's button does.
     private func cardRow(_ card: ProactiveCard) -> some View {
         let tag: String = BriefReady.cardTag(method: card.action?.method ?? "", hasDraft: !(card.action?.draft ?? "").isEmpty)
-        let detail: String = card.body.isEmpty ? card.metaLine.capitalized : card.body
+        let detail: String = BriefReady.rowDetail(context: card.context, sendsDraft: card.action?.sendsDraft == true,
+                                                  otherwise: card.body.isEmpty ? card.metaLine.capitalized : card.body)
+        let context: String? = card.action?.sendsDraft == true ? BriefReady.contextLine(card.context) : nil
         let state = actions.fires[card.id]
         return VStack(alignment: .leading, spacing: 2) {
             compactRow(tag: tag, title: card.chipTitle, detail: detail,
-                       help: card.why.isEmpty ? card.title : card.why, spoken: card.metaLine + ". " + card.title) {
+                       help: context ?? (card.why.isEmpty ? card.title : card.why),
+                       spoken: card.metaLine + ". " + card.title + (context.map { ". " + BriefReady.contextSpoken($0) } ?? "")) {
                 cardRowAction(card)
                 cardDismiss(card)
             }
@@ -1373,6 +1376,10 @@ struct ProactiveBriefSection: View, Equatable {
                 .font(.harbor(size: 15.5, weight: .semibold)).foregroundStyle(Theme.textPrimary)
                 .fixedSize(horizontal: false, vertical: true)
             if card.isGroup { groupRows(card) }
+            if quote != nil, let line = BriefReady.contextLine(card.context) {
+                // What the reply answers, above the draft: one line, the whole of it in the editor.
+                contextLine(line)
+            }
             if let quote {
                 // The reply Harbor drafted, as it would go: the whole of it opens with the button.
                 draftQuote(quote, full: action?.draft ?? "")
@@ -1483,6 +1490,15 @@ struct ProactiveBriefSection: View, Equatable {
         .buttonStyle(StudyRowButtonStyle())
         .help("Next card")
         .accessibilityLabel("Card \(position + 1) of \(cards.count); next")
+    }
+
+    /// What a reply answers, in one muted line; the whole line is its tooltip.
+    private func contextLine(_ line: String) -> some View {
+        Text(line).font(.harbor(size: 11.5)).foregroundStyle(Theme.textMuted)
+            .lineLimit(1).truncationMode(.tail)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .help(line)
+            .accessibilityLabel(BriefReady.contextSpoken(line))
     }
 
     /// The drafted reply in one quoted line; the whole draft is in its tooltip.
@@ -1661,7 +1677,13 @@ struct ProactiveBriefSection: View, Equatable {
     private func draftEditor(_ card: ProactiveCard, _ action: ProactiveCard.Action, fire: ProactiveActions.Fire? = nil,
                              withSend: Bool = false) -> some View {
         VStack(alignment: .leading, spacing: 5) {
-            if let source = card.sources.first(where: { !$0.quote.isEmpty }) {
+            if action.sendsDraft, let line = BriefReady.contextLine(card.context) {
+                // Open, what the reply answers shows whole.
+                Text(line).font(.harbor(size: 11.5)).foregroundStyle(Theme.textMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                    .accessibilityLabel(BriefReady.contextSpoken(line))
+            } else if let source = card.sources.first(where: { !$0.quote.isEmpty }) {
                 Text((source.who.isEmpty ? "" : source.who + ": ") + "“" + source.quote + "”")
                     .font(.harbor(size: 11.5)).italic().foregroundStyle(Theme.textMuted)
                     .lineLimit(2).fixedSize(horizontal: false, vertical: true)

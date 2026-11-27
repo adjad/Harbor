@@ -67,6 +67,9 @@ final class MotionRig {
     var host: NSView!
 
     static let offscreenShift: CGFloat = -20000
+    /// Reads of the Brief's schedule (TodayModel.refreshBriefSchedule): the
+    /// cold-start poll a kept, hidden Brief must stop and a shown one restart.
+    nonisolated(unsafe) static var scheduleReads = 0
     /// HARBOR_NOTCH_MOTION_APPEARANCE=light: the app runs as on a Mac set to
     /// Light, with nothing forcing the panel dark but the panel itself.
     static let lightMac = ProcessInfo.processInfo.environment["HARBOR_NOTCH_MOTION_APPEARANCE"] == "light"
@@ -85,6 +88,7 @@ final class MotionRig {
                 (body, HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
             }
             if request.httpMethod == "POST" { return ok(Data(#"{"ok":true,"detail":"Done"}"#.utf8)) }
+            if components?.path == "/assistant/summary_schedule" { MotionRig.scheduleReads += 1 }
             if components?.path == "/assistant/daily_summary/latest" {
                 return (Data(#"{"detail":"no composed summary for that day"}"#.utf8),
                         HTTPURLResponse(url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!)
@@ -325,6 +329,10 @@ enum Harness {
                 report += line + "\n"
                 print(line)
                 if line.hasPrefix("FAIL") { failures += 1 }
+                for r in try await deckCheck(rig) {
+                    report += r.line + "\n"; print(r.line)
+                    if !r.ok { failures += 1 }
+                }
             }
             try await run("ask-to-brief", prepare: { m.tab = .ask }) { m.tab = .brief }
             try await run("brief-to-day") { m.tab = .day }
@@ -505,7 +513,17 @@ enum Harness {
         ]
         var times: [String: [Double]] = [:]
         print("profile pid \(getpid()), \(rounds) rounds")
-        for _ in 0..<rounds {
+        // Resident size and footprint: opened on Ask, after every tab has been
+        // shown once (the first round), and at the end.
+        var memory = ["memory (MB): resident / footprint"]
+        func noteMemory(_ when: String) {
+            let (resident, footprint) = Self.memoryNow()
+            memory.append(String(format: "  %-22@ %7.1f / %7.1f", when as NSString, resident, footprint))
+        }
+        try await rig.settle()
+        noteMemory("opened on Ask")
+        for round in 0..<rounds {
+            if round == 1 { noteMemory("every tab shown once") }
             for (name, change) in steps {
                 let t0 = CACurrentMediaTime()
                 change()
@@ -516,17 +534,157 @@ enum Harness {
                 try await Task.sleep(for: .milliseconds(450))
             }
         }
-        var lines = ["first-frame cost (ms): median / max over \(rounds) rounds"]
+        noteMemory("after \(rounds) rounds")
+        var lines = ["first-frame cost (ms): median / max over \(rounds) rounds, then the first round's"]
         for (name, _) in steps {
-            let v = (times[name] ?? []).sorted()
+            let raw = times[name] ?? []
+            let v = raw.sorted()
             guard !v.isEmpty else { continue }
-            lines.append(String(format: "  %-11@ %6.1f / %6.1f", name as NSString, v[v.count / 2], v.last!))
+            lines.append(String(format: "  %-14@ %6.1f / %6.1f   first %6.1f", name as NSString, v[v.count / 2], v.last!, raw[0]))
         }
+        lines += memory
+        lines += try await realClose(rig, rounds: 5)
         let text = lines.joined(separator: "\n")
         print(text)
         try text.write(to: out.appendingPathComponent("profile.txt"), atomically: true, encoding: .utf8)
         rig.close()
         return true
+    }
+
+    /// The close people see (AppDelegate.veiledClose): the content veils, the
+    /// panel rolls up on its spring, and only when that is done does the bar
+    /// replace the open panel, letting every kept tab page go. Every tab is
+    /// shown before each close, so the pages are kept. Reports the longest
+    /// main-thread stall while the roll-up runs, and the cost of the one turn
+    /// that puts the bar in after it.
+    @MainActor static func realClose(_ rig: MotionRig, rounds: Int) async throws -> [String] {
+        let m = rig.model
+        var rollStalls: [Double] = [], shownStalls: [Double] = [], barCosts: [Double] = [], rollTimes: [Double] = []
+        // The first part of the roll-up, while the content still fades and is
+        // drawn (OverlayPanel.contentHideDelay); after it only the window's own
+        // shape animation is on screen.
+        for _ in 0..<rounds {
+            if m.collapsed {
+                m.collapsed = false
+                try await rig.open()
+            }
+            for tab in [NotchTab.ask, .brief, .day, .meet, .study, .ideate, .ask] {
+                m.tab = tab
+                try await rig.settle()
+            }
+            var rolling = true, worst = 0.0, worstShown = 0.0, rollEnd = 0.0, barCost = 0.0
+            let start = CACurrentMediaTime()
+            AppDelegate.veiledClose(model: m, animated: true, rollUp: { done in
+                rig.panel.rollUp {
+                    rollEnd = CACurrentMediaTime()
+                    rolling = false
+                    let t = CACurrentMediaTime()
+                    done()   // the veil lifts and collapsed = true: the bar replaces the panel
+                    rig.host.layoutSubtreeIfNeeded()
+                    rig.host.display()
+                    barCost = (CACurrentMediaTime() - t) * 1000
+                }
+            }, then: {})
+            var last = CACurrentMediaTime()
+            while rolling && CACurrentMediaTime() - start < 2 {
+                try await Task.sleep(for: .milliseconds(1))
+                let now = CACurrentMediaTime()
+                if rolling {
+                    worst = max(worst, (now - last) * 1000)
+                    if last - start < OverlayPanel.contentHideDelay { worstShown = max(worstShown, (now - last) * 1000) }
+                }
+                last = now
+            }
+            rollStalls.append(worst)
+            shownStalls.append(worstShown)
+            barCosts.append(barCost)
+            rollTimes.append((rollEnd - start) * 1000)
+            try await rig.settle()
+        }
+        func med(_ v: [Double]) -> Double { let s = v.sorted(); return s[s.count / 2] }
+        return [
+            "real close (every tab shown first, \(rounds) closes): median / max ms",
+            String(format: "  longest main-thread stall during the roll-up  %6.1f / %6.1f", med(rollStalls), rollStalls.max() ?? 0),
+            String(format: "    of it while the content still shows        %6.1f / %6.1f", med(shownStalls), shownStalls.max() ?? 0),
+            String(format: "  the bar's turn after the roll-up               %6.1f / %6.1f", med(barCosts), barCosts.max() ?? 0),
+            String(format: "  roll-up from start to its end                  %6.1f / %6.1f", med(rollTimes), rollTimes.max() ?? 0),
+        ]
+    }
+
+    /// This process's resident size and physical footprint, in MB.
+    static func memoryNow() -> (Double, Double) {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        guard kr == KERN_SUCCESS else { return (-1, -1) }
+        return (Double(info.resident_size) / 1_048_576, Double(info.phys_footprint) / 1_048_576)
+    }
+
+    /// A tab's page is kept while the panel is open (NotchPageDeck), and its
+    /// own shown/hidden work still runs on every switch, three rounds over:
+    /// - Brief, each time it comes forward: "Brief opened" is posted, it pins
+    ///   the planner to today (Day was showing yesterday), and its cold-start
+    ///   schedule poll starts again at once, not after its 20-120 s wait;
+    /// - Day, each time it comes forward, gets the day it had back (restore,
+    ///   which refreshes), and each time it leaves, its week row's form is
+    ///   forgotten (weekRowClosed), checked in the same update as the switch.
+    @MainActor static func deckCheck(_ rig: MotionRig) async throws -> [(ok: Bool, line: String)] {
+        let m = rig.model, day = rig.today
+        final class Count { var n = 0 }
+        let opened = Count()
+        let token = NotificationCenter.default.addObserver(forName: MailReader.briefOpened, object: nil, queue: nil) { _ in
+            opened.n += 1
+        }
+        defer { NotificationCenter.default.removeObserver(token) }
+        var briefOpened: [Int] = [], pinned: [Bool] = [], restored: [Bool] = [], closed: [Bool] = [], polled: [Int] = []
+        var stayed: [Bool] = []
+        m.tab = .ask
+        try await rig.settle()
+        for _ in 0..<3 {
+            m.tab = .day
+            try await rig.settle()
+            day.selectDate(day.now.addingTimeInterval(-86400))
+            await day.refresh()
+            try await rig.settle()
+            // A form chosen under a name only this check uses: gone once Day has left.
+            _ = day.weekRowFull(start: "qa-probe-week", readNow: true)
+            let before = opened.n, reads = MotionRig.scheduleReads
+            m.tab = .brief
+            rig.host.layoutSubtreeIfNeeded()
+            closed.append(day.weekRowLatched(start: "qa-probe-week") == nil)
+            try await rig.settle()
+            briefOpened.append(opened.n - before)
+            pinned.append(day.isShowingCurrentDay)
+            polled.append(MotionRig.scheduleReads - reads)
+            m.tab = .day
+            try await rig.settle()
+            restored.append(!day.isShowingCurrentDay)
+            // With Brief kept and hidden, the other day stays: a fresh read
+            // redraws the planner, and a hidden Brief must not pin it back.
+            await day.refresh()
+            try await rig.settle()
+            stayed.append(!day.isShowingCurrentDay)
+            day.returnToToday()
+            await day.refresh()
+            try await rig.settle()
+        }
+        m.tab = .ask
+        try await rig.settle()
+        func line(_ ok: Bool, _ what: String, _ seen: String) -> (ok: Bool, line: String) {
+            (ok, "\(ok ? "PASS" : "FAIL") kept tabs: \(what) (\(seen))")
+        }
+        return [
+            line(briefOpened == [1, 1, 1], "Brief posts \"Brief opened\" once on every switch to it", "\(briefOpened)"),
+            line(pinned.allSatisfy { $0 }, "Brief pins the planner to today on every switch to it", "\(pinned)"),
+            line(polled.allSatisfy { $0 >= 1 }, "Brief's cold-start schedule read restarts at once on every switch to it", "reads \(polled)"),
+            line(restored.allSatisfy { $0 }, "Day gets its own day back on every switch to it", "\(restored)"),
+            line(stayed.allSatisfy { $0 }, "with Brief kept and hidden, Day stays on the other day", "\(stayed)"),
+            line(closed.allSatisfy { $0 }, "Day forgets its week row's form on every switch away", "\(closed)"),
+        ]
     }
 
     /// The panel redraws for what it shows, not for every key or mic level:
@@ -1102,9 +1260,27 @@ enum FlashProbe {
     }
 
     static func homeScroll(_ rig: MotionRig) -> NSScrollView? {
-        let all = Harness.scrollViews(in: rig.host)
+        // Only the page on screen: kept tab pages (NotchPageDeck) are still in
+        // the tree, invisible, and Brief's and Day's are taller than Study's.
+        let all = Harness.scrollViews(in: rig.host).filter { drawn($0, in: rig.host) }
         for s in all { hook(type(of: s)) }
         return all.filter { $0.frame.width > 300 }.max { $0.frame.height < $1.frame.height }
+    }
+
+    /// Whether a view is drawn: nothing between it and `root` is hidden or
+    /// faded out, as a view or as a layer.
+    static func drawn(_ view: NSView, in root: NSView) -> Bool {
+        var v: NSView? = view
+        while let x = v, x !== root {
+            if x.isHidden || x.alphaValue < 0.01 { return false }
+            v = x.superview
+        }
+        var l = view.layer
+        while let x = l, x !== root.layer {
+            if x.isHidden || x.opacity < 0.01 { return false }
+            l = x.superlayer
+        }
+        return true
     }
 
     static func scroll(_ rig: MotionRig) -> Scroll {
@@ -1353,7 +1529,9 @@ extension FlashProbe {
             fits.append((n, sc.doc))
         }
         guard let cap, let pick = fits.last(where: { $0.doc + delta > cap + 4 }) else {
-            return [(false, "FAIL \(mode): study-row-across-cap - no fixture crosses the cap (cap \(cap.map(Harness.f) ?? "none"), row adds \(Harness.f(delta)))")]
+            let views = Harness.scrollViews(in: rig.host)
+            let seen = views.map { "\(Int($0.frame.width))x\(Int($0.frame.height))\(drawn($0, in: rig.host) ? "" : " hidden")" }
+            return [(false, "FAIL \(mode): study-row-across-cap - no fixture crosses the cap (cap \(cap.map(Harness.f) ?? "none"), row adds \(Harness.f(delta)); scroll views \(seen))")]
         }
         try await show(pick.n)
         NotchStudyView.qaHover.send("qa:lab4"); try await rig.settle()

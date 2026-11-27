@@ -16,8 +16,8 @@ import AppKit
 /// The app keeps the plan current in the background, so opening either tab
 /// shows the latest loaded day immediately.
 struct NotchDayView: View {
-    @ObservedObject var model: OverlayModel
-    @ObservedObject var today: TodayModel
+    @NotchPageObserved var model: OverlayModel
+    @NotchPageObserved var today: TodayModel
     // Plans caught in texts and the stale-reminder questions come from shared
     // models (DayCards) that outlive a tab switch and load in the background
     // with the plan, so the Day tab's first frame already holds every card.
@@ -185,7 +185,7 @@ struct NotchDayView: View {
         .environment(\.timeZone, today.timezone)
         .modifier(DayRefreshLoop(model: model, today: today))
         // The Brief always shows today and moved the model there; Day shows the day it had.
-        .onAppear { if BriefFollowsToday.restore(today) { Task { await today.refresh() } } }
+        .onNotchPageShown { if BriefFollowsToday.restore(today) { Task { await today.refresh() } } }
         // A change anywhere (a sync, an answer from another place) refreshes the
         // stale-reminder questions now instead of at the next minute.
         .onReceive(NotificationCenter.default.publisher(for: .harborAssistantChanged)) { _ in
@@ -201,7 +201,7 @@ struct NotchDayView: View {
         // The week row's other days: read once the plan is on screen; the
         // task ends (and its read with it) when the Day closes.
         .task(id: weekReadKey) { if !weekReadKey.isEmpty { await readWeek() } }
-        .onDisappear { today.weekRowClosed() }
+        .onNotchPageHidden { today.weekRowClosed() }
         // A cancel the service answered: the plan is read again, so a cancelled
         // block goes and a refused one shows the fresh facts the service now has.
         .onChange(of: checkIn.cancelling) { before, now in
@@ -590,6 +590,8 @@ struct NotchDayView: View {
         let calendar: Calendar = weekCalendar
         let days: [String] = DayWeek.keys(DayWeek.dates(containing: shownNoon, calendar: calendar), calendar: calendar)
         await today.refreshWeek(start: DayWeek.start(of: shownNoon, calendar: calendar), days: days, revision: plan.revision)
+        // Then the week's other days, one at a time, so a tap on any shows it at once.
+        await today.prefetchDays(days)
     }
 
     /// The full week row is taller: one-column Day shows one row fewer before Show more.
@@ -603,7 +605,10 @@ struct NotchDayView: View {
         withAnimation(Theme.Motion.panel(reduceMotion: reduceMotion)) {
             if card.isToday { today.returnToToday() } else { today.selectDate(card.date) }
         }
-        // The held day keeps the panel's height; it resizes once, for the new day.
+        // A kept day is on screen already: the panel fits it now, and the read
+        // after it changes the plan (and the height) only if the day changed.
+        // Otherwise the held day keeps the panel's height until the read lands.
+        if today.currentPlan != nil { model.onResize() }
         Task { await today.refresh(); model.onResize() }
     }
 
@@ -2286,33 +2291,6 @@ struct DayHalfHeights: PreferenceKey {
     static let defaultValue: [String: CGFloat] = [:]
     static func reduce(value: inout [String: CGFloat], nextValue: () -> [String: CGFloat]) {
         value.merge(nextValue()) { $1 }
-    }
-}
-
-// MARK: - Shared by Brief and Day
-
-extension TodayModel {
-    /// The plan, only when it is for the day and time zone shown.
-    var currentPlan: TodayPlan? {
-        guard let plan, plan.day == day, plan.timezone == timezone.identifier else { return nil }
-        return plan
-    }
-}
-
-extension TodayPlan {
-    /// The workspace's "Needs you" items, for the timeline and the badge.
-    var dayNeeds: [DayNeedInput] {
-        (workspace?.attention ?? []).map {
-            DayNeedInput(id: $0.id, title: $0.title, source: $0.source, due: $0.due_ts, allDay: $0.all_day == true)
-        }
-    }
-
-    /// School work due that day (deadlines from service/study/day_hook.py), for
-    /// the agenda only: "Due 11:59 PM". Not counted in the badge.
-    var studyNeeds: [DayNeedInput] {
-        deadlines.filter { $0.source == "study" }.map {
-            DayNeedInput(id: $0.id, title: $0.title, source: "study", due: $0.due_ts, allDay: $0.all_day == true)
-        }
     }
 }
 

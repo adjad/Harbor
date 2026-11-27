@@ -16,8 +16,8 @@ import Combine
 /// screen): the home screen as a whole, an opened material under its fixed
 /// back row and title.
 struct NotchStudyView: View {
-    @ObservedObject var model: OverlayModel
-    @ObservedObject var study: StudyModel
+    @NotchPageObserved var model: OverlayModel
+    @NotchPageObserved var study: StudyModel
     let cap: CGFloat?
 
     /// The course chip picked: filters the due list and the library, and is what
@@ -151,8 +151,8 @@ struct NotchStudyView: View {
             // A course that left (a clear, a fresh read) is no longer a filter.
             if let courseID, !ids.contains(courseID) { self.courseID = nil }
         }
-        .onDisappear { study.editing = false }
-        .task {
+        .onNotchPageHidden { study.editing = false }
+        .notchPageTask {
             now = Date()
             await study.refresh()
             await study.loadSettings()
@@ -1070,8 +1070,22 @@ private struct StudyLibraryRow: View {
 /// shimmer under them. Still, with Reduce Motion.
 struct StudyBusyRow: View {
     let label: String
+
+    var body: some View {
+        // Still while the page it is on is kept hidden (NotchPageDeck).
+        StillWhenHidden { StudyBusyRowContent(label: label, moving: true) } still: {
+            StudyBusyRowContent(label: label, moving: false)
+        }
+    }
+}
+
+/// StudyBusyRow breathing and shimmering, or still as with Reduce Motion.
+private struct StudyBusyRowContent: View {
+    let label: String
+    let moving: Bool
     @State private var breathing = false
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceMotion) private var systemReduceMotion
+    private var reduceMotion: Bool { systemReduceMotion || !moving }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {

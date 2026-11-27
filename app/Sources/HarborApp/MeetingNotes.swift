@@ -744,7 +744,7 @@ struct NotchMeetingView: View {
         .animation(Theme.Motion.panel(reduceMotion: reduceMotion), value: branches)
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.bottom, 8)
-        .task { await model.refresh() }
+        .notchPageTask { await model.refresh() }
     }
 
     private var home: some View {

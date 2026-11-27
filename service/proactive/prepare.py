@@ -29,6 +29,7 @@ from service.proactive import draft_context, guard
 MAX_CARDS = 5
 DRAFT_TOKENS = (460, 1600)
 MAX_DRAFT_CHARS = 1200
+_REPLY_METHODS = ("email_reply", "text_reply")
 _LABEL = {"mail": "MAIL", "messages": "TEXTS", "notes": "NOTES", "reminders": "REMINDERS", "calendar": "CALENDAR"}
 _NOUN = {"mail": "email", "messages": "texts", "notes": "note", "reminders": "reminder"}
 
@@ -235,6 +236,61 @@ def _notes(item: dict) -> str:
     return ("\nNotes from an earlier reading (the messages win if they differ):\n" + "\n".join(lines)) if lines else ""
 
 
+# A day said relative to when it was said. In a message from an earlier day
+# these name a day that is no longer "today", so a draft never repeats them.
+_RELATIVE_DAY = re.compile(r"\b(?:today|tonight|tomorrow|tmrw|this (?:morning|afternoon|evening))\b", re.I)
+
+
+def _arrived_day(item: dict, now: float, tz: str):
+    """The day the message to answer arrived, when that was before today; else None."""
+    received = (item.get("item") or {}).get("received_ts")
+    if not isinstance(received, (int, float)) or received <= 0:
+        return None
+    zone = ZoneInfo(tz)
+    day = datetime.fromtimestamp(received, zone).date()
+    return day if day < datetime.fromtimestamp(now, zone).date() else None
+
+
+def dates_note(item: dict, now: float, tz: str) -> str:
+    """For a message from an earlier day, the dates its relative words mean,
+    written by code: "today" in a Monday email is that Monday, not today."""
+    day = _arrived_day(item, now, tz)
+    if day is None:
+        return ""
+    zone = ZoneInfo(tz)
+    today = datetime.fromtimestamp(now, zone).date()
+    name = lambda d: f"{d:%A}, {d:%b} {d.day}"  # noqa: E731
+    return (f"Dates: today is {name(today)}. The message to answer was sent on {name(day)}, so its "
+            f"\"today\" means {name(day)} and its \"tomorrow\" means {name(day + timedelta(days=1))}. "
+            "Never write today, tonight or tomorrow in the reply: name the day instead, and if what they "
+            "asked about has already happened, don't accept it as if it were still ahead.")
+
+
+def stale_relative_day(words: str, item: dict, now: float, tz: str) -> bool:
+    """A draft for a message from an earlier day that says "today" or "tomorrow"."""
+    return _arrived_day(item, now, tz) is not None and bool(_RELATIVE_DAY.search(words or ""))
+
+
+def expires_at(item: dict, tz: str) -> float | None:
+    """When a meeting or call is over: its clock time, or the end of its day.
+    None for anything else: a reply owed by a time ("reply by 5 PM Monday") is
+    still worth sending late."""
+    due = item.get("due_ts")
+    if not isinstance(due, (int, float)) or item.get("kind") not in ("meet", "call"):
+        return None
+    if item.get("has_clock"):
+        return float(due)
+    zone = ZoneInfo(tz)
+    day = datetime.fromtimestamp(due, zone).date() + timedelta(days=1)
+    return datetime.combine(day, datetime.min.time(), zone).timestamp()
+
+
+def event_passed(item: dict, now: float, tz: str) -> bool:
+    """The time the item is about has gone: a reply accepting it would be stale."""
+    end = expires_at(item, tz)
+    return end is not None and end <= now
+
+
 async def write_draft(item: dict, method: str, reply_fn, abort, *, allowed: set[str],
                       now: float | None = None, tz: str = "UTC") -> tuple[str | None, str]:
     """(words, "model" | "template"). Words of None stand down."""
@@ -258,8 +314,13 @@ async def write_draft(item: dict, method: str, reply_fn, abort, *, allowed: set[
         built = await draft_context.build(item, now=time.time() if now is None else now, tz=tz,
                                           budget=draft_context.budget_chars(system))
     thread, source = built if built else (f"<<<ITEM\n{raw.get('text', '')}\nITEM>>>", "")
+    at = time.time() if now is None else now
+    dates = dates_note(item, at, tz)
     material = (f"Reply to: {guard.clean(item.get('who'), 60)}\n{thread}{_notes(item) if built else ''}\n"
-                f"What to answer: {guard.clean(item.get('title'), 120)}")
+                + (dates + "\n" if dates else "")
+                + f"What to answer: {guard.clean(item.get('title'), 120)}")
+    # The dates are code's own words, so a draft may name them.
+    held = "\n".join(filter(None, (source, dates)))
     for rules in (system, system + RETRY_RULE):
         try:
             reply = await reply_fn(rules, material, abort, DRAFT_TOKENS)
@@ -267,7 +328,9 @@ async def write_draft(item: dict, method: str, reply_fn, abort, *, allowed: set[
             reply = ""
         if reply is None:
             return None, ""
-        words = valid_draft(reply, item, allowed, source)
+        words = valid_draft(reply, item, allowed, held)
+        if words and stale_relative_day(words, item, at, tz):
+            words = ""                   # "at 5 PM today" from a three-day-old email
         if words:
             return words, "model"
         if not str(reply).strip():
@@ -504,10 +567,15 @@ async def prepare(items: list[dict], sched: dict, reply_fn, abort, *, now: float
         if item["kind"] == "reply" and method in ("add_to_day", "reminder"):
             why(item, "no contact handle to text" if item["source"] == "messages" else "can't reply from Harbor")
             continue                     # a reply Harbor can't send: a to-do, not a card
+        if method in ("email_reply", "text_reply") and event_passed(item, now, tz):
+            why(item, "what it asks about has already happened")
+            continue                     # never a draft accepting a meeting that is over
         words, written_by = "", ""
         if method in ("email_reply", "text_reply"):
             asked = (item.get("asks") or [None])[0]
             words = drafts.get((item["primary"], asked, method))
+            if words and stale_relative_day(words, item, now, tz):
+                words = None             # written on the day it arrived: its "today" has passed
             if words:
                 written_by = "model"     # only a model's words are handed back (stable.reusable_drafts)
             else:
@@ -537,8 +605,70 @@ async def prepare(items: list[dict], sched: dict, reply_fn, abort, *, now: float
             "fingerprints": list(item.get("fingerprints") or []),
             "asks": list(item.get("asks") or []),
             "due_ts": item.get("due_ts"),
+            **({"context": reply_context(item, now, tz)} if method in _REPLY_METHODS else {}),
+            **({"expires_ts": expires_at(item, tz)}
+               if method in _REPLY_METHODS and expires_at(item, tz) is not None else {}),
             **({"_sealed": plan["sealed"]} if plan.get("sealed") else {}),
         })
         if message:
             shown_messages.setdefault(message, False)
     return "ok", cards
+
+
+# --- what a reply answers ------------------------------------------------------------
+
+GIST_CHARS = 150
+_WITHHELD = re.compile(r"details omitted|withheld|^\(?no subject\)?$", re.I)
+# A line that only greets, thanks or signs off says nothing about the ask.
+_SMALL_TALK = re.compile(
+    r"^(?:hi|hey|hello|dear|good (?:morning|afternoon|evening)|hope (?:you|this|all|your|everything)|"
+    r"thanks|thank you|cheers|best|regards|sent from)\b[^.!?]{0,50}[.!?,]*$", re.I)
+
+
+def _gist_candidates(item: dict) -> list[str]:
+    raw = item.get("item") or {}
+    lines = [str(line) for line in raw.get("lines") or []]
+    if item.get("source") == "mail":
+        lines = lines[1:]                # the first line is the subject itself
+    pending = [str(line) for line in raw.get("pending") or []]
+    return [str(item.get("quote") or "")] + pending + lines
+
+
+def reply_context(item: dict, now: float, tz: str) -> str:
+    """One line on what a reply answers, built by code from the message itself:
+    the subject, then the line the item is about (or the first that says
+    something), in quotes. Secret values, addresses, links and numbers are
+    masked as a draft's material is; "" when nothing can be shown."""
+    from service.proactive import triage
+    from service.proactive.sources import bare_subject
+    raw = item.get("item") or {}
+    # The same gate as a draft's material: a withheld or sensitive reading shows no words.
+    if (raw.get("secret") or raw.get("critical") or (item.get("result") or {}).get("sensitive")
+            or triage.withheld({**raw, "text": str(raw.get("text") or "")})):
+        return ""
+    # Masked as a whole, so a label and its value on two lines are still caught,
+    # and a message that held any secret value shows none of its lines.
+    candidates = [guard.clean(line, 1000) for line in _gist_candidates(item)]
+    candidates = [line for line in candidates if line]
+    body = draft_context.safe_text("\n".join(candidates)) if candidates else ""
+    quoted = bool(body) and "(omitted)" not in body
+    subject = ""
+    if item.get("source") == "mail":
+        subject = guard.clean(draft_context.safe_text(bare_subject(str(raw.get("title") or ""))), 90)
+        if _WITHHELD.search(subject) or "(omitted)" in subject:
+            subject = ""
+    gist = ""
+    for line in body.split("\n") if quoted else []:
+        text = guard.clean(line, 1000)
+        if len(text) > GIST_CHARS:
+            text = text[:GIST_CHARS].rsplit(" ", 1)[0].rstrip(",;:") + "\u2026"
+        if (len(text.split()) >= 3 and not _SMALL_TALK.match(text) and "omitted" not in text.casefold()
+                and text.casefold() != subject.casefold()):
+            gist = text
+            break
+    parts = [subject] if subject else []
+    if gist:
+        day = _arrived_day(item, now, tz)
+        sent = f"{day:%a}: " if day is not None and _RELATIVE_DAY.search(gist) else ""
+        parts.append(f"{sent}\u201c{gist}\u201d")
+    return " \u2014 ".join(parts)

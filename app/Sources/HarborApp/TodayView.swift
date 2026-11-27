@@ -473,7 +473,9 @@ final class TodayModel: ObservableObject {
     // The one problem report about Today, shared by the notch's Day tab and
     // the window's planner. Each shows it inline.
     let report = ReportDraft()
-    @Published var plan: TodayPlan?
+    @Published var plan: TodayPlan? {
+        didSet { if let plan { noteDueCount(plan) } }
+    }
     /// `/assistant/upcoming`'s reply (the next week's calendar events and
     /// reminders) for the notch Brief's SOON row, read with UpcomingItem.parseList.
     /// Nil until it has been read once.
@@ -541,10 +543,40 @@ final class TodayModel: ObservableObject {
     /// Brief's "updated" time and anything keyed on `generated_at` stay current.
     nonisolated static let republishAfter: TimeInterval = 120
 
-    private struct DayKey: Equatable {
+    private struct DayKey: Hashable {
         let day: String
         let zone: String
     }
+
+    /// The last good reply for each recently shown or prefetched day, so a tap
+    /// on another day in the week row shows that day at once (live, not a faded
+    /// stand-in) while a read of it runs; the read swaps the plan only if it
+    /// changed. Any change the person makes clears it. Memory only.
+    private struct KeptDay {
+        let plan: TodayPlan
+        let fingerprint: Data?
+        let readAt: Date
+        /// When its read began (`nextRead`): an older read never replaces a newer one.
+        let started: Int
+    }
+    private var readSerial = 0
+    private func nextRead() -> Int {
+        readSerial += 1
+        return readSerial
+    }
+    private var keptDays: [DayKey: KeptDay] = [:]
+    private var keptOrder: [DayKey] = []
+    /// Moves when the kept days are cleared, so a prefetch begun before a change is not kept.
+    private var keptEpoch = 0
+    /// A week and one more, as the Day's own hold keeps.
+    nonisolated static let keptDayLimit = 8
+    /// Older than this, a kept day is not shown as live; the Day's faded hold shows
+    /// it instead. Short, since a change made elsewhere (Calendar, Reminders,
+    /// another device) is only seen on the next read; each opening of the Day
+    /// re-reads days older than `prefetchFreshFor` anyway.
+    nonisolated static let keptDayMaxAge: TimeInterval = 5 * 60
+    /// The week prefetch skips a day read this recently.
+    nonisolated static let prefetchFreshFor: TimeInterval = 120
 
     /// - Parameters:
     ///   - transport: how the service is asked; the app's URLSession when nil.
@@ -566,6 +598,31 @@ final class TodayModel: ObservableObject {
         let cache = planCache ?? (transport == nil ? DayPlanDiskCache.app : nil)
         self.planCache = cache
         launchPlan = cache?.load(day: key.day, zone: key.zone)
+        if let launchPlan { noteDueCount(launchPlan) }
+    }
+
+    /// Today's due count as last read (the Day tab's "Day (3)" and the bar's
+    /// badge): from today's plan as the last launch kept it, then from each of
+    /// today's plans as it comes in. A reload, a day picked in the week row or
+    /// a tab switch never zeroes it; only a plan for today says another number.
+    private var keptDue: (day: String, zone: String, count: Int)?
+
+    private func noteDueCount(_ plan: TodayPlan) {
+        guard let end = Self.defaultDeadline(for: plan.day, in: TimeZone(identifier: plan.timezone) ?? timezone) else { return }
+        let count = DayTimeline.badgeCount(plan.dayNeeds, endOfDay: end.timeIntervalSince1970)
+        guard plan.day == Self.dayString(nowProvider(), in: TimeZone(identifier: plan.timezone) ?? timezone) else { return }
+        keptDue = (plan.day, plan.timezone, count)
+    }
+
+    /// Due today or overdue: today's plan when it is on screen, else the count
+    /// last read for today (0 once the day has turned, until today is read).
+    var dueTodayCount: Int {
+        if isShowingCurrentDay, let plan = currentPlan {
+            return DayTimeline.badgeCount(plan.dayNeeds, endOfDay: dayInterval.end.timeIntervalSince1970)
+        }
+        let zone = timezone
+        guard let kept = keptDue, kept.zone == zone.identifier, kept.day == Self.dayString(nowProvider(), in: zone) else { return 0 }
+        return kept.count
     }
 
     /// Today's plan from the last launch, while this launch has read none for
@@ -721,11 +778,21 @@ final class TodayModel: ObservableObject {
         guard key != displayedKey else { return false }
         displayedKey = key
         generation += 1
-        plan = nil
-        planFingerprint = nil
-        planPublishedAt = nil
+        if let kept = keptDays[key], nowProvider().timeIntervalSince(kept.readAt) >= 0,
+           nowProvider().timeIntervalSince(kept.readAt) < Self.keptDayMaxAge {
+            // Shown at once; the read that follows publishes again only if it changed.
+            plan = kept.plan
+            planFingerprint = kept.fingerprint
+            planPublishedAt = nowProvider()
+            reportMetadata = ["surface": "today", "client_outcome": "kept", "revision": kept.plan.revision,
+                              "journal_available": false]
+        } else {
+            plan = nil
+            planFingerprint = nil
+            planPublishedAt = nil
+            reportMetadata = ["surface": "today", "client_outcome": "not_loaded", "journal_available": false]
+        }
         error = ""
-        reportMetadata = ["surface": "today", "client_outcome": "not_loaded", "journal_available": false]
         reportDetails = nil
         selectedDate = manualDay == nil ? nowProvider() : Self.pickerDate(for: key.day, in: timezone)
         return true
@@ -801,6 +868,7 @@ final class TodayModel: ObservableObject {
     /// it awaits without holding the main actor.
     func studyBlockCalendar(_ operation: StudyBlockCalendar.Operation, blockID: String) async -> StudyBlockCalendar.Outcome {
         let key = currentKey
+        forgetKeptDays()   // the write may change any kept day; a prefetch in flight predates it
         let path = StudyBlockCalendar.path(operation, blockID: blockID)
         guard let url = URL(string: path, relativeTo: HarborClient.baseURL),
               let body = try? JSONSerialization.data(withJSONObject: StudyBlockCalendar.body(operation, day: key.day,
@@ -837,6 +905,9 @@ final class TodayModel: ObservableObject {
         components.queryItems = [URLQueryItem(name: "day", value: selected.day), URLQueryItem(name: "timezone", value: selected.zone)]
         let capturing = capturePlannerDetails
         if capturing { components.queryItems?.append(URLQueryItem(name: "debug", value: "true")) }
+        // A change the person made can touch any day: no kept day is shown again unread.
+        if afterMutation { forgetKeptDays() }
+        let started = nextRead()
         do {
             let data = try await request(components.string!)
             let fingerprint = capturing ? nil : TodayPlanFingerprint.of(data)
@@ -848,6 +919,7 @@ final class TodayModel: ObservableObject {
                nowProvider().timeIntervalSince(published) < Self.republishAfter {
                 guard ticket == generation, selected == currentKey, !Task.isCancelled else { return }
                 lastRefreshed = nowProvider()
+                keep(shown, fingerprint: fingerprint, for: selected, started: started)
                 settleSuccess()
                 return
             }
@@ -856,6 +928,7 @@ final class TodayModel: ObservableObject {
             plan = next
             planFingerprint = fingerprint
             planPublishedAt = nowProvider()
+            if !capturing { keep(next, fingerprint: fingerprint, for: selected, started: started) }
             // Today's plan is kept for the next launch's first open (never a
             // debug read, which carries the replay, nor another day's).
             if !capturing, selected.day == Self.dayString(nowProvider(), in: timezone) { planCache?.save(data) }
@@ -873,6 +946,9 @@ final class TodayModel: ObservableObject {
             }
             reportDetails = capturing && capturePlannerDetails ? ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any]) : nil
             settleSuccess()
+            // A change made while another day is shown can change today's due
+            // count (a reminder marked done, say): today is read for the badge.
+            if afterMutation, selected.day != Self.dayString(nowProvider(), in: timezone) { await refreshDueCount() }
         } catch {
             guard ticket == generation, selected == currentKey else { return }
             // View/task cancellation is normal navigation, not a failed day.
@@ -895,10 +971,87 @@ final class TodayModel: ObservableObject {
             if transientFailures != 0 { transientFailures = 0 }
             if failingSince != nil { failingSince = nil }
             // A refused or unreadable plan must not leave stale slots looking actionable.
+            forgetKeptDay(selected)
             plan = nil
             planFingerprint = nil
             planPublishedAt = nil
         }
+    }
+
+    private func keep(_ plan: TodayPlan, fingerprint: Data?, for key: DayKey, started: Int) {
+        guard plan.day == key.day, plan.timezone == key.zone else { return }
+        if let kept = keptDays[key], kept.started > started { return }   // a newer read is kept already
+        keptDays[key] = KeptDay(plan: plan, fingerprint: fingerprint, readAt: nowProvider(), started: started)
+        keptOrder.removeAll { $0 == key }
+        keptOrder.append(key)
+        while keptOrder.count > Self.keptDayLimit { keptDays[keptOrder.removeFirst()] = nil }
+    }
+
+    private func forgetKeptDay(_ key: DayKey) {
+        keptDays[key] = nil
+        keptOrder.removeAll { $0 == key }
+    }
+
+    private func forgetKeptDays() {
+        keptEpoch += 1
+        keptDays.removeAll()
+        keptOrder.removeAll()
+    }
+
+    /// Whether `day` in the current zone has a kept plan a switch would show at once (checks).
+    func hasKeptDay(_ day: String) -> Bool {
+        guard let kept = keptDays[DayKey(day: day, zone: timezone.identifier)] else { return false }
+        let age = nowProvider().timeIntervalSince(kept.readAt)
+        return age >= 0 && age < Self.keptDayMaxAge
+    }
+
+    /// Reads the week row's other days, one at a time, into the kept days, so
+    /// a tap on any of them shows it at once. Skips the day shown and any day
+    /// read in the last `prefetchFreshFor`; never touches the plan on screen.
+    /// The Day calls it from the week row's task, so closing the Day cancels it.
+    /// A failed read is simply not kept.
+    func prefetchDays(_ days: [String]) async {
+        let zone = timezone.identifier
+        for day in days {
+            guard !Task.isCancelled, zone == timezone.identifier, !capturePlannerDetails else { return }
+            let key = DayKey(day: day, zone: zone)
+            if key == currentKey { continue }
+            if let kept = keptDays[key], nowProvider().timeIntervalSince(kept.readAt) >= 0,
+               nowProvider().timeIntervalSince(kept.readAt) < Self.prefetchFreshFor { continue }
+            var components = URLComponents()
+            components.path = "/assistant/today"
+            components.queryItems = [URLQueryItem(name: "day", value: day), URLQueryItem(name: "timezone", value: zone)]
+            let epoch = keptEpoch
+            let started = nextRead()
+            guard let data = try? await request(components.string!),
+                  let read = try? JSONDecoder().decode(TodayPlan.self, from: data),
+                  !Task.isCancelled, zone == timezone.identifier else { continue }
+            // A change the person made since the read began, or one still being
+            // written, leaves it unkept; a read of that day begun later (the day
+            // was shown meanwhile) wins (`keep`).
+            guard epoch == keptEpoch, !busy else { continue }
+            keep(read, fingerprint: TodayPlanFingerprint.of(data), for: key, started: started)
+        }
+    }
+
+    /// Reads today quietly for its due count (the plan on screen is another
+    /// day's), and keeps the read for a tap back to today. A failure keeps the
+    /// count as it was. Redraws the badge only when the count changed.
+    private func refreshDueCount() async {
+        let zone = timezone.identifier
+        let key = DayKey(day: Self.dayString(nowProvider(), in: timezone), zone: zone)
+        var components = URLComponents()
+        components.path = "/assistant/today"
+        components.queryItems = [URLQueryItem(name: "day", value: key.day), URLQueryItem(name: "timezone", value: zone)]
+        let epoch = keptEpoch
+        let started = nextRead()
+        guard let data = try? await request(components.string!),
+              let read = try? JSONDecoder().decode(TodayPlan.self, from: data),
+              !Task.isCancelled, zone == timezone.identifier else { return }
+        let before = dueTodayCount
+        noteDueCount(read)
+        if epoch == keptEpoch, !busy { keep(read, fingerprint: TodayPlanFingerprint.of(data), for: key, started: started) }
+        if dueTodayCount != before { objectWillChange.send() }
     }
 
     /// A read succeeded: clear what the failures said. Each published value is
@@ -1090,6 +1243,8 @@ final class TodayModel: ObservableObject {
         guard !busy else { return false }
         busy = true
         generation += 1 // invalidate any in-flight refresh before writing
+        // And any kept day or prefetch in flight: it may predate this change.
+        forgetKeptDays()
         var failure: String?
         var failureCode: Int?
         do { _ = try await request(path, method: method, body: body) }
@@ -1615,5 +1770,32 @@ enum TodayWindow {
         }
         NotificationCenter.default.post(name: didShowNotification, object: nil, userInfo: ["tab": initialTab])
         return existing
+    }
+}
+
+// MARK: - Shared by Brief and Day
+
+extension TodayModel {
+    /// The plan, only when it is for the day and time zone shown.
+    var currentPlan: TodayPlan? {
+        guard let plan, plan.day == day, plan.timezone == timezone.identifier else { return nil }
+        return plan
+    }
+}
+
+extension TodayPlan {
+    /// The workspace's "Needs you" items, for the timeline and the badge.
+    var dayNeeds: [DayNeedInput] {
+        (workspace?.attention ?? []).map {
+            DayNeedInput(id: $0.id, title: $0.title, source: $0.source, due: $0.due_ts, allDay: $0.all_day == true)
+        }
+    }
+
+    /// School work due that day (deadlines from service/study/day_hook.py), for
+    /// the agenda only: "Due 11:59 PM". Not counted in the badge.
+    var studyNeeds: [DayNeedInput] {
+        deadlines.filter { $0.source == "study" }.map {
+            DayNeedInput(id: $0.id, title: $0.title, source: "study", due: $0.due_ts, allDay: $0.all_day == true)
+        }
     }
 }

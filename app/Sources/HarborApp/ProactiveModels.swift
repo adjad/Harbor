@@ -415,12 +415,17 @@ struct ProactiveCard: Decodable, Equatable, Identifiable {
     var notes: [String] = []
     /// The day and time a done card is for ("Fri, Nov 13 at 7 PM"), shown on its row in a group.
     var when = ""
+    /// For a reply: what it answers, one line built by the engine from the message itself
+    /// ("Community meeting — “Can you come Thursday at 5?”"). Empty from an older service.
+    var context = ""
 
     static let groupMethod = "harbor_did"
     static let groupRows = 4
     var isGroup: Bool { action?.method == Self.groupMethod }
 
-    private enum Keys: String, CodingKey { case id, meta, title, body, why, account, sources, action, reply_ref, members, notes, when }
+    private enum Keys: String, CodingKey {
+        case id, meta, title, body, why, account, sources, action, reply_ref, members, notes, when, context
+    }
 
     init(id: String, meta: String = "", title: String = "", body: String = "", why: String = "",
          account: String = "", sources: [Source] = [], action: Action? = nil) {
@@ -442,6 +447,7 @@ struct ProactiveCard: Decodable, Equatable, Identifiable {
         members = c.lenient(.members, LossyList<ProactiveCard>.self)?.items ?? []
         notes = (c.lenient(.notes, LossyList<String>.self)?.items ?? []).filter { !$0.isEmpty }
         when = c.lenientString(.when) ?? ""
+        context = c.lenientString(.context) ?? ""
     }
 
     /// The card's name on a chip under the one shown.

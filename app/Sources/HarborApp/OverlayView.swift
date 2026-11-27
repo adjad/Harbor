@@ -19,7 +19,10 @@ struct OverlayView: View {
     // in the menu bar — NOT a full quit. Full quit is still available via the
     // menu-bar icon's right-click menu.
     var onDismiss: () -> Void = {}
-    @FocusState private var focused: Bool
+    // The Ask or Research field that has the keyboard, by its tab: a kept,
+    // hidden Ask page (NotchPageDeck) keeps its field, which must never be
+    // the one focused while another tab is in front.
+    @FocusState private var focused: NotchTab?
     @State private var breathe = false
     @Environment(\.accessibilityReduceMotion) private var systemReduceMotion
     @Environment(\.reduceMotionOverride) private var reduceMotionOverride
@@ -50,6 +53,10 @@ struct OverlayView: View {
     @AppStorage(NotchBriefView.wideKey) private var wideChosen = false
     // Which way the page change in flight slides (NotchPageSlide).
     @State private var pageSlide = NotchPageSlide()
+    // The tab pages kept while the panel is open (NotchPageDeck), and a count
+    // that redraws the panel once the close has let the hidden ones go.
+    @State private var deck = NotchDeckState()
+    @State private var deckReleased = 0
     // The panel's drawn height (followHeight): nil until the open panel's
     // content is first measured, and again once it closes.
     @State private var shownHeight: CGFloat?
@@ -100,23 +107,37 @@ struct OverlayView: View {
             .receive(on: DispatchQueue.main)) { _ in
             if !model.collapsed { model.updatePersonalStarters(today: todayModel) }
         }
+        // A close: once the content is out of the picture (OverlayPanel hides
+        // it after contentHideDelay, and the roll-up is the window's own
+        // animation from then on), the kept, hidden pages go. Taken down with
+        // the panel when the bar replaces it, they made that turn several
+        // pages long; nothing on screen can show the work here. A close cut
+        // short only means the next switch builds its page again.
+        .onChange(of: model.contentVeiled) { _, veiled in
+            guard veiled, !model.collapsed else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + OverlayPanel.contentHideDelay + 0.02) {
+                guard model.contentVeiled, !model.collapsed, deck.releaseHidden() else { return }
+                deckReleased &+= 1
+            }
+        }
         .onChange(of: model.collapsed) { _, isCollapsed in
             if isCollapsed {
                 // Reopening shows its page without a slide from the last one,
                 // and each tab back at its top, as before.
                 pageSlide.forget()
+                deck.forget()
                 PanelScrollMemory.forgetAll()
                 shownHeight = nil
             }
             if !isCollapsed {
-                if model.tab.hasPrompt { focused = true }
+                if model.tab.hasPrompt { focused = model.tab }
                 model.refreshRecentChats()
                 model.refreshStarters(today: todayModel)
             }
         }
         // Switching to Ask or Research (including Ask Harbor from Brief or Day) puts the cursor in the field.
         .onChange(of: model.tab) { _, tab in
-            if tab.hasPrompt && !model.collapsed { focused = true }
+            focused = tab.hasPrompt && !model.collapsed ? tab : nil
         }
     }
 
@@ -129,6 +150,8 @@ struct OverlayView: View {
     }
     /// Brief or Day in two columns, in the wider panel.
     private var panelIsWide: Bool { wideChosen && panelCanWiden }
+    /// The content's veil for the open and close (OverlayModel.contentVeiled).
+    private var veil: Double { model.contentVeiled ? 0 : 1 }
     private var isNotch: Bool { layout.style == .notch }
 
     /// Brief and Day under the fixed header: as tall as their content until the
@@ -136,9 +159,9 @@ struct OverlayView: View {
     /// scrolling. Without this the window clipped the last rows out of reach.
     /// It keeps the tab's scroll position while the panel is open
     /// (PanelScrollMemory), so going back to a tab finds it where it was left.
-    private func tabScroll<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+    private func tabScroll<Content: View>(_ tab: NotchTab, @ViewBuilder _ content: () -> Content) -> some View {
         CappedScroll(cap: layout.tabScrollCap(headerHeight: headerHeight), reveals: true,
-                     remembers: PanelScrollMemory.key(model.tab)) {
+                     remembers: PanelScrollMemory.key(tab)) {
             content().frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(.top, SurfaceLayout.tabTopPadding)
@@ -159,12 +182,19 @@ struct OverlayView: View {
         pageSlide.follow(page)
         let surfaceWidth: CGFloat = layout.widened(panelIsWide).expandedWidth
         let pageWidth: CGFloat = max(0, surfaceWidth - 2 * Self.sideInset)
+        _ = deckReleased
+        // No redraw of its own after a change: the panel draws again only for
+        // what it shows (one after every switch cost a whole-panel pass, and
+        // could land inside the close's roll-up).
+        deck.show(page, layout: NotchDeckLayout(width: pageWidth, wide: panelIsWide),
+                  strip: NotchTab.strip, animated: !reduceMotion, generation: renderKey)
         return VStack(alignment: .leading, spacing: 0) {
             header
                 .background(GeometryReader { geo in
                     Color.clear.onAppear { noteHeader(geo.size.height) }
                         .onChange(of: geo.size.height) { noteHeader(geo.size.height) }
                 })
+                .opacity(veil)
             // One page at a time, keyed by what it is, so any change of page
             // (a tab, quick settings, a permission page, a card) crossfades with
             // a short slide while the panel's height follows. The ZStack lets
@@ -174,12 +204,22 @@ struct OverlayView: View {
             // narrows over it, never re-laid out at the narrower one, and the
             // arriving page is at its final width from its first frame. Both
             // are clipped to the surface.
+            //
+            // A tab's page is kept once shown (NotchPageDeck): switching back
+            // shows it again instead of building it again. Research, quick
+            // settings, a permission page and the cards still come and go.
             ZStack(alignment: .topLeading) {
-                PinnedWidth(width: pageWidth) {
-                    VStack(alignment: .leading, spacing: 0) { pageBody }
+                NotchPageDeck(deck: deck, page: page, slide: pageSlide, veiled: model.contentVeiled) { tab, kept in
+                    tabBody(tab, wide: kept.wide)
                 }
-                .id(page)
-                .transition(.notchPage(pageSlide))
+                if NotchDeckState.keptTab(page) == nil {
+                    PinnedWidth(width: pageWidth) {
+                        VStack(alignment: .leading, spacing: 0) { pageBody }
+                    }
+                    .opacity(veil)
+                    .id(page)
+                    .transition(.notchPage(pageSlide))
+                }
             }
         }
         .background(shortcuts)
@@ -222,10 +262,12 @@ struct OverlayView: View {
         .background(GeometryReader { geo in
             Color.clear.onChange(of: geo.size.height) { model.onResize() }
         })
-        // The content fades before the shape retracts and after it has grown;
-        // the surface below stays, so the panel still reads as the notch
-        // drawing back in and out.
-        .opacity(model.contentVeiled ? 0 : 1)
+        // The content fades before the shape retracts and after it has grown
+        // (`veil`, on the header and the page shown, not here): the surface
+        // below stays, so the panel still reads as the notch drawing back in
+        // and out. Kept, hidden tab pages are already invisible, so the fade
+        // never reaches them; on the whole content it updated every one of
+        // them on each frame of the close.
         // Must match the width OverlayPanel sizes its window to — both widen
         // SurfaceLayout.expandedWidth from the same state (AppDelegate's layout
         // provider asks NotchBriefView.showsWide), so they cannot disagree.
@@ -310,14 +352,15 @@ struct OverlayView: View {
                               cap: layout.pageContentCap(headerHeight: headerHeight))
                 .padding(.top, SurfaceLayout.tabTopPadding)
         } else {
-            tabBody
+            tabBody(model.tab, wide: panelIsWide)
         }
     }
 
-    /// The tab's own content. Any tab added to NotchTab gets the same page
+    /// A tab's own content, laid out two-column or not by `wide` (its page's
+    /// own, NotchDeckLayout). Any tab added to NotchTab gets the same page
     /// motion with no case of its own: the page is keyed by the tab.
-    @ViewBuilder private var tabBody: some View {
-        switch model.tab {
+    @ViewBuilder private func tabBody(_ tab: NotchTab, wide: Bool) -> some View {
+        switch tab {
         case .ask:
             // First run: the open setup card replaces Ask until it is done or
             // set aside, then shrinks to a line. One view in one place for both.
@@ -335,7 +378,7 @@ struct OverlayView: View {
                 if model.serviceDown { serviceDownCard }
                 MemoryReviewNotice()
                 NudgeStack(model: model)
-                promptArea
+                promptArea(tab)
                 if model.showingCorpus {
                     NotchCorpusView(controller: corpus, openWindow: model.openTabInWindow)
                 } else {
@@ -344,11 +387,11 @@ struct OverlayView: View {
                 }
             }
         case .brief:
-            tabScroll { NotchBriefView(model: model, today: todayModel, wide: panelIsWide) }
+            tabScroll(.brief) { NotchBriefView(model: model, today: todayModel, wide: wide) }
         case .day:
-            tabScroll { NotchDayView(model: model, today: todayModel, wide: panelIsWide) }
+            tabScroll(.day) { NotchDayView(model: model, today: todayModel, wide: wide) }
         case .meet:
-            tabScroll { NotchMeetingView(model: MeetingModel.shared) }
+            tabScroll(.meet) { NotchMeetingView(model: MeetingModel.shared) }
         case .study:
             // Study stops at half the screen and scrolls inside itself, so an
             // opened material keeps its back row fixed (SurfaceLayout.studyContentCap).
@@ -358,7 +401,7 @@ struct OverlayView: View {
                 .padding(.top, SurfaceLayout.tabTopPadding)
         case .ideate:
             // Like Study: stops at half the screen and scrolls inside itself.
-            NotchIdeateView(ideate: IdeateModel.shared, wide: panelIsWide,
+            NotchIdeateView(ideate: IdeateModel.shared, wide: wide,
                             cap: layout.studyContentCap(headerHeight: headerHeight),
                             onResize: { model.onResize() })
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -369,7 +412,7 @@ struct OverlayView: View {
                              onBack: { model.returnToChat() })
             } else {
                 transientNotice
-                promptArea
+                promptArea(tab)
                 HStack(alignment: .firstTextBaseline) {
                     Text("Harbor drafts an editable plan first, then reads the web and writes a cited report.")
                         .font(.harbor(.body)).foregroundStyle(Theme.textMuted)
@@ -492,7 +535,7 @@ struct OverlayView: View {
     }
 
     // The Ask field (Research's prompt on that tab), its command list and the rule under it.
-    @ViewBuilder private var promptArea: some View {
+    @ViewBuilder private func promptArea(_ tab: NotchTab) -> some View {
         if let warning = model.lookWarning {
             lookWarningBox(warning).padding(.top, 10)
         }
@@ -503,8 +546,9 @@ struct OverlayView: View {
         // (AskInputScope): the rest of the panel doesn't read it.
         AskInputScope(text: model.askInput) {
             VStack(alignment: .leading, spacing: 0) {
-                inputRow.padding(.top, 10)
-                VoiceStatusLine(voice: model.voice)
+                inputRow(tab).padding(.top, 10)
+                // Its own redraw follows the voice: none while Ask is kept hidden.
+                StillWhenHidden { VoiceStatusLine(voice: model.voice) } still: { EmptyView() }
                 if !model.commandSuggestions.isEmpty {
                     commandList.padding(.top, 8)
                 }
@@ -905,7 +949,7 @@ struct OverlayView: View {
         .help("Look at your screen").accessibilityLabel("Look at your screen")
     }
 
-    private var inputRow: some View {
+    private func inputRow(_ tab: NotchTab) -> some View {
         HStack(spacing: 10) {
             TextField(model.voice.isActive ? model.voice.placeholder
                       : model.researchMode ? "What would you like to research?" : "Ask anything…",
@@ -913,7 +957,7 @@ struct OverlayView: View {
                 .textFieldStyle(.plain)
                 .font(.harbor(.input))
                 .foregroundStyle(Theme.textPrimary)
-                .focused($focused)
+                .focused($focused, equals: tab)
                 .accessibilityLabel(model.researchMode ? "Research question" : "Ask Harbor")
                 .onSubmit { model.submit() }
                 // Enlarge the click target well beyond the glyph height and make
@@ -924,7 +968,7 @@ struct OverlayView: View {
                 .background(RoundedRectangle(cornerRadius: 12).fill(Theme.chipFill))
                 .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.chipStroke, lineWidth: 1))
                 .contentShape(RoundedRectangle(cornerRadius: 12))
-                .onTapGesture { focused = true }
+                .onTapGesture { focused = tab }
                 .onPasteCommand(of: [.fileURL, .image]) { providers in
                     _ = attach(from: providers, source: .paste)
                 }
@@ -945,7 +989,10 @@ struct OverlayView: View {
                 lookButton
             }
             if !model.researchMode {
-                VoiceMicButton(voice: model.voice, speaker: model.speaker, action: model.toggleVoice)
+                // Its meter redraws on every mic level: not while Ask is kept hidden.
+                StillWhenHidden {
+                    VoiceMicButton(voice: model.voice, speaker: model.speaker, action: model.toggleVoice)
+                } still: { EmptyView() }
             }
             Button(action: { model.submit() }) {
                 Image(systemName: "arrow.up.circle.fill")
@@ -1169,10 +1216,14 @@ struct OverlayView: View {
             // shows it (OverlayModel.stallSeconds).
             if model.phase == .streaming {
                 HStack(spacing: 6) {
-                    Circle().fill(Theme.textMuted).frame(width: 5, height: 5)
-                        .opacity(reduceMotion ? 0.9 : (breathe ? 0.25 : 0.9))
-                        .animation(reduceMotion ? nil : .easeInOut(duration: 0.9).repeatForever(autoreverses: true), value: breathe)
-                        .accessibilityHidden(true)
+                    StillWhenHidden {
+                        Circle().fill(Theme.textMuted).frame(width: 5, height: 5)
+                            .opacity(reduceMotion ? 0.9 : (breathe ? 0.25 : 0.9))
+                            .animation(reduceMotion ? nil : .easeInOut(duration: 0.9).repeatForever(autoreverses: true), value: breathe)
+                    } still: {
+                        Circle().fill(Theme.textMuted).frame(width: 5, height: 5).opacity(0.9)
+                    }
+                    .accessibilityHidden(true)
                     if model.heartbeats > 0 {
                         Text("still generating… (\(model.stallSeconds)s)")
                             .font(.harbor(.caption)).foregroundStyle(Theme.textMuted)
@@ -1229,7 +1280,7 @@ struct OverlayView: View {
             }
         }
         // Each time Ask opens empty (or a new chat empties it): read what is cached now.
-        .task { await askSuggestions.refresh() }
+        .notchPageTask { await askSuggestions.refresh() }
     }
 
     // A light row of the starters not yet asked in this chat, under the last reply.
@@ -1560,24 +1611,34 @@ private struct BreathingOrb: View {
 // Animated "working" indicator shown between submit and first output.
 struct ProcessingRow: View {
     let label: String
-    @State private var animate = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         HStack(spacing: 8) {
-            HStack(spacing: 4) {
-                ForEach(0..<3) { i in
-                    Circle()
-                        .fill(Theme.textSecondary)
-                        .frame(width: 6, height: 6)
-                        .opacity(!reduceMotion && animate ? 0.25 : 1.0)
-                        .animation(reduceMotion ? nil : .easeInOut(duration: 0.6).repeatForever().delay(Double(i) * 0.18), value: animate)
-                }
-            }
-            .accessibilityHidden(true)
+            // Still while the page they are on is kept hidden (NotchPageDeck).
+            StillWhenHidden { ProcessingDots(animated: !reduceMotion) } still: { ProcessingDots(animated: false) }
+                .accessibilityHidden(true)
             Text(label).font(.harbor(.body)).foregroundStyle(Theme.textSecondary)
         }
         .accessibilityElement(children: .combine)
+    }
+}
+
+/// ProcessingRow's three dots, pulsing in turn, or still.
+private struct ProcessingDots: View {
+    let animated: Bool
+    @State private var animate = false
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(0..<3) { i in
+                Circle()
+                    .fill(Theme.textSecondary)
+                    .frame(width: 6, height: 6)
+                    .opacity(animated && animate ? 0.25 : 1.0)
+                    .animation(animated ? .easeInOut(duration: 0.6).repeatForever().delay(Double(i) * 0.18) : nil, value: animate)
+            }
+        }
         .onAppear { animate = true }
     }
 }
@@ -1633,10 +1694,7 @@ extension TodayModel {
     /// Due today or overdue, once the day has loaded. Undated items wait in the
     /// Brief. Shown on the collapsed bar, or on the menu-bar icon when no bar is
     /// drawn.
-    var dueBadgeCount: Int {
-        guard isShowingCurrentDay, let plan = currentPlan else { return 0 }
-        return DayTimeline.badgeCount(plan.dayNeeds, endOfDay: dayInterval.end.timeIntervalSince1970)
-    }
+    var dueBadgeCount: Int { dueTodayCount }
 }
 
 /// The slide of the page change in flight. A transition reads it when a page

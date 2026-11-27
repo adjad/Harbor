@@ -1161,11 +1161,288 @@ struct TodayPlanChecks {
     }
 
 
+    /// A tap on another day in the week row shows that day at once once the
+    /// week's other days were prefetched: live, never a faded stand-in or the
+    /// loading row; the read after it swaps the plan only if the day changed.
+    @MainActor
+    static func daySwitchChecks() async throws {
+        let zone = TimeZone(identifier: "America/Los_Angeles")!
+        var now = instant("2026-10-22T19:00:00Z")      // Thursday 2026-10-22 there
+        let week = ["2026-10-18", "2026-10-19", "2026-10-20", "2026-10-21", "2026-10-22", "2026-10-23", "2026-10-24"]
+        var reads: [String: Int] = [:]
+        var titles: [String: String] = [:]
+        var failing: Set<String> = []
+        let model = TodayModel(now: { now }, timeZoneProvider: { zone }, transport: { request in
+            let day = URLComponents(url: request.url!, resolvingAgainstBaseURL: true)?.queryItems?
+                .first { $0.name == "day" }?.value ?? "2026-10-22"
+            reads[day, default: 0] += 1
+            if failing.contains(day) { throw URLError(.cannotConnectToHost) }
+            return (try planData(day: day, zone: zone.identifier, blocks: [titles[day] ?? "Invented block \(day)"]),
+                    response(request))
+        })
+        model.retrySleep = { _ in try await Task.sleep(for: .seconds(3600)) }
+        await model.refresh()
+        check(model.currentPlan?.day == "2026-10-22", "Today is read first")
+
+        // The week's other days are read once each, never today again.
+        failing = ["2026-10-24"]
+        await model.prefetchDays(week)
+        check(week.filter { $0 != "2026-10-22" }.allSatisfy { reads[$0] == 1 } && reads["2026-10-22"] == 1,
+              "The prefetch reads each other day once and never the day shown")
+        check(!model.hasKeptDay("2026-10-24") && model.hasKeptDay("2026-10-20"), "A failed prefetch keeps nothing")
+        await model.prefetchDays(week)
+        check(reads["2026-10-20"] == 1, "A day read moments ago is not read again")
+        failing = []
+
+        // The tap: the day is on screen before any read, live (no stand-in).
+        model.selectDate(instant("2026-10-20T19:00:00Z"))
+        check(model.currentPlan?.day == "2026-10-20" && model.currentPlan?.blocks.first?.title == "Invented block 2026-10-20",
+              "A prefetched day shows at once")
+        check(model.savedPlan == nil && model.error.isEmpty, "Nothing faded, nothing failed")
+        let shownAt = model.currentPlan?.generated_at
+        // The read that follows brings nothing new: nothing is published again.
+        await model.refresh()
+        check(reads["2026-10-20"] == 2 && model.currentPlan?.generated_at == shownAt
+              && model.currentPlan?.blocks.first?.title == "Invented block 2026-10-20",
+              "The day is read again, and an unchanged reply is not swapped in")
+
+        // Another kept day that changed meanwhile: shown at once, then swapped.
+        titles["2026-10-21"] = "Invented block moved"
+        model.selectDate(instant("2026-10-21T19:00:00Z"))
+        check(model.currentPlan?.blocks.first?.title == "Invented block 2026-10-21", "The kept day stands in at once")
+        await model.refresh()
+        check(model.currentPlan?.blocks.first?.title == "Invented block moved", "A changed day is swapped in after its read")
+
+        // A day never read still loads (no kept plan to show).
+        model.selectDate(instant("2026-10-24T19:00:00Z"))
+        check(model.currentPlan == nil, "A day not kept waits for its read")
+        await model.refresh()
+        check(model.currentPlan?.day == "2026-10-24", "Then it shows")
+
+        // A change the person makes forgets every kept day.
+        _ = await model.mutate("/assistant/today/tasks", method: "POST", body: [:])
+        check(!model.hasKeptDay("2026-10-20") && !model.hasKeptDay("2026-10-21"), "A change clears the kept days")
+        model.selectDate(instant("2026-10-20T19:00:00Z"))
+        check(model.currentPlan == nil, "After a change, a day is read before it is shown")
+        await model.refresh()
+
+        // A kept day too old is not shown as live.
+        await model.prefetchDays(week)
+        check(model.hasKeptDay("2026-10-23"), "Prefetched again after the change")
+        now = now.addingTimeInterval(TodayModel.keptDayMaxAge + 1)
+        check(!model.hasKeptDay("2026-10-23"), "A kept day expires")
+        model.selectDate(instant("2026-10-23T19:00:00Z"))
+        check(model.currentPlan == nil, "An expired kept day waits for its read")
+        await model.refresh()
+
+        // Measured: the time from a tap to the day's plan on screen, with the
+        // service answering after `HARBOR_DAY_SWITCH_DELAY_MS` (the installed
+        // service's median Today read; the check itself uses a short one).
+        let delayMS = Int(ProcessInfo.processInfo.environment["HARBOR_DAY_SWITCH_DELAY_MS"] ?? "") ?? 20
+        func switchTimes(prefetch: Bool) async -> [Double] {
+            var clock = instant("2026-10-22T19:00:00Z")
+            let slow = TodayModel(now: { clock }, timeZoneProvider: { zone }, transport: { request in
+                try await Task.sleep(for: .milliseconds(delayMS))
+                let day = URLComponents(url: request.url!, resolvingAgainstBaseURL: true)?.queryItems?
+                    .first { $0.name == "day" }?.value ?? "2026-10-22"
+                return (try planData(day: day, zone: zone.identifier, blocks: ["Invented block \(day)"]), response(request))
+            })
+            slow.retrySleep = { _ in try await Task.sleep(for: .seconds(3600)) }
+            await slow.refresh()
+            if prefetch { await slow.prefetchDays(week) }
+            var times: [Double] = []
+            for day in ["2026-10-19", "2026-10-20", "2026-10-21", "2026-10-23", "2026-10-24"] {
+                let started = ContinuousClock.now
+                slow.selectDate(instant(day + "T19:00:00Z"))
+                let read = Task { await slow.refresh() }
+                while slow.currentPlan?.day != day { await Task.yield() }
+                let elapsed = ContinuousClock.now - started
+                times.append(Double(elapsed.components.attoseconds) / 1e15 + Double(elapsed.components.seconds) * 1000)
+                await read.value
+                clock = clock.addingTimeInterval(1)
+            }
+            return times
+        }
+        func median(_ values: [Double]) -> Double { values.sorted()[values.count / 2] }
+        let before = median(await switchTimes(prefetch: false))
+        let after = median(await switchTimes(prefetch: true))
+        print(String(format: "day switch to plan on screen, median of 5 (service %d ms): no prefetch %.1f ms, prefetched %.3f ms",
+                     delayMS, before, after))
+        // Generous under load: a prefetched day never waits for the service, so it
+        // is faster than any read; an unprefetched one waits at least the delay.
+        check(before >= Double(delayMS) * 0.9 && after < before, "A prefetched day is on screen without waiting for the service")
+    }
+
+    /// The Day tab's "Day (2)" from the first frame: the count comes from
+    /// today's plan as the last launch kept it, and a reload, a tab switch or
+    /// another day picked in the week row never zeroes it. Only a read of
+    /// today says another number.
+    @MainActor
+    static func dueBadgeChecks() async throws {
+        let zone = TimeZone(identifier: "America/Los_Angeles")!
+        var now = instant("2026-10-22T19:00:00Z")   // 12:00 PM on 2026-10-22 there
+        let due = instant("2026-10-22T23:00:00Z").timeIntervalSince1970
+        func plan(day: String, titles: [String]) throws -> Data {
+            var body = try JSONSerialization.jsonObject(with: planData(day: day, zone: zone.identifier)) as! [String: Any]
+            body["workspace"] = [
+                "attention": titles.enumerated().map { index, title in
+                    ["id": "att-\(index)", "source": "email", "title": title, "reason": "Due today",
+                     "quote": "", "due_ts": due, "priority": 1, "reference": "ref-\(index)",
+                     "suggested_minutes": 15, "needs_review": false] as [String: Any]
+                },
+                "attention_omitted": 0, "source_coverage": [],
+                "proposed_plan": ["blocks": [], "unscheduled": [], "warnings": []]]
+            return try JSONSerialization.data(withJSONObject: body)
+        }
+        let scratch = ProcessInfo.processInfo.environment["HARBOR_TODAY_SCRATCH"].flatMap { $0.isEmpty ? nil : $0 }
+        let base = scratch.map { URL(fileURLWithPath: $0, isDirectory: true) } ?? FileManager.default.temporaryDirectory
+        let folder = base.appendingPathComponent("harbor-day-badge-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let cache = DayPlanDiskCache(url: folder.appendingPathComponent(DayPlanDiskCache.fileName))
+        cache.save(try plan(day: "2026-10-22", titles: ["Invented reply to Dana", "Invented form for Ola"]))
+        cache.flush()
+
+        // A relaunch: the reply waits until the check lets it go.
+        var replies: [Data] = []
+        var held: CheckedContinuation<Void, Never>?
+        let model = TodayModel(now: { now }, timeZoneProvider: { zone }, transport: { request in
+            await withCheckedContinuation { held = $0 }
+            return (replies.removeFirst(), response(request))
+        }, planCache: cache)
+        model.retrySleep = { _ in try await Task.sleep(for: .seconds(3600)) }
+        check(model.currentPlan == nil && model.dueTodayCount == 2,
+              "The first frame shows the kept count before any read (\(model.dueTodayCount))")
+
+        // The reload: the count holds while the read is in flight, then stays.
+        replies = [try plan(day: "2026-10-22", titles: ["Invented reply to Dana", "Invented form for Ola"])]
+        let first = Task { await model.refresh() }
+        while held == nil { await Task.yield() }
+        check(model.dueTodayCount == 2, "A reload in flight never zeroes the count")
+        held?.resume(); held = nil
+        await first.value
+        check(model.currentPlan != nil && model.dueTodayCount == 2, "The same count after the read")
+
+        // Another day picked in the week row: still today's count, before and after its read.
+        model.selectDate(instant("2026-10-20T19:00:00Z"))
+        check(model.dueTodayCount == 2, "Another day shown keeps today's count")
+        replies = [try plan(day: "2026-10-20", titles: [])]
+        let other = Task { await model.refresh() }
+        while held == nil { await Task.yield() }
+        held?.resume(); held = nil
+        await other.value
+        check(model.currentPlan?.day == "2026-10-20" && model.dueTodayCount == 2, "Another day's read never changes it")
+
+        // Back to today with a new item: the fresh read says 3.
+        model.returnToToday()
+        check(model.dueTodayCount == 2, "Back on today, the count holds until the read")
+        replies = [try plan(day: "2026-10-22", titles: ["Invented reply to Dana", "Invented form for Ola", "Invented call"])]
+        let fresh = Task { await model.refresh() }
+        while held == nil { await Task.yield() }
+        held?.resume(); held = nil
+        await fresh.value
+        check(model.dueTodayCount == 3, "A fresh read of today changes the count")
+
+        // The day turns: yesterday's count is not today's.
+        now = instant("2026-10-23T19:00:00Z")
+        check(model.dueTodayCount == 0, "A new day shows no count until it is read")
+    }
+
+    /// Kept days and the reads racing them: a prefetch that predates a change
+    /// is never kept, a late prefetch never replaces a newer read of its day,
+    /// and a change made while another day is shown updates today's count.
+    @MainActor
+    static func keptDayRaceChecks() async throws {
+        let zone = TimeZone(identifier: "America/Los_Angeles")!
+        var now = instant("2026-10-22T19:00:00Z")
+        let due = instant("2026-10-22T23:00:00Z").timeIntervalSince1970
+        var titles: [String: String] = [:]
+        var todayItems = ["Invented reply to Dana", "Invented form for Ola"]
+        var holdDay: String?
+        var holdWrite = false
+        var held: CheckedContinuation<Void, Never>?
+        var writes = 0
+        let model = TodayModel(now: { now }, timeZoneProvider: { zone }, transport: { request in
+            if request.httpMethod == "POST" {
+                writes += 1
+                if holdWrite { holdWrite = false; await withCheckedContinuation { held = $0 } }
+                return (Data("{}".utf8), response(request))
+            }
+            let day = URLComponents(url: request.url!, resolvingAgainstBaseURL: true)?.queryItems?
+                .first { $0.name == "day" }?.value ?? "2026-10-22"
+            let title = titles[day] ?? "Invented block \(day)"     // read when the request is made
+            if holdDay == day { holdDay = nil; await withCheckedContinuation { held = $0 } }
+            var body = try JSONSerialization.jsonObject(with: planData(day: day, zone: zone.identifier, blocks: [title])) as! [String: Any]
+            if day == "2026-10-22" {
+                body["workspace"] = [
+                    "attention": todayItems.enumerated().map { index, item in
+                        ["id": "att-\(index)", "source": "email", "title": item, "reason": "Due today", "quote": "",
+                         "due_ts": due, "priority": 1, "reference": "ref-\(index)", "suggested_minutes": 15,
+                         "needs_review": false] as [String: Any]
+                    },
+                    "attention_omitted": 0, "source_coverage": [],
+                    "proposed_plan": ["blocks": [], "unscheduled": [], "warnings": []]]
+            }
+            return (try JSONSerialization.data(withJSONObject: body), response(request))
+        })
+        model.retrySleep = { _ in try await Task.sleep(for: .seconds(3600)) }
+        await model.refresh()
+
+        // 1. A prefetch begun before a change, answering while it is written, is not kept;
+        // nor is one begun while the change is being written.
+        holdDay = "2026-10-20"
+        let early = Task { await model.prefetchDays(["2026-10-20"]) }
+        while held == nil { await Task.yield() }          // the prefetch's read is in flight
+        let prefetchFirst = held; held = nil
+        holdWrite = true
+        let change = Task { await model.mutate("/assistant/today/tasks", method: "POST", body: [:]) }
+        while held == nil { await Task.yield() }          // the write is in flight too
+        let writeHeld = held; held = nil
+        prefetchFirst?.resume()                           // answers before the write's refresh
+        await early.value
+        check(!model.hasKeptDay("2026-10-20"), "A prefetch begun before a change is not kept")
+        await model.prefetchDays(["2026-10-21"])         // begun and answered during the write
+        check(!model.hasKeptDay("2026-10-21"), "A prefetch during a change is not kept")
+        writeHeld?.resume()
+        _ = await change.value
+        check(writes == 1, "The change was written")
+        await model.prefetchDays(["2026-10-20"])
+        check(model.hasKeptDay("2026-10-20"), "After the change, a prefetch is kept again")
+
+        // 2. A late prefetch never replaces a newer read of its day.
+        now = now.addingTimeInterval(TodayModel.prefetchFreshFor + 1)
+        titles["2026-10-20"] = "Invented old"
+        holdDay = "2026-10-20"
+        let late = Task { await model.prefetchDays(["2026-10-20"]) }
+        while held == nil { await Task.yield() }          // the prefetch's read is in flight, with the old title
+        let prefetchHeld = held; held = nil
+        titles["2026-10-20"] = "Invented new"
+        model.selectDate(instant("2026-10-20T19:00:00Z"))
+        await model.refresh()                             // a newer read of the day, shown
+        check(model.currentPlan?.blocks.first?.title == "Invented new", "The day's own read shows")
+        model.returnToToday()                             // the day is left again
+        prefetchHeld?.resume()
+        await late.value
+        model.selectDate(instant("2026-10-20T19:00:00Z"))
+        check(model.currentPlan?.blocks.first?.title == "Invented new", "The late prefetch lost to the newer read")
+        await model.refresh()
+
+        // 3. Marked done while another day is shown: today's count follows.
+        check(model.dueTodayCount == 2, "Today's count before the change")
+        todayItems = ["Invented form for Ola"]
+        _ = await model.mutate("/assistant/today/tasks/x", method: "PATCH", body: [:])
+        check(model.currentPlan?.day == "2026-10-20" && model.dueTodayCount == 1,
+              "A change on another day updates today's count (\(model.dueTodayCount))")
+    }
+
     static func main() async throws {
         await reminderCancelChecks()
         try await cacheFirstChecks()
         await dayPlanHoldChecks()
         try diskCacheWriteChecks()
+        try await daySwitchChecks()
+        try await dueBadgeChecks()
+        try await keptDayRaceChecks()
         try tolerantDecodeChecks()
         try sourceAccessChecks()
         try evidenceLabelChecks()

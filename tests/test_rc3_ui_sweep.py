@@ -98,7 +98,7 @@ def test_icon_only_buttons_have_accessibility_labels():
 
 def test_day_needs_carry_the_all_day_flag():
     view = _swift("NotchDayView.swift")
-    needs = _between(view, "var dayNeeds: [DayNeedInput] {", "\n    }\n")
+    needs = _between(_swift("TodayView.swift"), "var dayNeeds: [DayNeedInput] {", "\n    }\n")
     assert "due: $0.due_ts, allDay: $0.all_day == true" in needs
     spoken = _between(view, "private func spokenTime(_ item: DayItem) -> String {", "\n    }\n")
     assert 'item.allDay ? (today.isShowingCurrentDay ? "due today" : "due that day") : "due " + today.clock(due)' in spoken

@@ -524,6 +524,15 @@ func briefWordingChecks(_ check: (Bool, String) -> Void) {
           && BriefReady.cardTag(method: "calendar_event", hasDraft: false) == "SPOTTED"
           && BriefReady.cardTag(method: "", hasDraft: false) == "SPOTTED", "anything else it spotted")
     check(BriefReady.cardTag(method: "read", hasDraft: true) == "DRAFTED", "a card that carries a draft")
+    // A reply says what it answers: one line above the draft, and the row's muted line.
+    check(BriefReady.contextLine("Community meeting —\n  “Can you come Thursday?”") == "Community meeting — “Can you come Thursday?”",
+          "the context is one line")
+    check(BriefReady.contextLine("  \n ") == nil, "no context from an older service: nothing shown")
+    check(BriefReady.contextSpoken("Weekend plans") == "They wrote: Weekend plans", "VoiceOver hears what they wrote")
+    check(BriefReady.rowDetail(context: "Weekend plans", sendsDraft: true, otherwise: "I've drafted a reply") == "Weekend plans"
+          && BriefReady.rowDetail(context: "", sendsDraft: true, otherwise: "I've drafted a reply") == "I've drafted a reply"
+          && BriefReady.rowDetail(context: "Weekend plans", sendsDraft: false, otherwise: "Add it?") == "Add it?",
+          "a reply row shows what it answers; anything else keeps its line")
     check(BriefReady.studyTag(id: "ready:qa:quiz3", opensMaterial: true) == "QUIZ MADE", "Study made a quiz")
     check(BriefReady.studyTag(id: "ready:qa:pa3", opensMaterial: false) == "SLIDES", "Study found the slides")
     check(BriefReady.studyTag(id: "weak:qa:pointers", opensMaterial: false) == "WEAK SPOT", "a topic to look at again")

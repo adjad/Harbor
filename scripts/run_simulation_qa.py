@@ -1003,6 +1003,9 @@ ADDITIONAL_FULL_TESTS = {
     "tests/test_brief_accuracy_check.py",
     # A Stop after a confirmed send leaves the turn saying it was sent: faked agent and bridge.
     "tests/test_stop_after_verified_send.py",
+    "tests/test_reply_stale_dates.py",
+    "tests/test_reply_card_context.py",
+    "tests/test_composer_stale_dates.py",
 }
 # Integrated runtime contracts are mandatory; missing files fail selection.
 MINI_RUNTIME_INTEGRATION_TESTS = {
@@ -1071,6 +1074,7 @@ _NATIVE_GATE_DEPENDENCIES = {
     "native/relaunch-speed-contract": "native/relaunch-speed-compile",
     "native/swarm-lifecycle-contract": "native/swarm-lifecycle-compile",
     "native/notch-smoothness-contract": "native/notch-smoothness-compile",
+    "native/notch-page-deck-contract": "native/notch-page-deck-compile",
     "native/app-bugs-contract": "native/app-bugs-compile",
 }
 
@@ -1839,6 +1843,18 @@ def _native_gates(build_dir: Path) -> list[tuple[str, list[str]]]:
             ],
         ),
         ("native/notch-smoothness-contract", [str(build_dir / "notch-smoothness")]),
+        (
+            "native/notch-page-deck-compile",
+            [
+                TRUSTED_SWIFTC, "-parse-as-library", "-swift-version", "5",
+                "-module-cache-path", module_cache,
+                # Plain Foundation sources only: no SwiftUI macro plugins.
+                "app/Sources/HarborApp/NotchTab.swift", "app/Sources/HarborApp/WildcardTabs.swift",
+                "app/Sources/HarborApp/IdeateKind.swift", "app/Sources/HarborApp/NotchPageDeckState.swift",
+                "tests/NotchPageDeckChecks.swift", "-o", str(build_dir / "notch-page-deck"),
+            ],
+        ),
+        ("native/notch-page-deck-contract", [str(build_dir / "notch-page-deck")]),
     ]
 
 

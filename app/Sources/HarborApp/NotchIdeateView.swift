@@ -89,8 +89,8 @@ struct NotchIdeateView: View {
         }
         .animation(Theme.Motion.panel(reduceMotion: reduceMotion), value: branches)
         .onChange(of: branches) { _, _ in onResize() }
-        .onAppear { ideate.appeared() }
-        .onDisappear { ideate.disappeared() }
+        .onNotchPageShown { ideate.appeared() }
+        .onNotchPageHidden { ideate.disappeared() }
     }
 
     // MARK: Empty
@@ -187,7 +187,7 @@ struct NotchIdeateView: View {
         .padding(10)
         .background(RoundedRectangle(cornerRadius: 10).fill(Theme.chipFill))
         .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.chipStroke, lineWidth: 1))
-        .task(id: open) {
+        .notchPageTask(id: open) {
             // While the command is open, look again every few seconds: the row goes once
             // Terminal has raised the limit.
             while open && !Task.isCancelled {

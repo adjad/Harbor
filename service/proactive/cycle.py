@@ -840,7 +840,7 @@ async def _cycle(*, now, tz, account, force, patient, reply_fn, abort, collect, 
         # changed; this cycle's cards are added after it, never reshuffled.
         cards = stable.carry(shown, cards, items=items_by_id, withheld=withheld_ids, gone=dismissed,
                              suppressed=suppressed_now, done_todos=set(decided["done"]), now=now,
-                             since=float(previous.get("as_of") or now), limit=prepare_mod.MAX_CARDS)
+                             since=float(previous.get("as_of") or now), limit=prepare_mod.MAX_CARDS, tz=tz)
         for card in cards:
             if store.locked(card, now):
                 card["action"]["locked"] = "unknown"     # an unconfirmed send is never offered again
