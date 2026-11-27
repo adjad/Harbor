@@ -1,0 +1,99 @@
+# r5 on the 8x MI355X node
+
+The node bills $24 an hour from the moment it starts, idle or not, so have the kit ready first and stop it as soon as the last download is done. The user starts and stops the node. Only `r5-kit.tgz` and the three zips go up. No private exports, no tokens (the base model isn't gated).
+
+## On the Mac, before the node starts
+
+```bash
+PY=~/Desktop/Harbor_Project/.venv/bin/python
+# no HARBOR_REPO here: this reads this checkout's toolbench, not the pin's
+env -u HARBOR_REPO $PY training/ask-lora-r5/mi355x/seal_r5.py --build BUILD_DIR --private-dir ~/.moe/evals/private-real-use
+$PY training/ask-lora-r5/mi355x/verify_contract.py --build BUILD_DIR --out BUILD_DIR/contract_verification.json
+bash training/ask-lora-r5/mi355x/pack_kit.sh BUILD_DIR REUSE_FILE training/ask-lora-r5/data/kit/r5-kit.tgz
+```
+
+`seal_r5.py` removes every turn close to a test question, before any node time goes to it, and lists them in `overlap_manifest.json`.
+
+## On the RTX A6000: base's answers (the user's choice, 2026-11-07)
+
+About $0.60-0.68/h. The user starts and stops the instance; nobody enters credentials for them. Synthetic tool results only, nothing private goes up: just `r5-kit.tgz`. The base isn't gated, so setup downloads it with no token.
+
+```bash
+# on the Mac
+scp r5-kit.tgz mild-indigo-moose:~/                     # the brev ssh alias
+# on the box
+nvidia-smi                                               # must say RTX A6000
+tar -xzf r5-kit.tgz && cd r5
+bash run_r5.sh setup && bash run_r5.sh check             # torch 2.11.0+cu128, transformers 5.22.1, peft 0.21.2, the base
+SELFCHECK=1 bash run_r5.sh finals partial.jsonl          # ATTN=sdpa by default: batched = single AND sdpa = math, or nothing runs batched
+# if it fails: SELFCHECK=1 ATTN=math ..., and use ATTN=math for everything after
+BATCH=4 LIMIT=8 bash run_r5.sh finals partial.jsonl      # speed; try BATCH=8 too if memory allows (nvidia-smi)
+BATCH=4 K=1 TOPUP=0 FAMILIES=all_sources_r5,memory_contrast_r5,write_contrast_r5 LIMIT=40 bash run_r5.sh finals partial.jsonl
+tmux new -d -s r5 'TRACES=1 BATCH=4 bash run_r5.sh finals partial.jsonl > ~/harbor/finals/run.log 2>&1'   # survives an SSH drop; rerun resumes
+```
+
+The full run starts only if the smoke's measured speed projects answers plus tool-step thoughts within about $60 and about 4 days. Otherwise the box stays idle and the coordinator decides. Then download `~/harbor/finals/{chosen.jsonl,drop.ids,stats.json,rejections.jsonl,generation.*.json,traces.chosen.jsonl,traces.stats.json}` and follow "On the Mac: the final build".
+
+## On the RTX A6000: training (the user's choice, 2026-11-08)
+
+Training needs its own explicit OK, after the gate fixes in `DATASET-HANDOFF.md`. One GPU runs the same recipe as the node: batch 8 is 1 row x 8 accumulation steps either way (`run_sft.sh`). Upload the three zips from "On the Mac: the final build" to `~/harbor/uploads`, plus a kit from this commit or later.
+
+```bash
+bash run_r5.sh setup && bash run_r5.sh check     # skip setup on a box that already ran it; driver 570+ for cu128
+bash run_r5.sh unpack SHA256 && bash run_r5.sh preflight
+bash run_r5.sh smoke             # strict sdpa-vs-math parity (exit 8: ATTN=math for everything after), peak memory under 40 GiB,
+                                 # and its tok/s: rerun ../../ask-lora-r4/a6000/estimate.py with it before paying for the run
+bash run_r5.sh train             # background; stops itself after step 400 (see "Early snapshots, pause and resume" below)
+bash run_r5.sh resume            # after checking the early snapshots: carries on from step 400 to the end
+bash run_r5.sh unzip-pickers && bash run_r5.sh pick    # one model after another on GPU 0, 8 generations together
+bash run_r5.sh merge && bash run_r5.sh package && bash run_r5.sh bundle
+```
+
+**Early snapshots, pause and resume.** The regular snapshots start near step 190, too late to see how the run begins. So `train` also saves an adapter snapshot at steps 50, 100 and 200 (`SNAPSHOT_STEPS`, default `50,100,200`; `SNAPSHOT_STEPS=` for none) in `OUT/ckpt`. They are kept like the others, and `pick` includes them as candidates (`EARLY_STEPS`). `train` also stops itself after step 400 (`PAUSE_AT=400`; `PAUSE_AT=0` runs straight through). At that point it saves the adapter, the optimizer and the learning-rate schedule in `OUT/step-00400`, writes `OUT/PAUSED.json` with the step, the reason and the resume command, and exits cleanly. The GPU is then free and the box is still billing, so check the snapshots quickly, then run `bash run_r5.sh resume`. To pause at any other time, run `bash run_r5.sh pause`: it creates `OUT/PAUSE`, and the run saves and exits after its current step (a few minutes at most; a dev eval in progress finishes first). `resume` continues from the step in `PAUSED.json`, or from the newest `OUT/step-*` if there is none; it removes `PAUSE` and `PAUSED.json`, and does not pause again at 400. The data order depends only on the seed and the epoch, so a resumed run sees the same batches as an uninterrupted one. Do not kill the training process to stop it: a kill saves nothing, and only the last three `step-*` folders (every 200 steps) exist to resume from. The pause and resume logic is checked by unit tests of its decisions and by stubbed shell tests; a real pause and resume on the GPU has not been run yet, so do the first one at step 400 and look at `status` afterwards.
+
+Estimate before smoke measures it (estimate.py on the packed final build at $0.60/h, r2's 624 tok/s on this card, 6,968 train rows of about 6,925 tokens, 2,126 steps, 98.1 M tokens): training about 46 h with evals and setup, $28, and about 58 h with the picker, merge and download, $35. Disk: about 7 GB of packages, the 15 GB base, small adapters, and 16 GB for each merged model. On a 100 GB disk, merge one checkpoint at a time (`merge CKPT`) and download it before the next, or merge on the Mac with `../../ask-lora-r3/brev/merge_mac.py`.
+
+## On the node: base's answers
+
+```bash
+mkdir -p ~/harbor/uploads && tar -xzf r5-kit.tgz && cd r5
+bash run_r5.sh setup && bash run_r5.sh check
+SELFCHECK=1 bash run_r5.sh finals partial.jsonl          # batched and single greedy agree, or stay at BATCH=1
+BATCH=8 LIMIT=8 bash run_r5.sh finals partial.jsonl      # speed: multiply tok/s by the finals left (`DATASET-HANDOFF.md`) before going on
+BATCH=8 K=1 TOPUP=0 FAMILIES=all_sources_r5,memory_contrast_r5,write_contrast_r5 LIMIT=40 bash run_r5.sh finals partial.jsonl
+# ^ the contract on base's real wording: read smoke/ with choose_r5.py before going on. If over half of these are rejected, look at why first.
+BATCH=8 bash run_r5.sh finals partial.jsonl              # resumes; writes ~/harbor/finals/{chosen,drop.ids,stats.json,rejections.jsonl}
+TRACES=1 BATCH=8 bash run_r5.sh finals partial.jsonl     # recommended, needs the user's OK for the cost: base's own thought at tool steps, about 1-2 h more (unmeasured)
+```
+
+Read `stats.json`. Download `chosen.jsonl`, `drop.ids`, `stats.json`, `rejections.jsonl`, `generation.*.json` and, with `TRACES=1`, `traces.chosen.jsonl`.
+
+## On the Mac: the final build
+
+```bash
+PY=~/Desktop/Harbor_Project/.venv/bin/python
+$PY training/ask-lora-r5/mi355x/finish_r5.py --build BUILD_DIR --chosen chosen.jsonl --drop drop.ids --rejections rejections.jsonl \
+    --choose-stats stats.json [--traces traces.chosen.jsonl] --harbor-repo PIN_DIR --out FINAL     # drops base rows the validator flags
+(cd training/ask-lora-r2/builder && ASK_LORA_ROUND=4 ASK_LORA_R5=1 ASK_LORA_OUT=FINAL HARBOR_REPO=PIN_DIR $PY validate.py)
+$PY training/ask-lora-r5/mi355x/report_r5.py --build FINAL --model MODEL_DIR --out FINAL/report --r4-zip training/ask-lora-r4/a6000/out/ask-lora-data.zip
+$PY training/ask-lora-r4/a6000/pack_r4.py --model ~/Desktop/OMLX_Model_Files/Jundot/gemma-4-E4B-it-oQ4e-mtp --data FINAL --out-dir OUT --no-estimate
+```
+
+`FINAL` and `OUT` are absolute paths. Validation must exit 0. `finish_r5.py` stops if any final has no base sample, and `pack_r4.py` refuses anything whose `stats.json` isn't `complete` or doesn't match its rows. Upload the three zips to `~/harbor/uploads`.
+
+**Training needs its own explicit OK.** The 2026-11-07 audit says NO-GO until this dataset, its review and the gate fixes in `DATASET-HANDOFF.md` are done.
+
+## On the node: training
+
+```bash
+bash run_r5.sh unpack SHA256      # from OUT/upload.json
+bash run_r5.sh preflight && bash run_r5.sh smoke
+bash run_r5.sh train              # `status` shows the step; stops itself after step 400 with everything saved
+bash run_r5.sh resume             # after checking the snapshots at steps 50, 100, 200 and 400
+bash run_r5.sh unzip-pickers && bash run_r5.sh pick    # batches 8 at a time and checks that first; PICK_BATCH=1 turns it off
+bash run_r5.sh merge && bash run_r5.sh package && bash run_r5.sh bundle
+```
+
+`bash run_r5.sh pause` stops a running `train` cleanly at the end of its current step, and `resume` continues it; the same pause and resume rules as on the A6000 apply (all eight processes agree on the pause, and none is ever killed to stop the run).
+
+Download the bundle and merged model and check their checksums before the user stops the node. Quantizing and the gate run on the Mac.

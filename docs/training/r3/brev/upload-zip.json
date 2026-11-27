@@ -1,0 +1,68 @@
+{
+ "file": "ask-lora-data.zip",
+ "sha256": "d46e3443cab3447cdc8beaf1ea0e6fcb94b753a68cbc5258b3eace4f44e5d97f",
+ "bytes": 89732528,
+ "train": {
+  "rows": 3254,
+  "think": 1046,
+  "no_think": 2208,
+  "shapes": {
+   "first_answer": 1051,
+   "first_think": 522,
+   "forced_empty": 1157,
+   "forced_think": 524
+  },
+  "forced_prompts": 1681,
+  "ends": {
+   "<turn|>": 1679,
+   "<|tool_response>": 1575
+  }
+ },
+ "dev": {
+  "rows": 364,
+  "think": 108,
+  "no_think": 256,
+  "shapes": {
+   "first_answer": 122,
+   "first_think": 52,
+   "forced_empty": 134,
+   "forced_think": 56
+  },
+  "forced_prompts": 190,
+  "ends": {
+   "<turn|>": 189,
+   "<|tool_response>": 175
+  }
+ },
+ "vision": {
+  "train": 387,
+  "dev": 57,
+  "images": 476,
+  "kinds": {
+   "image": 230,
+   "document": 40,
+   "text_document": 25,
+   "picture_read": 149
+  },
+  "picture_read": {
+   "train": 129,
+   "dev": 20
+  }
+ },
+ "audio": {
+  "train": 296,
+  "dev": 64,
+  "clips": 360,
+  "kinds": {
+   "command": 74,
+   "injection": 51,
+   "long": 32,
+   "names": 26,
+   "no_speech": 48,
+   "non_english": 51,
+   "numbers": 78
+  },
+  "seconds": 2452.2,
+  "dev_transcripts_also_in_train": 0
+ }
+}

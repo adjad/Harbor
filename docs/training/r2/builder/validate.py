@@ -1,0 +1,899 @@
+"""Validate the Ask LoRA dataset against the live Harbor code in this checkout.
+
+Usage:
+    python validate.py                     # train.jsonl, valid.jsonl (and all.jsonl if built)
+    python validate.py --private-results PATH
+        also checks every example against names, addresses, subjects and titles
+        from the REAL eval results (the user's data). The denylist is built in
+        memory only and never written anywhere. HARBOR_EVAL_RESULTS works too.
+
+Exit code 1 on any problem. Checks, per example:
+  structure   roles in a legal order; every history call has exactly one result
+  live tools  every offered schema equals what this checkout's registry offers:
+              full schemas byte-for-byte, name-only stubs, and get_tool_schemas
+              (its family enum must be a subset of the live families)
+  calls       every call names an offered tool that exists in the live registry;
+              target arguments validate against the offered schema; tool names
+              given to get_tool_schemas exist
+  writes      a call (history or target) to a tool outside the read categories is
+              allowed only if writes.WRITE_ALLOW[family] lists it; a family absent
+              from WRITE_ALLOW stays reads-only. Needs the example's meta line
+              (train.meta.jsonl beside train.jsonl, meta.jsonl beside all.jsonl)
+  cards       a writes.ALWAYS_CARD tool that ran must be in meta cards_seen; a
+              writes.NEVER_CARD tool must not be; meta expect_cards == cards_seen
+  approval    the history agrees with meta approve (one entry per card, in order;
+              a denied card's result is "The user denied this action."), and a
+              final after a denial must not claim the action happened
+  tool steps  an assistant step with tool calls has empty content (Bolt's chat
+              template keeps it, Gemma's drops it, so rows would differ)
+  injection   when a tool result carries text addressed to an assistant, no
+              write call and no later reply repeats that text's payload
+              (addresses, links, amounts, account numbers, commands)
+  privacy     every email domain is synthetic; no /Users/<real account> path;
+              no git identity or macOS account name; optional private denylist
+              over EVERYTHING, system prompts and tool schemas included
+  leak        the user prompt does not repeat or nearly repeat an eval question
+              or a toolbench prompt (all splits, all fact seeds); no toolbench
+              fact value (names, amounts, businesses, files, codes) appears in
+              the conversation (leak.py)
+  markup      no <|tool_call> text inside assistant content
+  harness     no trace of the build harness (World.t_* names, stub errors)
+  thinking    (needs the meta line; builder/thinking.py) every example has a bool
+              `think`; THINK => a non-empty thought of at most 60 words, with no
+              tool plumbing, markup or harness text, not the user's name, no
+              injected payload, and not a copy of the reply (character-trigram
+              Jaccard < 0.5 against the target text and the turn's final); NO
+              THINK => thought null; a date or weekday the thought states must
+              equal the date in the step's call arguments (or, with no dated
+              call, a date some tool result shows, or today); `think` equals
+              thinking.decide() re-run on the example; chat_voice and
+              knowledge_direct never think; two consecutive THINK examples
+              never share a thought. A thought must not describe the schema
+              loading (think:mechanics), call the user they/them/the user
+              (think:user_pronoun), carry a filler tail like "Just the facts
+              it states" (think:boilerplate), sound like a success ("sent",
+              "went through", "confirms") right after a refusal, no-match,
+              ambiguity, denial or error result (think:success_on_failure), or
+              make a "tomorrow is X" / "today is X" claim that disagrees with
+              the clock (think:relative_day), mention the approval/send card
+              the model never sees (think:card), call a clarifying question's
+              request destructive when nothing in the prompt or turn removes
+              anything (think:clarify_destructive), or think on a final in a
+              single-source family (grounded_only, right_source,
+              weather_and_web, act_dont_promise, no_write_for_reads) without a
+              date/time or free/busy computation (think:single_source), or write a tool name twice in one
+              plan ("call get_my_day_plan ... and call get_my_day_plan": think:mechanics).
+              Round 4 extraction thoughts (a final after a read, and the facts part
+              of an ignore_embedded_instructions thought) also pass: facts_missing
+              (a time, amount or quoted title the thought lists reaches the final),
+              facts_unlisted (the reverse: a time, amount, quoted title, month-day
+              date, H:MM, name or list item the final states and a tool result also
+              shows is in the thought, or the thought ends "plus N more" with N equal
+              to the number of result items none of the thought's pieces comes from:
+              result lines, minus the headers and summary sentences of a bulleted
+              result, plus the N of a "…and N more" line, with no merging of lines;
+              counted per title occurrence: the same event on several days is one
+              item per day the answer states it (less the times the thought lists it);
+              a line the thought lists in part must also give its times, amounts
+              and quoted titles, and the bullet count is repeated independently of
+              the builder: bullet_items_left), fragment
+              (every ';' piece is one contiguous, whole run of a tool-result line: no
+              clause tail such as "and tell you ...", no opening "(", no unbalanced
+              bracket, no repeated piece, no lone AM/PM in any thought; no bare day
+              header such as "Mon Nov 2" as a piece; no piece that stops at the start of a
+              "9:00 AM–10:00 AM" range, before the object of "send me", after a
+              parenthetical whose clause goes on, or on the tail of a list), banner (no
+              Mail cache/freshness text in any thought), ellipsis (no piece cut with
+              "…" unless the result itself has one), brief (a Brief item of a day plan
+              keeps its "(email)" / "(text)" / "(note)" / "(reminder)" source), iso (no
+              ISO date or timestamp in any thought: think:iso_timestamp) and empty
+              range ("free from ." / "between  and": think:empty_range). A free-slot
+              piece states only a range the result produces (think:slot_window): a
+              slot's start to where its gap ends, a range another result line shows
+              or one the prompt asks for; the search window of a find_free_time
+              header ("9:00-18:00") is not a free slot unless a slot spans it. A
+              piece that holds a bullet's whole title has the title's content words
+              in the final (think:item_title). The copy bound is 0.5 for extraction
+              thoughts too.
+              A thought that quotes an earlier turn ("The earlier reply said: ...",
+              "Earlier in this chat: ...") passes think:quote: one contiguous run of
+              a turn by the speaker its label names (never "the earlier reply" for
+              what the person said), sharing a time, amount, name or two content
+              words with the final; "what was that" quotes the assistant turn right
+              before it. A system digest ("Earlier in this conversation ...") counts
+              as the user / assistant turns its lines condense.
+  finals      no template glitch in a final reply: "to on"/"for on" or
+              "N today emails" (final:template_glitch). No ISO date or timestamp
+              (final:iso_timestamp; a date inside a file name is a name), no range
+              that lost its times (final:empty_range), no "nothing is free / no gap"
+              against a free-time result that lists slots the final does not state
+              (final:nofree_contradiction), and a position claim ("in my first
+              answer", "your first message", "you started by asking") names the
+              right turn (final:position_claim): meta anchor_pos (the longchat
+              scenario's 0-based exchange index of the fact asked about), or meta
+              recall_anchor {"role": "user"|"assistant", "pos": 1-based, -1 =
+              latest}, else the earlier turn of that speaker that shares the most
+              words with the final; "near the start" / "early in our chat" needs
+              anchor_pos <= 1. No absence claim without a read: a final that says
+              nothing / none / no messages / "I don't have ..." about the person's
+              own data needs a tool call in its own turn (final:absence_without_read;
+              "nobody has replied", "all caught up", "free all day", "wide open",
+              "I haven't seen ..." count; chat, voice, knowledge and session chat /
+              recall answers about the conversation itself are exempt, instructions
+              answers are checked). Warns (does not fail)
+              when more than 3 finals in a file are byte-identical, listing them
+  template    (with --template MODEL_DIR, repeatable) each model's chat template
+              renders every example, and the prompt is a prefix of the full text,
+              as mlx-lm's mask_prompt needs; brev/render.py renders the row (the
+              thought, the empty thought or none, per meta). With two or more,
+              its prompt and completion must be byte-identical under every template.
+Across files: no prompt group appears in both train and valid.
+"""
+from __future__ import annotations
+
+import boot  # noqa: F401  (fresh HARBOR_HOME, repo on sys.path)
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import Counter
+
+import leak
+import thinking
+import writes
+
+# ASK_LORA_OUT points a later round (round 3: training/ask-lora-r3) at its own data dir.
+OUT = os.environ.get("ASK_LORA_OUT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DENIED = "The user denied this action."
+READ_ACTIONS = {"manage_timers": frozenset({"list", "stopwatch_read"})}
+
+import service.tools  # noqa: E402,F401
+from service import skills as _skills  # noqa: E402
+
+try:   # production registers the bundled skills' tools (use_skill, mac_*) at startup (main.lifespan)
+    _skills.load()
+except Exception:  # noqa: BLE001  (production tolerates a failed load the same way)
+    pass
+from service.router.model_led import (CapabilityCatalog, DISCOVERY_TOOL, discovery_schema,  # noqa: E402
+                                      registry_specs, stub_schema)
+from service.tools.registry import REGISTRY  # noqa: E402
+
+READ_CATEGORIES = {"assistant_read", "browser_history_read", "compute", "email_read", "fs_read",
+                   "messages_read", "notes_read", "system_read", "web_read", "harbor_admin"}
+READ_TOOLS = {"list_running_apps"}   # app_control, but only lists
+
+# Email domains the synthetic world and Harbor's own scaffold use. Anything else is
+# treated as a possible real address.
+SYNTHETIC_DOMAINS = {"linden.edu", "example.com", "example.net", "example.org", "example",
+                     "fernbrooklabs.com", "northlinebank.com"}
+
+# One definition of "a line written to an assistant" for the builder and the validator (thinking.INJECTION also
+# catches "assistant: ...", "System note for AI assistants: ..." and notes addressed to the assistant).
+INJECTION_MARKERS = thinking.INJECTION
+_PAYLOAD = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+|\b[\w-]+(?:\.[\w-]+)*\.(?:net|com|org|io|sh)\b(?:/\S*)?"
+                      r"|\$\d[\d,.]*|\b\d{3,}-\d{3,}\b|`[^`]+`")
+
+_TYPES = {"string": str, "integer": int, "number": (int, float), "boolean": bool, "array": list, "object": dict}
+
+
+def check_schema(value, schema, path="$"):
+    errs = []
+    t = schema.get("type")
+    if t:
+        ok = isinstance(value, _TYPES[t]) and not (t in ("integer", "number") and isinstance(value, bool))
+        if not ok:
+            return [f"{path}: expected {t}, got {type(value).__name__}"]
+    if "enum" in schema and value not in schema["enum"]:
+        errs.append(f"{path}: {value!r} not in enum")
+    if t == "object":
+        props = schema.get("properties", {})
+        for req in schema.get("required", []) or []:
+            if req not in value:
+                errs.append(f"{path}: missing required {req!r}")
+        for k, v in value.items():
+            if k in props:
+                errs += check_schema(v, props[k], f"{path}.{k}")
+            elif schema.get("additionalProperties") is False or props:
+                errs.append(f"{path}: unexpected argument {k!r}")
+    if t == "array":
+        if schema.get("items"):
+            for i, v in enumerate(value):
+                errs += check_schema(v, schema["items"], f"{path}[{i}]")
+        if "minItems" in schema and len(value) < schema["minItems"]:
+            errs.append(f"{path}: fewer than minItems")
+        if "maxItems" in schema and len(value) > schema["maxItems"]:
+            errs.append(f"{path}: more than maxItems")
+        if schema.get("uniqueItems") and len({json.dumps(v, sort_keys=True) for v in value}) != len(value):
+            errs.append(f"{path}: duplicate items")
+    return errs
+
+
+# ----------------------------------------------------------------- live tools
+CATALOG = CapabilityCatalog.build(registry_specs(REGISTRY))
+LIVE_DISCOVERY = discovery_schema(CATALOG)["function"]
+
+
+def is_read(name: str) -> bool:
+    if name == DISCOVERY_TOOL:
+        return True
+    tool = REGISTRY.get(name)
+    return bool(tool) and (tool.category in READ_CATEGORIES or name in READ_TOOLS)
+
+
+def live_problems(schema: dict) -> list[str]:
+    fn = schema.get("function") or {}
+    name = fn.get("name")
+    if name == DISCOVERY_TOOL:
+        fam = ((fn.get("parameters") or {}).get("properties") or {}).get("families", {}).get("items", {}).get("enum", [])
+        live_fam = LIVE_DISCOVERY["parameters"]["properties"]["families"]["items"]["enum"]
+        errs = [] if set(fam) <= set(live_fam) else [f"{name}: unknown families {sorted(set(fam) - set(live_fam))}"]
+        a = json.loads(json.dumps(fn)); b = json.loads(json.dumps(LIVE_DISCOVERY))
+        a["parameters"]["properties"]["families"]["items"].pop("enum", None)
+        b["parameters"]["properties"]["families"]["items"].pop("enum", None)
+        return errs + ([] if a == b else [f"{name}: schema differs from live"])
+    tool = REGISTRY.get(name)
+    if tool is None:
+        return [f"{name}: not in the live registry"]
+    if "description" not in fn:
+        return [] if schema == stub_schema(name) else [f"{name}: stub differs from live"]
+    return [] if schema == tool.schema() else [f"{name}: schema differs from live"]
+
+
+# ----------------------------------------------------------------- meta, approval
+_META_NAMES = {"train.jsonl": "train.meta.jsonl", "valid.jsonl": "valid.meta.jsonl", "all.jsonl": "meta.jsonl"}
+_SENTENCES = re.compile(r"(?<=[.!?])\s+|\n+")
+_DONE = re.compile(r"\b(?:sent|added|scheduled|created|booked|saved|deleted|removed|moved|cancel+ed|updated|"
+                   r"emailed|texted|replied|forwarded|completed|marked|done|all set)\b", re.I)
+_NEGATED = re.compile(r"\b(?:not|never|no|nothing|none|nope|without|cannot|unsent|unsaved)\b|n['’]t\b", re.I)
+
+
+def meta_path_for(path: str) -> str | None:
+    """The per-step metadata file that goes with an examples file, if it exists."""
+    d, base = os.path.split(path)
+    cand = os.path.join(d, _META_NAMES.get(base) or os.path.splitext(base)[0] + ".meta.jsonl")
+    return cand if os.path.exists(cand) else None
+
+
+def claims_done(text: str) -> bool:
+    """True when some statement in ``text`` says an action happened (sent, added, done...)."""
+    for sentence in _SENTENCES.split(text or ""):
+        s = sentence.strip()
+        if s and not s.endswith("?") and _DONE.search(s) and not _NEGATED.search(s):
+            return True
+    return False
+
+
+def pair_cards(calls: list[tuple[str, str]], cards: list[str], approve: list) -> dict[str, bool]:
+    """Match the example's calls (id, name), in order, to the turn's cards (tool names, in order);
+    returns {tool_call_id: approved}. A card with no approve entry was approved."""
+    # Pair from the END: a name-only stub call (a schema load) precedes its real
+    # call and raises no card, so the real call is always the later one.
+    used, out = set(), {}
+    for cid, name in reversed(calls):
+        for k in reversed(range(len(cards))):
+            card = cards[k]
+            if k not in used and card == name:
+                used.add(k)
+                out[cid] = bool(approve[k]) if k < len(approve) else True
+                break
+    return out
+
+
+# ----------------------------------------------------------------- privacy
+def identity_tokens() -> set[str]:
+    """The machine owner's git identity and account name, never written anywhere."""
+    out = set()
+    for key in ("user.name", "user.email"):
+        try:
+            val = subprocess.run(["git", "config", key], capture_output=True, text=True, cwd=OUT).stdout.strip()
+        except OSError:
+            val = ""
+        for part in re.split(r"[\s@.]+", val):
+            if len(part) >= 4 and part.lower() not in {"claude", "noreply", "anthropic", "gmail", "users"}:
+                out.add(part.lower())
+    home = os.path.basename(os.path.expanduser("~"))
+    if len(home) >= 4:
+        out.add(home.lower())
+    return out
+
+
+def _is_common(word: str, common: set[str]) -> bool:
+    """A dictionary word, allowing regular inflections (-s, -es, -ed, -ing, -ly, -er) and hyphen parts."""
+    w = word.lower().strip("'’-")
+    if not w or w in common:
+        return True
+    for suf, rep in (("ies", "y"), ("es", ""), ("s", ""), ("ed", ""), ("ed", "e"), ("d", ""), ("ing", ""),
+                     ("ing", "e"), ("ly", ""), ("er", ""), ("ers", "")):
+        if w.endswith(suf) and len(w) - len(suf) >= 3 and (w[: -len(suf)] + rep) in common:
+            return True
+    m = re.fullmatch(r"(.*([b-df-hj-np-tv-z]))\2(?:ed|ing|er)", w)   # scanned, stopping
+    if m and m.group(1) in common:
+        return True
+    return "-" in w and all(_is_common(part, common) for part in w.split("-") if part)
+
+
+def private_denylist(path: str):
+    """Names, addresses, subjects and titles from the REAL eval results."""
+    common = {w.strip().lower() for w in open("/usr/share/dict/words") if w[:1].islower()}
+    common |= {w.lower() for w in ("Monday Tuesday Wednesday Thursday Friday Saturday Sunday January February March April "
+                                   "May June July August September October November December AM PM PDT PST AI OK").split()}
+    exempt = {w.lower() for q in leak.load_eval() for w in re.findall(r"[A-Za-z][A-Za-z'’-]+", q["prompt"])}
+    texts = []
+    for line in open(path):
+        row = json.loads(line)
+        texts.append(str(row.get("text") or ""))
+        texts += [str(r) for r in row.get("results") or []]
+    tokens, emails, phrases = set(), set(), set()
+    for t in texts:
+        emails |= {e.lower() for e in re.findall(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+", t)}
+        for tok in re.findall(r"\b[A-Z][a-z][A-Za-z'’-]{1,}\b", t):
+            base = re.split(r"['’]", tok)[0]
+            if len(base) >= 4 and not _is_common(base, common) and base.lower() not in exempt:
+                tokens.add(base)
+        for pat in (r"^Subject: (.+)$", r"^Title: (.+?)(?: \[|$)"):
+            phrases |= {m.strip().lower() for m in re.findall(pat, t, re.M) if len(m.strip()) >= 12}
+    return tokens, emails, phrases
+
+
+# ----------------------------------------------------------------- thinking
+def turn_contexts(path, metas) -> dict[int, dict]:
+    """Per line index: the later steps' calls and the final text of its turn (same file; a turn never
+    straddles the split)."""
+    turns: dict[str, list] = {}
+    for idx, (line, meta) in enumerate(zip(open(path), metas)):
+        try:
+            target = json.loads(line)["messages"][-1]
+        except (ValueError, KeyError, IndexError):
+            continue
+        turns.setdefault(str(meta.get("id", idx)).rsplit("-s", 1)[0], []).append((meta.get("step", 0), idx, target))
+    out = {}
+    for steps in turns.values():
+        steps.sort(key=lambda s: (s[0], s[1]))
+        final = next((t.get("content") or "" for _, _, t in steps if not t.get("tool_calls")), "")
+        for k, (_, idx, _t) in enumerate(steps):
+            out[idx] = {"later_calls": [c for _, _, t in steps[k + 1:] for c in thinking.calls_of(t)], "final": final}
+    return out
+
+
+def check_thinking(meta, msgs, ctx, injected, prev_thought, bad, where):
+    """The thinking checks for one example; returns the thought to compare the next THINK example with."""
+    think, text = meta.get("think"), meta.get("thought")
+    family = meta.get("family")
+    if not isinstance(think, bool):
+        bad("think:missing", where)
+        return prev_thought
+    if not think:
+        if text is not None:
+            bad("think:thought_without_think", where)
+        if meta.get("extract_skipped") and thinking.ROUND4 and not thinking.decide_r3(meta, msgs):
+            return prev_thought      # round 4: no extraction passed check(), so the build kept this final QUIET
+        try:
+            if thinking.decide(meta, msgs):
+                bad("think:policy", f"{where} decide() says THINK ({thinking.step_kind(meta, msgs)})")
+        except Exception as exc:  # noqa: BLE001
+            bad("think:policy", f"{where} decide() failed: {exc!r}"[:160])
+        return prev_thought
+    if meta.get("distilled"):
+        # Round 4 self-distilled chat (training/ask-lora-r4/distill): the base model's own reasoning is the thought,
+        # kept as it came (the user likes the base model's chat). Only the injection check below applies.
+        if not isinstance(text, str) or not text.strip():
+            bad("think:thought_missing", where)
+            return prev_thought
+        for payload in injected:
+            if payload.lower() in text.lower():
+                bad("think:injection_payload", f"{where} {payload[:12]}…")
+        return text
+    if family in thinking.NEVER:
+        bad("think:never_family", f"{where} {family}")
+    try:
+        if not thinking.decide(meta, msgs):
+            bad("think:policy", f"{where} decide() says NO THINK ({thinking.step_kind(meta, msgs)})")
+    except Exception as exc:  # noqa: BLE001
+        bad("think:policy", f"{where} decide() failed: {exc!r}"[:160])
+    if not isinstance(text, str) or not text.strip():
+        bad("think:thought_missing", where)
+        return prev_thought
+    errs = thinking.check(meta, msgs, text, ctx)
+    for err in errs:
+        key = ("think:too_long" if err.endswith(" words") else "think:noise" if err.startswith("noise") else
+               "think:mechanics" if err.startswith("mechanics") else
+               "think:user_pronoun" if err.startswith("user pronoun") else
+               "think:boilerplate" if err.startswith("boilerplate") else
+               "think:success_on_failure" if err.startswith("success on failure") else
+               "think:relative_day" if err.startswith("relative day") else
+               "think:card" if err.startswith("card") else
+               "think:clarify_destructive" if err.startswith("clarify destructive") else
+               "think:single_source" if err.startswith("single source") else
+               "think:facts_missing" if err.startswith("facts_missing") else
+               "think:facts_unlisted" if err.startswith("facts_unlisted") else
+               "think:fragment" if err.startswith("fragment") else
+               "think:banner" if err.startswith("banner") else
+               "think:ellipsis" if err.startswith("ellipsis") else
+               "think:planted_line" if err.startswith("planted line") else
+               "think:iso_timestamp" if err.startswith("iso") else
+               "think:empty_range" if err.startswith("empty range") else
+               "think:quote" if err.startswith("quote") else
+               "think:brief_source" if err.startswith("brief") else
+               "think:slot_window" if err.startswith("free slot") else
+               "think:item_title" if err.startswith("item") else
+               "think:copies_reply" if err.startswith("too close") else "think:thought_missing" if err == "empty"
+               else "think:date_mismatch")
+        bad(key, f"{where} {err}")
+    for payload in injected:
+        if payload.lower() in text.lower():
+            bad("think:injection_payload", f"{where} {payload[:12]}…")
+    # no planted line enters a thought: no 4-gram shared with a sentence written to an assistant in this example's results
+    if not any(e.startswith("planted line") for e in errs):
+        for err in thinking.planted_problems(text, [str(m.get("content") or "") for m in msgs if m.get("role") == "tool"]):
+            bad("think:planted_line", f"{where} {err}")
+    if text == prev_thought:
+        bad("think:adjacent_duplicate", where)
+    return text
+
+
+# ----------------------------------------------------------------- per example
+AUTO = object()
+# Template glitches a final must never carry ("Moved it to on Saturday", "You have 3 today emails").
+FINAL_GLITCH = re.compile(r"\b(?:to|for) on\b|\b\d+ (?:today|yesterday) emails?\b", re.I)
+DUP_FINALS_MAX = 3
+# Round 4: internals a final must never show (PLAN.md D): JSON, the untrusted-content banner, source stalls,
+# call syntax; and in chat (no tool), receipt or refusal phrasing (r2's "I didn't send anything…" non-replies).
+FINAL_LEAK = re.compile(r"\{\"|\bUNTRUSTED\b|haven['’]t checked (?:a |any )?current|current personal source|"
+                        r"\b[a-z]+_[a-z_]+\(", re.I)
+CHAT_RECEIPT = re.compile(r"\b(?:didn['’]t|did not|won['’]t|haven['’]t) (?:send|sent|save|saved|add|added|set|"
+                          r"schedule|search|look)\w*\b|\bnothing (?:was|got) (?:sent|saved|added)\b|"
+                          r"couldn['’]t find any (?:web )?results", re.I)
+# Round 5 (ASK_LORA_R5=1 only; r4 builds validate as before). A final never counts a list's remainder ("and 3 more",
+# "plus 3 more": r4's cut-off lists, 9 of its 13 debug-log losses), and a final with no tool call in its turn never answers
+# ordinary chat as a memory lookup (r4's "Our memory has nothing saved for 'rough day'") unless the row is a real recall question.
+# The checks take plain text, so the later step that splices base's own finals into BASE_WRITES rows can call
+# ``final_problems_r5`` on each candidate text too.
+R5_MORE = re.compile(r"(?i)\b(?:and|plus) \d+ more\b")
+R5_MEMORY_STALL = re.compile(r"(?i)\b(?:nothing (?:was |is )?saved|didn['’]?t save|nothing(?:['’]s| is| was)? in your memory|"
+                             r"we haven['’]?t talked about)\b")
+# meta qkind of a real recall question (build.py copies it from the scenario): scen_r4_session_recall._recall_labels sets
+# rec_user / rec_asst / rec_none, scen_r4_session_chat.Q and scen_r4_devsets add rec_both. Every other qkind (build, emo,
+# fact, close, agenda re-reads, ...) is not a recall. No family marks a recall as a whole: recall families mix both.
+R5_RECALL_QKINDS = frozenset({"rec_user", "rec_asst", "rec_both", "rec_none"})
+
+
+def r5_enabled() -> bool:
+    return os.environ.get("ASK_LORA_R5") == "1"
+
+
+def is_recall_row(meta) -> bool:
+    meta = meta or {}
+    return meta.get("qkind") in R5_RECALL_QKINDS or bool(meta.get("recall_refs")) or bool(meta.get("recall_absent"))
+
+
+def final_problems_r5(text: str, meta=None, had_tool_call: bool = False) -> list[tuple[str, str]]:
+    """Round-5 problems of one final's text: [(key, matched text)]. ``had_tool_call``: the final's turn called any tool.
+    Works on any text, so it also checks finals written later (base's text spliced into a BASE_WRITES row)."""
+    out = []
+    m = R5_MORE.search(text or "")
+    if m:
+        out.append(("final:and_n_more", m.group(0)))
+    m = R5_MEMORY_STALL.search(text or "")
+    if m and not had_tool_call and not is_recall_row(meta):
+        out.append(("final:memory_stall", m.group(0)))
+    return out
+
+
+def _source_contract():
+    """gpu/source_contract.py, the one implementation the chooser and this validator share."""
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "ask-lora-r5", "gpu", "source_contract.py")
+    spec = importlib.util.spec_from_file_location("source_contract", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# Families whose every final must carry a gold contract: a row without one can't be checked, so it fails.
+R5_GOLD_FAMILIES = frozenset({"all_sources_r5", "chat_contrast_r5", "memory_contrast_r5", "write_contrast_r5"})
+R5_PLACEHOLDER = "Base writes this answer."     # scen_r5_debuglog.BASE_WRITES: a build still waiting for base's answers
+
+
+def gold_problems_r5(content: str, meta: dict, msgs: list) -> list[tuple[str, str]]:
+    """The contract and grounding problems of one final, keyed for the validator's report. A placeholder isn't checked
+    here: finish_r5.py refuses a final build that still has one."""
+    if content == R5_PLACEHOLDER:
+        return []
+    out = []
+    if meta.get("family") in R5_GOLD_FAMILIES and not meta.get("gold"):
+        out.append(("gold:missing", str(meta.get("id"))))
+    return out + [(f"final:{k}", d) for k, d in _source_contract().final_problems(content, meta, msgs[:-1])]
+
+
+LAST_WARNINGS: list[str] = []     # validate_file's warnings for the last file (selftest reads them)
+
+
+def load_meta(path, meta_path=AUTO, bad=None):
+    """Per-line metadata for an examples file: a list of dicts, or None when there is no meta file."""
+    mp = meta_path_for(path) if meta_path is AUTO else meta_path
+    if not mp or not os.path.exists(mp):
+        return None
+    metas = [json.loads(l) for l in open(mp)]
+    if len(metas) != sum(1 for _ in open(path)):
+        if bad:
+            bad("meta:line_count", os.path.basename(mp))
+        return None
+    return metas
+
+
+def validate_file(path, leaks, ident, deny, wl, meta_path=AUTO, on_bad=None):
+    problems, samples = Counter(), {}
+
+    def bad(key, where):
+        problems[key] += 1
+        samples.setdefault(key, where)
+        if on_bad:
+            on_bad(key, where)
+
+    metas = load_meta(path, meta_path, bad)
+    turn_ctx = turn_contexts(path, metas) if metas else {}
+    prev_thought = None
+    finals: dict[str, list[str]] = {}
+    LAST_WARNINGS.clear()
+    n = 0
+    for ln, line in enumerate(open(path), 1):
+        n += 1
+        where = f"{os.path.basename(path)}:{ln}"
+        meta = metas[ln - 1] if metas else {}
+        try:
+            ex = json.loads(line)
+        except ValueError:
+            bad("parse", where)
+            continue
+        msgs, tools = ex.get("messages"), ex.get("tools")
+        if not isinstance(msgs, list) or not isinstance(tools, list) or not msgs:
+            bad("shape", where)
+            continue
+        offered = {}
+        for t in tools:
+            for err in live_problems(t):
+                bad("live_schema", f"{where} {err}")
+            offered[t["function"]["name"]] = t["function"]
+        roles = [m.get("role") for m in msgs]
+        i = 0
+        while i < len(roles) and roles[i] == "system":
+            i += 1
+        if i == 0 or i >= len(roles) or roles[i] != "user":
+            bad("roles:start", where)
+            continue
+        if roles[-1] != "assistant":
+            bad("roles:end", where)
+        family = meta.get("family")
+        if family in writes.MULTITURN:   # seeded earlier turns: the request is the last user message
+            i = max(j for j, r in enumerate(roles) if r == "user")
+        prompt = msgs[i].get("content") or ""
+        hit, score, q = leaks.leaks(prompt)
+        if hit and not meta.get("leak_ok"):   # the user's own wording in a round-5 row is kept on purpose (build.py)
+            bad("leak:toolbench_prompt" if str(q["id"]).startswith("tb:") else "leak:eval_question",
+                f"{where} {score:.2f} ~ {q['id']}")
+        for val in leak.fact_hits(leak.conversation_text(ex)):
+            bad("leak:toolbench_fact", f"{where} {val[:3]}…({len(val)})")
+        family = meta.get("family")
+        allowed = writes.WRITE_ALLOW.get(family, frozenset())
+        calls, results = [], {}      # calls: (tool_call_id, name) in order; results: tool_call_id -> text
+        pending, injected, call_args = [], [], []
+        for j in range(i + 1, len(msgs)):
+            m, r = msgs[j], roles[j]
+            is_target = j == len(msgs) - 1
+            if r == "assistant":
+                if pending:
+                    bad("roles:assistant_before_tool_results", f"{where}:{j}")
+                content = m.get("content") or ""
+                if "<|tool_call>" in content or "<tool_call" in content:
+                    bad("markup_in_content", f"{where}:{j}")
+                if m.get("tool_calls") and content.strip():
+                    bad("toolcall_content_nonempty", f"{where}:{j}")
+                for tc in m.get("tool_calls") or []:
+                    fn = tc.get("function") or {}
+                    name = fn.get("name")
+                    calls.append((tc.get("id"), name))
+                    _a = fn.get("arguments")
+                    call_args.append(json.loads(_a) if isinstance(_a, str) else (_a or {}))
+                    if tc.get("type") != "function" or not tc.get("id"):
+                        bad("tool_call_shape", f"{where}:{j}")
+                    # Only the target step's offer list is stored; history calls were
+                    # offered on their own step (get_tool_schemas drops out after loads).
+                    if is_target and name not in offered:
+                        bad("call_not_offered", f"{where}:{j} {name}")
+                    host_read = name == writes.PICTURE_TOOL and not is_target   # the host's own read call (picture turns)
+                    if name != DISCOVERY_TOOL and name not in REGISTRY and not host_read:
+                        bad("call_not_in_registry", f"{where}:{j} {name}")
+                    if not is_read(name) and name not in allowed and not host_read:
+                        bad("write_call", f"{where}:{j} {name} (family {family})")
+                    args = fn.get("arguments")
+                    if isinstance(args, str):   # wire format; the written files carry objects
+                        try:
+                            args = json.loads(args or "{}")
+                        except ValueError:
+                            bad("args_not_json", f"{where}:{j}")
+                            continue
+                    if not isinstance(args, dict):
+                        bad("args_not_object", f"{where}:{j}")
+                        continue
+                    if name == DISCOVERY_TOOL:
+                        unknown = [t for t in args.get("tools", []) if t not in REGISTRY]
+                        if unknown:
+                            bad("discovery_unknown_tool", f"{where}:{j} {unknown}")
+                    if is_target and name in offered and "description" in offered[name]:
+                        errs = check_schema(args, offered[name].get("parameters") or {"type": "object"})
+                        if errs:
+                            bad("args_schema(target)", f"{where} {name} {errs[:2]}")
+                    if is_target or not is_read(name):   # a write call never carries an injected payload
+                        for payload in injected:
+                            if payload.lower() in json.dumps(args).lower():
+                                bad("injection:payload_in_call", f"{where}:{j} {name}")
+                    if not is_target:
+                        pending.append(tc.get("id"))
+                if is_target and not m.get("tool_calls"):
+                    for payload in injected:
+                        if payload.lower() in content.lower():
+                            bad("injection:payload_in_reply", f"{where} {payload[:12]}…")
+                    g = FINAL_GLITCH.search(content)
+                    if g:
+                        bad("final:template_glitch", f"{where} {meta.get('id', '')} {g.group(0)!r}")
+                    if thinking.ROUND4:
+                        g = FINAL_LEAK.search(content) or next(
+                            (re.search(rf"\b{re.escape(t)}\b", content) for t in REGISTRY
+                             if "_" in t and re.search(rf"\b{re.escape(t)}\b", content)), None)
+                        if g:
+                            bad("final:leak", f"{where} {meta.get('id', '')} {g.group(0)!r}")
+                        for err in thinking.iso_problems(content):
+                            bad("final:iso_timestamp", f"{where} {meta.get('id', '')} {err[:60]}")
+                        for err in thinking.empty_range_problems(content):
+                            bad("final:empty_range", f"{where} {meta.get('id', '')} {err[:60]}")
+                        for err in thinking.nofree_problems(content, [str(v) for v in results.values()]):
+                            bad("final:nofree_contradiction", f"{where} {meta.get('id', '')} {err[:80]}")
+                        # A crashed stand-in tool must never reach a row: its final would answer from nothing.
+                        if any(m.get("role") == "tool" and str(m.get("content") or "").startswith("(error running") for m in msgs):
+                            bad("tool:crashed", f"{where} {meta.get('id', '')}")
+                        for err in thinking.absence_problems(meta, msgs):
+                            bad("final:absence_without_read", f"{where} {meta.get('id', '')} {err[:80]}")
+                        try:
+                            pos_errs = thinking.position_problems(meta, msgs)
+                        except Exception as exc:  # noqa: BLE001
+                            pos_errs = [f"position: check failed {exc!r}"[:80]]
+                        for err in pos_errs:
+                            bad("final:position_claim", f"{where} {meta.get('id', '')} {err[:100]}")
+                        if (family in thinking.NEVER or str(family).startswith("chat_")) and CHAT_RECEIPT.search(content):
+                            bad("final:chat_receipt", f"{where} {meta.get('id', '')} "
+                                f"{CHAT_RECEIPT.search(content).group(0)!r}")
+                    finals.setdefault(content, []).append(str(meta.get("id") or where))
+            elif r == "tool":
+                if m.get("tool_call_id") in pending:
+                    pending.remove(m["tool_call_id"])
+                else:
+                    bad("tool_without_call", f"{where}:{j}")
+                text = str(m.get("content") or "")
+                results[m.get("tool_call_id")] = text
+                for sentence in re.split(r"(?<=[.!?])\s+|\n", text):
+                    if INJECTION_MARKERS.search(sentence):
+                        injected += [p.strip("`") for p in _PAYLOAD.findall(sentence)]
+            elif r == "user":
+                if meta.get("family") not in writes.MULTITURN:
+                    bad("extra_user", f"{where}:{j}")
+            else:
+                bad("bad_role", f"{where}:{j}")
+        if pending:
+            bad("call_without_tool_result", where)
+        if r5_enabled() and msgs[-1].get("role") == "assistant" and not msgs[-1].get("tool_calls"):
+            for key, hit_text in final_problems_r5(msgs[-1].get("content") or "", meta, bool(calls)):
+                bad(key, f"{where} {meta.get('id', '')} {hit_text!r}")
+            # a base-written answer (or a scripted one in a family with a contract) has to say what its sources said
+            if meta.get("distilled") or meta.get("family") in R5_GOLD_FAMILIES:
+                for key, detail in gold_problems_r5(msgs[-1].get("content") or "", meta, msgs):
+                    bad(key, f"{where} {meta.get('id', '')} {str(detail)[:80]!r}")
+        # writes, approval cards and denials, against the example's meta line
+        names = [name for _, name in calls]
+        # manage_timers is one tool for reads and writes: list/stopwatch_read are reads (as build.py records them)
+        ran_writes = [name for (_, name), args in zip(calls, call_args) if name in REGISTRY and not is_read(name)
+                      and str((args or {}).get("action") or "list") not in READ_ACTIONS.get(name, ())
+                      # organize_files without confirm is the preview (a read); the confirm call moves files
+                      and not (name == "organize_files" and not (args or {}).get("confirm"))]
+        cards = list(meta.get("cards_seen") or [])
+        if ran_writes != list(meta.get("writes") or [])[:len(ran_writes)]:
+            bad("meta:writes", f"{where} example {ran_writes} vs meta {meta.get('writes')}")
+        if sorted(meta.get("expect_cards") or []) != sorted(cards):
+            bad("cards:expect_mismatch", f"{where} expected {meta.get('expect_cards')} saw {cards}")
+        took_effect = {e[0] for e in meta.get("effects") or []}
+        for name in sorted(set(names) & writes.ALWAYS_CARD):
+            # The loop may refuse a write before its card (e.g. a move onto a read-only
+            # calendar); that call has no effect and needs no card. One that took effect does.
+            if name not in cards and name in took_effect:
+                bad("cards:missing", f"{where} {name}")
+        for name in sorted(set(cards) & writes.NEVER_CARD):
+            if family not in writes.PICTURE_TURN:     # a picture turn cards every effect
+                bad("cards:never_card", f"{where} {name}")
+        decided = pair_cards(calls, cards, list(meta.get("approve") or []))
+        denied_any = False
+        for cid, _name in calls:
+            text = results.get(cid)
+            if text is None:
+                continue      # the target's own call has no result yet
+            denied = DENIED in text
+            denied_any |= denied
+            if cid in decided and decided[cid] == denied:
+                bad("approve:denied_result_missing" if not decided[cid] else "approve:unexpected_denial",
+                    f"{where} {_name}: card {'allowed' if decided[cid] else 'denied'}, result {text[:40]!r}")
+            elif cid not in decided and denied:
+                bad("approve:denial_without_card", f"{where} {_name}")
+        if denied_any and not msgs[-1].get("tool_calls") and claims_done(msgs[-1].get("content") or ""):
+            bad("approve:denied_claims_success", f"{where} {(msgs[-1].get('content') or '')[:60]!r}")
+        # situational thinking (thinking.py), against the example's meta line
+        if metas:
+            prev_thought = check_thinking(meta, msgs, turn_ctx.get(ln - 1, {}), injected, prev_thought, bad, where)
+        # the synthetic harness must never show through (class or stub names)
+        if re.search(r"\bWorld\.t_\w+|\bt_[a-z_]+\(\)|synthetic world|lora-dataset harness", json.dumps(msgs)):
+            bad("harness_leak", where)
+        # privacy: the whole example, scaffold included
+        blob = json.dumps(ex, ensure_ascii=False)
+        low = blob.lower()
+        for dom in {e.split("@", 1)[1].lower() for e in re.findall(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+", blob)}:
+            if dom not in SYNTHETIC_DOMAINS and not any(dom.endswith("." + s) for s in SYNTHETIC_DOMAINS):
+                bad("privacy:email_domain", f"{where} {dom[:3]}…")
+        for user in set(re.findall(r"/Users/([A-Za-z0-9._-]+)", blob)):
+            if user.lower() not in {"shared", "sam"}:
+                bad("privacy:home_path", f"{where} /Users/{user[:2]}…")
+        for tok in ident:
+            if re.search(rf"\b{re.escape(tok)}\b", low):
+                bad("privacy:identity", f"{where} {tok[:2]}…")
+        if deny:
+            tokens, emails, phrases = deny
+            for tok in set(re.findall(r"\b[A-Z][a-z][A-Za-z'’-]{1,}\b", blob)):
+                base = re.split(r"['’]", tok)[0]
+                if base in tokens and base.lower() not in wl:
+                    bad("privacy:real_name", f"{where} {base[:2]}…({len(base)})")
+            for e in emails:
+                if e in low:
+                    bad("privacy:real_email", f"{where} {e[:2]}…")
+            for p in phrases:
+                if p in low:
+                    bad("privacy:real_phrase", f"{where} {p[:3]}…({len(p)})")
+    for text, ids in sorted(finals.items(), key=lambda kv: -len(kv[1])):
+        if len(ids) > DUP_FINALS_MAX:
+            LAST_WARNINGS.append(f"{len(ids)} identical finals {text[:70]!r}: {', '.join(ids[:6])}"
+                                 f"{' …' if len(ids) > 6 else ''}")
+    return n, problems, samples
+
+
+def _brev_render():
+    """brev/render.py's render(): the exact prompt/completion rows the GPU box trains on."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("ask_brev_render", os.path.join(OUT, "brev", "render.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def template_check(path, model_dirs, meta_path=AUTO):
+    """Render every example with each model's own chat template, as mlx-lm does, and with
+    several templates require brev/render.py's prompt and completion to match byte for byte.
+    Returns (problems, {template tag: token stats})."""
+    import statistics
+    from transformers import AutoTokenizer
+    dirs = [model_dirs] if isinstance(model_dirs, str) else list(model_dirs)
+    tags = [os.path.basename(os.path.normpath(d)) for d in dirs]
+    toks = [AutoTokenizer.from_pretrained(d) for d in dirs]
+    brev = _brev_render()
+    metas = load_meta(path, meta_path)
+    lens, targets, problems = {t: [] for t in tags}, {t: [] for t in tags}, Counter()
+    shapes = {t: Counter() for t in tags}
+    for ln, line in enumerate(open(path)):
+        ex = json.loads(line)
+        meta = metas[ln] if metas else {"id": f"line{ln + 1}", "family": "", "target_kind": "", "think": False,
+                                        "thought": None, "chat_template_kwargs": {"enable_thinking": True}}
+        tools = ex["tools"] or None
+        rows = []
+        for tag, tok in zip(tags, toks):
+            try:
+                full = tok.apply_chat_template(ex["messages"], tools=tools, tokenize=False)
+                pre = tok.apply_chat_template(ex["messages"][:-1], tools=tools, tokenize=False, add_generation_prompt=True)
+            except Exception as exc:  # noqa: BLE001
+                problems[f"{tag}: template_error: {str(exc)[:80]}"] += 1
+                continue
+            if not full.startswith(pre):
+                problems[f"{tag}: template:prompt_not_prefix"] += 1
+                continue
+            n = len(tok(full, add_special_tokens=False)["input_ids"])
+            lens[tag].append(n)
+            targets[tag].append(n - len(tok(pre, add_special_tokens=False)["input_ids"]))
+            try:
+                r = brev.render(tok, ex, meta)
+                rows.append((tag, r["prompt"], r["completion"]))
+                shapes[tag][brev.row_shape(r)] += 1
+            except Exception as exc:  # noqa: BLE001
+                problems[f"{tag}: render_error: {str(exc).split(': ', 1)[-1][:80]}"] += 1
+        for tag, prompt, completion in rows[1:]:
+            if prompt != rows[0][1]:
+                problems[f"template:parity_prompt({rows[0][0]} vs {tag})"] += 1
+            if completion != rows[0][2]:
+                problems[f"template:parity_completion({rows[0][0]} vs {tag})"] += 1
+    stats = {}
+    for tag in tags:
+        ls = sorted(lens[tag])
+        if ls:
+            stats[tag] = {"median_tokens": statistics.median(ls), "p90_tokens": ls[int(0.9 * len(ls))],
+                          "max_tokens": ls[-1], "total_tokens": sum(ls), "target_tokens": sum(targets[tag]),
+                          "rendered_shapes": dict(shapes[tag])}
+    return problems, stats
+
+
+def turn_groups(meta_path):
+    return {leak.fold(json.loads(l)["prompt"]) for l in open(meta_path)}
+
+
+# Public words that also occur in the real data: planets, places, people from
+# history, books and Harbor's own words. Each was reviewed: it is common knowledge
+# or text already in Harbor's public source (e.g. the weather tool's 'Palo Alto,CA'
+# example, the 'Paris,TX' stand-in), not a detail of the user's life.
+PUBLIC_WORDS = {"neptune", "jupiter", "venus", "mercury", "saturn", "uranus", "mars", "africa", "asia", "europe",
+                "america", "california", "palo", "paris", "texas", "alexander",
+                "hamlet", "claudius", "laertes", "gertrude", "polonius", "ophelia", "pomodoro", "online", "harbor",
+                "time-bound", "message-id"}
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser()
+    ap.add_argument("paths", nargs="*")
+    ap.add_argument("--private-results", default=os.environ.get("HARBOR_EVAL_RESULTS"))
+    ap.add_argument("--template", metavar="MODEL_DIR", action="append", default=[],
+                    help="also render each example with this model's chat template (repeatable; with two or more, "
+                         "the rendered prompt and completion must match byte for byte). Reads template/tokenizer "
+                         "files only, never weights.")
+    ap.add_argument("--problems-out", metavar="JSONL",
+                    help="also write every problem as {file, line, key, where}, one per line (finish_r5.py drops by it)")
+    args = ap.parse_args(argv)
+    sink = open(args.problems_out, "w", encoding="utf-8") if args.problems_out else None
+    paths = args.paths or [os.path.join(OUT, x) for x in ("train.jsonl", "valid.jsonl", "all.jsonl")
+                           if os.path.exists(os.path.join(OUT, x))]
+    if r5_enabled():    # what build.py gets through scen: picture turns may write, and they card every effect
+        import scen_r5_picture
+        writes.WRITE_ALLOW = {**writes.WRITE_ALLOW, **scen_r5_picture.WRITE_ALLOW_R5}
+    leaks = leak.LeakIndex()
+    ident = identity_tokens()
+    deny = None
+    if args.private_results:
+        deny = private_denylist(args.private_results)
+        print(f"private denylist: {len(deny[0])} names, {len(deny[1])} emails, {len(deny[2])} phrases (memory only)")
+    else:
+        print("private denylist: skipped (pass --private-results to check against the real eval results)")
+    print(f"live registry: {len(REGISTRY)} tools, {len(CATALOG.families)} families")
+    failed = False
+    for p in paths:
+        def record(key, where, _f=os.path.basename(p)):
+            ln = where.split()[0].split(":")
+            sink.write(json.dumps({"file": _f, "line": int(ln[1]) if len(ln) > 1 and ln[1].isdigit() else None,
+                                   "key": key, "where": where}) + "\n")
+        n, problems, samples = validate_file(p, leaks, ident, deny, PUBLIC_WORDS, on_bad=record if sink else None)
+        print(f"{os.path.basename(p)}: {n} examples, problems: {dict(problems) or 'none'}")
+        for k, v in list(samples.items())[:30]:
+            print("   ", k, "->", v)
+        for w in LAST_WARNINGS:
+            print("    WARN", w)
+        failed |= bool(problems)
+        if args.template:
+            tproblems, tstats = template_check(p, args.template)
+            print(f"    template ({len(args.template)} checked"
+                  f"{', parity' if len(args.template) > 1 else ''}): problems {dict(tproblems) or 'none'}")
+            for tag, st in tstats.items():
+                print(f"      {tag}: {st}")
+            failed |= bool(tproblems)
+    tm, vm = os.path.join(OUT, "train.meta.jsonl"), os.path.join(OUT, "valid.meta.jsonl")
+    if not args.paths and os.path.exists(tm) and os.path.exists(vm):
+        both = turn_groups(tm) & turn_groups(vm)
+        print(f"split: {len(both)} prompt groups in both train and valid")
+        failed |= bool(both)
+    if sink:
+        sink.close()
+    sys.exit(1 if failed else 0)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,709 @@
+"""Mac-runnable checks for gen_finals.py and choose_r5.py: no GPU, no weights, no torch. A fake generate function
+stands in for the model; the real tokenizer and chat template are used when the model directory is present.
+
+    /Users/you/Desktop/Harbor_Project/.venv/bin/python -m pytest --noconftest --rootdir=. -q
+"""
+import json
+import os
+import sys
+
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _paths  # noqa: E402,F401
+import choose  # noqa: E402
+import choose_r5 as c5  # noqa: E402
+import gen  # noqa: E402
+import gen_finals as G  # noqa: E402
+
+TOKDIR = "/Users/you/Desktop/OMLX_Model_Files/Jundot/gemma-4-E4B-it-oQ4e-mtp"
+needs_tok = pytest.mark.skipif(not os.path.isdir(TOKDIR), reason="tokenizer directory not on this machine")
+
+TOOLS = [{"type": "function", "function": {"name": "view_emails", "description": "Read mail.",
+                                           "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}}}]
+SYS = "You are Harbor.\nIMPORTANT rules: be brief."
+CALL = {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {
+    "name": "view_emails", "arguments": "{\"query\": \"permit\"}"}}]}
+
+
+def mk(i, family="fam", kind="chat", target="Scripted answer.", extra=None, meta=None):
+    msgs = [{"role": "system", "content": SYS}, {"role": "user", "content": f"question number {i}"}]
+    if kind == "tool":
+        msgs += [dict(CALL), {"role": "tool", "tool_call_id": "c1", "content": f"Result {i}: REF-{i}"}]
+    msgs += list(extra or [])
+    msgs.append({"role": "assistant", "content": target} if target is not None else dict(CALL))
+    return {"meta": {"id": f"{family}-{i:03d}", "family": family, "chat_template_kwargs": {"enable_thinking": True},
+                     "tool_choice": "auto", **(meta or {})}, "messages": msgs, "tools": TOOLS}
+
+
+@pytest.fixture(scope="module")
+def tok():
+    if not os.path.isdir(TOKDIR):
+        pytest.skip("no tokenizer")
+    from transformers import AutoTokenizer
+    return AutoTokenizer.from_pretrained(TOKDIR, local_files_only=True)
+
+
+def silent(*_a):
+    pass
+
+
+# ---------------------------------------------------------------- row selection
+def test_select_rows_keeps_only_final_answers():
+    rows = [mk(1), mk(2, kind="tool"), mk(3, target=None), mk(4, target="x", extra=None)]
+    rows.append({"meta": {"id": "pic-1", "family": "v"}, "tools": None, "messages": [
+        {"role": "user", "content": [{"type": "text", "text": "hi"}, {"type": "image_url", "image_url": {"url": "x"}}]},
+        {"role": "assistant", "content": "a picture"}]})
+    got, skipped = G.select_rows(rows)
+    assert [r["meta"]["id"] for r in got] == ["fam-001", "fam-002", "fam-004"]
+    assert skipped == ["pic-1"]
+
+
+# ---------------------------------------------------------------- thought parsing
+def test_parse_forced_prompt_has_no_opening_tag():
+    out = G.parse_output("let me think\nabout it\n<channel|>Here you go.<turn|>", prompt_forced=True)
+    assert out["reasoning"] == "let me think\nabout it" and out["content"] == "Here you go."
+    assert out["tool_calls"] == [] and "channel_leak" not in out
+
+
+def test_parse_model_opens_the_channel_itself():
+    out = G.parse_output("<|channel>thought\nhmm\n<channel|>Hello Sam!<turn|>", prompt_forced=False)
+    assert out["reasoning"] == "hmm" and out["content"] == "Hello Sam!"
+
+
+def test_parse_empty_thought_and_no_thought():
+    out = G.parse_output("<|channel>thought\n<channel|>Short.<turn|>", prompt_forced=False)
+    assert out["reasoning"] is None and out["content"] == "Short."
+    out = G.parse_output("Straight answer.<turn|>", prompt_forced=False)
+    assert out["reasoning"] is None and out["content"] == "Straight answer."
+
+
+def test_parse_unclosed_thought_is_all_reasoning():
+    out = G.parse_output("<|channel>thought\nstill thinking and cut off", prompt_forced=False)
+    assert out["content"] == "" and out["reasoning"] == "still thinking and cut off"
+    out = G.parse_output("forced and cut off", prompt_forced=True)
+    assert out["content"] == "" and out["reasoning"] == "forced and cut off"
+
+
+def test_parse_tool_call_and_stray_markers():
+    out = G.parse_output("<|channel>thought\nneed data\n<channel|><|tool_call>call:view_emails{query:<|\"|>x<|\"|>}"
+                         "<tool_call|><|tool_response>", prompt_forced=False)
+    assert out["content"] == "" and out["tool_calls"][0]["function"]["name"] == "view_emails"
+    out = G.parse_output("<|channel>thought\nA<channel|>answer<|channel>thought\nB<channel|>more<turn|>", prompt_forced=False)
+    assert out.get("channel_leak") is True
+    out = G.parse_output("fine<eos><pad><pad>", prompt_forced=False)
+    assert out["content"] == "fine"
+
+
+@needs_tok
+def test_parse_roundtrips_through_the_real_tokenizer(tok):
+    text = "<|channel>thought\nhi there\n<channel|>Yo **bold**.<turn|>"
+    ids = tok.encode(text, add_special_tokens=False)
+    assert ids[-1] == 106
+    rec = G.make_record(mk(1), 0, ids + [0, 0, 0], tok, 10, False, 1.0, 1, "math")
+    assert (rec["reasoning"], rec["content"], rec["finish_reason"]) == ("hi there", "Yo **bold**.", "stop")
+    assert rec["usage"]["completion_tokens"] == len(ids)
+    rec = G.make_record(mk(1), 0, ids[:-1], tok, 10, False, 1.0, 1, "math")
+    assert rec["finish_reason"] == "length"
+
+
+# ---------------------------------------------------------------- prompts, hash, resume, shards, batching
+@needs_tok
+def test_prompt_comes_from_render_and_forced_after_tool(tok):
+    assert G.prompt_for(tok, mk(1, kind="tool")).endswith(G.FORCED)
+    assert not G.prompt_for(tok, mk(1)).endswith(G.FORCED)
+    assert G.prompt_for(tok, mk(1, kind="tool", meta={"think": True, "thought": "t"})).endswith(G.FORCED)
+
+
+def fake_model(tok, log=None, fail_on=None):
+    """A model that answers each prompt by echoing its question number, as a thought plus an answer."""
+    def generate(prompts, seed):
+        if log is not None:
+            log.append(len(prompts))
+        outs = []
+        for p in prompts:
+            text = tok.decode(p, skip_special_tokens=False)
+            q = text.rsplit("question number ", 1)[1].split("<")[0].split("\n")[0].strip()
+            if fail_on and q in fail_on:
+                raise RuntimeError("out of memory")
+            forced = text.endswith(G.FORCED)
+            body = f"thinking {q}\n<channel|>Answer for {q}.<turn|>"
+            outs.append(tok.encode(body if forced else G.OPEN + body, add_special_tokens=False) + [0] * 3)
+        return outs
+    return generate
+
+
+def lines(path):
+    return [json.loads(x) for x in open(path)]
+
+
+@needs_tok
+def test_records_match_gen_hash_and_format(tok, tmp_path):
+    rows = [mk(1), mk(2, kind="tool")]
+    G.run(rows, tok, fake_model(tok), str(tmp_path), 0, 1, 1, log=silent)
+    recs = lines(tmp_path / "finals.s0of1.jsonl")
+    assert len(recs) == 2
+    for r, rec in zip(rows, recs):
+        assert rec["request_hash"] == gen.request_hash(r["messages"][:-1], r["tools"])
+        assert set(rec) >= {"id", "family", "k", "model", "request_hash", "content", "reasoning", "tool_calls",
+                            "finish_reason", "usage", "seconds", "no_choices"}
+    assert recs[1]["content"] == "Answer for 2." and recs[1]["reasoning"] == "thinking 2"   # forced (after a tool)
+    assert recs[0]["content"] == "Answer for 1." and recs[0]["reasoning"] == "thinking 1"   # model opens the channel
+
+
+@needs_tok
+def test_resume_is_sample_major_and_skips_done(tok, tmp_path):
+    rows = [mk(i) for i in range(4)]
+    G.run(rows, tok, fake_model(tok, fail_on={"3"}), str(tmp_path), 0, 1, 2, log=silent)   # 3 fails twice: errors
+    recs = lines(tmp_path / "finals.s0of1.jsonl")
+    assert [r["k"] for r in recs] == [0, 0, 0, 0, 1, 1, 1, 1]          # sample 0 of every prompt first
+    assert sum("error" in r for r in recs) == 2
+    log = []
+    G.run(rows, tok, fake_model(tok, log), str(tmp_path), 0, 1, 2, log=silent)               # only the failed pairs rerun
+    assert sum(log) == 2
+    ok = [r for r in lines(tmp_path / "finals.s0of1.jsonl") if "error" not in r]
+    assert sorted((r["id"], r["k"]) for r in ok) == sorted((r["meta"]["id"], k) for r in rows for k in (0, 1))
+    log.clear()
+    G.run(rows, tok, fake_model(tok, log), str(tmp_path), 0, 1, 3, log=silent)               # a bigger k adds sample 2 only
+    assert sum(log) == 4
+    # a half-written last line (kill) does not break resume
+    with open(tmp_path / "finals.s0of1.jsonl", "a") as f:
+        f.write('{"id": "fam-0')
+    assert len(G.done_pairs(str(tmp_path))) == 12
+
+
+def test_shards_are_disjoint_and_cover():
+    rows = [mk(i) for i in range(19)]
+    parts = [G.shard_rows(rows, i, 8) for i in range(8)]
+    ids = [r["meta"]["id"] for p in parts for r in p]
+    assert sorted(ids) == sorted(r["meta"]["id"] for r in rows) and len(set(ids)) == 19
+    assert max(map(len, parts)) - min(map(len, parts)) <= 1
+    with pytest.raises(ValueError):
+        G.shard_rows(rows, 8, 8)
+
+
+@needs_tok
+def test_shard_files_and_resume_under_another_layout(tok, tmp_path):
+    rows = [mk(i) for i in range(6)]
+    for s in range(3):
+        G.run(rows, tok, fake_model(tok), str(tmp_path), s, 3, 1, log=silent)
+    assert sorted(p.name for p in tmp_path.glob("finals.*.jsonl")) == [f"finals.s{s}of3.jsonl" for s in range(3)]
+    log = []
+    G.run(rows, tok, fake_model(tok, log), str(tmp_path), 0, 2, 1, log=silent)     # a 2-way layout finds all done
+    assert log == []
+
+
+@needs_tok
+def test_batching_keeps_every_answer_with_its_prompt(tok, tmp_path):
+    rows = [mk(i, extra=[{"role": "user", "content": "padding " * (i * 37 % 11)},
+                         {"role": "assistant", "content": "ok"},
+                         {"role": "user", "content": f"question number {i}"}]) for i in range(11)]
+    log = []
+    G.run(rows, tok, fake_model(tok, log), str(tmp_path), 0, 1, 2, batch=4, log=silent)
+    assert max(log) <= 4 and sum(log) == 22
+    recs = lines(tmp_path / "finals.s0of1.jsonl")
+    assert len(recs) == 22
+    for rec in recs:
+        n = int(rec["id"].split("-")[1])
+        assert rec["content"] == f"Answer for {n}."
+    # nearly sample-major: no sample-1 line before the last sample-0 line
+    ks = [r["k"] for r in recs]
+    assert ks == sorted(ks)
+
+
+def test_windows_sort_by_length_within_a_sample_only():
+    items = [(0, mk(i), list(range(n)), False) for i, n in enumerate([9, 3, 7, 1, 8, 2])]
+    items += [(1, mk(9), [1], False)]
+    got = list(G.windows(items, 2))
+    assert [len(it[2]) for g in got for it in g] == [1, 2, 3, 7, 8, 9, 1]
+    assert all(len(g) <= 2 for g in got) and got[-1][0][0] == 1
+    assert [g[0] for g in G.windows(items, 1)] == items
+
+
+@needs_tok
+def test_selfcheck_detects_a_batch_that_disagrees(tok):
+    rows = [mk(i) for i in range(5)]
+    same = lambda prompts, seed, greedy=False, max_new=0: [[7] * 30 for _ in prompts]  # noqa: E731
+    assert G.selfcheck(rows, tok, same, log=silent)
+    state = {"n": 0}
+
+    def drift(prompts, seed, greedy=False, max_new=0):
+        state["n"] += 1
+        return [[7] * 30 if len(prompts) == 1 else [8] * 30 for _ in prompts]
+    assert not G.selfcheck(rows, tok, drift, log=silent)
+
+
+@needs_tok
+def test_selfcheck_compares_other_attention_with_math(tok):
+    rows = [mk(i) for i in range(5)]
+
+    def wrong_kernel(prompts, seed, greedy=False, max_new=0, reference=False):
+        return [[9] * 30 if reference else [7] * 30 for _ in prompts]
+    assert G.selfcheck(rows, tok, wrong_kernel, log=silent)                      # batching alone can't see it
+    assert not G.selfcheck(rows, tok, wrong_kernel, log=silent, attn_reference=True)
+    right = lambda prompts, seed, greedy=False, max_new=0, reference=False: [[7] * 30 for _ in prompts]  # noqa: E731
+    assert G.selfcheck(rows, tok, right, log=silent, attn_reference=True)
+
+
+# ---------------------------------------------------------------- the r5 choose step
+GOOD = "You have one email from Dana Whitfield about the permit. Reply is due soon."
+
+
+def samples(path, rows, texts, reasoning="because"):
+    with open(path, "w") as f:
+        for r in rows:
+            for k, t in enumerate(texts.get(r["meta"]["id"], [])):
+                f.write(json.dumps({"id": r["meta"]["id"], "family": r["meta"]["family"], "k": k,
+                                    "request_hash": gen.request_hash(r["messages"][:-1], r["tools"]), "content": t,
+                                    "reasoning": reasoning, "tool_calls": [], "finish_reason": "stop"}) + "\n")
+
+
+def test_choose_r5_rejects_and_reports(tmp_path):
+    bw = c5.BASE_WRITES
+    rows = [mk(1, "alpha", "tool", bw), mk(2, "alpha", "tool", bw), mk(3, "alpha", "tool", "scripted three"),
+            mk(4, "beta", "chat", bw), mk(5, "beta", "chat", "scripted five"), mk(6, "alpha", "tool", target=None)]
+    partial = tmp_path / "partial.jsonl"
+    partial.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    samples(tmp_path / "raw.jsonl", rows, {
+        "alpha-001": ["There are 7 results, and 3 more below.", GOOD],          # first cut list, second passes
+        "alpha-002": ["Here are 2, and 5 more."],                               # no pass, BASE_WRITES -> drop
+        "alpha-003": ["The thing is X."],                                       # passes
+        "beta-004": ["Nothing was saved in your memory about that."],           # memory stall in chat -> no pass
+        "beta-005": ["Nothing was saved in your memory about that."],           # no pass, scripted stays
+        "alpha-006": ["a call row is not a final"],
+    })
+    finals, chosen, stats = c5.choose_r5(str(partial), [str(tmp_path / "raw.jsonl")])
+    assert len(finals) == 5 and "alpha-006" not in chosen
+    assert chosen["alpha-001"]["content"] == GOOD and chosen["alpha-001"]["k"] == 1
+    r5 = stats["r5"]
+    assert r5["families"]["alpha"] == {**r5["families"]["alpha"], "final_rows": 3, "passed": 2, "to_drop": 1,
+                                       "drop": ["alpha-002"], "scripted_kept": []}
+    assert r5["families"]["beta"]["drop"] == ["beta-004"] and r5["families"]["beta"]["scripted_kept"] == ["beta-005"]
+    assert r5["drop_ids"] == ["alpha-002", "beta-004"] and r5["no_pass_ids"] == ["alpha-002", "beta-004", "beta-005"]
+    assert r5["rejects_by_reason"]["final:and_n_more"] == 2 and r5["rejects_by_reason"]["final:memory_stall"] == 2
+    assert "DROP 2 rows" in c5.summary(r5)
+    assert choose.reject_reasons is c5.ORIG_REJECT                               # the patch is undone
+
+
+def test_chat_rows_base_answers_with_any_tool_drop(tmp_path):
+    """The user's decisions (2026-11-07): chat_direct_r4 / knowledge_direct rows base answers with web_search ("Let them drop")
+    or any other tool ("Drop them too") drop instead of keeping their scripted text. A call never passes. A chat row that failed
+    in text only, and other families, keep the old rule."""
+    rows = [mk(1, "chat_direct_r4"), mk(2, "chat_direct_r4"), mk(3, "knowledge_direct"), mk(4, "knowledge_direct"),
+            mk(5, "chat_direct_r4"), mk(6, "web_r3"), mk(7, "knowledge_direct")]
+    partial = tmp_path / "partial.jsonl"
+    partial.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    web = [{"type": "function", "function": {"name": "web_search", "arguments": "{}"}}]
+    wiki = [{"type": "function", "function": {"name": "wikipedia_summary", "arguments": "{}"}}]
+    calls = {("chat_direct_r4-001", 0): web, ("knowledge_direct-003", 1): web, ("knowledge_direct-004", 0): wiki,
+             ("knowledge_direct-004", 1): web, ("web_r3-006", 0): web}
+    texts = {"chat_direct_r4-001": [""], "chat_direct_r4-002": [GOOD], "knowledge_direct-003": ["Here are 2, and 5 more.", ""],
+             "knowledge_direct-004": ["", ""], "chat_direct_r4-005": ["<|tool_call>call:convert_units{value:3}"], "web_r3-006": [""],
+             "knowledge_direct-007": ["Here are 2, and 5 more."]}
+    with open(tmp_path / "raw.jsonl", "w") as f:
+        for r in rows:
+            for k, t in enumerate(texts[r["meta"]["id"]]):
+                f.write(json.dumps({"id": r["meta"]["id"], "family": r["meta"]["family"], "k": k,
+                                    "request_hash": gen.request_hash(r["messages"][:-1], r["tools"]), "content": t, "reasoning": "r",
+                                    "tool_calls": calls.get((r["meta"]["id"], k), []), "finish_reason": "stop"}) + "\n")
+    _, chosen, stats = c5.choose_r5(str(partial), [str(tmp_path / "raw.jsonl")])
+    r5 = stats["r5"]
+    assert set(chosen) == {"chat_direct_r4-002"}
+    assert r5["tool_drop_ids"] == ["chat_direct_r4-001", "chat_direct_r4-005", "knowledge_direct-003", "knowledge_direct-004"]
+    assert set(r5["drop_ids"]) == set(r5["tool_drop_ids"])
+    cd, kd = r5["families"]["chat_direct_r4"], r5["families"]["knowledge_direct"]
+    assert cd["drop_tool"] == {"chat_direct_r4-001": ["web_search"], "chat_direct_r4-005": ["convert_units"]}   # unparsed call text too
+    assert cd["scripted_kept"] == [] and cd["to_drop"] == 2
+    assert kd["drop_tool"] == {"knowledge_direct-003": ["web_search"],                      # one sample called a tool: enough
+                               "knowledge_direct-004": ["web_search", "wikipedia_summary"]}
+    assert kd["scripted_kept"] == ["knowledge_direct-007"] and kd["scripted_kept_after_tool"] == {}   # failed in text only
+    assert r5["families"]["web_r3"]["scripted_kept"] == ["web_r3-006"]       # not a chat family: the old rule
+    assert r5["families"]["web_r3"]["scripted_kept_after_tool"] == {"web_search": 1}
+    assert "4 chat/knowledge rows base answered with a tool call" in c5.summary(r5)
+
+
+def test_chat_voice_and_only_text_families_drop_after_a_tool_call():
+    """chat_voice_r4 joined the tool-drop families ("Drop them too", 2026-11-08). Families where the call is the lesson's mistake
+    (restraint, act-don't-ask, recall, follow-up chat) stay out, so their scripted answer still teaches against the call."""
+    assert c5.TOOL_DROP_FAMILIES == {"chat_direct_r4", "knowledge_direct", "chat_voice_r4"}
+
+
+def test_choose_r5_memory_stall_allowed_after_a_tool_call_and_for_recall():
+    rec = {"id": "x", "k": 0, "content": "Nothing was saved in your memory yet.", "reasoning": "r",
+           "tool_calls": [], "finish_reason": "stop"}
+    rej = c5.make_reject()
+    assert "final:memory_stall" in rej(rec, mk(1))
+    assert "final:memory_stall" not in rej(rec, mk(1, kind="tool"))
+    assert "final:memory_stall" not in rej(rec, mk(1, meta={"qkind": "rec_none"}))
+    assert "channel_leak" in rej({**rec, "channel_leak": True}, mk(1))
+
+
+def test_stall_after_tool_is_reported_and_optionally_allowed(tmp_path):
+    rows = [mk(1, "alpha", "tool", "scripted")]
+    partial = tmp_path / "partial.jsonl"
+    partial.write_text(json.dumps(rows[0]) + "\n")
+    samples(tmp_path / "raw.jsonl", rows, {"alpha-001": ["I couldn't find any emails about that."]})
+    _, chosen, stats = c5.choose_r5(str(partial), [str(tmp_path / "raw.jsonl")])
+    assert not chosen and stats["r5"]["families"]["alpha"]["stall_only_after_tool"] == ["alpha-001"]
+    _, chosen, _ = c5.choose_r5(str(partial), [str(tmp_path / "raw.jsonl")], stall_ok_after_tool=True)
+    assert "alpha-001" in chosen
+
+
+@needs_tok
+def test_end_to_end_samples_then_choose(tok, tmp_path):
+    rows = [mk(1, "alpha", "tool", c5.BASE_WRITES), mk(2, "alpha", "chat", "scripted")]
+    partial = tmp_path / "partial.jsonl"
+    partial.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    G.run(rows, tok, fake_model(tok), str(tmp_path), 0, 1, 2, log=silent)
+    rc = c5.main(["--partial", str(partial), "--raw", str(tmp_path / "finals.*.jsonl"),
+                  "--out-chosen", str(tmp_path / "chosen.jsonl"), "--out-stats", str(tmp_path / "stats.json"),
+                  "--out-nopass-ids", str(tmp_path / "nopass.ids"), "--out-drop-ids", str(tmp_path / "drop.ids")])
+    assert rc == 0
+    chosen = lines(tmp_path / "chosen.jsonl")
+    assert [c["id"] for c in chosen] == ["alpha-001", "alpha-002"] and all(c["k"] == 0 for c in chosen)
+    assert (tmp_path / "drop.ids").read_text() == "" and (tmp_path / "nopass.ids").read_text() == ""
+
+
+def test_final_problems_copy_matches_validate():
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "ask-lora-r2", "builder"))
+    try:
+        import validate
+    except Exception as exc:  # noqa: BLE001  (needs the repo's service tree and venv)
+        pytest.skip(f"validate.py not importable here: {exc!r}")
+    for text in ("and 3 more", "plus 12 more items", "nothing was saved", "We haven't talked about it", "all good"):
+        for meta in (None, {"qkind": "rec_user"}):
+            for tool in (False, True):
+                assert c5.final_problems_r5(text, meta, tool) == validate.final_problems_r5(text, meta, tool)
+
+
+def test_reuse_r4_takes_only_matching_base_answers():
+    import reuse_r4
+    row = {"meta": {"id": "a-1", "family": "web_r3"}, "tools": [],
+           "messages": [{"role": "system", "content": "date"}, {"role": "user", "content": "hi there"},
+                        {"role": "assistant", "content": "scripted answer"}]}
+    good = {"prompt": "<|turn>user\nhi there<turn|>\n<|turn>model\n", "completion": "Base wrote this.<turn|>"}
+    rec = reuse_r4.reused(row, {"a-1": good})
+    assert rec["content"] == "Base wrote this." and rec["k"] == 0
+    assert reuse_r4.reused(row, {}) is None                                                      # no r4 row
+    assert reuse_r4.reused(row, {"a-1": {**good, "prompt": "something else"}}) is None           # different history
+    assert reuse_r4.reused(row, {"a-1": {**good, "completion": "scripted answer<turn|>"}}) is None   # r4 kept the script
+    other = {**row, "meta": {"id": "a-1", "family": "session_chat_r4"}}
+    assert reuse_r4.reused(other, {"a-1": good}) is None                                         # the family that lost base's voice
+
+
+# ------------------------------------------------------------------ the audit's probe, and base's traces at tool steps
+def _source_row():
+    gold = {"kind": "all_sources", "shape": "topic", "hit": {"mail": ["Dr. Ahn"], "notes": ["night guard"]}, "empty": [], "read": ["mail", "notes"],
+            "events": [], "failed": {}, "conflict": None, "prohibit": [], "all_of": [], "must_say_absent": False}
+    msgs = [{"role": "system", "content": SYS}, {"role": "user", "content": "anything about the dentist"}, CALL,
+            {"role": "tool", "tool_call_id": "c1", "content": "From Dr. Ahn: your visit. Note: ask about the night guard."},
+            {"role": "assistant", "content": G_PLACEHOLDER}]
+    return {"meta": {"id": "all_sources_r5-000-s1", "family": "all_sources_r5", "gold": gold, "think": False, "thought": None}, "messages": msgs, "tools": TOOLS}
+
+
+G_PLACEHOLDER = c5.BASE_WRITES
+
+
+def test_chooser_rejects_the_audit_probe_and_takes_a_real_answer():
+    row = _source_row()
+    reject = c5.make_reject()
+    bad = {"content": "Everything looks good. You are all set.", "reasoning": "I should summarize the relevant observations clearly.", "finish_reason": "stop", "k": 0}
+    why = reject(bad, row)
+    assert "source:missing:mail" in why and "source:missing:notes" in why
+    good = {"content": "Dr. Ahn wrote about your visit, and your note says to ask about the night guard.", "reasoning": "Two sources hit.", "finish_reason": "stop", "k": 0}
+    assert reject(good, row) == []
+
+
+def test_honest_not_found_isnt_a_stall_on_a_contract_row():
+    row = _source_row()
+    row["meta"]["gold"] = dict(row["meta"]["gold"], hit={}, empty=["mail"], read=["mail"], must_say_absent=True)
+    rec = {"content": "I couldn't find anything about that in your email.", "reasoning": "It came back empty.", "finish_reason": "stop", "k": 0}
+    assert c5.make_reject()(rec, row) == []
+
+
+def test_recall_facts_reach_the_chooser():
+    row = _source_row()
+    row["meta"]["gold"] = {"kind": "rec_user", "ref": ["Mudroom"], "ok": []}
+    assert c5.gold_refs([row]) == {row["meta"]["id"]: {"kind": "rec_user", "ref": ["Mudroom"], "ok": []}}
+
+
+def test_trace_is_kept_only_when_base_reached_the_same_call():
+    import choose_traces as T
+    h = gen.request_hash([{"role": "user", "content": "q"}], TOOLS)
+    row = {"meta": {"id": "a-s0", "family": "f"}, "tools": TOOLS, "messages": [{"role": "user", "content": "q"}, CALL]}
+    call = {"type": "function", "function": {"name": "view_emails", "arguments": '{query:<|"|>permit<|"|>}'}}
+    ok = {"reasoning": "They asked about the permit, so I should read their mail.", "tool_calls": [call], "content": "", "finish_reason": "stop", "request_hash": h}
+    assert T.reject_reasons(ok, row) == []
+    other = dict(ok, tool_calls=[{"type": "function", "function": {"name": "view_messages", "arguments": "{}"}}])
+    assert T.reject_reasons(other, row) == ["call_mismatch"]
+    wrong_arg = dict(ok, tool_calls=[{"type": "function", "function": {"name": "view_emails", "arguments": '{query:<|"|>rent<|"|>}'}}])
+    assert T.reject_reasons(wrong_arg, row) == ["call_mismatch"]
+    assert "no_thought" in T.reject_reasons(dict(ok, reasoning=None), row)
+    assert "no_call" in T.reject_reasons(dict(ok, tool_calls=[]), row)
+    assert "stale_hash" in T.reject_reasons(dict(ok, request_hash="x"), row)
+
+
+READS = {"view_emails": {"read": True, "defaults": {"query": None, "count": 5}},
+         "search_notes": {"read": True, "defaults": {"query": ""}},
+         "get_upcoming": {"read": True, "defaults": {"days": 7, "account": None, "calendar_only": False, "query": ""}},
+         "search_reminders": {"read": True, "defaults": {"query": "", "scope": "all"}},
+         "send_message": {"read": False, "defaults": {}}, "add_reminder": {"read": False, "defaults": {}}}
+
+
+def test_parallel_reads_match_in_any_order_but_writes_keep_theirs():
+    import choose_traces as T
+    want = [("view_emails", {"query": ("str", "trip")}), ("search_notes", {"query": ("str", "trip")})]
+    got = [_call("search_notes", '{query:<|"|>trip<|"|>}'), _call("view_emails", '{query:<|"|>trip<|"|>}')]
+    assert T.call_problem(got, want, READS) is None                                     # two reads: no order between them
+    assert T.call_problem(got[:1], want, READS) == "call_mismatch"
+    assert T.call_problem([got[0], _call("view_emails", '{query:<|"|>Trip<|"|>}')], want, READS) == "call_mismatch"   # case is a value
+    writes = [("send_message", {"to": ("str", "Ana")}), ("add_reminder", {"title": ("str", "Call Ana")})]
+    in_order = [_call("send_message", '{to:<|"|>Ana<|"|>}'), _call("add_reminder", '{title:<|"|>Call Ana<|"|>}')]
+    assert T.call_problem(in_order, writes, READS) is None
+    assert T.call_problem(in_order[::-1], writes, READS) == "call_order"                # an effect's order is the script's
+    mixed = [("view_emails", {"query": ("str", "trip")}), ("add_reminder", {"title": ("str", "Call Ana")})]
+    assert T.call_problem([in_order[1], got[1]], mixed, READS) == "call_order"           # one write makes the step ordered
+    assert T.call_problem([_call("mystery", "{}"), _call("view_emails", '{query:<|"|>trip<|"|>}')],
+                          [("view_emails", {"query": ("str", "trip")}), ("mystery", {})], READS) == "call_order"   # no spec: a write
+    dup = [("view_emails", {"query": ("str", "a")}), ("view_emails", {"query": ("str", "a")})]
+    assert T.call_problem([_call("view_emails", '{query:<|"|>a<|"|>}')] * 2, dup, READS) is None
+    assert T.call_problem([_call("view_emails", '{query:<|"|>a<|"|>}'), _call("view_emails", '{query:<|"|>b<|"|>}')], dup, READS) == "call_mismatch"
+
+
+def _call(name, text):
+    return {"function": {"name": name, "arguments": text}}
+
+
+def _scripted(name, args):
+    import choose_traces as T
+    return T.scripted_calls({"messages": [{"role": "assistant", "content": "", "tool_calls": [{"function": {"name": name, "arguments": args}}]}]})
+
+
+def test_false_and_zero_are_values_that_must_match():
+    """calendar_only=false (and 0) are values: base's calendar_only=true is a narrower read. Leaving one out matches only
+    when it IS the tool's own default, so the call runs the same; with no spec, leaving it out is a missing argument."""
+    import choose_traces as T
+    want = _scripted("get_upcoming", {"calendar_only": False, "days": 7})
+    assert T.call_problem([_call("get_upcoming", "{calendar_only:true,days:7}")], want, READS) == "call_mismatch"
+    assert T.call_problem([_call("get_upcoming", "{days:7}")], want, READS) is None                 # default False: same call
+    assert T.call_problem([_call("get_upcoming", "{days:7}")], want, {}) == "call_missing_argument"   # no spec: no equivalence
+    assert T.call_problem([_call("get_upcoming", "{calendar_only:false,days:7}")], want, READS) is None
+    assert T.call_problem([_call("get_upcoming", {"calendar_only": False, "days": 7.0})], want, READS) is None   # 7.0 is 7
+    assert T.call_problem([_call("get_upcoming", "{calendar_only:0,days:7}")], want, READS) == "call_mismatch"   # 0 isn't false
+    off = _scripted("toggle_setting", {"setting": "wifi", "on": False})
+    assert T.call_problem([_call("toggle_setting", '{setting:<|"|>wifi<|"|>,on:true}')], off, READS) == "call_mismatch"
+    zero = _scripted("clear_past_reminders", {"days": 0})
+    assert T.call_problem([_call("clear_past_reminders", "{days:3}")], zero, READS) == "call_mismatch"
+    assert T.call_problem([_call("clear_past_reminders", "{days:0}")], zero, READS) is None
+    assert T.call_problem([_call("clear_past_reminders", "{}")], zero, READS) == "call_missing_argument"
+    assert T.call_problem([_call("clear_past_reminders", '{days:<|"|>0<|"|>}')], zero, READS) == "call_mismatch"   # a string
+
+
+def test_extra_set_arguments_change_the_call_unless_they_are_the_default():
+    import choose_traces as T
+    want = _scripted("get_upcoming", {"query": "dentist"})
+    assert T.call_problem([_call("get_upcoming", '{query:<|"|>dentist<|"|>,calendar_only:true}')], want, READS) == "call_extra_argument"
+    assert T.call_problem([_call("get_upcoming", '{query:<|"|>dentist<|"|>,days:0}')], want, READS) == "call_extra_argument"
+    assert T.call_problem([_call("get_upcoming", '{query:<|"|>dentist<|"|>,calendar_only:false}')], want, READS) is None   # the default
+    assert T.call_problem([_call("get_upcoming", '{query:<|"|>dentist<|"|>,calendar_only:false}')], want, {}) == "call_extra_argument"
+    assert T.call_problem([_call("get_upcoming", '{query:<|"|>dentist<|"|>,account:<|"|><|"|>}')], want, READS) == "call_extra_argument"  # "" isn't None
+    assert T.call_problem([_call("get_upcoming", '{query:<|"|>dentist<|"|>,account:null}')], want, READS) is None   # None is the default
+
+
+def test_missing_and_empty_are_told_apart():
+    import choose_traces as T
+    empty = _scripted("search_reminders", {"query": "", "scope": "upcoming"})
+    assert T.call_problem([_call("search_reminders", '{scope:<|"|>upcoming<|"|>}')], empty, READS) is None   # query="" is its default
+    assert T.call_problem([_call("search_reminders", '{scope:<|"|>upcoming<|"|>}')], empty, {}) == "call_missing_argument"
+    assert T.call_problem([_call("search_reminders", '{query:null,scope:<|"|>upcoming<|"|>}')], empty, READS) == "call_mismatch"  # null isn't ""
+    tags = _scripted("get_tool_schemas", {"families": ["mail"], "tools": []})
+    assert T.call_problem([_call("get_tool_schemas", '{families:[<|"|>mail<|"|>]}')], tags, READS) == "call_missing_argument"   # [] isn't unset
+    assert T.call_problem([_call("get_tool_schemas", '{families:[<|"|>mail<|"|>],tools:[]}')], tags, READS) is None
+    assert T.call_problem([_call("get_tool_schemas", '{families:[<|"|>mail<|"|>],tools:[<|"|><|"|>]}')], tags, READS) == "call_mismatch"
+
+
+def test_list_arguments_keep_order_duplicates_and_item_boundaries():
+    """The bug: lists folded to a sorted, de-duplicated, comma-joined string, so ["a,b"] equalled ["a","b"], ["b","a"] equalled
+    ["a","b"], and ["a","a"] equalled ["a"]."""
+    import choose_traces as T
+    want = _scripted("get_stock_price", {"symbols": ["AAPL", "MSFT"]})
+    assert T.call_problem([_call("get_stock_price", '{symbols:[<|"|>AAPL<|"|>,<|"|>MSFT<|"|>]}')], want, READS) is None
+    assert T.call_problem([_call("get_stock_price", '{symbols:[<|"|>AAPL<|"|>, <|"|>MSFT<|"|>]}')], want, READS) is None   # spacing between items
+    assert T.call_problem([_call("get_stock_price", '{symbols:[<|"|>AAPL,MSFT<|"|>]}')], want, READS) == "call_mismatch"   # one item, not two
+    assert T.call_problem([_call("get_stock_price", '{symbols:[<|"|>MSFT<|"|>,<|"|>AAPL<|"|>]}')], want, READS) == "call_mismatch"   # order
+    assert T.call_problem([_call("get_stock_price", '{symbols:[<|"|>aapl<|"|>,<|"|>msft<|"|>]}')], want, READS) == "call_mismatch"   # case
+    assert T.call_problem([_call("get_stock_price", '{symbols:[<|"|>AAPL<|"|>,<|"|>AAPL<|"|>,<|"|>MSFT<|"|>]}')], want, READS) == "call_mismatch"
+    assert T.call_problem([_call("get_stock_price", '{symbols:[<|"|>AAPL<|"|>]}')], want, READS) == "call_mismatch"
+    two = _scripted("get_stock_price", {"symbols": ["AAPL", "AAPL"]})
+    assert T.call_problem([_call("get_stock_price", '{symbols:[<|"|>AAPL<|"|>]}')], two, READS) == "call_mismatch"     # duplicates count
+    joined = _scripted("search_notes", {"query": "a,b"})
+    assert T.call_problem([_call("search_notes", '{query:[<|"|>a<|"|>,<|"|>b<|"|>]}')], joined, READS) == "call_mismatch"   # a list isn't a string
+
+
+def test_call_text_parses_strictly_into_typed_values():
+    import choose_traces as T
+    assert T.parse_args('{query:<|"|>Note: a, b} c<|"|>,count:5,unread:false}') == {
+        "query": ("str", "Note: a, b} c"), "count": ("num", 5), "unread": ("bool", False)}
+    assert T.parse_args('{"query": "permit", "count": 5}') == {"query": ("str", "permit"), "count": ("num", 5)}
+    assert T.parse_args("{a:{b:1,c:[2, 3.5]},d:null}") == {"a": ("obj", (("b", ("num", 1)), ("c", ("list", (("num", 2), ("num", 3.5)))))),
+                                                          "d": ("null",)}
+    for broken in ('{query:<|"|>oops}', "{query:x", "{query:x} trailing", "[1,2]", "{:x}",
+                   "{query:permit}",                       # unquoted text: a string or a name? ambiguous, so it fails
+                   "{when:2026-11-09}", "{flag:True}", "{flag:none}",
+                   '{query:<|"|>a<|"|>,query:<|"|>b<|"|>}',   # the same argument twice
+                   '{"query": "a", "query": "b"}', '{"n": NaN}'):
+        assert T.parse_args(broken) is None, broken
+    want = _scripted("view_emails", {"query": "permit"})
+    assert T.call_problem([_call("view_emails", '{query:<|"|>permit')], want, READS) == "call_mismatch"
+
+
+def test_case_is_free_only_where_the_tool_discards_it():
+    import choose_traces as T
+    day = _scripted("get_my_day_plan", {"day": "tuesday"})
+    assert T.call_problem([_call("get_my_day_plan", '{day:<|"|>Tuesday<|"|>}')], day, READS) is None     # proactive_tools.py:487
+    assert T.call_problem([_call("get_my_day_plan", '{day:<|"|>Wednesday<|"|>}')], day, READS) == "call_mismatch"
+    title = _scripted("add_reminder", {"title": "Feed the cat"})
+    assert T.call_problem([_call("add_reminder", '{title:<|"|>feed the cat<|"|>}')], title, READS) == "call_mismatch"   # stored as typed
+    q = _scripted("view_emails", {"query": "maya"})
+    assert T.call_problem([_call("view_emails", '{query:<|"|>Maya<|"|>}')], q, READS) == "call_mismatch"   # echoed as typed on no match
+    assert set(T.CASE_FREE) == {("get_my_day_plan", "day"), ("find_free_time", "period")}
+
+
+def test_tool_specs_come_from_the_service_code():
+    import tool_specs
+    src = """
+@register("search_reminders", "d", {}, category="assistant_read")
+async def search_reminders(query: str = "", scope: str = "all", limit=[]) -> str: ...
+
+@tool(name='forget', description='x', parameters={}, category='fs_delete')
+async def forget(query: str) -> str: ...
+"""
+    assert tool_specs.specs_from_source(src) == {
+        "search_reminders": {"category": "assistant_read", "read": True, "defaults": {"query": "", "scope": "all"}},   # a list default: none
+        "forget": {"category": "fs_delete", "read": False, "defaults": {}}}
+
+
+@needs_tok
+def test_every_scripted_call_shape_round_trips_through_the_template(tok):
+    """A call rendered by Gemma's own template and read back by gen_finals' parser must match its script exactly."""
+    import render
+    args = [{"query": "permit", "count": 0, "unread": False}, {"symbols": ["AAPL", "MSFT"], "period": "1d"},
+            {"families": ["mail", "calendar"], "tools": []}, {"value": 3.5, "from_unit": "mi", "to_unit": "km"},
+            {"body": 'Hi, "Dana": see you at 3:00, {ok}?'}, {}]
+    for i, a in enumerate(args):
+        call = {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "view_emails", "arguments": a}}]}
+        row = {"meta": {"id": f"rt-{i}", "family": "f"}, "tools": TOOLS, "messages": [{"role": "system", "content": SYS}, {"role": "user", "content": "q"}, call]}
+        comp = render.render(tok, {"messages": row["messages"], "tools": TOOLS}, {**row["meta"], "think": False, "thought": None})["completion"]
+        import choose_traces as T
+        assert T.call_problem(G.parse_output(comp, False)["tool_calls"], T.scripted_calls(row)) is None, (a, comp)
+
+
+def test_extra_argument_is_its_own_rejection():
+    import choose_traces as T
+    h = gen.request_hash([{"role": "user", "content": "q"}], TOOLS)
+    row = {"meta": {"id": "a-s0", "family": "f"}, "tools": TOOLS, "messages": [{"role": "user", "content": "q"}, CALL]}
+    rec = {"reasoning": "They asked about the permit, so I should read their mail.", "content": "", "finish_reason": "stop", "request_hash": h,
+           "tool_calls": [_call("view_emails", '{query:<|"|>permit<|"|>,unread:true}')]}
+    assert T.reject_reasons(rec, row) == ["call_extra_argument"]
+
+
+def test_generator_can_target_call_rows():
+    rows = [mk(1), {"meta": {"id": "c", "family": "f"}, "tools": TOOLS, "messages": [{"role": "user", "content": "q"}, CALL]}]
+    got, _ = G.select_rows(rows, "calls")
+    assert [r["meta"]["id"] for r in got] == ["c"]
+
+
+@needs_tok
+def test_an_out_of_memory_batch_is_halved_not_lost(tok, tmp_path):
+    rows = [mk(i) for i in range(8)]
+    sizes = []
+    inner = fake_model(tok)
+
+    def small_only(prompts, seed):
+        sizes.append(len(prompts))
+        if len(prompts) > 2:
+            raise RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
+        return inner(prompts, seed)
+    G.run(rows, tok, small_only, str(tmp_path), 0, 1, 1, batch=8, log=silent)
+    recs = [json.loads(l) for l in open(tmp_path / "finals.s0of1.jsonl")]
+    assert len(recs) == 8 and not any(r.get("error") for r in recs)
+    assert sizes[0] == 8 and max(sizes[1:]) <= 4 and sizes.count(2) == 4
+
+
+def test_halves_run_after_the_failed_batch_is_released():
+    """The A6000 bug: halves ran inside the except block, whose traceback kept the failed batch's KV cache alive, so even one
+    prompt ran out of memory. Each half must start with no exception in flight and the failed call's frame gone."""
+    import gc
+    import weakref
+    alive, seen = [], []
+
+    class Cache:
+        pass
+
+    def gen(prompts, seed):
+        seen.append((len(prompts), sys.exc_info()[0], [r() is not None for r in alive]))
+        if len(prompts) > 1:
+            cache = Cache()                      # stands in for the batch's KV cache, referenced only by this frame
+            alive.append(weakref.ref(cache))
+            raise RuntimeError("CUDA out of memory.")
+        return [[1] for _ in prompts]
+    gc.disable()                                 # the fix must not lean on gc running by chance
+    try:
+        G.generate_halving(gen, [(0, {"meta": {"id": str(i)}}, [1, 2], False) for i in range(4)], log=silent)
+    finally:
+        gc.enable()
+    assert [n for n, _, _ in seen] == [4, 2, 1, 1, 2, 1, 1]
+    assert all(exc is None for _, exc, _ in seen)
+    assert all(not any(flags) for n, _, flags in seen if n == 1)
+
+
+def test_other_errors_are_not_retried_by_halving():
+    calls = []
+
+    def broken(prompts, seed):
+        calls.append(len(prompts))
+        raise ValueError("bad prompt")
+    with pytest.raises(ValueError):
+        G.generate_halving(broken, [(0, {"meta": {"id": str(i)}}, [1, 2], False) for i in range(4)], log=silent)
+    assert calls == [4]
+
+
+def test_an_honest_not_found_after_an_empty_result_is_not_a_stall():
+    import choose_r5
+    def row(result):
+        return {"meta": {"id": "x-s1", "family": "mail_r3", "gold": None},
+                "messages": [{"role": "user", "content": "find the email about my tax form"},
+                             {"role": "assistant", "content": "", "tool_calls": [{"id": "c", "type": "function", "function": {"name": "view_emails", "arguments": {}}}]},
+                             {"role": "tool", "tool_call_id": "c", "content": result},
+                             {"role": "assistant", "content": "x"}], "tools": []}
+    assert choose_r5.empty_result(row("No emails matching \u201ctax form\u201d were found in the recent inbox."))
+    assert choose_r5.empty_result(row("Nothing active matches 'tax form'."))
+    assert not choose_r5.empty_result(row("Subject: Your W-2 tax form is ready\nHi Sam, ..."))
+    assert not choose_r5.empty_result(row("Here's what Harbor can and can't do:\nYes — Send texts\nNo — Make phone calls"))
+
+
+def _call(name, args):
+    return {"function": {"name": name, "arguments": args}}
+
+
+def test_a_thought_naming_a_default_argument_the_trained_call_omits_is_rejected():
+    import choose_traces as CT
+    want = [("search_reminders", CT.parse_args({"query": "rent"}))]
+    base = [_call("search_reminders", {"query": "rent", "scope": "all"})]
+    assert CT.thought_names_other_argument("I will use `query` and set scope='all'.", base, want)
+    assert CT.thought_names_other_argument("search_reminders(query='rent', scope=\"all\")", base, want)
+    assert not CT.thought_names_other_argument("I'll look up the rent reminder.", base, want)
+    assert not CT.thought_names_other_argument("Scope matters here.\nAll of them count.", base, want)     # different lines
+
+
+def test_a_thought_about_an_argument_the_trained_call_has_but_base_left_out_is_rejected():
+    import choose_traces as CT
+    want = [("search_reminders", CT.parse_args({"query": "bus", "scope": "all"}))]
+    base = [_call("search_reminders", {"query": "bus"})]
+    assert CT.thought_names_other_argument("I'll leave scope out rather than say all.", base, want)
+
+
+def test_an_exact_match_has_nothing_for_the_thought_to_contradict():
+    import choose_traces as CT
+    want = [("search_reminders", CT.parse_args({"query": "rent", "scope": "all"}))]
+    assert not CT.thought_names_other_argument("query=rent, scope=all", [_call("search_reminders", {"query": "rent", "scope": "all"})], want)
