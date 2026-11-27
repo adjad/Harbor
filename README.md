@@ -2,6 +2,28 @@
   <img src="docs/assets/harbor-wordmark.svg" alt="Harbor" width="320">
 </p>
 
+<p align="center">
+  <a href="https://github.com/adjad/Harbor/releases/latest"><b>Download Harbor 0.1.8</b></a>
+  · <a href="docs/releases/0.1.8.md">What's new</a>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/notch-open.png" alt="Harbor's Brief open under the MacBook notch: a drafted reply to Maya about the roadmap, a free-time block for a lab report, a dentist reminder, today's calendar, to-dos and the messages that need a reply" width="760">
+</p>
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/ask.png" alt="Ask: the question 'When am I meeting Maya Okafor next?' answered with today's lunch at 12 PM and the 3:30 PM design review"></td>
+    <td width="50%"><img src="docs/screenshots/day.png" alt="Day: a week row, the current standup as a card, then the day's agenda with classes, meetings, a call and two suggested work blocks"></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/ideate.png" alt="Ideate building a habit tracker: a one-line plan, then files edited and a check script run, each marked passed"></td>
+    <td width="50%"><img src="docs/screenshots/brief.png" alt="Brief: Ready for you, with a drafted reply waiting for your tap, then Your lists with to-dos and Needs attention"></td>
+  </tr>
+</table>
+
+<p align="center"><sub>Shown with made-up people and plans. Harbor reads your own data on your Mac.</sub></p>
+
 Harbor is a private assistant for the Mac. It lives in the notch (or the menu bar on a Mac without
 one), reads your mail, messages, calendar and reminders on the Mac, and works out what needs you
 today. The AI that does the reading is a local Gemma model running on Apple silicon, so by default
@@ -41,9 +63,32 @@ Harbor is a Swift app plus a bundled Python (FastAPI) service. It is Apache-2.0 
   link and can be added as a video source, but it is never opened. Nothing is added until you tick
   it.
 
+- **Ideate.** Describe a small project and Harbor builds it in its own folder on this Mac, with the
+  built-in engine and one local model, Inkling 2 Mini. It shows each step as it goes and asks before
+  anything risky: a command that reaches the network, or a change outside the project folder, always
+  gets a card first. It has five starting points (General ideator, UI developer, Debugger, CS student,
+  Scripts & data). Ideate is for Apple silicon Macs with more than 16 GB of memory.
+
+Ask, Brief and Day are always in the notch. You can add up to two extra tabs from Meet, Study and
+Ideate, in setup or in Settings.
+
 Also in the app: meeting notes, reading files attached to email, and an optional mode where Harbor
 adds events and reminders by itself from trusted sources (off until you say yes, with an Undo on
 each action). See [CHANGELOG.md](CHANGELOG.md).
+
+## What's new in 0.1.8
+
+- **Ideate,** the new tab above, and a "You" step in setup that suggests extra tabs to suit you.
+- **Permissions asked when they are needed.** Setup asks for Calendar, Reminders and Contacts; the
+  rest are asked the first time a task needs them.
+- **A more accurate Brief.** Things you answered yourself leave it, reply drafts read more of the
+  conversation, and a reply card says what it answers.
+- **Faster Day and relaunch,** safer sends, cloud requests that mask personal details, and a round of
+  security fixes.
+- **The built-in engine follows oMLX 0.8.4.**
+
+The full list, and what was and was not tried by hand, is in the
+[0.1.8 release notes](docs/releases/0.1.8.md).
 
 ## How it uses Gemini and Google APIs
 
@@ -112,23 +157,31 @@ To turn cloud use off:
 - macOS 26.2 or newer to use the built-in engine. On macOS 14 to 26.1, Harbor needs another local
   engine running (oMLX, Ollama, LM Studio or any OpenAI-compatible server on the Mac).
 - Building from source needs macOS 14 or newer, Python 3.13 (the version the app ships; the build driver itself starts on Python 3.9 or newer and fetches its own pinned 3.13 runtime), and Apple's Command Line Tools.
-- Intel Macs cannot run the local model. A cloud-only mode sends every model role to one
-  OpenAI-compatible server you configure while your data, tools and approvals stay on the Mac. See
+- Intel Macs have their own download (`02-Harbor-…-intel.zip`). They cannot run the local model or
+  Ideate. A cloud-only mode sends every model role to one OpenAI-compatible server you configure
+  while your data, tools and approvals stay on the Mac. See
   [docs/REMOTE_INFERENCE.md](docs/REMOTE_INFERENCE.md).
+- Ideate needs the built-in engine, the Inkling 2 Mini download and about 18 GB of free memory when
+  a build starts.
 
 ## Install and first run
 
-Download the ZIP from the latest release on the [Releases](https://github.com/adjad/Harbor/releases)
-page, or build from source (next section). Harbor is ad-hoc signed, not notarized, so macOS blocks the
+Download the ZIP from the [latest release](https://github.com/adjad/Harbor/releases/latest):
+`01-Harbor-…-arm64.zip` for Apple silicon, `02-Harbor-…-intel.zip` for Intel. Or build from source
+(next section). Harbor is ad-hoc signed, not notarized, so macOS blocks the
 first open:
 
 1. Unzip the build and move `Harbor.app` to Applications.
 2. Open it. When macOS says it cannot verify the app, choose Done.
 3. Open System Settings > Privacy & Security, scroll down, and choose Open Anyway.
 
-Setup is one window with five skippable steps: the model (it downloads in the background), macOS
-permissions (each optional, each asked only when you click Allow), Google (optional), a few things
-about you (optional), and a short tour. Harbor then lives in the notch and menu bar. Option-Space
+Setup is one window with seven steps you can skip or jump between: Model (it downloads in the
+background), Permissions (Calendar, Reminders and Contacts, each optional and asked only when you
+click it), Google (optional), About you (optional), You (which extra tabs suit you), How to use (a
+picture of the open notch), and Get more (Full Disk Access and automation, all optional, plus a few
+questions to try). The first launch of 0.1.8 also does a one-time fresh start of Harbor's own
+settings; they are backed up first, and your chats, memory and sign-ins stay. See the
+[release notes](docs/releases/0.1.8.md). Harbor then lives in the notch and menu bar. Option-Space
 opens Ask, Option-Shift-Space asks by voice, Command-5 opens Study. To quit, right-click the
 menu-bar icon.
 

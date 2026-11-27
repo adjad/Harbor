@@ -33,7 +33,9 @@ def test_no_caller_outside_the_confirm_card():
         text = path.read_text()
         assert "runInTerminal(" not in text, path
         if "runInTerminalConfirmed" in text:
-            assert path.name == "MarkdownView.swift"
+            # The code block's card, and the Ideate GPU row's own Cancel-first confirmation
+            # (tests/test_ideate_gpu_row.py).
+            assert path.name in ("MarkdownView.swift", "NotchIdeateView.swift"), path
     assert MARKDOWN.count("runInTerminalConfirmed") == 1
     block = MARKDOWN[MARKDOWN.index('Button("Run in Terminal")'):]
     assert "runInTerminalConfirmed" in block[:200]
@@ -52,3 +54,16 @@ def test_confirm_card_contents():
     assert 'Button("Cancel")' in MARKDOWN and ".keyboardShortcut(.defaultAction)" in MARKDOWN
     assert "@State private var confirming" in MARKDOWN
     assert ".frame(maxHeight: 200)" in MARKDOWN
+
+
+def test_terminal_gets_a_file_not_apple_events():
+    run = RUNNER[RUNNER.index("private static func runInTerminal("):RUNNER.index("struct TerminalFiles")]
+    assert "NSWorkspace.shared.open([files.launcher], withApplicationAt: terminal" in run
+    assert 'withBundleIdentifier: "com.apple.Terminal"' in run
+    for bad in ("NSAppleScript", "do script", "tell application", "/usr/bin/osascript"):
+        assert bad not in RUNNER, bad
+    files = RUNNER[RUNNER.index("static func writeTerminalFiles"):RUNNER.index("static func launcherText")]
+    assert files.count("0o700") == 3
+    assert 'appendingPathComponent("run.command")' in files
+    launcher = RUNNER[RUNNER.index("static func launcherText"):RUNNER.index("static func removeTerminalFiles")]
+    assert "trap 'rm -rf -- \\\"$HARBOR_RUN_DIR\\\"' EXIT" in launcher

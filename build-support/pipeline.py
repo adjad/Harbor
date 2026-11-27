@@ -538,7 +538,7 @@ def plist(meta: dict) -> dict:
         "NSCalendarsUsageDescription": "Harbor reads your calendar to plan your day, and adds, moves or cancels events only when you ask.",
         "NSRemindersFullAccessUsageDescription": "Harbor reads your reminders to show what is due, and adds, completes or removes ones you ask for.",
         "NSRemindersUsageDescription": "Harbor reads your reminders to show what is due, and adds, completes or removes ones you ask for.",
-        "NSAppleEventsUsageDescription": "Harbor reads Mail and Notes to find what needs your attention, and, only when you approve, sends emails and messages or opens a script in Terminal. When Study finds course materials, it also closes the browser tabs it opened itself.",
+        "NSAppleEventsUsageDescription": "Harbor reads Mail and Notes to find what needs your attention, and, only when you approve, sends emails and messages. When Study finds course materials, it also closes the browser tabs it opened itself. Scripts you choose to run open in Terminal as a file, so Harbor never needs to control Terminal.",
         "NSContactsUsageDescription": "Harbor reads your contacts to show names instead of phone numbers in messages.",
         "NSMicrophoneUsageDescription": "Harbor listens only while you ask by voice (the mic or ⌥⇧Space) or while a meeting you started in Meet is recording. What is said is turned into text on this Mac; Harbor keeps no recording and never sends it off your Mac.",
         "HarborSourceCommit": meta["commit"], "HarborPreviewBuild": bool(meta["dirty"] or meta.get("preview")),

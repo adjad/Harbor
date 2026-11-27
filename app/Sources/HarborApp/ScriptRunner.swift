@@ -6,11 +6,14 @@ import Foundation
 // not to press — nothing executes automatically. A script is never run from the
 // first click: the code block shows the whole script inline and asks (Cancel is
 // the default), and only its second button calls `runInTerminalConfirmed`, which
-// opens a new, visible Terminal window running the exact command (via `do script`),
-// never silently in the background, so what runs is always in plain sight.
+// opens a new, visible Terminal window running the exact command, never silently in
+// the background, so what runs is always in plain sight. Terminal gets a private
+// `.command` file opened like any document (NSWorkspace), not Apple Events, so macOS
+// never asks for Automation access to Terminal; the files delete themselves when the
+// window's shell exits.
 enum ScriptRunner {
     // Where a code block's language tag says it belongs. `interpreter == nil`
-    // for shell/sh/bash/zsh means "run the file directly" (chmod +x + execute);
+    // for shell/sh/bash/zsh means "run the file directly" (it is written 0700);
     // otherwise the interpreter is prefixed onto the temp file's path.
     enum RunTarget {
         case terminal(interpreter: String?, ext: String)
@@ -102,27 +105,61 @@ enum ScriptRunner {
     }
 
     private static func runInTerminal(_ code: String, interpreter: String?, ext: String) {
-        guard let path = writeTemp(code, ext: ext) else { return }
-        let command: String
-        if let interpreter {
-            command = "\(interpreter) \(shellQuote(path))"
-        } else {
-            chmodExecutable(path)
-            command = shellQuote(path)
+        guard let files = writeTerminalFiles(code, interpreter: interpreter, ext: ext),
+              let terminal = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal")
+        else { return }
+        let config = NSWorkspace.OpenConfiguration()
+        config.activates = true
+        NSWorkspace.shared.open([files.launcher], withApplicationAt: terminal, configuration: config) { _, error in
+            // Terminal never got it: nothing will run, so nothing is left behind.
+            if error != nil { removeTerminalFiles(files) }
         }
-        // AppleScript string literal: escape backslashes first, then quotes.
-        let escaped = command
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-        let source = """
-        tell application "Terminal"
-            activate
-            do script "\(escaped)"
-        end tell
-        """
-        guard let script = NSAppleScript(source: source) else { return }
-        var err: NSDictionary?
-        script.executeAndReturnError(&err)
+    }
+
+    struct TerminalFiles: Equatable {
+        let directory: URL
+        let script: URL
+        let launcher: URL
+    }
+
+    /// The script and the `.command` Terminal opens, in a new folder only this user can
+    /// read (0700, files 0700). The launcher runs the script, then deletes the folder when
+    /// its shell exits (normally, Ctrl-C or the window closing).
+    static func writeTerminalFiles(_ code: String, interpreter: String?, ext: String,
+                                   in base: URL = FileManager.default.temporaryDirectory) -> TerminalFiles? {
+        let fm = FileManager.default
+        let dir = base.appendingPathComponent("harbor-run-\(UUID().uuidString)", isDirectory: true)
+        let script = dir.appendingPathComponent("script.\(ext)")
+        let launcher = dir.appendingPathComponent("run.command")
+        let files = TerminalFiles(directory: dir, script: script, launcher: launcher)
+        do {
+            try fm.createDirectory(at: dir, withIntermediateDirectories: false,
+                                   attributes: [.posixPermissions: 0o700])
+            try Data(code.utf8).write(to: script, options: .withoutOverwriting)
+            try Data(launcherText(script: script.path, directory: dir.path, interpreter: interpreter).utf8)
+                .write(to: launcher, options: .withoutOverwriting)
+            try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
+            try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: launcher.path)
+            return files
+        } catch {
+            removeTerminalFiles(files)
+            return nil
+        }
+    }
+
+    /// What the `.command` file says. The script runs in the window as typed, so Terminal (not
+    /// Harbor) asks for any password.
+    static func launcherText(script: String, directory: String, interpreter: String?) -> String {
+        let run = interpreter.map { "\($0) \(shellQuote(script))" } ?? shellQuote(script)
+        return "#!/bin/bash\n"
+            + "HARBOR_RUN_DIR=\(shellQuote(directory))\n"
+            + "trap 'rm -rf -- \"$HARBOR_RUN_DIR\"' EXIT\n"
+            + "trap 'exit 130' INT HUP TERM\n"
+            + "\(run)\n"
+    }
+
+    static func removeTerminalFiles(_ files: TerminalFiles) {
+        try? FileManager.default.removeItem(at: files.directory)
     }
 
     private static func openWithApp(_ appName: String, path: String) {
@@ -143,15 +180,8 @@ enum ScriptRunner {
         }
     }
 
-    private static func chmodExecutable(_ path: String) {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/chmod")
-        p.arguments = ["+x", path]
-        try? p.run()
-        p.waitUntilExit()
-    }
-
-    private static func shellQuote(_ s: String) -> String {
+    static func shellQuote(_ s: String) -> String {
         "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
+
 }
