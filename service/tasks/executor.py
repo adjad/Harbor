@@ -292,9 +292,9 @@ async def execute_task(plan: TaskPlan, emit, approver, *, test_mode: bool = Fals
                 if not claim():
                     return TaskExecution("failed", response("duplicate"),
                                          calls, results, finalize=False)
-                from service.tools.action_tools import human_reviewed_content
+                from service.tools.action_tools import effect_claim_scope, human_reviewed_content
                 with human_reviewed_content(bool(action.get("preview"))), \
-                        access_needed.noting() as needs:
+                        access_needed.noting() as needs, effect_claim_scope():
                     raw = await run_tool(tool, step.args)
                 outcome = classify_tool_outcome(step.tool, raw)
             else:
@@ -304,7 +304,8 @@ async def execute_task(plan: TaskPlan, emit, approver, *, test_mode: bool = Fals
             if not claim():
                 return TaskExecution("failed", response("duplicate"),
                                      calls, results, finalize=False)
-            with access_needed.noting() as needs:
+            from service.tools.action_tools import effect_claim_scope
+            with access_needed.noting() as needs, effect_claim_scope():
                 raw = await run_tool(tool, step.args)
             outcome = classify_tool_outcome(step.tool, raw)
         if (not test_mode and outcome.status == "succeeded"

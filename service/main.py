@@ -2607,6 +2607,13 @@ def _ask_tool_rank(prompt: str, previous: str = "") -> tuple[list[str], list[str
         return [], []
 
 
+def _task_step_tool(plan, call_id: str) -> str:
+    """The tool a typed task's effect claim is for (tasks/executor names each call
+    task_<plan>_<step>_<revision>), or "" when no step matches."""
+    return next((step.tool for step in getattr(plan, "steps", None) or []
+                 if f"task_{plan.id}_{step.id}_{plan.revision}" == call_id), "")
+
+
 @app.post("/agent")
 async def agent(body: dict[str, Any]):
     """Route the request and run it, streaming events over SSE.
@@ -2866,8 +2873,8 @@ async def agent(body: dict[str, Any]):
         # True once this request's assistant reply is stored: a stop after that point (the client
         # closing at `done`, then the summary) finished a turn; it is not an unfinished one.
         assistant_reply_stored = False
-        from service.tools.action_tools import begin_verified_sends
-        verified_sends = begin_verified_sends()
+        from service.tools.action_tools import begin_turn_sends, unconfirmed_sends
+        turn_sends = begin_turn_sends()
 
         def settle_unfinished(message: str) -> None:
             """Leave durable state honest when a turn stops without finishing.
@@ -2894,11 +2901,21 @@ async def agent(body: dict[str, Any]):
                     finish_task(store, sid, task_turn.plan, status="failed", result=message)
             except Exception:  # noqa: BLE001 — persistence must not mask the real error
                 pass
+            # Each send is judged on its own outcome (turn_sends: what this turn's
+            # send tools and effect claims saw). A plan this turn's record knows
+            # nothing about, such as claims made on an earlier turn, keeps the plan-level
+            # rule: claimed and not completed is unknown.
+            def tracked(plan) -> bool:
+                return any(e.get("plan") is plan for e in turn_sends)
             try:
-                uncertain_send = bool(
-                    task_turn and task_turn.plan.status != "completed"
-                    and task_turn.plan.intent in {"email.reply", "email.send", "message.send"}
-                    and task_turn.plan.claimed_calls)
+                uncertain_send = unconfirmed_sends(turn_sends)
+            except Exception:  # noqa: BLE001
+                uncertain_send = True
+            try:
+                if (task_turn and not tracked(task_turn.plan) and task_turn.plan.status != "completed"
+                        and task_turn.plan.intent in {"email.reply", "email.send", "message.send"}
+                        and task_turn.plan.claimed_calls):
+                    uncertain_send = True
             except Exception:  # noqa: BLE001
                 pass
             for entry in owned_workflows:
@@ -2916,7 +2933,8 @@ async def agent(body: dict[str, Any]):
                 # Reached only for a plan this settlement handled (finished plans
                 # `continue` above and already reported their own outcome).
                 try:
-                    if store.workflow_effect_claimed(plan.id) and plan.status != "completed":
+                    if (not tracked(plan) and store.workflow_effect_claimed(plan.id)
+                            and plan.status != "completed"):
                         uncertain_send = True
                 except Exception:  # noqa: BLE001
                     pass
@@ -2926,15 +2944,12 @@ async def agent(body: dict[str, Any]):
                 pass
             if assistant_reply_stored:
                 return   # the real reply is already stored; never follow it with a failure note
-            if verified_sends:
+            verified = [e["what"] for e in turn_sends if e["state"] == "sent"]
+            if verified:
                 # A send the tool confirmed went out before the stop: say it was sent,
-                # so neither the person nor the model sends it a second time.
-                sent = "; ".join(dict.fromkeys(verified_sends))
-                try:
-                    if task_turn and task_turn.plan.intent in {"email.reply", "email.send", "message.send"}:
-                        uncertain_send = False   # the task's own send is the confirmed one
-                except Exception:  # noqa: BLE001
-                    pass
+                # so neither the person nor the model sends it a second time. The
+                # warning below is for a DIFFERENT send whose outcome is unknown.
+                sent = "; ".join(dict.fromkeys(verified))
                 try:
                     store.add_turn(sid, "assistant",
                                    f"(Sent: {sent}. It went out before this request stopped — "
@@ -3140,7 +3155,11 @@ async def agent(body: dict[str, Any]):
                 """The database decides who runs the effect, then the plan is
                 persisted with the claim BEFORE the send leaves — so a crash
                 mid-flight leaves evidence rather than a repeatable task."""
-                return store.claim_effect_call(plan.id, call_id, revision=plan.revision)
+                claimed = store.claim_effect_call(plan.id, call_id, revision=plan.revision)
+                if claimed:
+                    from service.tools.action_tools import note_effect_claim
+                    note_effect_claim(plan, _task_step_tool(plan, call_id))
+                return claimed
 
             typed_shadow_only = os.environ.get(
                 "HARBOR_TYPED_REMINDERS_SHADOW_ONLY", "0").strip().lower() in {

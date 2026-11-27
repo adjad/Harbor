@@ -116,11 +116,15 @@ async def execute_workflow(plan, emit, approver, *, test_mode=False, store=None,
                             revision=plan.revision))
                     except Exception:
                         claimed = False
+                    if claimed:
+                        from service.tools.action_tools import note_effect_claim
+                        note_effect_claim(plan, name)
                     if not claimed:
                         return "failed", ("Nothing sent by this attempt: durable delivery "
                                           "claim unavailable or already used. Check the destination "
                                           "before starting another delivery.")
-                with access_needed.noting() as needs:
+                from service.tools.action_tools import effect_claim_scope
+                with access_needed.noting() as needs, effect_claim_scope():
                     raw = await run_tool(tool, args)
                 if isinstance(raw, DisplayOnlyToolResult):
                     news_used = True

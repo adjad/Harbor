@@ -24,6 +24,7 @@ Mail and Messages Automation is granted to Harbor.app, not to this Python proces
 """
 from __future__ import annotations
 
+import functools
 import re
 import time
 from contextlib import contextmanager
@@ -518,25 +519,126 @@ def _unreviewed() -> bool:
     return not _CONTENT_REVIEWED.get()
 
 
-# Each send this turn's tools confirmed went out, in words ("the text to Sam").
-# Noted before any later await, so a Stop that lands after the send (in the Brief
-# bookkeeping, or before the result is shown) still lets the turn say it was sent
-# instead of leaving it looking unfinished, which invites a second send. The
-# turn starts its own list (begin_verified_sends); without one nothing is kept.
-_VERIFIED_SENDS: ContextVar[list | None] = ContextVar("harbor_verified_sends", default=None)
+# Every send this turn reached, each with its own outcome, so a Stop that lands
+# part way says exactly what is known: what went out ("the text to Sam"), and
+# whether some other send's outcome is unknown. An entry is "claimed" when a task
+# or workflow durably claims an effect (its tool may not have run yet), "pending"
+# once a send tool hands it to Mail or Messages, then "sent" (confirmed, noted
+# before any later await), "not_sent" (definitely not) or "unknown". A Stop
+# leaves a pending send pending: unknown. The turn starts its own record
+# (begin_turn_sends); without one nothing is kept.
+_TURN_SENDS: ContextVar[list | None] = ContextVar("harbor_turn_sends", default=None)
+_CURRENT_SEND: ContextVar[dict | None] = ContextVar("harbor_current_send", default=None)
+_ACTIVE_CLAIM: ContextVar[dict | None] = ContextVar("harbor_active_claim", default=None)
+_CALL_CLAIM: ContextVar[dict | None] = ContextVar("harbor_call_claim", default=None)
+_UNCONFIRMED = ("pending", "unknown")
 
 
-def begin_verified_sends() -> list[str]:
-    """Start this turn's record of confirmed sends and return it."""
-    sends: list[str] = []
-    _VERIFIED_SENDS.set(sends)
+def begin_turn_sends() -> list[dict]:
+    """Start this turn's record of sends and return it."""
+    sends: list[dict] = []
+    _TURN_SENDS.set(sends)
     return sends
 
 
-def _note_verified_send(what: str) -> None:
-    sends = _VERIFIED_SENDS.get()
+def note_effect_claim(plan: object = None, operation: str = "") -> None:
+    """A task or workflow claimed `operation` (a send tool's name) for `plan`, just
+    before running that tool. Only that tool's very next call takes the claim over
+    (_ACTIVE_CLAIM, matched by operation); any other send gets its own entry, so an
+    unrelated send can never settle or hide this plan's claim."""
+    entry = {"what": "", "state": "claimed", "plan": plan, "operation": operation, "taken": False}
+    sends = _TURN_SENDS.get()
     if sends is not None:
-        sends.append(what)
+        sends.append(entry)
+    _ACTIVE_CLAIM.set(entry)
+
+
+@contextmanager
+def effect_claim_scope() -> Iterator[None]:
+    """Around the one run_tool a claim was made for. When it returns or raises, the
+    claim is closed whether or not its tool ever ran (a refusal before the tool body,
+    a name mismatch), so no later call of the same tool can take it over. A claim
+    left unsent stays "claimed": its outcome reads as unknown."""
+    try:
+        yield
+    finally:
+        claim = _ACTIVE_CLAIM.get()
+        if claim is not None:
+            claim["taken"] = True
+            _ACTIVE_CLAIM.set(None)
+
+
+def unconfirmed_sends(sends: list[dict]) -> bool:
+    """True when some send this turn may have gone out unconfirmed: a send handed
+    over without a confirmed outcome, or a claim whose plan never completed."""
+    for entry in sends:
+        if entry["state"] in _UNCONFIRMED:
+            return True
+        if entry["state"] == "claimed" and getattr(entry["plan"], "status", None) != "completed":
+            return True
+    return False
+
+
+def _proven_not_sent(result: object) -> bool:
+    """Only a marked refusal (nothing dispatched) or Messages' own Not Delivered
+    proves nothing went out; any other failure after dispatch is unknown. The send
+    tools mint a refusal after dispatch only on the host's own proof: the bridge's
+    not_attempted with dispatch_started False, or send_message's no_sms_account
+    (the app's script stopped before sending)."""
+    from service.tools.registry import _NotDeliveredResult, _NotDoneResult
+    return isinstance(result, (_NotDoneResult, _NotDeliveredResult))
+
+
+def _tracked_send(operation: str):
+    """Give each call of a send tool its own entry: the claim its task or workflow
+    just made for this very tool, or a new one. "pending" just before the app is
+    asked to send (_dispatching); settled from the tool's own result unless it
+    already said "sent". A claim whose tool stopped before dispatching with a
+    marked refusal is "not_sent"; one that raised stays claimed (unknown)."""
+    def wrap(fn):
+        @functools.wraps(fn)
+        async def tracked(*args, **kwargs):
+            claim = _ACTIVE_CLAIM.get()
+            own = claim if (claim is not None and claim["state"] == "claimed" and not claim.get("taken")
+                            and claim.get("operation") == operation) else None
+            if own is not None:
+                # Taken on the shared entry, not only in this context: a tool run in a
+                # copied context can't leave the claim for a later, unrelated call.
+                own["taken"] = True
+                _ACTIVE_CLAIM.set(None)
+            token = _CURRENT_SEND.set(None)
+            claim_token = _CALL_CLAIM.set(own)
+            try:
+                result = await fn(*args, **kwargs)
+                entry = _CURRENT_SEND.get()
+                if entry is not None and entry["state"] == "pending":
+                    entry["state"] = "not_sent" if _proven_not_sent(result) else "unknown"
+                elif own is not None and own["state"] == "claimed" and _proven_not_sent(result):
+                    own["state"] = "not_sent"
+                return result
+            finally:
+                _CALL_CLAIM.reset(claim_token)
+                _CURRENT_SEND.reset(token)
+        return tracked
+    return wrap
+
+
+def _dispatching(what: str) -> None:
+    """The send is about to leave: from here a Stop leaves its outcome unknown."""
+    entry = _CALL_CLAIM.get()
+    if entry is None:
+        entry = {"what": "", "state": "pending", "plan": None, "operation": ""}
+        sends = _TURN_SENDS.get()
+        if sends is not None:
+            sends.append(entry)
+    entry.update(what=what, state="pending")
+    _CURRENT_SEND.set(entry)
+
+
+def _note_verified_send(what: str) -> None:
+    entry = _CURRENT_SEND.get()
+    if entry is not None:
+        entry.update(what=what, state="sent")
 
 
 # The small on-device agent model (LFM2.5) sometimes over-escapes when it
@@ -982,6 +1084,7 @@ def prepare_send_recipient(tool, args: dict) -> tuple[dict, str | None]:
     category="email_send",
     retrieval_description=_OUTBOUND_RETRIEVAL_DESCRIPTIONS["send_email"],
 )
+@_tracked_send("send_email")
 async def send_email(to: str, subject: str, body: str, cc: str = "",
                      confirmed_self_send: bool = False) -> str:
     if (msg := _own_address_guard(to, "send_email", confirmed_self_send)):
@@ -1031,6 +1134,7 @@ async def send_email(to: str, subject: str, body: str, cc: str = "",
                           "context, or just end the message without a signature — an "
                           "email signed '[Your Name]' is worse than one with no sign-off.)"))
 
+    _dispatching(f"the email to {', '.join(recipients)}")
     res = await app_request("send_email", {
         "to": recipients, "cc": copies,
         "subject": subject or "", "body": body or "",
@@ -1043,6 +1147,7 @@ async def send_email(to: str, subject: str, body: str, cc: str = "",
                 "Email outcome unknown — sending was not confirmed. Check Mail before trying again; do not retry automatically.",
                 operation="send_email", action_id=res.get("action_id") or "")
         return _not_sent(f"(the email was NOT sent: {res.get('error') or 'unknown error'})")
+    _note_verified_send(f"the email to {', '.join(recipients)}")
     return f"Email sent to {', '.join(recipients)}."
 
 
@@ -1344,6 +1449,7 @@ async def cancel_scheduled_send(id: str) -> str:
     category="email_send",
     retrieval_description=_OUTBOUND_RETRIEVAL_DESCRIPTIONS["reply_to_email"],
 )
+@_tracked_send("reply_to_email")
 async def reply_to_email(message_id: str, body: str, reply_all: bool = False,
                          account: str = "", expected_reply: dict | None = None) -> str:
     message_id = (message_id or "").strip()
@@ -1366,6 +1472,7 @@ async def reply_to_email(message_id: str, body: str, reply_all: bool = False,
     if (expected is None or expected["message_id"] != message_id
             or expected["account"] != account or not expected["content"].startswith(body)):
         return _not_sent("(reply NOT sent — resolve and preview the outgoing reply before approval)")
+    _dispatching("the email reply to " + (", ".join(expected["to"]) or "the sender"))
     res = await app_request("reply_to_email", {
         "message_id": message_id, "body": body, "reply_all": bool(reply_all),
         "account": account, "expected_reply": expected,
@@ -1609,6 +1716,7 @@ def _forward_confirmed(receipt, message_id: str, recipients: list[str]) -> bool:
     aliases=["forward this email to Dan", "send this to my accountant",
              "fwd this to the team", "can you forward that email over to mom"],
 )
+@_tracked_send("forward_email")
 async def forward_email(message_id: str, to: str, note: str = "") -> str:
     message_id = (message_id or "").strip()
     if not message_id:
@@ -1630,6 +1738,7 @@ async def forward_email(message_id: str, to: str, note: str = "") -> str:
     note = note or ""
     if _unreviewed():  # as send_email: an approved note goes out as its card showed it
         note = _degarble(note)
+    _dispatching(f"the forward to {', '.join(_named(r) for r in resolved)}")
     res = await app_request("forward_email", {
         "message_id": message_id, "to": resolved, "body": note,
     })
@@ -1646,6 +1755,7 @@ async def forward_email(message_id: str, to: str, note: str = "") -> str:
         return _OutboundUnknownResult(
             "Forward outcome unknown — Mail did not confirm this forward. Check Mail before trying again; do not retry automatically.",
             operation="forward_email", action_id=res.get("action_id") or "")
+    _note_verified_send(f"the forward to {', '.join(_named(r) for r in resolved)}")
     return f"Forwarded to {', '.join(_named(r) for r in resolved)}."
 
 
@@ -1695,6 +1805,7 @@ TEXT_FORWARDING_HINT = ("To send SMS texts from this Mac, turn on Text Message F
     category="messages_send",
     retrieval_description=_OUTBOUND_RETRIEVAL_DESCRIPTIONS["send_message"],
 )
+@_tracked_send("send_message")
 async def send_message(to: str, text: str, confirmed_self_send: bool = False,
                        resolved_to: str = "") -> str:
     if (msg := _own_address_guard(to, "send_message", confirmed_self_send)):
@@ -1745,6 +1856,7 @@ async def send_message(to: str, text: str, confirmed_self_send: bool = False,
     if _unreviewed() and (holes := _unfilled_placeholders(text)):
         return _not_sent(f"(NOT sent — the message still has unfilled placeholders: "
                          f"{', '.join(holes[:4])}. Rewrite it with the real values.)")
+    _dispatching(f"the text to {display}")
     res = await app_request("send_message", {"to": to, "text": text})
     if res.get("ok") is not True or ("status" in res and res["status"] != "succeeded"):
         if not (res.get("ok") is False and res.get("status") == "not_attempted"
