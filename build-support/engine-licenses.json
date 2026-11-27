@@ -58,6 +58,16 @@
       "class": "permissive",
       "no_licence_file": true,
       "note": "Apache-2.0 per its package metadata; the upstream wheel ships no licence file."
+    },
+    "jieba": {
+      "class": "permissive",
+      "no_licence_file": true,
+      "note": "MIT per its package metadata; new in oMLX 0.8.4, and the upstream wheel ships no licence file, so the notice names it and its project address instead."
+    },
+    "ordered-set": {
+      "class": "permissive",
+      "no_licence_file": true,
+      "note": "MIT per its package metadata; new in oMLX 0.8.4, and the upstream wheel ships no licence file, so the notice names it and its project address instead."
     }
   },
   "components": [
