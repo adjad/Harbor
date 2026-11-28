@@ -71,6 +71,17 @@ def _norm_handle(h: str) -> str:
     return "1" + digits if len(digits) == 10 else digits
 
 
+def _contact_for_key(key: str) -> str:
+    """The name saved for a normalized handle. A cache from before handles kept
+    their country code holds bare ten-digit keys; a North American number still
+    finds its name there."""
+    if key in _contacts:
+        return _contacts[key]
+    if len(key) == 11 and key.startswith("1"):
+        return _contacts.get(key[1:], "")
+    return ""
+
+
 # name (lowercased) -> the contact's handles in their ORIGINAL form.
 #
 # _contacts above is keyed by NORMALIZED handle (last 10 digits) because its
@@ -247,7 +258,7 @@ def resolve_contact(text: str, *, prefix_only: bool = False) -> str:
         return f"{resolve_contact(head)}{sep}{rest}"
 
     def sub(m: re.Match) -> str:
-        return _contacts.get(_norm_handle(m.group(0)), m.group(0))
+        return _contact_for_key(_norm_handle(m.group(0))) or m.group(0)
     return _HANDLE_RE.sub(sub, text)
 
 
@@ -309,7 +320,7 @@ def contact_name_for_handle(handle: str) -> str:
     key = _norm_handle(h)
     if not h or not key:
         return ""
-    shown = _contacts.get(key, "")
+    shown = _contact_for_key(key)
     for name, handles in _name_handles.items():
         if h in handles:
             # The name as it is saved when the two maps agree, else the same
@@ -1199,6 +1210,10 @@ def _summary_on_device() -> bool:
     """True only when every model that will read a summary (the digest's fast role
     and the agent that receives the tool result) runs on this Mac's own engine.
     Fails closed: any doubt reads as off this Mac, which keeps the strict rules."""
+    import sys
+    # Not loaded means no service is routing a model here: stay strict.
+    if "service.config.endpoints" not in sys.modules or "service.proactive.sources" not in sys.modules:
+        return False
     try:
         from service.config.endpoints import role_target
         from service.proactive.sources import reading_on_device
@@ -2557,7 +2572,7 @@ async def view_messages(query: str | None = None, day: str | None = None,
     "chatter, promotions, codes and resolved items are left out, so it cannot answer 'who "
     "texted me' or 'did X send Y' - use view_messages instead. Use for 'what matters in my texts' or "
     "a catch-up. `period` for a RANGE ('this month'), `day` for ONE day ('today', "
-    "'YYYY-MM-DD'); omit both for the three-day digest (`days` widens it). `conversation` for one chat (included "
+    "'YYYY-MM-DD'); omit both for the three-day digest. `conversation` for one chat (included "
     "even if nothing in it is important). `unread=true` for source-backed unread excerpts "
     "with coverage disclosed; never marks read. Summarized by the local model.",
     {"type": "object",

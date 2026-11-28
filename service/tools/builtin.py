@@ -239,8 +239,8 @@ def run_shell(cmd: str) -> str:
             # at run time is not in the text.
             argv, contained = shell_sandbox.contain(["/bin/sh", "-c", cmd])
             p = subprocess.run(argv, shell=False, capture_output=True, text=True,
-                               timeout=120, cwd=str(Path.home()), env=child_environment(),
-                               stdin=subprocess.DEVNULL)
+                               stdin=subprocess.DEVNULL,
+                               timeout=120, cwd=str(Path.home()), env=child_environment())
             note = shell_sandbox.explain(contained, p.returncode, p.stderr)
         out = (p.stdout or "") + (("\n[stderr]\n" + p.stderr) if p.stderr else "")
         out = _clip(out.strip() or f"(exit {p.returncode}, no output)")
