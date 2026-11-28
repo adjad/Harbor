@@ -26,8 +26,29 @@ final class MessagesReader {
     }
 
     /// Tapback types Messages stores for an added reaction (love, like, dislike,
-    /// laugh, emphasis, question); 3000-3005 are their removals.
-    static let tapbackTypes = 2000...2005
+    /// laugh, emphasis, question, and the 2006/2007 emoji and sticker reactions);
+    /// 3000-3007 are their removals.
+    static let tapbackTypes = 2000...2007
+    static let tapbackRemovalTypes = 3000...3007
+
+    /// What a retracted (unsent) message shows in place of its removed text.
+    static let unsentMarker = "[unsent message]"
+
+    /// A short, human kind for an attachment's MIME type ("photo", "video"...).
+    static func attachmentKind(mime: String?) -> String {
+        let value = (mime ?? "").lowercased()
+        if value.hasPrefix("image/") { return "photo" }
+        if value.hasPrefix("video/") { return "video" }
+        if value.hasPrefix("audio/") { return "audio" }
+        if value == "application/pdf" { return "document" }
+        return "file"
+    }
+
+    /// The line an attachment-only message stands for, e.g. "[attachment: photo]".
+    static func attachmentMarker(count: Int, mime: String?) -> String {
+        let kind = attachmentKind(mime: mime)
+        return count > 1 ? "[\(count) attachments: \(kind)]" : "[attachment: \(kind)]"
+    }
 
     /// The newest tapback the user added in each chat since `cutoffNs`, or none
     /// when the store has no chat GUID column. Read-only, like every read here.
@@ -73,8 +94,9 @@ final class MessagesReader {
         let partial: Bool
     }
 
-    private static let structuredLimit = 2000
-    private static let structuredByteLimit = 4_000_000
+    // The service accepts up to 10_000 records / 16 MB; stay inside that.
+    private static let structuredLimit = 10_000
+    private static let structuredByteLimit = 16_000_000
     private static let structuredTextLimit = 8192
     private static let structuredLinkLimit = 32
     private static let structuredURLLimit = 8192
@@ -193,13 +215,23 @@ final class MessagesReader {
         // is one Apple verified; an SMS's sender number can be forged. NULL when the store has no
         // such column, which the service reads as unknown.
         let messageService = hasColumn(db, table: "message", name: "service") ? "m.service" : "NULL"
+        let dateRetracted = hasColumn(db, table: "message", name: "date_retracted") ? "m.date_retracted" : "0"
+        let hasAttachments = hasColumn(db, table: "message_attachment_join", name: "attachment_id")
+            && hasColumn(db, table: "attachment", name: "mime_type")
+        let attachmentCount = hasAttachments
+            ? "(SELECT COUNT(*) FROM message_attachment_join maj WHERE maj.message_id = m.ROWID)" : "0"
+        let attachmentMime = hasAttachments
+            ? "(SELECT a.mime_type FROM message_attachment_join maj JOIN attachment a ON a.ROWID = maj.attachment_id WHERE maj.message_id = m.ROWID ORDER BY maj.attachment_id LIMIT 1)"
+            : "NULL"
         let sql = """
         SELECT m.date, m.text, m.attributedBody, m.is_from_me,
                h.id AS handle_id, c.display_name AS chat_name, c.chat_identifier,
                c.ROWID AS chat_id, COALESCE(m.is_read, 0) AS is_read,
                m.ROWID AS message_id, COALESCE(m.handle_id, 0) AS handle_row_id,
                \(messageGUID) AS message_guid, \(chatGUID) AS chat_guid,
-               \(dateEdited) AS date_edited, \(messageService) AS service
+               \(dateEdited) AS date_edited, \(messageService) AS service,
+               COALESCE(\(dateRetracted), 0) AS date_retracted,
+               \(attachmentCount) AS attachment_count, \(attachmentMime) AS attachment_mime
         FROM message m
         LEFT JOIN handle h ON m.handle_id = h.ROWID
         LEFT JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
@@ -244,12 +276,29 @@ final class MessagesReader {
             let attributedUnreadable = sqlite3_column_type(stmt, 2) != SQLITE_NULL
                 && (attributed == nil || attributed?.linksKnown == false)
             let wasEdited = sqlite3_column_int64(stmt, 13) > 0
-            let text = wasEdited ? (attributed?.text ?? columnText(stmt, 1))
-                                 : (columnText(stmt, 1) ?? attributed?.text)
-            guard let text, !text.isEmpty else { skipped += 1; continue }
+            let bodyText = wasEdited ? (attributed?.text ?? columnText(stmt, 1))
+                                     : (columnText(stmt, 1) ?? attributed?.text)
+            let wasRetracted = sqlite3_column_int64(stmt, 15) > 0
+            let attachmentCount = Int(sqlite3_column_int64(stmt, 16))
+            // The attachment placeholder (U+FFFC) is not text.
+            let visibleBody = bodyText?.replacingOccurrences(of: "\u{FFFC}", with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            // A retracted message drops its text; an attachment-only message
+            // keeps a marker so the conversation does not silently lose it.
+            let synthetic = wasRetracted || (visibleBody.isEmpty && attachmentCount > 0)
+            let text: String
+            if wasRetracted {
+                text = Self.unsentMarker
+            } else if visibleBody.isEmpty && attachmentCount > 0 {
+                text = Self.attachmentMarker(count: attachmentCount, mime: columnText(stmt, 17))
+            } else if let bodyText, !bodyText.isEmpty {
+                text = bodyText
+            } else {
+                skipped += 1; continue
+            }
             // An unedited row may contain a stale attributedBody alongside a
             // newer plain text. NSLink metadata only describes its own body.
-            let attributedBodyMismatch = attributed.map { $0.text != text } ?? false
+            let attributedBodyMismatch = synthetic ? false : (attributed.map { $0.text != text } ?? false)
 
             let isFromMe = sqlite3_column_int(stmt, 3) == 1
             let handle = columnText(stmt, 4)
@@ -287,7 +336,7 @@ final class MessagesReader {
             if clipped.count < text.count { truncated += 1 }
             let extracted = Self.actualLinks(text: text,
                                              visibleCount: clipped.count,
-                                             attributed: attributedBodyMismatch ? [] : (attributed?.links ?? []))
+                                             attributed: (attributedBodyMismatch || synthetic) ? [] : (attributed?.links ?? []))
             let links = extracted.links.filter { ($0["url"] ?? "").count <= Self.structuredURLLimit }
             if attributedBodyMismatch || extracted.partial || links.count < extracted.links.count
                     || links.count > Self.structuredLinkLimit { truncated += 1 }

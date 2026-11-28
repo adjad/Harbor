@@ -104,6 +104,7 @@ def _gone(*pids: int) -> bool:
 
 def test_cancelled_turn_kills_the_tool_and_its_children(tmp_path, monkeypatch):
     monkeypatch.setattr(skill_tools.sandbox, "available", lambda: False)
+    monkeypatch.setattr(skill_tools.sandbox, "refusal", lambda: "")
     run = skill_tools._make_runner(_script(tmp_path), {"script": "run.sh"}, "synthetic_stop")
 
     async def go():
@@ -121,6 +122,7 @@ def test_cancelled_turn_kills_the_tool_and_its_children(tmp_path, monkeypatch):
 
 def test_timeout_kills_the_tool_and_its_children(tmp_path, monkeypatch):
     monkeypatch.setattr(skill_tools.sandbox, "available", lambda: False)
+    monkeypatch.setattr(skill_tools.sandbox, "refusal", lambda: "")
     monkeypatch.setattr(skill_tools, "_TIMEOUT_S", 1)
     run = skill_tools._make_runner(_script(tmp_path), {"script": "run.sh"}, "synthetic_timeout")
     out = asyncio.run(run())

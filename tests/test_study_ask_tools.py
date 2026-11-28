@@ -139,8 +139,24 @@ def test_slides_result_names_deck_and_page_and_fences_the_slide_text(store):
 def test_slides_course_names_resolve_to_the_course_id(store):
     run(ask_tools.study_slides("pointers", course="cs 20"))
     run(ask_tools.study_slides("pointers", course="biology"))
-    run(ask_tools.study_slides("pointers", course="Underwater Basketry"))
-    assert [s[1] for s in store.searches] == ["c_cs20", "c_bio1", None]
+    assert [s[1] for s in store.searches] == ["c_cs20", "c_bio1"]
+
+
+def test_slides_unmatched_course_is_reported_not_silently_widened(store):
+    text = run(ask_tools.study_slides("pointers", course="Underwater Basketry"))
+    assert "No course matches" in text and "Underwater Basketry" in text
+    assert "CS 20" in text and "BIO 1" in text          # the candidates are listed
+    assert "Nothing was searched" in text
+    assert store.searches == []                          # it did not search every course
+
+
+def test_slides_ambiguous_course_lists_the_candidates(store, monkeypatch):
+    monkeypatch.setattr(store, "courses", lambda: COURSES + [
+        {"id": "c_cs31", "name": "Algorithms", "code": "CS 31"}])
+    text = run(ask_tools.study_slides("pointers", course="CS"))
+    assert "more than one course" in text
+    assert "CS 20" in text and "CS 31" in text and "BIO 1" not in text
+    assert store.searches == []
 
 
 def test_slide_text_cannot_close_the_fence_or_forge_a_header(monkeypatch):

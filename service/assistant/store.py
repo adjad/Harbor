@@ -32,7 +32,7 @@ from service.paths import MOE_DIR, private_sqlite_file
 
 # Most undated reminders one native snapshot may carry. The app sends at most this many
 # plus the TRUE total, so the backend can tell a complete list from a truncated one.
-UNDATED_MAX = 200
+UNDATED_MAX = 1000
 # Sanity bounds on what a native read may declare, so a malformed or hostile client cannot
 # crash the sync with an absurd number or fill the store with huge strings.
 UNDATED_TOTAL_MAX = 1_000_000
@@ -97,6 +97,14 @@ def parse_undated_snapshot(raw, total) -> UndatedSnapshot | None:
     # had to cut the list at the cap. Merging a duplicate id is not truncation.
     return UndatedSnapshot(kept, max(total, len(rows)),
                            total > len(raw) or len(rows) > UNDATED_MAX)
+
+def _source_counts(rows: list[dict]) -> dict[str, int]:
+    """How many of ``rows`` carry each native ``source_id``."""
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row["source_id"]] = counts.get(row["source_id"], 0) + 1
+    return counts
+
 
 DB_PATH = MOE_DIR / "assistant.db"
 _log = logging.getLogger(__name__)
@@ -1671,8 +1679,9 @@ class AssistantStore:
     def reminder_terminal_retry_state(self, kind: str, payload: dict) -> str:
         """Classify the current occurrence, ignoring historical completed rows."""
         from service.assistant.verified_reminders import expected_matches
-        if kind == "delete_reminder" and payload.get("expected_due_ts") is None:
+        if kind in {"delete_reminder", "complete_reminder"} and payload.get("expected_due_ts") is None:
             # An undated reminder lives only in the undated list, never in commitments.
+            finished = "dismissed" if kind == "delete_reminder" else "done"
             with self._lock:
                 terminal = self._db.execute(
                     "SELECT status FROM assistant_reminder_terminals WHERE source_id=?",
@@ -1682,7 +1691,7 @@ class AssistantStore:
                     (payload["source_id"],)).fetchone()
             if row is not None:
                 return "expected" if row["title"] == payload["expected_title"] else "other"
-            return "desired" if terminal and terminal["status"] == "dismissed" else "other"
+            return "desired" if terminal and terminal["status"] == finished else "other"
         with self._lock:
             rows = self._db.execute(
                 "SELECT title,when_ts,status,all_day FROM scheduled_commitments WHERE source='reminders' "
@@ -2195,7 +2204,7 @@ class AssistantStore:
                     self._db.execute(
                         "DELETE FROM assistant_reminder_writes WHERE source_id=?",
                         (payload["source_id"],))
-                    if kind == "delete_reminder" and payload["expected_due_ts"] is None:
+                    if kind in {"delete_reminder", "complete_reminder"} and payload["expected_due_ts"] is None:
                         removed = self._db.execute(
                             "DELETE FROM assistant_undated_reminders WHERE source_id=?",
                             (payload["source_id"],)).rowcount
@@ -2640,38 +2649,42 @@ class AssistantStore:
                 "ON d.source_id=u.source_id ORDER BY u.title COLLATE NOCASE, u.source_id").fetchall()
         return [{**dict(r), "stale_state": classify(r["created_ts"], r["decision"], now, r["title"])} for r in rows]
 
-    def undated_reminders(self, query: str = "") -> list[dict]:
+    def undated_reminders(self, query: str = "", *, policy_hidden: bool = False) -> list[dict]:
         """Incomplete Apple reminders with no due date, by title then id.
 
         Reminders the stale policy excludes (about a week old or more, not kept by the user)
         are left out here, which is how every reader (Day plans, tools, task evidence, model
         context) stops using them. ``undated_view`` reports how many were hidden.
+        ``policy_hidden=True`` returns ONLY those hidden ones instead, for a direct read
+        that asks for the user's reminders: it lists them apart, so asking still shows them.
         """
         from service.assistant.stale_reminders import EXCLUDED_STATES
         needle = (query or "").strip().lower()
         return [{"source_id": r["source_id"], "title": r["title"], "context": r["context"]}
                 for r in self._undated_rows()
-                if r["stale_state"] not in EXCLUDED_STATES
+                if (r["stale_state"] in EXCLUDED_STATES) == policy_hidden
                 and (not needle or needle in r["title"].lower())]
 
     def stale_reminder_asks(self, now: float | None = None) -> list[dict]:
         """Undated reminders in the ask window, oldest first, but only from a current list:
         a stale list could offer to delete something that already changed."""
-        if self.undated_view()["freshness"] != "current":
-            return []
         now = time.time() if now is None else now
-        rows = [r for r in self._undated_rows(now) if r["stale_state"] == "ask"]
+        # The undated list is only offered from a current list; the dated overdue rows have
+        # their own receipt, so a stale undated list no longer silences their question too
+        # (they were hidden with nothing ever asked).
+        undated_current = self.undated_view()["freshness"] == "current"
+        rows = [r for r in self._undated_rows(now) if r["stale_state"] == "ask"] if undated_current else []
         rows.sort(key=lambda r: (r["created_ts"], r["source_id"]))
         asks = [{"kind": "stale_reminder", "reason": "undated", "source_id": r["source_id"],
                  "title": r["title"], "context": r["context"], "created_ts": r["created_ts"],
                  "due_ts": None, "age_days": int((now - r["created_ts"]) // 86400),
                  **_passed_label(r["title"], r["created_ts"], now),
                  "actions": ["keep", "delete"]} for r in rows]
-        overdue = self._overdue_rows(now)
-        once = {r["source_id"] for r in overdue}
-        counts = {sid: sum(r["source_id"] == sid for r in overdue) for sid in once}
-        # ``age_days`` is days overdue for these. A native ID with two active rows is
-        # ambiguous for an exact delete, so it is hidden but never offered.
+        overdue = self._overdue_rows(now) if self._reminders_read_available() else []
+        counts = _source_counts(overdue)
+        # ``age_days`` is days overdue for these. A native ID with two active rows (a
+        # repeating reminder) is ambiguous for an exact delete, so it is never offered;
+        # hidden_commitment_ids leaves it visible for the same reason.
         asks += [{"kind": "stale_reminder", "reason": "overdue", "source_id": r["source_id"],
                   "title": r["title"], "context": r["context"], "created_ts": None,
                   "due_ts": r["when_ts"], "age_days": int((now - r["when_ts"]) // 86400),
@@ -2724,7 +2737,12 @@ class AssistantStore:
         in every list, so leaving the twin would bring the reminder straight back)."""
         from service.assistant.stale_reminders import EXCLUDED_STATES
         with self._lock:
-            rows = [r for r in self._overdue_rows(now) if r["stale_state"] in EXCLUDED_STATES]
+            overdue = self._overdue_rows(now)
+            counts = _source_counts(overdue)
+            # A native ID with more than one active row (a repeating reminder) can never be
+            # offered Keep/Delete, so hiding it would hide it for good: it stays visible.
+            rows = [r for r in overdue
+                    if r["stale_state"] in EXCLUDED_STATES and counts[r["source_id"]] == 1]
             hidden = {r["id"] for r in rows}
             keys = {_dedupe_key(r) for r in rows} - {None}
             if not keys:
@@ -2775,9 +2793,11 @@ class AssistantStore:
         out = [{"source_id": r["source_id"], "title": r["title"], "reason": "undated",
                 "stale_state": r["stale_state"], "hidden_since": since(r["title"], r["created_ts"])}
                for r in self._undated_rows(now) if r["stale_state"] in EXCLUDED_STATES]
+        overdue = self._overdue_rows(now)
+        counts = _source_counts(overdue)
         out += [{"source_id": r["source_id"], "title": r["title"], "reason": "overdue",
                  "stale_state": r["stale_state"], "hidden_since": since(r["title"], r["when_ts"])}
-                for r in self._overdue_rows(now) if r["stale_state"] in EXCLUDED_STATES]
+                for r in overdue if r["stale_state"] in EXCLUDED_STATES and counts[r["source_id"]] == 1]
         return out
 
     def hidden_reminder_titles(self, now: float | None = None) -> set[str]:
@@ -2893,11 +2913,23 @@ class AssistantStore:
                 "decision=excluded.decision,title=excluded.title,decided_at=excluded.decided_at",
                 (source_id, title, time.time()))
 
-    def undated_listing(self, query: str = "") -> tuple[dict, list[dict]]:
+    def undated_listing(self, query: str = "", *, policy_hidden: bool = False) -> tuple[dict, list[dict]]:
         """The view and the matching rows from ONE locked read, so they always describe the
         same snapshot even if a sync lands between two separate calls."""
         with self._lock:
-            return self.undated_view(), self.undated_reminders(query)
+            return self.undated_view(), self.undated_reminders(query, policy_hidden=policy_hidden)
+
+    def _reminders_read_available(self) -> bool:
+        """True when the latest Reminders source receipt is an available read."""
+        with self._lock:
+            receipt = self._db.execute(
+                "SELECT payload FROM today_source_sync WHERE source='reminders'").fetchone()
+        if receipt is None:
+            return False
+        try:
+            return json.loads(receipt["payload"]).get("available") is True
+        except (TypeError, ValueError):
+            return False
 
     def raw_reminder_list_snapshot(self, *, list_label: str = "", query: str = "",
                                    limit: int = 500) -> dict:

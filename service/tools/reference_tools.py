@@ -82,12 +82,36 @@ def _fmt(when: dt.datetime) -> str:
     return when.strftime("%-I:%M %p on %A, %B %-d, %Y")
 
 
+_DISPLAY = {"sf": "San Francisco", "la": "Los Angeles", "nyc": "New York",
+            "utc": "UTC", "gmt": "GMT"}
+
+
 def _label(place: str, zone: ZoneInfo) -> str:
-    """Display name for a place, taken from the RESOLVED zone rather than what
-    the user typed. `"sf".title()` is "Sf"; the zone's own last segment is
-    "Los Angeles", which is both correct and what they meant."""
+    """Display name for a place: the one the user asked for.
+
+    A city the user named ("Boston") is never replaced by the IANA zone's city
+    ("New York"). Short abbreviations are expanded ("sf" -> San Francisco, not
+    "Sf"), and an IANA name they typed ("Europe/London") shows its own city.
+    """
+    key = re.sub(r"\s+", " ", (place or "").strip().lower())
+    key = re.sub(r"^(?:in|at|the)\s+", "", key)
+    if key in _DISPLAY:
+        return _DISPLAY[key]
+    if key and "/" not in key:
+        return key.title()
     city = str(zone).rsplit("/", 1)[-1].replace("_", " ")
     return city if city.upper() == "UTC" else city.title()
+
+
+def _span(seconds: float, *, compact: bool = False) -> str:
+    """A whole-minute offset as '3 hours' / '5 h 45 min' (never 5.8 hours)."""
+    minutes = int(round(abs(seconds) / 60))
+    h, m = divmod(minutes, 60)
+    if m == 0:
+        return f"{h}h" if compact else f"{h} hour{'s' if h != 1 else ''}"
+    if h == 0:
+        return f"{m} min"
+    return f"{h} h {m} min"
 
 
 @register(
@@ -132,8 +156,7 @@ def world_time(place: str = "", compare_to: str = "") -> str:
         if hours == 0:
             rel = "the same time as"
         else:
-            mag = f"{abs(hours):.0f}" if abs(hours) == int(abs(hours)) else f"{abs(hours):.1f}"
-            rel = f"{mag} hour{'s' if abs(hours) != 1 else ''} {'ahead of' if hours > 0 else 'behind'}"
+            rel = f"{_span(delta.total_seconds())} {'ahead of' if hours > 0 else 'behind'}"
         la, lb = _label(place, a), _label(compare_to, b)
         return (f"{la} is {rel} {lb}.\n"
                 f"  {la}: {_fmt(now_a)}\n"
@@ -150,8 +173,7 @@ def world_time(place: str = "", compare_to: str = "") -> str:
     if delta == 0:
         rel = "same as here"
     else:
-        mag = f"{abs(delta):.0f}" if abs(delta) == int(abs(delta)) else f"{abs(delta):.1f}"
-        rel = f"{mag}h {'ahead of' if delta > 0 else 'behind'} you"
+        rel = f"{_span(delta * 3600, compact=True)} {'ahead of' if delta > 0 else 'behind'} you"
     return f"In {_label(target, zone)} it's {_fmt(there)} ({rel})."
 
 

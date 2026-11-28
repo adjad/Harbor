@@ -15,10 +15,10 @@ which app they care about.
 
 TWO DESIGN RULES worth stating, because both were learned from real failures:
 
-  * NOTES IS WEIGHTED LAST. The user keeps very little in Notes, so a note
-    edit is the least interesting thing here and must never crowd out a real
-    message or email. It gets its own small quota rather than competing on
-    recency alone.
+  * EVERY SOURCE GETS ITS OWN QUOTA. A burst from one app (a busy group
+    thread, a batch of note edits) must never crowd the others out, so each
+    source has a cap of its own instead of competing on recency alone. Notes
+    get the same cap as mail.
 
   * AN EMPTY WINDOW WIDENS ITSELF instead of dead-ending. `summarize_emails`
     shipped the opposite behaviour and it produced a wrong answer in the field:
@@ -40,10 +40,9 @@ from service.tools.registry import register
 # be a dead end.
 _WIDEN_STEPS = (24, 72, 168, 720)
 
-# Most note edits that may appear regardless of how recent they are. Notes is
-# the weakest source for this user, and a burst of edits would otherwise push
-# real messages and mail out of the list entirely.
-_NOTES_QUOTA = 3
+# Most note edits that may appear. The same size as mail's cap: a quota, so a
+# burst of edits cannot push messages and mail out, but not a penalty.
+_NOTES_QUOTA = 6
 
 # Per-source caps. These are deliberately small and per-SOURCE rather than one
 # shared budget: verified on real data, a single chatty group thread ("Comp",
@@ -135,7 +134,7 @@ def _collect(since: float, now: float) -> list[dict]:
     except Exception:  # noqa: BLE001
         pass
 
-    # --- Notes (LAST, and quota'd — see the module docstring) -----------------
+    # --- Notes (quota'd like the others — see the module docstring) ----------
     try:
         from service.tools import notes_tools
         rows = [n for n in notes_tools._parse() if n["ts"] >= since]
@@ -206,6 +205,9 @@ async def get_recent_activity(hours: int = 24, limit: int = 20) -> str:
     for i, window in enumerate([start, *steps]):
         items = _collect(now - window * 3600, now)
         if items:
+            # Newest first BEFORE the limit: _collect appends source by source,
+            # so slicing first always cut whichever source was read last.
+            items.sort(key=lambda item: item["ts"], reverse=True)
             return _render(items[: max(1, limit)], now, window,
                            asked_h=start if i > 0 else None)
     return ("Nothing new turned up in any app going back a month — messages, "

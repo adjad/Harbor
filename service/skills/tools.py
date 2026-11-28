@@ -25,11 +25,13 @@ import contextlib
 import os
 import re
 import shlex
+import shutil
 import signal
+import sys
 import tempfile
 from pathlib import Path
 
-from service.identity import child_environment
+from service.identity import skill_environment
 from service.skills import sandbox, scopes
 from service.tools.registry import REGISTRY, register
 
@@ -74,6 +76,18 @@ async def _read_capped(proc) -> tuple[bytes, bool]:
     await proc.wait()
     return bytes(kept), False
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,48}$")
+_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+TRUE_MARK = "\0true"
+_GONE = object()
+
+
+def _omitted(value) -> bool:
+    """An argument the caller left out. 0 is a value (volume 0), not an omission."""
+    return value is None or value is False or (isinstance(value, str) and value == "")
+
+
+def _text(value) -> str:
+    return "" if value is None else str(value)
 
 
 def _build_argv(template: str, args: dict) -> list[str] | str:
@@ -89,27 +103,91 @@ def _build_argv(template: str, args: dict) -> list[str] | str:
     except ValueError as e:
         return f"(bad command template in this skill: {e})"
 
-    argv: list[str] = []
+    # None marks a placeholder-only token whose argument was omitted.
+    argv: list[str | None] = []
     for token in tokens:
         m = _PLACEHOLDER_RE.fullmatch(token)
         if m:
             value = args.get(m.group(1))
-            if value is None or value == "":
-                continue          # optional argument the caller omitted
-            argv.append(str(value))
+            if _omitted(value):
+                argv.append(None)          # optional argument the caller omitted
+            elif value is True:
+                argv.append(TRUE_MARK)     # resolved against a preceding flag below
+            else:
+                text = str(value)
+                if text.startswith("-") and not _NUMBER_RE.fullmatch(text):
+                    return (f"(the '{m.group(1)}' argument may not start with '-': it "
+                            "could be read as an option by the program)")
+                argv.append(text)
+            continue
+        names = _PLACEHOLDER_RE.findall(token)
+        if names and any(_omitted(args.get(n)) for n in names):
+            # "--app={app}" with no app must vanish, never become "--app=None".
+            argv.append(_GONE)
             continue
         argv.append(_PLACEHOLDER_RE.sub(
-            lambda mm: str(args.get(mm.group(1), "")), token))
-    return argv
+            lambda mm: _text(args.get(mm.group(1))), token))
+
+    # A flag whose value was omitted goes with it; a boolean flag is bare.
+    out: list[str | None] = []
+    for i, item in enumerate(argv):
+        prev_is_flag = (i > 0 and tokens[i - 1].startswith("-")
+                        and not _PLACEHOLDER_RE.search(tokens[i - 1]))
+        if item is TRUE_MARK:
+            if prev_is_flag:
+                continue                   # the flag alone says "on"
+            item = "true"
+        if item is None and prev_is_flag and out and out[-1] == tokens[i - 1]:
+            out.pop()                      # drop the now-pointless flag
+            continue
+        out.append(item)
+    out = [x for x in out if x is not _GONE]
+    # Trailing omissions simply end the argument list. One in the middle keeps
+    # its place as an empty argument, so later positional arguments do not shift
+    # into it.
+    while out and out[-1] is None:
+        out.pop()
+    return ["" if x is None else x for x in out]
 
 
-def _make_runner(skill_dir: Path, spec: dict, name: str = ""):
+def _run_time_problem(skill_dir: Path) -> str:
+    """Why this skill's tool must not start now, or "". A loaded skill is
+    re-checked in full (skills.verify_before_run). A folder no loaded skill
+    owns may still run only when it is outside the user's skills folder (a
+    bundled skill); a user folder must still match what the person approved."""
+    from service import skills as _skills
+    from service.skills import trust
+    try:
+        here = skill_dir.resolve()
+    except (OSError, RuntimeError):
+        return "this skill's folder can't be read"
+    if any(_skills._same_path(s.path, here) for s in _skills.all_skills().values()):
+        return _skills.verify_before_run(skill_dir)
+    try:
+        here.relative_to(_skills.SKILLS_DIR.resolve())
+    except (ValueError, OSError, RuntimeError):
+        return ""
+    return trust.problem(skill_dir)
+
+
+def _make_runner(skill_dir: Path, spec: dict, name: str = "", *, bundled: bool = False):
     template = str(spec.get("command") or "")
     script = str(spec.get("script") or "")
+    # Apple Events only for a skill that ships inside Harbor's signed bundle, and
+    # only to the closed set of apps in sandbox.APPLE_EVENT_TARGETS. A skill the
+    # user installed or Harbor generated cannot declare them: the key is ignored.
+    declared = spec.get("apple_events") if bundled else None
+    apple_events = sandbox.apple_event_destinations(
+        declared if isinstance(declared, list) else [])
+    # A bad scope is reported when the skill's tools are registered
+    # (register_skill_tools sets the skill's error); here it can only be empty.
     read_scopes, _ = scopes.parse_scopes(spec.get("read_scopes"))
     write_scopes, _ = scopes.parse_scopes(spec.get("write_scopes"))
 
     async def run(**args) -> str:
+        # Re-check trust at run time: a script changed after load must not run.
+        if (why := _run_time_problem(skill_dir)):
+            return f"({why})"
         if script:
             path = (skill_dir / script).resolve()
             # Containment check: a skill's own folder is the only place it may
@@ -121,11 +199,19 @@ def _make_runner(skill_dir: Path, spec: dict, name: str = ""):
                 return f"(this skill's script path escapes its own folder: {script})"
             if not path.exists():
                 return f"(this skill's script is missing: {script})"
-            interpreter = {".py": "python3", ".sh": "bash", ".js": "node"}.get(
-                path.suffix.lower())
+            # Absolute interpreters: PATH is the model-visible environment's, and
+            # python3 from it is not the Python Harbor itself runs on.
+            interpreter = {".py": sys.executable, ".sh": "/bin/bash",
+                           ".js": shutil.which("node") or "node"}.get(path.suffix.lower())
             argv = ([interpreter, str(path)] if interpreter else [str(path)])
             for key, value in args.items():
-                if value not in (None, ""):
+                if _omitted(value):
+                    continue
+                if value is True:
+                    argv.append(f"--{key}")            # a bare flag
+                elif str(value).startswith("-"):
+                    argv.append(f"--{key}={value}")    # never read as an option
+                else:
                     argv += [f"--{key}", str(value)]
         else:
             built = _build_argv(template, args)
@@ -146,8 +232,10 @@ def _make_runner(skill_dir: Path, spec: dict, name: str = ""):
             scratch.mkdir(parents=True, exist_ok=True, mode=0o700)
         except OSError as e:
             return f"(couldn't prepare this skill's scratch folder: {e})"
+        if not sandbox.available() and (why := sandbox.refusal()):
+            return f"(this skill's tool was not run: {why})"
         if sandbox.available():
-            profile = sandbox.build_profile(skill_dir, read_scopes, write_scopes)
+            profile = sandbox.build_profile(skill_dir, read_scopes, write_scopes, apple_events)
             fd, profile_path = tempfile.mkstemp(suffix=".sb", prefix="harbor-skill-")
             with os.fdopen(fd, "w") as f:
                 f.write(profile)
@@ -161,7 +249,7 @@ def _make_runner(skill_dir: Path, spec: dict, name: str = ""):
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
                     cwd=str(skill_dir),
-                    env={**child_environment(), "HARBOR_SKILL_DIR": str(skill_dir),
+                    env={**skill_environment(), "HARBOR_SKILL_DIR": str(skill_dir),
                          "HARBOR_SKILL_SCRATCH": str(scratch), "TMPDIR": str(scratch) + "/",
                          # No .pyc beside the skill: its folder is fingerprinted (skills/trust.py).
                          "PYTHONDONTWRITEBYTECODE": "1"},
@@ -189,19 +277,21 @@ def _make_runner(skill_dir: Path, spec: dict, name: str = ""):
                 profile_file.unlink(missing_ok=True)
 
         text = (out or b"").decode(errors="replace").strip()
+        # Judged on everything captured, before the text is shortened: the
+        # sandbox's "Operation not permitted" can sit past the first 8000
+        # characters of a chatty tool and must still be named.
+        denied = (proc.returncode != 0
+                  and ("Operation not permitted" in text or "Errno 1" in text))
+        if denied:
+            allowed = scopes.describe(read_scopes, write_scopes)
+            return (f"(blocked by the sandbox — this tool tried to reach a "
+                    f"file outside what it's allowed. {allowed})\n{text[-_MAX_OUTPUT:]}")
         if cut:
             return (text[:_MAX_OUTPUT] + f"\n…[truncated: this skill's tool printed more than "
                     f"{_MAX_OUTPUT} characters and was stopped]")
         if len(text) > _MAX_OUTPUT:
             text = text[:_MAX_OUTPUT] + "\n…[truncated]"
         if proc.returncode != 0:
-            # A sandbox denial surfaces as a bare EPERM, which reads like a bug
-            # in the tool. Name the real cause so the model reports "it isn't
-            # allowed there" instead of retrying the same call.
-            if "Operation not permitted" in text or "Errno 1" in text:
-                allowed = scopes.describe(read_scopes, write_scopes)
-                return (f"(blocked by the sandbox — this tool tried to reach a "
-                        f"file outside what it's allowed. {allowed})\n{text}")
             return f"(exit code {proc.returncode})\n{text}"
         # The host-observed exit status 0 is the completion boundary, not the
         # skill's own words (router.model_led.EXTENSION_COMPLETION_MODULES).
@@ -239,6 +329,24 @@ async def _stop(proc: asyncio.subprocess.Process) -> None:
         await asyncio.wait_for(asyncio.shield(proc.wait()), _STOP_DRAIN_S)
 
 
+def _tool_problems(skill) -> str:
+    """What is wrong with the tools a skill declares, or ""."""
+    problems = []
+    for spec in skill.tools:
+        if not isinstance(spec, dict):
+            problems.append("a tool entry is not a mapping")
+            continue
+        raw = str(spec.get("name") or "").strip()
+        if not _NAME_RE.match(raw.lower()):
+            problems.append(f"tool name {raw!r} is invalid (lowercase letters, digits and "
+                            "underscores, starting with a letter, 2-49 characters)")
+        for key in ("read_scopes", "write_scopes"):
+            _, why = scopes.parse_scopes(spec.get(key))
+            if why:
+                problems.append(f"tool {raw or '?'}: {key}: {why}")
+    return "; ".join(problems)
+
+
 def register_skill_tools(skills: dict) -> list[str]:
     """Register every enabled skill's declared tools; retract stale ones."""
     for name in _registered:
@@ -251,6 +359,11 @@ def register_skill_tools(skills: dict) -> list[str]:
     claimed: dict[str, str] = {}
     for skill in skills.values():
         if not skill.enabled or skill.error:
+            continue
+        if (problem := _tool_problems(skill)):
+            # One bad declaration makes the whole skill broken, said plainly,
+            # instead of quietly leaving a tool out or running it unscoped.
+            skill.error = problem
             continue
         for spec in skill.tools:
             name = str(spec.get("name") or "").strip().lower()
@@ -273,7 +386,10 @@ def register_skill_tools(skills: dict) -> list[str]:
                 props = {}
             schema = {
                 "type": "object",
-                "properties": {k: (v if isinstance(v, dict) else {"type": "string"})
+                # `required` is a JSON-Schema list on the object, not a flag
+                # inside each property.
+                "properties": {k: ({pk: pv for pk, pv in v.items() if pk != "required"}
+                                   if isinstance(v, dict) else {"type": "string"})
                                for k, v in props.items()},
                 "required": [k for k, v in props.items()
                              if isinstance(v, dict) and v.get("required")],
@@ -281,7 +397,7 @@ def register_skill_tools(skills: dict) -> list[str]:
             description = (str(spec.get("description") or name)
                            + f" (from the '{skill.name}' skill)")
             register(name, description, schema, category="skill_tool")(
-                _make_runner(skill.path, spec, name))
+                _make_runner(skill.path, spec, name, bundled=bool(skill.bundled)))
             _registered.add(name)
             claimed[name] = skill.name
             added.append(name)
@@ -326,4 +442,7 @@ async def use_skill(name: str) -> str:
         # A reply style, added to plain chat replies by Harbor itself; a
         # tool-using turn doesn't follow it (skills.Skill.always).
         return f"(the '{skill.name}' skill is a reply style Harbor applies to plain chat replies on its own; there's nothing to load)"
+    from service import skills as _skills
+    if (why := _skills.verify_before_run(skill)):
+        return f"({why})"
     return f"Instructions from the '{skill.name}' skill:\n\n{skill.body}"

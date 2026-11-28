@@ -210,17 +210,20 @@ def test_get_endpoint_shape(store):
 
 # --- delete -----------------------------------------------------------------------------
 
-def test_only_delete_may_target_an_undated_reminder():
+def test_undated_targets_need_an_explicit_null_and_no_all_day_date():
     base = {"action_id": "a1", "source_id": "ek", "expected_title": "T", "expected_due_ts": None}
-    assert validate_payload("delete_reminder", {"type": "delete_reminder", **base})
-    for kind in ("complete_reminder",):
-        with pytest.raises(ValueError):
-            validate_payload(kind, {"type": kind, **base})
-    with pytest.raises(ValueError):
-        validate_payload("update_reminder", {"type": "update_reminder", **base,
-                                             "title": "U", "due_ts": 2_000_000_000.0})
-    with pytest.raises(ValueError):
-        validate_payload("delete_reminder", {"type": "delete_reminder", **base, "expected_due_ts": 0})
+    for kind in ("delete_reminder", "complete_reminder"):
+        assert validate_payload(kind, {"type": kind, **base})
+    assert validate_payload("update_reminder", {"type": "update_reminder", **base,
+                                                "title": "U", "due_ts": 2_000_000_000.0})
+    for kind in ("delete_reminder", "complete_reminder"):
+        with pytest.raises(ValueError):          # zero is not "undated"
+            validate_payload(kind, {"type": kind, **base, "expected_due_ts": 0})
+        with pytest.raises(ValueError):          # a floating date is a dated target
+            validate_payload(kind, {"type": kind, **base, "expected_due_date": "2026-10-11"})
+    with pytest.raises(ValueError):              # create never targets an existing reminder
+        validate_payload("create_reminder", {"type": "create_reminder", "action_id": "a1",
+                         "title": "T", "commitment_kind": "reminder", "expected_due_ts": None})
 
 
 def _native_request():
@@ -542,12 +545,15 @@ def test_verified_overdue_delete_retires_the_row(store):
     assert "Get doordash order" not in {c["title"] for c in store.history(days=60, include_stale=True)}
 
 
-def test_an_ambiguous_native_id_is_hidden_but_never_offered(store):
+def test_an_ambiguous_native_id_is_never_offered_so_it_is_never_hidden(store):
+    # A repeating reminder with two active rows can't be asked Keep/Delete; hiding it
+    # anyway would hide it for good, with no way back.
     _sync(store, [], events=[_dated("dup", "Repeat", NOW - 9 * DAY_S),
                              _dated("dup", "Repeat", NOW - 10 * DAY_S)])
     assert store.stale_reminder_asks(NOW) == []
     assert store.stale_reminder_target("dup") is None
-    assert "Repeat" not in {c["title"] for c in store.history(days=60)}
+    assert "Repeat" in {c["title"] for c in store.history(days=60)}
+    assert "Repeat" not in {r["title"] for r in store.hidden_reminders(NOW)}
 
 
 def test_reminder_tools_hide_but_removals_reach(store):
@@ -762,3 +768,110 @@ def test_the_guard_itself_refuses_non_json_and_any_origin():
             stale_reminders_api._native_only(bad)
         assert refused.value.status_code == code
     stale_reminders_api._native_only(request((b"content-type", b"Application/JSON; charset=utf-8")))
+
+
+# --- audit 2.2: completing an undated reminder --------------------------------------------
+
+def test_complete_reminder_completes_an_undated_reminder_through_the_native_path(store, monkeypatch):
+    from service.tools import schedule_extras
+    _sync(store, [_row("u-1", "Invented someday errand", FRESH)])
+    monkeypatch.setattr(schedule_extras, "_store", store)
+    native = AsyncMock(return_value={"ok": True, "status": "succeeded", "error": "",
+                                     "source_id": "u-1", "is_completed": True})
+    monkeypatch.setattr(outbox, "request", native)
+    text = asyncio.run(schedule_extras.complete_reminder("someday errand"))
+    assert text == "Marked “Invented someday errand” done."
+    kind, payload = native.await_args.args
+    assert kind == "complete_reminder"
+    assert payload == {"source_id": "u-1", "expected_title": "Invented someday errand", "expected_due_ts": None}
+    validate_payload(kind, {"type": kind, "action_id": "a1", **payload})
+
+
+def test_complete_commitment_refuses_a_row_that_is_not_a_current_undated_reminder(store, monkeypatch):
+    from service.tools import schedule_extras
+    _sync(store, [_row("u-1", "Invented someday errand", FRESH)])
+    native = AsyncMock(side_effect=AssertionError("must not reach the native writer"))
+    monkeypatch.setattr(outbox, "request", native)
+    for row in ({"id": "x", "source": "reminders", "source_id": "gone", "title": "Invented someday errand", "when_ts": None},
+                {"id": "x", "source": "reminders", "source_id": "u-1", "title": "Renamed", "when_ts": None}):
+        done, message = asyncio.run(schedule_extras.complete_commitment(row, store))
+        assert done is False and "not a current undated reminder" in message
+    native.assert_not_awaited()
+
+
+def test_complete_reminder_still_reports_no_match_for_unknown_titles(store, monkeypatch):
+    from service.tools import schedule_extras
+    _sync(store, [_row("u-1", "Invented someday errand", FRESH)])
+    monkeypatch.setattr(schedule_extras, "_store", store)
+    assert "Nothing active matches" in asyncio.run(schedule_extras.complete_reminder("quarterly taxes"))
+
+
+def test_terminal_retry_state_for_an_undated_completion(store):
+    _sync(store, [_row("u-1", "Invented someday errand", FRESH)])
+    payload = {"source_id": "u-1", "expected_title": "Invented someday errand", "expected_due_ts": None}
+    assert store.reminder_terminal_retry_state("complete_reminder", payload) == "expected"
+
+
+# --- a direct read still shows what the policy keeps quiet ------------------------------
+
+_READY = {"sources": [{"id": "reminders", "state": "ready"}], "reminders_fresh": True}
+
+
+def _read(query="", scope="all"):
+    from service.assistant import sync_status
+    with patch.object(sync_status, "ensure_sources", new_callable=AsyncMock, return_value=_READY), \
+         patch.object(assistant_tools, "_reminders_brief", return_value=""):
+        return asyncio.run(assistant_tools.search_reminders(query, scope))
+
+
+def test_a_reminders_read_lists_overdue_ones_the_policy_keeps_quiet(store):
+    _overdue(store)
+    answer = _read()
+    head, _, quiet = answer.partition("Overdue a week or more and not marked Keep")
+    assert "Recently due" in head and "Get doordash order" not in head
+    assert "- Get doordash order" in quiet and "- Go to club meeting" in quiet
+    # Still hidden from everything that brings reminders up on its own.
+    assert "Get doordash order" not in {c["title"] for c in assistant_tools.reminders_matching("all")}
+
+
+def test_a_past_due_read_lists_them_too(store):
+    _overdue(store)
+    answer = _read(scope="past_due")
+    assert "Get doordash order" in answer and "Dentist" not in answer
+
+
+def test_a_reminders_read_lists_old_undated_ones_apart(store):
+    _standard(store)
+    answer = _read()
+    head, _, quiet = answer.partition("Older Apple Reminders with no due date")
+    assert "Fresh errand" in head and "Ancient idea" not in head
+    assert "- Ancient idea" in quiet and "- Ask about this" in quiet
+
+
+def test_overdue_asks_do_not_wait_on_a_current_undated_list(store):
+    _overdue(store)
+    # A later dated read arrives without an undated list: that list is no longer current,
+    # but the dated rows still come from an available read.
+    store.sync_source("reminders", [
+        _dated("o-ask", "Go to club meeting", NOW - 9 * DAY_S)],
+        diagnostics={"authorized": True, "available": True, "count": 1,
+                     "snapshot_started_at": float(next(_clock))})
+    assert store.undated_view()["freshness"] == "stale"
+    assert [a["source_id"] for a in store.stale_reminder_asks(NOW)] == ["o-ask"]
+
+
+def test_important_is_a_due_browse_not_a_title_filter(store):
+    _sync(store, [_row("f", "Fresh errand", FRESH)], events=[
+        _dated("p-over", "Pay the water bill", NOW - 1 * DAY_S),
+        _dated("p-soon", "Call the clinic", NOW + 1 * DAY_S),
+        _dated("p-later", "Renew passport", NOW + 20 * DAY_S),
+        _dated("p-word", "Important: tax form", NOW + 20 * DAY_S),
+    ])
+    for word in ("important", "urgent", "priority"):
+        answer = _read(word)
+        assert "Pay the water bill" in answer and "Call the clinic" in answer, word
+        assert "Renew passport" not in answer, word
+        assert "priority and flag are not synced" in answer
+        assert "no active match" not in answer
+    assert "Important: tax form" in _read("important")
+    assert "1 Apple reminder with no due date is not listed here" in _read("urgent")

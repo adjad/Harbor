@@ -265,9 +265,12 @@ def test_digests_never_run_concurrently():
 
 def test_digests_per_lookup_are_capped_newest_first():
     client = StubClient()
-    rows = [_row(i) for i in range(D.MAX_DIGESTS_PER_CALL + 1)]
+    # As many digests as the result budget has room for (tools audit 3.5), newest first.
+    allowed = D.digest_limit(D.RESULT_BUDGET_CHARS)
+    assert 1 < allowed <= D.MAX_DIGESTS_PER_CALL
+    rows = [_row(i) for i in range(allowed + 1)]
     out = asyncio.run(D.digest_rows(rows, client=client, model=MODEL))
-    assert len(client.calls) == D.MAX_DIGESTS_PER_CALL
+    assert len(client.calls) == allowed
     assert not out[0]["body"].startswith("[Harbor's digest")   # oldest
     assert all(r["body"].startswith("[Harbor's digest") for r in out[1:])
 
@@ -485,3 +488,57 @@ def test_n3_quote_keeping_matches_query_words():
     body = reply + "\n\nOn Mon, Oct 20, 2026 Vendor <v@example.com> wrote:\n> Your shipment arrives Friday."
     kept, quoted, _ = D.clean_body(body, query="when does the shipment arrive")
     assert "shipment arrives Friday" in kept and quoted == 0
+
+
+# --- app audit 2.2.4 and tools audit 3.5 ------------------------------------------------------------
+
+
+def test_long_document_and_signature_links_survive_but_trackers_go():
+    doc = "https://docs.google.com/document/d/" + "1aB2cD3eF4gH5iJ6kL7mN8oP9qR0sT1uV2wX3yZ4aB5c" + "/edit?usp=sharing&" + "x=1" * 60
+    sign = ("https://na3.docusign.net/Signing/EmailStart.aspx?a=" + "a1b2c3d4" * 12 + "&acct=" + "9f8e7d6c" * 6)
+    portal = "https://portal.city.example.gov/permits/applications/2026/residential/view?id=" + "4" * 150
+    for url in (doc, sign, portal):
+        assert len(url) > D._MAX_LINK_CHARS and not D.is_tracking_link(url), url
+    assert not D.is_tracking_link("https://shop.example.com/a/17?utm_source=news&utm_medium=email")
+    assert D.is_tracking_link("http://email.example-crm.test/ls/click?upn=u001." + "AbCd-2Fx" * 40)
+    assert D.is_tracking_link("https://clicks.example-promo.test/f/a/" + "q1w2e3r4" * 30)
+    assert D.is_tracking_link("https://links.example.test/u/" + "Zx9Yw8Vu7Ts6" * 10)
+    assert D.is_tracking_link("https://ex.example.com/r/" + "aZ09" * 60)        # long and only a token
+
+
+def test_the_quoted_thread_stays_when_the_reply_repeats_the_query_word():
+    reply = "Yes, I can pay the invoice this week, thanks for sending it over. " * 4
+    body = reply + "\n\nOn Mon, Oct 20, 2026 Vendor <v@example.com> wrote:\n> Invoice INV-2207 is due Nov 3."
+    kept, quoted, _ = D.clean_body(body, query="invoice")
+    assert "INV-2207" in kept and quoted == 0
+
+
+def test_a_match_past_the_first_20000_chars_is_kept_for_the_search():
+    body = "Routine filler text that says nothing in particular. " * 600 + "\nYour locker code is LK-7731.\n"
+    assert len(body) > D._MAX_INPUT_CHARS
+    fitted = D.fit_rows([_row(0, body=body), _row(1, body=body)], query="locker code", budget=6000)
+    assert all("LK-7731" in r["body"] for r in fitted.rows)
+
+
+def test_one_long_email_uses_the_whole_real_budget():
+    body = "A long policy paragraph with details that all matter to the reader. " * 1500
+    fitted = D.fit_rows([_row(0, body=body)], budget=200_000)
+    assert len(fitted.rows[0]["body"]) > D._MAX_INPUT_CHARS and fitted.cut == 0
+
+
+def test_one_timeout_backs_off_that_message_not_every_digest(monkeypatch):
+    monkeypatch.setattr(D, "_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(D, "_timeouts_in_a_row", 0)
+    slow = asyncio.run(D.digest_body(_row(1), client=StubClient(delay=1.0), model=MODEL))
+    assert slow.startswith("[A digest of this long email was unavailable")
+    assert D._paused_until <= D.time.monotonic()                   # nothing else paused
+    monkeypatch.setattr(D, "_TIMEOUT_S", 20.0)
+    other = StubClient()
+    assert asyncio.run(D.digest_body(_row(2), client=other, model=MODEL)).startswith("[Harbor's digest")
+    again = StubClient()
+    asyncio.run(D.digest_body(_row(1), client=again, model=MODEL))
+    assert again.calls == []                                       # the slow message itself backs off
+    monkeypatch.setattr(D, "_TIMEOUT_S", 0.05)
+    for i in range(3, 3 + D._TIMEOUTS_BEFORE_PAUSE):               # a run of timeouts: the engine is stuck
+        asyncio.run(D.digest_body(_row(i), client=StubClient(delay=1.0), model=MODEL))
+    assert D._paused_until > D.time.monotonic()

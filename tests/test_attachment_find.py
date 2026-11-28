@@ -484,6 +484,15 @@ async def test_across_needs_the_local_model(world):
     assert world.kinds("local") == [] and world.index_args == []
 
 
+async def test_across_with_list_only_lists_and_reads_nothing(world):
+    # list_only wins over across (run's contract): no model, no file opened.
+    invoices(world, 2)
+    world.model_error = vision.VisionUnavailable("not local")
+    out = await ma.run(across=True, list_only=True)
+    assert out != ma._LOCAL_ONLY and "newest first" in out
+    assert fetched(world) == [] and world.kinds("model") == [] and world.kinds("chat") == []
+
+
 async def test_across_with_nothing_found(world):
     out = await ma.run(across=True, query="zebra")
     assert out.startswith("I didn't find any email attachments matching zebra")

@@ -1838,6 +1838,9 @@ def make_fakes(w: World) -> dict:
             _copies, problem = _emails_for(w, cc)
             if problem:
                 return problem
+            for c in _copies:  # the user's own address in cc is refused, as in `to`
+                if msg := _own_address_guard(c, "send_email", confirmed_self_send):
+                    return msg
         _record(w, "send_email", {"to": to, "subject": subject, "body": body})
         return f"Email sent to {', '.join(resolved)}."
 
@@ -1848,7 +1851,7 @@ def make_fakes(w: World) -> dict:
         _record(w, "reply_to_email", {"message_id": message_id, "body": body})
         return f"Reply sent to {m['from']}."
 
-    def forward_email(message_id, to, note=None, **_):
+    def forward_email(message_id, to, note=None, confirmed_self_send=None, **_):
         message_id = (message_id or "").strip()
         if not message_id:
             return ("(no message_id — call view_emails first and use the Message-ID "
@@ -1856,6 +1859,9 @@ def make_fakes(w: World) -> dict:
         resolved, problem = _emails_for(w, to)
         if problem:
             return problem
+        for r in resolved:
+            if msg := _own_address_guard(r, "forward_email", confirmed_self_send):
+                return msg
         _record(w, "forward_email", {"message_id": message_id, "to": to})
         return f"Forwarded to {', '.join(_named(w, r) for r in resolved)}."
 
@@ -1929,15 +1935,20 @@ def make_fakes(w: World) -> dict:
         return note + "\n".join(f"[{_msg_ts(w, m):%a %b %-d, %-I:%M %p}] {m['from']} — {_msg_text(m)}"
                                 for m in rows[-n:])
 
-    def summarize_messages(period=None, day=None, conversation=None, count=None, unread=None, **_):
+    def summarize_messages(period=None, day=None, conversation=None, count=None, unread=None, days=None, **_):
         if "messages" in w.access_needed:
             return "(Harbor needs Full Disk Access to read Messages. " + _fix("messages", "full_disk_access") + ")"
         rows = _message_rows(None, period, day, unread, conversation)
         if isinstance(rows, str):
             return rows
+        # `days` widens the default catch-up window only (1 to 30, default 3), as in production.
+        try:
+            window = min(30, max(1, int(days))) if days is not None else 3
+        except (TypeError, ValueError):
+            window = 3
         if not (period or day or conversation or unread):
-            rows = [m for m in rows if _msg_ts(w, m) >= w.now - timedelta(days=3)]
-        label = _span_label(w, period, day) if (period or day) else "the last 3 days"
+            rows = [m for m in rows if _msg_ts(w, m) >= w.now - timedelta(days=window)]
+        label = _span_label(w, period, day) if (period or day) else f"the last {window} days"
         if not rows:
             return f"No substantive messages found for {label}."
         groups: dict[str, list[dict]] = {}
@@ -1999,7 +2010,7 @@ def make_fakes(w: World) -> dict:
         _record(w, "send_message", {"to": to, "text": text})
         return f"Message sent to {display}."
 
-    def schedule_send(channel, to, when, body=None, text=None, subject=None, **_):
+    def schedule_send(channel, to, when, body=None, text=None, subject=None, confirmed_self_send=None, **_):
         _service_ready()
         from service.tools.timeranges import BadWhen, resolve_when
         channel = (channel or "").strip().lower()
@@ -2041,6 +2052,8 @@ def make_fakes(w: World) -> dict:
                     return problem
                 display = _named(w, handle, to)
                 recipient = handle
+        if refused := _own_address_guard(recipient, "schedule_send", confirmed_self_send):
+            return refused
         _record(w, "schedule_send", {"channel": channel, "to": to, "when": when, "body": body or text,
                                      "subject": subject})
         sid = w.new_id("sq")

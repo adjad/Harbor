@@ -63,7 +63,7 @@ def isolated(monkeypatch):
     for name, value in (("_snapshot_at", 0.0), ("_snapshot_started_at", 0.0),
                         ("_received_at", 0.0), ("_receipt_started", 0.0),
                         ("_receipt_available", None),
-                        ("_receipt_reason", "")):
+                        ("_receipt_reason", ""), ("_changed_at", 0.0)):
         monkeypatch.setattr(notes_tools, name, value, raising=False)
 
 
@@ -788,13 +788,17 @@ SAME = [("use", "used"), ("use", "using"), ("used", "using"), ("study", "studied
         ("families", "family"), ("ordering", "ordered"), ("boxes", "box"),
         ("running", "run"), ("story", "stories"), ("house", "houses"), ("make", "making"),
         ("stop", "stopped"), ("potato", "potatoes"), ("class", "classes"), ("bus", "buses"),
-        ("toy", "toys"), ("stay", "stayed"), ("plan", "planning")]
+        ("toy", "toys"), ("stay", "stayed"), ("plan", "planning"),
+        ("pass", "passed"), ("passes", "passed"), ("pass", "passing"), ("miss", "missed"),
+        ("misses", "missed"), ("stuff", "stuffed"), ("fix", "fixed"), ("box", "boxed"),
+        ("wish", "wished"), ("wash", "washes")]
 DIFFERENT = [("order", "border"), ("order", "ordinary"), ("order", "orderly"), ("ord", "order"),
              ("amaz", "amazon"), ("cat", "category"), ("car", "care"), ("plan", "plane"),
              ("tim", "time"), ("can", "cane"), ("hat", "hate"), ("win", "wine"),
              ("wedding", "wed"), ("evening", "even"), ("news", "new"), ("bed", "red"),
              ("red", "shed"), ("king", "ring"), ("thing", "string"), ("is", "as"),
-             ("glass", "class"), ("car", "cares"), ("fee", "feed"), ("ne", "need")]
+             ("glass", "class"), ("car", "cares"), ("fee", "feed"), ("ne", "need"),
+             ("pas", "passed"), ("mis", "missed"), ("pas", "passing"), ("stuf", "stuffed")]
 
 
 @pytest.mark.parametrize("a,b", SAME)
@@ -852,3 +856,93 @@ def test_scoped_miss_reports_filtered_and_total_counts(app):
     app(behaviour)
     out = search(query="amazon order", strict=True, refresh=True, day="today")
     assert "of 3" in out and "today" in out.lower()
+
+
+# ============================================================ app audit, section 3
+@pytest.mark.parametrize("q,terms", [
+    ("Vitamin D", ["vitamin", "d"]), ("Project X notes", ["project", "x"]),
+    ("plan B for Friday", ["plan", "b", "friday"]), ("room 4", ["room", "4"]),
+    ("what's the plan", ["plan"]), ("I'd like the vitamin", ["like", "vitamin"]),
+    ("x", []),
+])
+def test_a_single_letter_next_to_a_word_is_a_term(q, terms):
+    assert notes_tools.significant_terms(q) == terms
+
+
+def test_vitamin_d_finds_vitamin_d_and_not_vitamin_c():
+    load((NOW - 60, "Supplements", "Health", "Vitamin C every morning"),
+         (NOW - 120, "Doctor", "Health", "Take Vitamin D, 1000 IU"))
+    out = search(query="vitamin D", strict=True)
+    assert "Title: Doctor" in out and "Title: Supplements" not in out
+
+
+@pytest.mark.parametrize("q", ["important", "urgent", "priority", "important notes",
+                               "any urgent notes?", "my priorities"])
+def test_importance_words_are_a_browse_not_a_literal_term(q):
+    assert notes_tools.significant_terms(q) == []
+    assert notes_tools.is_browse_query(q)
+    load(RECENT_GROCERY, RECENT_TRIP, (NOW - 9000, "Taxes", "Home", "File by Friday, deadline is close"))
+    out = search(query=q, strict=True)
+    # Nothing says "important" literally, and the notes still come back,
+    # the one that names a deadline first.
+    assert "No note matches" not in out and "found nothing" not in out
+    assert out.index("Title: Taxes") < out.index("Title: Groceries") < out.index("Title: Trip ideas")
+    assert "no importance flag" in out
+
+
+def test_importance_with_a_topic_searches_the_topic():
+    assert notes_tools.significant_terms("important dentist notes") == ["dentist"]
+    assert not notes_tools.is_browse_query("urgent dentist")
+    load((NOW - 60, "Dentist", "Home", "cleaning in May"),
+         (NOW - 120, "Dentist bill", "Home", "urgent: pay the dentist"), RECENT_GROCERY)
+    out = search(query="urgent dentist", strict=True)
+    assert "Groceries" not in out
+    assert out.index("Title: Dentist bill") < out.index("Title: Dentist [")
+
+
+def test_importance_only_works_without_strict_too():
+    load(RECENT_GROCERY, RECENT_TRIP)
+    out = search(query="important")
+    assert "Title: Groceries" in out and "no exact match" not in out
+
+
+def test_a_search_returns_more_than_five_matching_notes():
+    load(*[(NOW - i * 60, f"Standup {i}", "Work", "standup notes") for i in range(8)])
+    out = search(query="standup", strict=True)
+    assert out.count("Title:") == 8
+    assert notes_tools._SEARCH_COUNT >= 8 and notes_tools._BROWSE_COUNT > notes_tools._SEARCH_COUNT
+
+
+def test_the_snapshot_budget_holds_500_ordinary_notes():
+    body = "x" * 2000
+    load(*[(NOW - i, f"Note {i}", "Home", body) for i in range(500)])
+    snap = notes_tools.raw_notes_snapshot()
+    assert len(snap.records) == 500 and snap.omitted == 0
+    with pytest.raises(ValueError):
+        notes_tools.raw_notes_snapshot(byte_limit=notes_tools._SNAPSHOT_MAX_BYTES + 1)
+    assert len(notes_tools.raw_notes_snapshot(byte_limit=5000).records) == 2
+
+
+def test_an_undated_note_says_its_date_is_unknown():
+    load((0, "Undated", "Home", "kept anyway"))
+    out = search()
+    assert "Title: Undated" in out and "Modified: unknown" in out and "1970" not in out
+
+
+def test_a_write_makes_the_next_browse_re_read_notes(app):
+    load(RECENT_GROCERY, started=time.time() - 30)
+
+    async def behaviour(a):
+        notes_tools.cache_notes(raw(RECENT_GROCERY, NEW_AMAZON), snapshot_started_at=time.time())
+
+    fake = app(behaviour)
+    assert "Title: Amazon" not in search()
+    assert fake.requests == []
+    notes_tools.mark_notes_changed()
+    assert notes_tools.notes_change_pending()
+    out = search()
+    assert len(fake.requests) == 1 and "Title: Amazon" in out
+    # The fresh read covered the write: no more re-reads.
+    assert not notes_tools.notes_change_pending()
+    search()
+    assert len(fake.requests) == 1

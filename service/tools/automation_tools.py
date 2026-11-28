@@ -41,8 +41,12 @@ def run_applescript(script: str) -> str:
     if decision.tier is Tier.DENY:
         return f"(error: blocked by safety policy: {decision.reason})"
     from service.identity import child_environment
-    p = subprocess.run(["osascript", "-e", src], capture_output=True,
-                       text=True, timeout=_TIMEOUT, env=child_environment())
+    try:
+        p = subprocess.run(["osascript", "-e", src], capture_output=True,
+                           text=True, timeout=_TIMEOUT, env=child_environment())
+    except subprocess.TimeoutExpired:
+        return (f"(script error: the script did not finish within {_TIMEOUT} "
+                "seconds and was stopped.)")
     if p.returncode != 0:
         return f"(script error: {(p.stderr or '').strip()})"
     return BuiltinCompletion(p.stdout.strip() or "(ran with no output)",

@@ -29,10 +29,11 @@ LEXICAL_K = 8
 LEXICAL_K_HINTED = 4
 
 CORE: dict[str, tuple[str, ...]] = {
-    # Order matters: the first CORE_HEAD of each touched family survive the cap.
-    "calendar": ("get_upcoming", "add_reminder", "add_calendar_event", "search_reminders",
-                 "update_reminder", "complete_reminder", "cancel_event", "update_event",
-                 "find_free_time", "get_past_events", "clear_reminders"),
+    # Order matters: the head of each touched family (CORE_HEAD, or the
+    # family's own HEAD_SIZE) is offered before retrieval and survives the cap.
+    "calendar": ("get_upcoming", "search_reminders", "add_reminder", "add_calendar_event",
+                 "update_reminder", "complete_reminder", "find_free_time", "get_past_events",
+                 "cancel_event", "update_event", "clear_reminders"),
     "mail": ("view_emails", "summarize_emails", "send_email", "reply_to_email", "draft_email",
              "forward_email", "schedule_send"),
     "messages_contacts": ("lookup_contact", "send_message", "view_messages", "summarize_messages",
@@ -45,8 +46,18 @@ CORE: dict[str, tuple[str, ...]] = {
     "device": ("system_status", "toggle_setting", "clipboard_read"),
     "automation": ("set_timer", "manage_timers", "run_shell"),
     "compute": ("calculate", "convert_units", "world_time"),
+    "harbor_activity": ("get_recent_activity",),
 }
 CORE_HEAD = 4
+# Families whose everyday tools do not fit in four. A head of four cut
+# update_reminder, complete_reminder, find_free_time and get_past_events from
+# every calendar menu that retrieval filled, and draft_email/forward_email
+# from mail. Destructive and bulk tools stay in the tail.
+HEAD_SIZE: dict[str, int] = {"calendar": 8, "mail": 6}
+
+
+def head_size(family: str) -> int:
+    return HEAD_SIZE.get(family, CORE_HEAD)
 
 _DAYS = r"(?:mon|tues?|wed(?:nes)?|thu(?:rs)?|fri|sat(?:ur)?|sun)(?:day)?s?"
 HINTS: tuple[tuple[re.Pattern, tuple[str, ...]], ...] = tuple(
@@ -72,6 +83,8 @@ HINTS: tuple[tuple[re.Pattern, tuple[str, ...]], ...] = tuple(
         (r"\b(?:wi-?fi|bluetooth|battery|"
          r"brightness|dark mode|settings?)\b", ("device",)),
         (r"\b(?:timer|alarm|stopwatch|countdown|shortcut)\b", ("automation",)),
+        (r"\b(?:what'?s new|anything new|what did i miss|anything i missed|catch me up|"
+         r"while i was (?:out|away|gone))\b", ("harbor_activity",)),
         (r"\b(?:calculate|convert|what time is it in|percent|\d+\s*[x*/+-]\s*\d+)\b", ("compute",)),
     ))
 
@@ -213,14 +226,18 @@ def build_menu(text: str, *, last_assistant: str | None = None,
             add('web_search', 'public_web')
 
     # Interleave so every touched family keeps its first core tools even when
-    # the cap bites: core heads first, then retrieval, then the rest of cores.
-    for fam in families:
-        for name in CORE.get(fam, ())[:CORE_HEAD]:
-            add(name, fam)
+    # the cap bites: core heads first, round-robin across families (so a long
+    # calendar head cannot crowd out the next family), then retrieval, then
+    # the rest of cores.
+    heads = {fam: CORE.get(fam, ())[:head_size(fam)] for fam in families}
+    for i in range(max((len(h) for h in heads.values()), default=0)):
+        for fam in families:
+            if i < len(heads[fam]):
+                add(heads[fam][i], fam)
     for name in ranked:
         add(name)
     for fam in families:
-        for name in CORE.get(fam, ())[CORE_HEAD:]:
+        for name in CORE.get(fam, ())[head_size(fam):]:
             add(name, fam)
     return menu[:max_tools]
 

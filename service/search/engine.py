@@ -12,9 +12,10 @@ from dataclasses import dataclass
 from typing import AsyncIterator
 
 from service.inference.omlx_client import OMLXClient
-from service.search import embedder, query as qmod, synth
+from service.search import embedder, filters as fmod, query as qmod, synth
 from service.search.chunker import Chunk, chunk
-from service.search.lexical import BM25, Hit, focus_span, fold, literal_hits, query_terms
+from service.search.lexical import (BM25, Hit, RegexRejected, focus_span, fold,
+                                    literal_hits, query_terms, regex_hits)
 
 # Reciprocal Rank Fusion constant. The standard 60 — it exists precisely so
 # BM25 scores and cosine similarities can be merged without pretending they
@@ -179,6 +180,25 @@ def _excluded(text: str, chunks: list[Chunk], idx: int, terms: list[str]) -> boo
     return any(fold(t) in body for t in terms)
 
 
+def _candidates(text: str, chunks: list[Chunk], pq: qmod.ParsedQuery
+                ) -> tuple[set[int] | None, list[str]]:
+    """Chunk indexes a result may come from: the parsed after:/before:/in:/
+    from:/type: filters, minus chunks containing a -excluded word. None means
+    nothing narrows the search. Applied INSIDE each tier, before its result
+    limit, so a filter selects from everything instead of thinning the top N."""
+    allow, unapplied = fmod.allowed_chunks(text, chunks, pq.filters)
+    if pq.exclude:
+        base = allow if allow is not None else {c.idx for c in chunks}
+        allow = {i for i in base if not _excluded(text, chunks, i, pq.exclude)}
+    return allow, unapplied
+
+
+def _hit_allowed(chunks: list[Chunk], pos: int, allow: set[int] | None) -> bool:
+    if allow is None:
+        return True
+    return any(c.idx in allow for c in chunks if c.start <= pos < c.end)
+
+
 async def search_stream(client: OMLXClient, text: str, raw_query: str, *,
                         want_answer: bool = True,
                         force_answer: bool = False,
@@ -213,9 +233,19 @@ async def search_stream(client: OMLXClient, text: str, raw_query: str, *,
                "empty": True}
         return
 
+    allow, unapplied = _candidates(text, chunks, pq)
+
     # ---- T0 literal ------------------------------------------------------
-    lits: list[Hit] = literal_hits(text, pq.exact[0] if pq.exact else pq.clean)
-    yield {
+    regex_error = ""
+    if pq.regex:
+        try:
+            lits: list[Hit] = regex_hits(text, pq.clean)
+        except RegexRejected as e:
+            lits, regex_error = [], str(e)
+    else:
+        lits = literal_hits(text, pq.exact[0] if pq.exact else pq.clean)
+    lits = [h for h in lits if _hit_allowed(chunks, h.start, allow)]
+    literal_event = {
         "event": "literal",
         "count": len(lits),
         "results": [dict(_snippet(text, h.start, h.end), kind="literal",
@@ -223,13 +253,17 @@ async def search_stream(client: OMLXClient, text: str, raw_query: str, *,
                     for h in lits[:50]],
         "ms": int((time.perf_counter() - t0) * 1000),
     }
+    if regex_error:
+        literal_event["regex_error"] = regex_error
+    if unapplied:
+        literal_event["unapplied_filters"] = unapplied
+    yield literal_event
     if pq.mode == "literal":
         yield {"event": "done", "ms": int((time.perf_counter() - t0) * 1000)}
         return
 
     # ---- T1 lexical ------------------------------------------------------
-    lex = _lexical_index(document).search(pq.clean, limit=30)
-    lex = [h for h in lex if not _excluded(text, chunks, h.chunk_idx, pq.exclude)]
+    lex = _lexical_index(document).search(pq.clean, limit=30, allow=allow)
     yield {
         "event": "lexical",
         "results": [dict(_snippet(text, h.start, h.end), kind="lexical",
@@ -261,9 +295,7 @@ async def search_stream(client: OMLXClient, text: str, raw_query: str, *,
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*retrieval, return_exceptions=True)
-        scored = embedder.rank(q_vecs, doc_vecs, limit=20)
-        scored = [(i, s) for i, s in scored
-                  if not _excluded(text, chunks, i, pq.exclude)]
+        scored = embedder.rank(q_vecs, doc_vecs, limit=20, allow=allow)
         sem_ranked = [i for i, _ in scored]
         # Point each result at the sentence that carries the match, not the
         # chunk's first 160 chars — otherwise every semantic hit in a document

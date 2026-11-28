@@ -970,7 +970,7 @@ def _self_not_invented(to: str, body: str = "") -> str:
     not their own, read as "me", on a turn where they named themselves as the
     recipient ("Email myself a test" reached a card addressed to an address
     the model made up, 2026-11-13 real-model run). Other turns: unchanged."""
-    from service.tools.self_send import named_self, typed_this_turn
+    from service.tools.self_send import named_in_request, named_self, typed_this_turn
     if not to or not named_self():
         return to
     try:
@@ -978,7 +978,8 @@ def _self_not_invented(to: str, body: str = "") -> str:
         own = {e.strip().casefold() for e in user_emails() or []}
     except Exception:  # noqa: BLE001 - no identity: nothing is known to be theirs
         own = set()
-    if not _is_handle(to) and "@" not in to and body and " ".join(to.split()).casefold() in body.casefold():
+    if (not _is_handle(to) and "@" not in to and body and " ".join(to.split()).casefold() in body.casefold()
+            and not named_in_request(to)):
         # "Text myself: Harbor test" arrived as to="Harbor test": the body, not a person.
         return "me"
     parts = _split_recipients(to) if "@" in to else [to]
@@ -1005,9 +1006,16 @@ def prepare_send_recipient(tool, args: dict) -> tuple[dict, str | None]:
     """
     name = getattr(tool, "name", "")
     # Only the real tools: another tool of that name resolves its own recipient.
-    if name not in {"send_email", "send_message"} or globals().get(name) is not getattr(tool, "func", None):
+    if name not in _PREPARED_SENDS or globals().get(name) is not getattr(tool, "func", None):
         return args, None
     tool = name
+    # The text is left as the model wrote it: the card shows it, and an approved
+    # send sends it, unchanged ("C:\new" keeps its backslash). Only a send no card
+    # showed repairs the model's escapes (see _unreviewed in each tool).
+    if tool == "forward_email":
+        return _prepare_forward(args)
+    if tool == "schedule_send":
+        return _prepare_scheduled(args)
     to = str(args.get("to") or "").strip()
     if (mine := _self_not_invented(to, " ".join(str(args.get(k) or "") for k in ("text", "body", "subject")))) != to:
         to = mine
@@ -1056,7 +1064,75 @@ def prepare_send_recipient(tool, args: dict) -> tuple[dict, str | None]:
     cc, problem = _cc_addresses(copies)
     if problem:
         return args, problem
+    # The user's own address in cc is the same borrowed-identity mistake as in To.
+    if cc and (problem := _own_address_guard(", ".join(cc), tool, bool(args.get("confirmed_self_send")),
+                                             copies)):
+        return {**args, "to": bound, "cc": ", ".join(cc)}, problem
     return {**args, "to": bound, "cc": ", ".join(cc)}, None
+
+
+# The sends whose recipient (and text) is settled before their card.
+_PREPARED_SENDS = frozenset({"send_email", "send_message", "forward_email", "schedule_send"})
+
+
+def _prepare_forward(args: dict) -> tuple[dict, str | None]:
+    """forward_email's recipients bound to addresses before the card, and the
+    user's own address caught there, as send_email's are."""
+    to = str(args.get("to") or "").strip()
+    resolved: list[str] = []
+    for r in _split_recipients(to):
+        if _EMAIL_RE.match(r):
+            resolved.append(r)
+            continue
+        handle, problem = _resolve_recipient(r, want_email=True)
+        if problem:
+            return args, problem
+        resolved.append(handle)
+    if not resolved:
+        return args, None  # the tool's own "no recipient" answer covers it
+    bound = ", ".join(resolved)
+    return {**args, "to": bound}, _own_address_guard(bound, "forward_email",
+                                                   bool(args.get("confirmed_self_send")), to)
+
+
+def _prepare_scheduled(args: dict) -> tuple[dict, str | None]:
+    """schedule_send settled before its card: a past or unreadable time and a
+    recipient that can't be resolved are the result, never a card to approve,
+    and the recipient is bound to the one address or number it resolved to (the
+    user's own caught here). The time is only checked here, never rewritten:
+    `when` leaves this function as it came. The card's preview (confirm_preview)
+    is what pins it to the instant shown; otherwise the tool resolves it again
+    when it runs, and a time that has passed by then is still refused. The text
+    is normalized here, as the card and the tool have always normalized it."""
+    from service.tools.timeranges import BadWhen, resolve_when
+    args = {**args, **{field: _degarble(args[field]) for field in ("subject", "body", "text")
+                       if isinstance(args.get(field), str)}}
+    channel = str(args.get("channel") or "").strip().lower()
+    recipients = _split_recipients(str(args.get("to") or ""))
+    if channel not in ("email", "message") or len(recipients) != 1:
+        return args, None  # the tool's own answers cover these
+    raw_when = str(args.get("when") or "").strip()
+    if raw_when:
+        try:
+            when_dt, _ = resolve_when(raw_when)
+        except BadWhen as e:
+            return args, _not_sent(str(e), question="I couldn't read that time, so nothing is scheduled. "
+                                                     "What time should I send it?")
+        if when_dt.timestamp() <= time.time():
+            return args, _not_sent(
+                f"(NOT scheduled — {raw_when!r} resolves to {when_dt:%a %b %-d at %-I:%M %p}, which is in "
+                "the past. Ask the user what time they actually meant, or send it now with "
+                f"{'send_email' if channel == 'email' else 'send_message'}.)",
+                question="That time has already passed, so nothing is scheduled. What time should I send it?")
+    typed = recipients[0]
+    if channel == "email":
+        bound, problem = (typed, None) if _EMAIL_RE.match(typed) else _resolve_recipient(typed, want_email=True)
+    else:
+        bound, problem = (typed, None) if _is_handle(typed) else _resolve_recipient(typed)
+    if problem:
+        return args, problem
+    return {**args, "to": bound}, _own_address_guard(bound, "schedule_send",
+                                                   bool(args.get("confirmed_self_send")), typed)
 
 
 @register(
@@ -1121,6 +1197,8 @@ async def send_email(to: str, subject: str, body: str, cc: str = "",
     copies, problem = _cc_addresses(cc)
     if problem:
         return problem
+    if copies and (msg := _own_address_guard(", ".join(copies), "send_email", confirmed_self_send, cc)):
+        return msg
     bad = [r for r in recipients + copies if not _EMAIL_RE.match(r)]
     if bad:
         return _not_sent((f"(not valid email addresses: {', '.join(bad)}. Don't guess an "
@@ -1180,12 +1258,14 @@ async def send_email(to: str, subject: str, body: str, cc: str = "",
                                   "call reaching for that name still works first try."},
          "when": WHEN_ARG,
          "subject": {"type": "string", "description": "subject line (email only)"},
+         "confirmed_self_send": {"type": "boolean",
+                                 "description": "true ONLY on a retry the user confirmed is to themselves"},
      },
      "required": ["channel", "to", "when"]},
     category="scheduled_send",
 )
 async def schedule_send(channel: str, to: str, when: str, body: str = "",
-                        text: str = "", subject: str = "") -> str:
+                        text: str = "", subject: str = "", confirmed_self_send: bool = False) -> str:
     from service.assistant.outbound_queue import outbound_queue
     from service.tools.timeranges import BadWhen, resolve_when
 
@@ -1253,6 +1333,8 @@ async def schedule_send(channel: str, to: str, when: str, body: str = "",
             display = _named(handle, recipient)
             recipient = handle
 
+    if (msg := _own_address_guard(recipient, "schedule_send", confirmed_self_send, typed if channel == "email" else recipients[0])):
+        return msg
     sid = outbound_queue.add(channel=channel, recipient=recipient, body=body,
                              when_ts=when_ts, subject=subject, display=display)
     pretty = when_dt.strftime("%a %b %-d at %-I:%M %p")
@@ -1520,6 +1602,8 @@ async def prepare_reply_args(args: dict) -> tuple[dict | None, str]:
     message_id = str(args.get("message_id") or "").strip()
     account = str(args.get("account") or "")
     account_id = str(args.get("account_id") or "")
+    # Left as written: the card and the approved reply carry the same text, and a
+    # typed "C:\new" keeps its backslash.
     body = str(args.get("body") or "")
     if not message_id or not body.strip():
         return None, "I need a specific email and reply text before preparing a reply."
@@ -1643,7 +1727,7 @@ _TRIAGE_ACTIONS = {
 @register(
     "email_triage",
     "Tidy one email in the user's own Mail: archive it (moves it out of the "
-    "inbox into Archive — NOT a delete, it can be found again), mark it read or "
+    "inbox into Archive — NOT a delete; a view_emails search still finds it), mark it read or "
     "unread, or flag/unflag it for follow-up. Needs the message's Message-ID, "
     "which view_emails prints for each email. Nothing leaves the Mac.",
     {"type": "object",
@@ -1710,6 +1794,8 @@ def _forward_confirmed(receipt, message_id: str, recipients: list[str]) -> bool:
          "message_id": {"type": "string", "description": "Message-ID of the email to forward, from view_emails"},
          "to": {"type": "string", "description": "recipient(s) — address or contact name, comma-separated"},
          "note": {"type": "string", "description": "optional short note to add above the forwarded content"},
+         "confirmed_self_send": {"type": "boolean",
+                                 "description": "true ONLY on a retry the user confirmed is to themselves"},
      },
      "required": ["message_id", "to"]},
     category="email_send",
@@ -1717,7 +1803,8 @@ def _forward_confirmed(receipt, message_id: str, recipients: list[str]) -> bool:
              "fwd this to the team", "can you forward that email over to mom"],
 )
 @_tracked_send("forward_email")
-async def forward_email(message_id: str, to: str, note: str = "") -> str:
+async def forward_email(message_id: str, to: str, note: str = "",
+                        confirmed_self_send: bool = False) -> str:
     message_id = (message_id or "").strip()
     if not message_id:
         return _not_sent("(no message_id — call view_emails first and use the Message-ID "
@@ -1735,6 +1822,8 @@ async def forward_email(message_id: str, to: str, note: str = "") -> str:
         if problem:
             return problem
         resolved.append(handle)
+    if (msg := _own_address_guard(", ".join(resolved), "forward_email", confirmed_self_send, to)):
+        return msg
     note = note or ""
     if _unreviewed():  # as send_email: an approved note goes out as its card showed it
         note = _degarble(note)

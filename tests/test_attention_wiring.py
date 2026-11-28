@@ -115,6 +115,38 @@ async def test_live_creates_and_alerts_and_an_unchanged_feed_is_skipped(isolated
     assert len(effects["created"]) == 1
 
 
+async def test_event_capture_on_still_lets_the_reminder_path_take_other_messages(isolated, feed, effects,
+                                                                                monkeypatch):
+    """capture_events adds a Calendar path; it must not switch off the reminder path for the
+    messages that path does not preview."""
+    async def no_capture(now, tz, settings):
+        return []
+    monkeypatch.setattr(wiring, "run_capture_tick", no_capture)
+    go_live(isolated, capture_events=True)
+    out = await wiring.run_tick(NOW)
+    assert [o.state for o in out] == ["created"] and len(effects["created"]) == 1
+
+
+async def test_a_message_event_capture_previews_is_left_to_it(isolated, feed, effects, monkeypatch):
+    async def no_capture(now, tz, settings):
+        return []
+    monkeypatch.setattr(wiring, "run_capture_tick", no_capture)
+    wiring.get_ledger().save_preview("preview:msg:m", title="Meet in the Quad", due_ts=NOW + 3600,
+                                     event_ts=NOW + 5400, now=NOW, detail={"paired": True})
+    go_live(isolated, capture_events=True)
+    assert await wiring.run_tick(NOW) == [] and effects["created"] == []
+
+
+async def test_a_pass_where_event_capture_wrote_makes_no_second_write(isolated, feed, effects, monkeypatch):
+    row = {"source_id": "capture:x", "state": "created"}
+
+    async def one_capture(now, tz, settings):
+        return [row]
+    monkeypatch.setattr(wiring, "run_capture_tick", one_capture)
+    go_live(isolated, capture_events=True)
+    assert await wiring.run_tick(NOW) == [row] and effects["created"] == []
+
+
 async def test_a_feed_that_is_not_ready_is_ignored(isolated, feed, effects):
     go_live(isolated)
     for i, state in enumerate(("syncing", "unavailable")):

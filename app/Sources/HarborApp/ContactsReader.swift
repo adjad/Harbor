@@ -20,6 +20,15 @@ final class ContactsReader {
     static let delivery = PrivacySyncChannel(key: "harbor.contactsRevision",
                                              endpoint: "assistant/sync/messages")
     typealias Snapshot = (contacts: [String: String], birthdays: [String: [String]])
+    /// What a read also learns beyond the handle map: names that tell contacts
+    /// apart or find them (nickname, organization, middle-name form), the
+    /// relationships a card records, and handles that more than one card holds.
+    /// Kept beside `Snapshot` so injected snapshots need not know about it.
+    struct Extras {
+        var aliases: [String: [String]] = [:]
+        var relations: [String: [String]] = [:]
+        var sharedHandles: [String: [String]] = [:]
+    }
     private let store = CNContactStore()
     private let channel: PrivacySyncChannel
     private let enabled: () -> Bool
@@ -125,7 +134,12 @@ final class ContactsReader {
             }
             DispatchQueue.global(qos: .utility).async { [weak self] in
                 guard let self else { return }
-                let result = try? (self.snapshot?() ?? self.read())
+                let full: (Snapshot, Extras)? = try? {
+                    if let injected = self.snapshot { return (try injected(), Extras()) }
+                    return try self.readFull()
+                }()
+                let result = full?.0
+                let extras = full?.1 ?? Extras()
                 DispatchQueue.main.async {
                     guard self.channel.revision == revision else { return }
                     guard self.enabled(), Self.canRead(self.authorization()), let result else {
@@ -135,7 +149,9 @@ final class ContactsReader {
                     // Empty is authoritative, including contacts with birthdays
                     // but no phone/email handles. Never silently keep old names.
                     self.channel.submit(["contacts_enabled": true, "contacts_available": true,
-                                         "contacts": result.contacts, "birthdays": result.birthdays],
+                                         "contacts": result.contacts, "birthdays": result.birthdays,
+                                         "aliases": extras.aliases, "relations": extras.relations,
+                                         "shared_handles": extras.sharedHandles],
                                         revision: revision)
                 }
             }
@@ -144,15 +160,21 @@ final class ContactsReader {
 
     private func postClear(revision: Int) {
         channel.submit(["contacts_enabled": enabled(), "contacts_available": false,
-                        "contacts": [String: String](), "birthdays": [String: [String]]()],
+                        "contacts": [String: String](), "birthdays": [String: [String]](),
+                        "aliases": [String: [String]](), "relations": [String: [String]](),
+                        "shared_handles": [String: [String]]()],
                        revision: revision)
     }
 
-    private func read() throws -> Snapshot {
+    private func read() throws -> Snapshot { try readFull().0 }
+
+    private func readFull() throws -> (Snapshot, Extras) {
         let keys: [CNKeyDescriptor] = [
             CNContactGivenNameKey as CNKeyDescriptor,
             CNContactFamilyNameKey as CNKeyDescriptor,
             CNContactNicknameKey as CNKeyDescriptor,
+            CNContactMiddleNameKey as CNKeyDescriptor,
+            CNContactRelationsKey as CNKeyDescriptor,
             CNContactOrganizationNameKey as CNKeyDescriptor,
             CNContactPhoneNumbersKey as CNKeyDescriptor,
             CNContactEmailAddressesKey as CNKeyDescriptor,
@@ -166,6 +188,8 @@ final class ContactsReader {
         // for. Two people sharing a day is fine; names are comma-joined by the
         // reader on the Python side rather than colliding here.
         var birthdays: [String: [String]] = [:]
+        var aliases: [String: [String]] = [:]
+        var relations: [String: [String]] = [:]
         let req = CNContactFetchRequest(keysToFetch: keys)
         try store.enumerateContacts(with: req) { c, stop in
             guard self.enabled() else { stop.pointee = true; return }
@@ -177,6 +201,17 @@ final class ContactsReader {
             let name = !full.isEmpty ? full
                 : (!c.nickname.isEmpty ? c.nickname : c.organizationName)
             guard !name.isEmpty else { return }
+            let alternates = Self.alternateNames(name: name, given: c.givenName, middle: c.middleName,
+                                                 family: c.familyName, nickname: c.nickname,
+                                                 organization: c.organizationName)
+            if !alternates.isEmpty { aliases[name, default: []].append(contentsOf: alternates) }
+            let related = c.contactRelations.compactMap { relation -> String? in
+                let who = relation.value.name.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !who.isEmpty else { return nil }
+                guard let label = relation.label, !label.isEmpty else { return who }
+                return CNLabeledValue<NSString>.localizedString(forLabel: label) + ": " + who
+            }
+            if !related.isEmpty { relations[name, default: []].append(contentsOf: related) }
             cards.append((name: name,
                           phones: c.phoneNumbers.map { $0.value.stringValue },
                           emails: c.emailAddresses.map { $0.value as String }))
@@ -185,7 +220,27 @@ final class ContactsReader {
                 birthdays[key, default: []].append(name)
             }
         }
-        return (contacts: Self.handleMap(cards), birthdays: birthdays)
+        let resolved = Self.resolveHandles(cards)
+        return ((contacts: resolved.map, birthdays: birthdays),
+                Extras(aliases: aliases, relations: relations, sharedHandles: resolved.shared))
+    }
+
+    /// Other names a card answers to, besides the display name: its nickname,
+    /// its organization, and its given-middle-family form. Nothing is dropped
+    /// because first and last name exist.
+    static func alternateNames(name: String, given: String, middle: String, family: String,
+                               nickname: String, organization: String) -> [String] {
+        var out: [String] = []
+        func add(_ value: String) {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, trimmed.lowercased() != name.lowercased(),
+                  !out.contains(where: { $0.lowercased() == trimmed.lowercased() }) else { return }
+            out.append(trimmed)
+        }
+        add(nickname)
+        add(organization)
+        if !middle.isEmpty { add([given, middle, family].filter { !$0.isEmpty }.joined(separator: " ")) }
+        return out
     }
 
     /// One contact card as read: its display name and its phone/email handles.
@@ -200,6 +255,14 @@ final class ContactsReader {
     /// two contacts and asks which one. Cards that share a handle are one
     /// person saved twice and keep the plain name.
     static func handleMap(_ cards: [Card]) -> [String: String] {
+        resolveHandles(cards).map
+    }
+
+    /// `handleMap`, plus the handles two or more different people hold. The map
+    /// can carry one string per handle, so such a handle shows every holder's
+    /// name ("Ann Lee / Bob Lee") and `shared` lists the names, so the backend
+    /// keeps the handle on each contact instead of the last one read winning.
+    static func resolveHandles(_ cards: [Card]) -> (map: [String: String], shared: [String: [String]]) {
         var people: [String: [(handles: Set<String>, members: [Int])]] = [:]
         for (index, card) in cards.enumerated() {
             let handles = Set((card.phones + card.emails).map { normalizedHandle($0) }.filter { !$0.isEmpty })
@@ -237,21 +300,41 @@ final class ContactsReader {
             }
         }
         var map: [String: String] = [:]
+        // normalized handle -> the distinct names holding it, in card order
+        var holders: [String: [String]] = [:]
+        var rawForms: [String: [String]] = [:]
         for (index, card) in cards.enumerated() {
             let name = labels[index] ?? card.name
-            for phone in card.phones { map[phone] = name }
-            for email in card.emails { map[email] = name }
+            for raw in card.phones + card.emails {
+                map[raw] = name
+                let key = normalizedHandle(raw)
+                guard !key.isEmpty else { continue }
+                if !rawForms[key, default: []].contains(raw) { rawForms[key, default: []].append(raw) }
+                if !holders[key, default: []].contains(where: { $0.lowercased() == name.lowercased() }) {
+                    holders[key, default: []].append(name)
+                }
+            }
         }
-        return map
+        var shared: [String: [String]] = [:]
+        for (key, names) in holders where names.count > 1 {
+            let joined = names.joined(separator: " / ")
+            for raw in rawForms[key] ?? [] {
+                map[raw] = joined
+                shared[raw] = names
+            }
+        }
+        return (map, shared)
     }
 
-    /// The same key the backend uses: the last 10 digits of a phone, or a
-    /// lowercased email address.
+    /// The same key the backend uses: a phone's digits including the country
+    /// code (a bare ten-digit number is read as North American, country code 1),
+    /// or a lowercased email address.
     static func normalizedHandle(_ handle: String) -> String {
         let trimmed = handle.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.contains("@") { return trimmed.lowercased() }
-        let digits = String(trimmed.filter { $0.isASCII && $0.isNumber })
-        return digits.count >= 10 ? String(digits.suffix(10)) : digits
+        var digits = String(trimmed.filter { $0.isASCII && $0.isNumber })
+        if trimmed.hasPrefix("00") { digits = String(digits.dropFirst(2)) }
+        return digits.count == 10 ? "1" + digits : digits
     }
 
     /// What tells one same-named card from another: the last four digits of

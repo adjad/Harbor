@@ -321,6 +321,54 @@ def test_skill_tools_never_add_outbound_or_calendar_writes(monkeypatch):
     assert d.tool_subset == ["get_weather", "mac_mute"], d.tool_subset
 
 
+def _one_tool_skill(name):
+    class _Skill:
+        error, enabled = "", True
+        tools = [{"name": name}]
+
+        def matches(self, text):
+            return True
+    return {"style": _Skill()}
+
+
+def test_skill_tool_names_match_the_registry_case_insensitively(monkeypatch):
+    from service.router import router as router_mod
+    monkeypatch.setattr(skills, "all_skills", lambda: _one_tool_skill("Mac_Mute"))
+    d = router_mod._mk("general", reason="test")
+    d.needs_tools, d.tool_subset = True, ["get_weather"]
+    router_mod._add_matched_skill_tools(d, "anything")
+    assert d.tool_subset == ["get_weather", "mac_mute"], d.tool_subset
+
+
+@pytest.mark.parametrize("field", ["force_first_tool", "required_tool_groups", "needs_tools"])
+def test_skill_tools_join_forced_and_required_routes(monkeypatch, field):
+    from service.router import router as router_mod
+    monkeypatch.setattr(skills, "all_skills", lambda: _one_tool_skill("mac_mute"))
+    d = router_mod._mk("general", reason="test")
+    d.needs_tools, d.tool_subset = True, ["get_weather"]
+    if field == "force_first_tool":
+        d.force_first_tool = "get_weather"
+    elif field == "required_tool_groups":
+        d.required_tool_groups = (frozenset({"get_weather"}),)
+    else:
+        d.needs_tools = False
+    router_mod._add_matched_skill_tools(d, "anything")
+    assert d.tool_subset == ["get_weather", "mac_mute"], d.tool_subset
+    # The route's own contract is untouched.
+    assert d.force_first_tool in (None, "get_weather")
+    assert d.required_tool_groups in ((), (frozenset({"get_weather"}),))
+
+
+def test_skill_tools_never_join_an_owned_execution_contract(monkeypatch):
+    from service.router import router as router_mod
+    monkeypatch.setattr(skills, "all_skills", lambda: _one_tool_skill("mac_mute"))
+    d = router_mod._mk("general", reason="test")
+    d.needs_tools, d.tool_subset = True, ["get_weather"]
+    d.tool_argument_bindings = {"get_weather": {"location": "Example City"}}
+    router_mod._add_matched_skill_tools(d, "anything")
+    assert d.tool_subset == ["get_weather"]
+
+
 @pytest.mark.parametrize("prompt", ["what's 9/11", "what's 24/7"])
 def test_dates_and_phrases_are_not_division(prompt):
     d = asyncio.run(route(prompt))
@@ -417,3 +465,12 @@ def test_preferred_name_stays_off_the_external_local_provider(monkeypatch):
     assert "called Tri" in identity.identity_prompt_block(with_date=False, messages=False)
     assert "called Tri" not in identity.identity_prompt_block(
         with_date=False, messages=False, preferred_name=False)
+
+
+def test_skill_tools_stay_out_of_a_forced_write(monkeypatch):
+    from service.router import router as router_mod
+    monkeypatch.setattr(skills, "all_skills", lambda: _one_tool_skill("mac_mute"))
+    d = router_mod._mk("general", reason="test")
+    d.needs_tools, d.tool_subset, d.force_first_tool = True, ["remember"], "remember"
+    router_mod._add_matched_skill_tools(d, "remember that I mute the TV at night")
+    assert d.tool_subset == ["remember"]

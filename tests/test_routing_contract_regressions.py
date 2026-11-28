@@ -1413,8 +1413,12 @@ class RoutingContractTests(unittest.IsolatedAsyncioTestCase):
         report = harbor_capabilities("email scheduling")
         self.assertIn("Yes — Schedule a new email or text for later", report)
         self.assertIn("No — schedule a reply inside an existing email thread", report)
-        self.assertIn("Yes — Move calendar events to a new time (confirmation required)", report)
         self.assertNotIn("settings under API keys", report)
+
+    def test_capability_report_answers_the_question_asked(self):
+        report = harbor_capabilities("can you move calendar events")
+        self.assertIn("Yes — Move calendar events to a new time (confirmation required)", report)
+        self.assertNotIn("Send email", report)
 
     async def test_compound_reminder_lookup_requires_both_actual_sources(self):
         prompt = "find my overdue dentist reminder and search my notes for dentist"
@@ -1515,7 +1519,8 @@ class RoutingContractTests(unittest.IsolatedAsyncioTestCase):
                 ('Moved “team meeting” to Thu Sep 10, 3:00 PM–4:00 PM.', "succeeded"),
                 ('Moved “standup” to Fri Sep 11, 10:00 AM–10:15 AM. Only this occurrence moved.', "succeeded"),
                 ('Moved “team meeting”.', "failed"),
-                ('(not confirmed: Calendar may have moved “team meeting”; check it in Calendar before trying again.)', "failed"),
+                # Calendar took the move but did not confirm it: it may have moved.
+                ('(not confirmed: Calendar may have moved “team meeting”; check it in Calendar before trying again.)', "unknown"),
                 ('Several items match “team meeting”. Which one?', "needs_input"),
                 ('Cancelled “team meeting”.', "failed"),
                 (UPDATE_RECEIPT.split("\n")[1], "failed"),

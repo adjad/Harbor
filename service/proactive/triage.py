@@ -21,7 +21,7 @@ from service.proactive import guard
 TOKENS = (160, 1400)
 # Bump whenever RULES or validate() change what a stored result means: older
 # checkpoints are then read again instead of served.
-VERSION = "8"
+VERSION = "9"
 
 RULES = (
     "You read ONE email thread or text conversation for the user's daily brief. "
@@ -75,6 +75,57 @@ def allowed_words() -> set[str]:
         return set()
 
 
+REDACTED = "[removed]"
+
+
+def _card_spans(text: str) -> list[tuple[int, int]]:
+    spans = []
+    for match in guard._DIGIT_RUN.finditer(text):
+        digits = re.sub(r"\D", "", match.group(0))
+        if 13 <= len(digits) <= 19 and guard._luhn(digits):
+            spans.append(match.span())
+    return spans
+
+
+def _secret_spans(text: str) -> list[tuple[int, int]]:
+    """Each "code is 482913" / "password: hunter22" span, skipping benign phrases
+    ("promo code SPRING20", "dress code formal") the same way the source check does."""
+    spans = []
+    for match in guard._SECRET_WITH_VALUE.finditer(text):
+        window = text[max(0, match.start() - 16):match.end()]
+        if guard._SECRET_WITH_VALUE.search(guard._without_benign_code(window)):
+            spans.append(match.span())
+    return spans
+
+
+# A credential label with a value after it ("card CVV 482", "account number 55120",
+# "routing number 0210 0002"): the value is cut, the label word stays.
+_LABELLED_VALUE = re.compile(guard._SECRET_WORD.pattern + r"[^\n.;\d]{0,20}(\d[\d -]{1,}\d)", re.I)
+
+
+def _labelled_spans(text: str) -> list[tuple[int, int]]:
+    return [m.span(1) for m in _LABELLED_VALUE.finditer(text)]
+
+
+def has_identifier_value(text: str) -> bool:
+    """An identifier's value is in the text (an SSN, a card number, a secret with its value)."""
+    text = text or ""
+    return bool(guard._SSN.search(text) or _card_spans(text) or _secret_spans(text) or _labelled_spans(text))
+
+
+def redact_identifiers(text: str) -> str:
+    """The text with every identifier value replaced by REDACTED; everything else unchanged."""
+    text = text or ""
+    for _ in range(4):
+        spans = ([m.span() for m in guard._SSN.finditer(text)] + _card_spans(text) + _secret_spans(text)
+                 + _labelled_spans(text))
+        if not spans:
+            break
+        for start, end in sorted(spans, reverse=True):
+            text = text[:start] + REDACTED + text[end:]
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def validate(reply: str | None, item: dict, *, allowed: set[str] | None = None) -> dict | None:
     """The triage result, or None for a reply that can't be trusted."""
     data = guard.parse_object(reply or "")
@@ -92,8 +143,20 @@ def validate(reply: str | None, item: dict, *, allowed: set[str] | None = None) 
         return None
     result = {"junk": data["junk"], "sensitive": data["sensitive"], **fields}
     if any(guard.output_has_pii(result[f]) for f in ("title", "summary", "asks_of_me")):
-        # The backstop: drop the words rather than leak an identifier.
-        return {"junk": result["junk"], "sensitive": True, "title": "", "summary": "", "asks_of_me": ""}
+        # The backstop. An identifier's VALUE (an SSN, a card number, a code or password with
+        # its value) is cut out of the words, so it reaches no later model call (the judge and
+        # the drafts, which may run on a cloud model), no card and no notification. The rest of
+        # the reading stays, so the item is still on the user's Brief. A bare word such as
+        # "password" carries no identifier and is kept. If anything identifying is left after
+        # the cut, the words are dropped as before.
+        for name in ("title", "summary", "asks_of_me"):
+            result[name] = redact_identifiers(result[name])
+        if any(guard.source_sensitive(result[f]) or has_identifier_value(result[f])
+               for f in ("title", "summary", "asks_of_me")):
+            return {"junk": result["junk"], "sensitive": True, "title": "", "summary": "", "asks_of_me": ""}
+        result["redacted"] = True
+        if not result["title"] and not result["summary"]:
+            return None
     if _META.search(result["summary"]):
         result["summary"] = ""           # the model describing its own labels, not the message
     allowed = allowed_words() if allowed is None else allowed

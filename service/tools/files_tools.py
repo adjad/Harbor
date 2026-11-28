@@ -31,7 +31,7 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
-from service.tools.builtin import _tcc_message
+from service.tools.builtin import _tcc_message, _wrong_account_path
 from service.tools.registry import register
 
 # Directories that are never what someone means by "my files", and that produce
@@ -185,6 +185,8 @@ def find_files(query: str, folder: str = "", kind: str = "",
     query = (query or "").strip()
     if not query:
         return "(error: find_files needs a `query` — what should I look for?)"
+    if folder and (msg := _wrong_account_path(folder)):
+        return msg
 
     # mdfind's query language is its own thing, not shell — but the value still
     # has to survive being embedded in a quoted expression, so a literal double
@@ -287,6 +289,9 @@ def move_preview_text(token: str) -> str:
                         f"(SHA-256: {move.identity.digest})" for move in plan.moves)
             + ("\nLeft untouched:\n" + "\n".join(f"{json.dumps(path)}: {reason}" for path, reason in plan.skipped)
                if plan.skipped else "")
+            + ("\nNot included (still downloading, temporary or recently modified):\n"
+               + "\n".join(f"{json.dumps(path)}: {reason}" for path, reason in plan.excluded)
+               if plan.excluded else "")
             + ("\nExisting destinations will be skipped; nothing will replace them:\n"
                + "\n".join(json.dumps(path) for path in plan.existing_targets)
                if plan.existing_targets else "")
@@ -318,6 +323,10 @@ def move_preview_text(token: str) -> str:
             "confirm": {"type": "boolean",
                         "description": "Set true to actually move the files. False (default) previews only."},
             "preview_token": {"type": "string", "description": "Token returned by the matching preview; required when confirm=true."},
+            "exclude_extensions": {"type": "string",
+                                   "description": "Comma-separated endings to leave where they are, e.g. '.download,.crdownload,.part' (files still downloading). Send the same value with the confirm call."},
+            "min_age_hours": {"type": "number",
+                              "description": "Leave files modified within this many hours where they are (24 skips anything touched today). Default 0 = no age limit. Send the same value with the confirm call."},
         },
         "required": ["pattern", "folder", "destination"],
     },
@@ -327,7 +336,11 @@ def move_preview_text(token: str) -> str:
              "move all the harbor logs into a logs folder"],
 )
 def organize_files(pattern: str, folder: str, destination: str,
-                   confirm: bool = False, preview_token: str = "", group_by: str = "") -> str:
+                   confirm: bool = False, preview_token: str = "", group_by: str = "",
+                   exclude_extensions: str = "", min_age_hours: float = 0) -> str:
+    for path_arg in (folder, destination):
+        if (msg := _wrong_account_path(path_arg)):
+            return msg
     now = time.monotonic()
     with _MOVE_PREVIEW_LOCK:
         for token, (created, _) in list(_MOVE_PREVIEWS.items()):
@@ -338,15 +351,18 @@ def organize_files(pattern: str, folder: str, destination: str,
             if not prior:
                 return "(error: missing, expired or changed file preview. Preview again before moving any files.)"
     try:
-        plan = build_plan(pattern, folder, destination, group_by)
-    except (OSError, ValueError) as exc:
+        plan = build_plan(pattern, folder, destination, group_by,
+                          exclude_extensions=exclude_extensions,
+                          min_age_seconds=float(min_age_hours or 0) * 3600)
+    except (OSError, ValueError, TypeError) as exc:
         prefix = "missing, expired or changed file preview; " if confirm else ""
         return f"(error: {prefix}{exc}. No files moved.)"
     if confirm and prior[1] != plan:
         return "(error: missing, expired or changed file preview. Preview again before moving any files.)"
     if not plan.moves:
-        note = ("\nLeft untouched:\n" + "\n".join(f"{json.dumps(path)}: {reason}" for path, reason in plan.skipped)
-                if plan.skipped else "")
+        note = ("\nLeft untouched:\n" + "\n".join(f"{json.dumps(path)}: {reason}"
+                                                       for path, reason in (*plan.skipped, *plan.excluded))
+                if plan.skipped or plan.excluded else "")
         return f"No files in {folder} match the requested move classification.{note}"
     if not confirm:
         preview_token = secrets.token_urlsafe(24)
@@ -360,13 +376,18 @@ def organize_files(pattern: str, folder: str, destination: str,
                 "Call again with the same inputs, confirm=true and preview_token to attempt these approved moves.")
     receipts = execute_plan(plan)
     moved = sum(row["status"] == "moved" for row in receipts)
-    incomplete = any(row["status"] != "moved" for row in receipts)
+    # Files the plan never meant to move (symlinks, unclassified names) are
+    # reported as skipped; only a PLANNED move that did not complete is a failure.
+    planned = {move.source for move in plan.moves}
+    incomplete = any(row["status"] != "moved" for row in receipts if row["source"] in planned)
     if incomplete:
         heading = (f"(error: file organization incomplete; moved {moved} of {len(plan.moves)} planned files. "
                    "Count includes only verified moves; unknown results may already have changed paths. "
                    "Read each receipt before retrying; unknown results must not be retried automatically.)")
     else:
-        heading = f"Moved {moved} file(s) to {plan.destination}."
+        left = len(receipts) - moved
+        heading = (f"Moved {moved} file(s) to {plan.destination}."
+                   + (f" {left} other file(s) were left untouched (see the receipts)." if left else ""))
     return heading + "\nFile receipts:\n" + "\n".join(json.dumps(row, sort_keys=True) for row in receipts)
 
 

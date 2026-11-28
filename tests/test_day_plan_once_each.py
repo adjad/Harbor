@@ -5,6 +5,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from service.proactive.prepare import todo_id
+from service.tools import proactive_tools
 from service.tools.proactive_tools import render_day_plan, render_range_plan
 
 TZ = "America/Los_Angeles"
@@ -190,22 +191,24 @@ def test_a_thread_never_matches_on_its_subject_line():
 # --- the caps count what is left ----------------------------------------------------------
 
 def test_more_lines_count_only_what_remains():
-    rows = [todo(f"Task {i}", id=f"todo:{i}") for i in range(8)]
+    cap = proactive_tools.DAY_PLAN_CAPS["later"]
+    rows = [todo(f"Task {i}", id=f"todo:{i}") for i in range(cap + 3)]
     cards = [card(f"Do task {i} properly", id=f"card:{i}", todo_ref=f"todo:{i}") for i in range(2)]
     text = day(snap(todos=rows, cards=cards))
-    assert "…and 1 more" in text.split("Other to-dos:")[1]  # 6 left, 5 shown; 8 - 5 would say 3
+    # cap + 1 left after the two folded into cards, cap shown; (cap + 3) - cap would say 3
+    assert "…and 1 more" in text.split("Other to-dos:")[1]
     assert "…and" not in text.split("Other to-dos:")[0]
     assert "- Task 2" in text and "- Task 0" not in text and "- Do task 0 properly" in text
 
 
 def test_no_more_line_when_only_repeats_passed_the_cap():
-    rows = [todo(f"Task {i}", id=f"todo:{i}") for i in range(6)]
+    rows = [todo(f"Task {i}", id=f"todo:{i}") for i in range(proactive_tools.DAY_PLAN_CAPS["later"] + 1)]
     text = day(snap(todos=rows, cards=[card("Do task 0 properly", todo_ref="todo:0")]))
     assert "…and" not in text
 
 
 def test_a_range_more_line_counts_only_what_remains():
-    rows = [todo(f"Task {i}", id=f"todo:{i}") for i in range(4)]
+    rows = [todo(f"Task {i}", id=f"todo:{i}") for i in range(proactive_tools.RANGE_PLAN_CAPS["undated"] + 1)]
     text = week(snap(todos=rows, cards=[card("Do task 0 properly", todo_ref="todo:0")]))
     assert "…and" not in text and len(lines_with(text, "task 0")) == 1
 
@@ -247,3 +250,54 @@ def test_range_plan_keeps_a_weekly_class_on_each_of_its_days():
 def test_range_plan_matches_a_thread_by_id_too():
     text = week(snap(todos=[todo("Answer Avika", id=todo_id("mail:1"), source="messages")], threads=[thread()]))
     assert "Other to-dos:" not in text and len(lines_with(text, "Avika")) == 1
+
+
+# --- the plan is long enough for a real day, and says when it is cut ---------------------
+
+def _waiting(i):
+    return {"id": f"thread:{i}", "title": f"Subject {i}", "who": f"Sender {i}", "source": "mail",
+            "needs_reply": True, "summary": f"asked about item {i}"}
+
+
+def test_more_than_three_people_waiting_are_listed():
+    text = day(snap(threads=[_waiting(i) for i in range(6)]))
+    assert all(f"Sender {i}" in text for i in range(6))
+    assert "…and" not in text
+
+
+def test_waiting_past_the_cap_says_how_many_more():
+    cap = proactive_tools.DAY_PLAN_CAPS["waiting"]
+    text = day(snap(threads=[_waiting(i) for i in range(cap + 4)]))
+    assert "…and 4 more" in text.split("Waiting on a reply from you:")[1]
+
+
+def test_more_than_three_overdue_are_listed():
+    rows = [todo(f"Late task {i}", id=f"todo:{i}", due=ts(1, 9 + i)) for i in range(6)]
+    text = day(snap(todos=rows))
+    assert all(f"Late task {i}" in text for i in range(6))
+
+
+def test_a_plan_cut_at_its_length_says_so_with_a_count(monkeypatch):
+    monkeypatch.setattr(proactive_tools, "MAX_CHARS", 300)
+    rows = [todo(f"Open task number {i} with a longer title", id=f"todo:{i}") for i in range(8)]
+    text = day(snap(todos=rows))
+    assert len(text) < 500
+    assert "plan cut at its length limit" in text and "not complete" in text
+    assert "more item" in text
+
+
+def test_a_day_due_entry_is_kept_when_its_title_is_on_another_date(monkeypatch):
+    import asyncio
+    from service.assistant import day_agenda
+    rows = [{"id": "day:1", "title": "Weekly lab report", "when_ts": ts(5, 17), "kind": "due",
+             "state": "due", "all_day": False}]
+
+    async def fake_rows(start, end, *, now, tz):
+        return rows
+    monkeypatch.setattr(day_agenda, "rows", fake_rows)
+    base = snap(todos=[todo("Weekly lab report", id="todo:a", due=ts(12, 17))])
+    out = asyncio.run(proactive_tools.with_day_rows(base, ts(5, 0), ts(6, 0), NOW, TZ))
+    assert [t["title"] for t in out["todos"] if t.get("source") == "day"] == ["Weekly lab report"]
+    same_day = snap(todos=[todo("Weekly lab report", id="todo:b", due=ts(5, 17, 1))])
+    out = asyncio.run(proactive_tools.with_day_rows(same_day, ts(5, 0), ts(6, 0), NOW, TZ))
+    assert not [t for t in out["todos"] if t.get("source") == "day"], "same day: the reminder row stays alone"

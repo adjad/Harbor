@@ -116,3 +116,70 @@ def test_python_still_starts_and_cannot_read_another_apps_temp(tmp_path):
     read = subprocess.run([sandbox.SANDBOX_EXEC, "-f", str(profile), python, "-c", probe],
                           capture_output=True, text=True, timeout=60, env=env, cwd="/")
     assert read.returncode != 0
+
+
+# -- tools audit 5.2: symlinked home, shared temp and volumes, credential folders --
+
+def test_a_linked_home_still_refuses_the_whole_home_folder(tmp_path, monkeypatch):
+    real = tmp_path / "real-home"
+    (real / "Documents").mkdir(parents=True)
+    link = tmp_path / "home-link"
+    link.symlink_to(real)
+    monkeypatch.setenv("HOME", str(link))
+    for raw in ("~", str(link), str(real), "~/Documents/.."):
+        paths, error = scopes.parse_scopes([raw])
+        assert error and not paths, raw
+    paths, error = scopes.parse_scopes(["~/Documents"])
+    assert not error and paths == [real / "Documents"]
+    assert "~/Documents" in scopes.describe(paths, [])
+
+
+@pytest.mark.parametrize("raw", ["/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp", "/Volumes"])
+def test_shared_temp_folders_and_volumes_are_refused(raw):
+    paths, error = scopes.parse_scopes([raw])
+    assert error and not paths, raw
+
+
+def test_a_folder_on_an_external_volume_is_still_a_scope():
+    paths, error = scopes.parse_scopes(["/Volumes/FixtureDrive/Photos"])
+    assert not error and paths
+
+
+@pytest.mark.parametrize("raw", ["~/.ssh", "~/.ssh/fixture_key", "~/.aws", "~/.gnupg", "~/.netrc",
+                                 "~/.config/gh", "~/.config/gcloud/fixture", "~/.config",
+                                 "~/Library/Keychains"])
+def test_credential_folders_are_refused_when_parsing(raw):
+    paths, error = scopes.parse_scopes([raw])
+    assert error and not paths, raw
+
+
+def test_a_linked_home_refuses_its_credential_folders_too(tmp_path, monkeypatch):
+    real = tmp_path / "real-home"
+    (real / ".ssh").mkdir(parents=True)
+    link = tmp_path / "home-link"
+    link.symlink_to(real)
+    monkeypatch.setenv("HOME", str(link))
+    paths, error = scopes.parse_scopes(["~/.ssh"])
+    assert error and "keys or credentials" in error and not paths
+
+
+def test_a_bad_scope_makes_the_skill_load_as_broken(tmp_path, monkeypatch):
+    from service.skills import trust
+    skills_dir = tmp_path / "skills"
+    folder = skills_dir / "fixture-scope"
+    folder.mkdir(parents=True)
+    (folder / "SKILL.md").write_text(
+        "---\nname: fixture-scope\ndescription: Invented.\ntools:\n  - name: fixture_scope_tool\n"
+        "    command: echo hi\n    read_scopes: ['~/.ssh']\n---\n\nInvented.\n")
+    monkeypatch.setattr(S, "SKILLS_DIR", skills_dir)
+    monkeypatch.setattr(S, "BUNDLED_SKILLS_DIR", tmp_path / "bundled-none")
+    monkeypatch.setattr(trust, "TRUST_PATH", tmp_path / "moe" / "skill_trust.json")
+    trust.approve(folder)
+    try:
+        skill = S.load()["fixture-scope"]
+        assert "read_scopes" in skill.error and not skill.enabled
+        from service.tools.registry import REGISTRY
+        assert "fixture_scope_tool" not in REGISTRY
+    finally:
+        monkeypatch.undo()
+        S.load()

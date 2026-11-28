@@ -58,12 +58,28 @@ _contacts: dict[str, str] = {}
 def _norm_handle(h: str) -> str:
     """Normalize a phone/email handle for matching. Phone numbers appear in
     several shapes across chat.db and Contacts (+1 925…, (925) …, 925-…), so
-    phones reduce to their last 10 digits; emails just lowercase."""
+    phones reduce to their digits WITH the country code. A bare ten-digit
+    number is read as a North American one (country code 1), so "(925) 555-0100"
+    and "+1 925 555 0100" are one key, while +44 20 7946 0958 and a US number
+    that merely shares its last ten digits are not. Emails just lowercase."""
     h = (h or "").strip()
     if "@" in h:
         return h.lower()
     digits = re.sub(r"\D", "", h)
-    return digits[-10:] if len(digits) >= 10 else digits
+    if h.startswith("00"):          # international call prefix: 0044… -> 44…
+        digits = digits[2:]
+    return "1" + digits if len(digits) == 10 else digits
+
+
+def _contact_for_key(key: str) -> str:
+    """The name saved for a normalized handle. A cache from before handles kept
+    their country code holds bare ten-digit keys; a North American number still
+    finds its name there."""
+    if key in _contacts:
+        return _contacts[key]
+    if len(key) == 11 and key.startswith("1"):
+        return _contacts.get(key[1:], "")
+    return ""
 
 
 # name (lowercased) -> the contact's handles in their ORIGINAL form.
@@ -76,16 +92,38 @@ def _norm_handle(h: str) -> str:
 _name_handles: dict[str, list[str]] = {}
 
 
-def cache_contacts(mapping: dict) -> None:
-    global _contacts, _name_handles
+# Alternate names per contact (nickname, organization, middle-name form) and the
+# relationships a card records, both keyed by the lowercased display name.
+_contact_aliases: dict[str, list[str]] = {}
+_contact_relations: dict[str, list[str]] = {}
+
+
+def cache_contacts(mapping: dict, shared: dict | None = None,
+                   aliases: dict | None = None, relations: dict | None = None) -> None:
+    """`shared` maps a handle that more than one contact holds to those contacts'
+    names, so every one of them keeps it (the handle map itself can name only
+    one display string per handle)."""
+    global _contacts, _name_handles, _contact_aliases, _contact_relations
     _contacts = {_norm_handle(k): v for k, v in (mapping or {}).items()
                  if k and v and _norm_handle(k)}
+    shared = {str(h).strip(): [str(n).strip() for n in names if str(n).strip()]
+              for h, names in (shared or {}).items() if h and isinstance(names, list)}
     by_name: dict[str, list[str]] = {}
     for handle, name in (mapping or {}).items():
-        if not (handle and name):
+        if not (handle and name) or str(handle).strip() in shared:
             continue
         by_name.setdefault(str(name).strip().lower(), []).append(str(handle).strip())
+    for handle, names in shared.items():
+        for name in names:
+            handles = by_name.setdefault(name.lower(), [])
+            if handle not in handles:
+                handles.append(handle)
     _name_handles = by_name
+
+    def clean(value: dict | None) -> dict[str, list[str]]:
+        return {str(k).strip().lower(): [str(v).strip() for v in vs if str(v).strip()]
+                for k, vs in (value or {}).items() if k and isinstance(vs, list)}
+    _contact_aliases, _contact_relations = clean(aliases), clean(relations)
     cache_store.save("contacts", json.dumps(_contacts))
     cache_store.save("contact_handles", json.dumps(_name_handles))
 
@@ -124,8 +162,9 @@ _contacts_not_allowed = False
 
 
 def clear_contacts() -> None:
-    global _contacts, _name_handles, _birthdays, _records_memo
+    global _contacts, _name_handles, _birthdays, _records_memo, _contact_aliases, _contact_relations
     _contacts, _name_handles, _birthdays = {}, {}, {}
+    _contact_aliases, _contact_relations = {}, {}
     _records_memo = None             # it holds names resolved from the old map
     # Unlike best-effort cache_store.save, a failed removal must surface to
     # the sender, which keeps the privacy change pending and retries it.
@@ -171,6 +210,12 @@ def apply_contacts_sync(body: dict) -> bool:
         if any(not isinstance(k, str) or not isinstance(v, list)
                or any(not isinstance(n, str) for n in v) for k, v in birthdays.items()):
             raise ValueError("birthdays must map dates to name lists")
+        for extra in ("shared_handles", "aliases", "relations"):
+            value = body.get(extra, {})
+            if not isinstance(value, dict) or any(
+                    not isinstance(k, str) or not isinstance(v, list)
+                    or any(not isinstance(n, str) for n in v) for k, v in value.items()):
+                raise ValueError(f"{extra} must map strings to string lists")
     if revision is not None:
         _contacts_revision = revision
     _contacts_privacy_current = False
@@ -179,7 +224,7 @@ def apply_contacts_sync(body: dict) -> bool:
     # Clear first so empty, denied and failed reads cannot preserve recipients.
     clear_contacts()
     if enabled and available:
-        cache_contacts(mapping)
+        cache_contacts(mapping, body.get("shared_handles"), body.get("aliases"), body.get("relations"))
         cache_birthdays(birthdays)
     if revision is not None:
         cache_store.save("contacts_privacy_revision", str(revision))
@@ -213,7 +258,7 @@ def resolve_contact(text: str, *, prefix_only: bool = False) -> str:
         return f"{resolve_contact(head)}{sep}{rest}"
 
     def sub(m: re.Match) -> str:
-        return _contacts.get(_norm_handle(m.group(0)), m.group(0))
+        return _contact_for_key(_norm_handle(m.group(0))) or m.group(0)
     return _HANDLE_RE.sub(sub, text)
 
 
@@ -236,19 +281,26 @@ def find_contacts(name: str) -> list[dict]:
     if not query or not _name_handles:
         return []
 
-    exact = [n for n in _name_handles if n == query]
+    def strings(n: str) -> list[str]:
+        return [n] + [a.lower() for a in _contact_aliases.get(n, [])]
+
+    word_re = re.compile(rf"\b{re.escape(query)}\b")
+    exact = [n for n in _name_handles if any(x == query for x in strings(n))]
     word = [n for n in _name_handles
-            if n != query and re.search(rf"\b{re.escape(query)}\b", n)]
+            if n not in exact and any(word_re.search(x) for x in strings(n))]
     partial = [n for n in _name_handles
-               if n not in exact and n not in word and query in n]
+               if n not in exact and n not in word and any(query in x for x in strings(n))]
     matches = exact or word or partial
 
     out = []
     for n in matches:
         handles = _name_handles.get(n, [])
-        out.append({"name": n.title() if n.islower() else n,
-                    "handles": handles,
-                    "preferred": _preferred_handle(handles)})
+        found = {"name": n.title() if n.islower() else n,
+                 "handles": handles,
+                 "preferred": _preferred_handle(handles)}
+        if _contact_relations.get(n):
+            found["relations"] = list(_contact_relations[n])
+        out.append(found)
     return out
 
 
@@ -268,7 +320,7 @@ def contact_name_for_handle(handle: str) -> str:
     key = _norm_handle(h)
     if not h or not key:
         return ""
-    shown = _contacts.get(key, "")
+    shown = _contact_for_key(key)
     for name, handles in _name_handles.items():
         if h in handles:
             # The name as it is saved when the two maps agree, else the same
@@ -276,7 +328,23 @@ def contact_name_for_handle(handle: str) -> str:
             if shown.strip().lower() == name:
                 return shown.strip()
             return name.title() if name.islower() else name
-    return shown.strip()
+    return shown.strip() or _loose_label(key)
+
+
+def _loose_label(key: str) -> str:
+    """The one saved name whose phone number shares `key`'s last ten digits, or "".
+
+    Labels only (contact_name_for_handle): the full-number key, which keeps the
+    country code, is tried first and is what matching that acts relies on. A
+    number saved in another country's format, or without its country code
+    where the handle has one, still gets its name on a label. Two different
+    names sharing those digits label nothing."""
+    if "@" in key or len(key) < 10:
+        return ""
+    tail = key[-10:]
+    names = {name.strip() for saved, name in _contacts.items()
+             if "@" not in saved and len(saved) >= 10 and saved[-10:] == tail and name.strip()}
+    return names.pop() if len(names) == 1 else ""
 
 
 # Digits-only projection of the message cache, for "has this number actually
@@ -322,7 +390,15 @@ def _preferred_handle(handles: list[str]) -> str:
 def contact_names() -> list[str]:
     """Distinct saved contact names, alphabetical — used by the
     `list_contacts` tool."""
-    return sorted({v for v in _contacts.values() if v})
+    names: set[str] = set()
+    for value in _contacts.values():
+        parts = [part.strip() for part in value.split(" / ")]
+        # A handle two contacts share is shown under both names, joined.
+        if len(parts) > 1 and all(part.lower() in _name_handles for part in parts):
+            names.update(parts)
+        elif value:
+            names.add(value)
+    return sorted(names)
 
 
 def _c() -> OMLXClient:
@@ -1141,18 +1217,59 @@ def _request_review_notice(body: str, *, sensitive: bool = False) -> str:
     return "Please review the original request with a stated deadline (private details omitted)."
 
 
-def _private_summary_value(body: str) -> bool:
+_NUMBER_LABEL = re.compile(
+    r"\b(?:order|confirmation|conf|reference|ref|booking|reservation|invoice|ticket|tracking|"
+    r"case|receipt|zip|postal|po)\b[^\n\d]{0,24}$", re.I)
+
+
+def _summary_on_device() -> bool:
+    """True only when every model that will read a summary (the digest's fast role
+    and the agent that receives the tool result) runs on this Mac's own engine.
+    Fails closed: any doubt reads as off this Mac, which keeps the strict rules."""
+    import sys
+    # Not loaded means no service is routing a model here: stay strict.
+    if "service.config.endpoints" not in sys.modules or "service.proactive.sources" not in sys.modules:
+        return False
+    try:
+        from service.config.endpoints import role_target
+        from service.proactive.sources import reading_on_device
+        if not reading_on_device():
+            return False
+        target = role_target("agent")
+        return bool(target.endpoint.managed and target.endpoint.name == "local")
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _private_summary_value(body: str, *, on_device: bool | None = None) -> bool:
     """Conservatively omit URLs and opaque values, regardless of their label.
 
     Dates, clock times and currency amounts have explicit source syntax. They
     may remain in ordinary schedule/payment reports; they cannot override an
     authentication context. An unfamiliar verification proposition is private.
+
+    On this Mac only (`on_device`, decided by _summary_on_device when None), the
+    opaque-value rules step aside: ZIP codes, years, confirmation and order
+    numbers, short codes such as B12 and ALLCAPS words such as URGENT are
+    ordinary logistics there (links stay private). Real secrets (a one-time code, card-like number,
+    password, token or tokenised link) are still withheld. Anything that may be
+    read off this Mac keeps the full rules.
     """
     from service.tools import message_digest as digest
 
     if _security_work_summary(body) == body:
         return False
-    if _AUTH_CONTEXT.search(body) or _SUMMARY_URL.search(body):
+    if _AUTH_CONTEXT.search(body):
+        return True
+    narrowed = None
+
+    def local() -> bool:
+        nonlocal narrowed
+        if narrowed is None:
+            narrowed = _summary_on_device() if on_device is None else on_device
+        return narrowed
+
+    if _SUMMARY_URL.search(body):
         return True
     if match := _VERIFICATION_VALUE.search(body):
         proposition = body[match.end():].strip(" .!?")
@@ -1181,15 +1298,28 @@ def _private_summary_value(body: str) -> bool:
         identifier = digest._IDENTIFIER.match(value_body, entity.end()) if entity else None
         if identifier:
             remainder = value_body[:identifier.start()] + " " + value_body[identifier.end():]
+    if local() and redact_secret_values(value_body) != value_body:
+        return True
     # A known date or amount must not look like a bare PIN or opaque ID.
     remainder = digest._AMOUNT.sub(" ", digest._TIME.sub(" ", remainder))
     if re.search(r"\b\d{4,}\b", remainder):
-        return True
+        if not local():
+            return True
+        # On this Mac a ZIP code, year or order number is ordinary. A bare
+        # six-digit number with no label is the shape of a one-time code, so
+        # it stays private unless a word like "order" or "ZIP" names it.
+        for number in re.finditer(r"\b\d{6}\b", remainder):
+            before = remainder[max(0, number.start() - 40):number.start()]
+            if not _NUMBER_LABEL.search(before):
+                return True
     for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]{3,}", remainder):
         letters = any(char.isalpha() for char in token)
         if letters and any(char.isdigit() for char in token):
-            return True
-        if len(token) >= 8 and token.isupper():
+            # A short code (B12, A4C) is logistics on this Mac; a long mixed
+            # token looks like a secret everywhere.
+            if not local() or len(token) >= 8:
+                return True
+        if len(token) >= 8 and token.isupper() and not (local() and token.isalpha()):
             return True
         if len(token) >= 20 and len(set(token.lower())) >= 8:
             return True
@@ -1625,11 +1755,30 @@ def latest_outgoing_by_context() -> dict[str, float]:
 _RECENT_SUMMARY_SECONDS = 3 * 86400
 
 
-def recent_priority_message_rows(*, now: float | None = None) -> list[tuple[float, str, str]]:
-    """Important read or unread messages within the prior 72 hours."""
+_RECENT_SUMMARY_MAX_DAYS = 30
+
+
+def _window_days(days) -> int:
+    """The digest window in whole days: three by default, at most thirty."""
+    try:
+        value = int(days) if days is not None else 3
+    except (TypeError, ValueError):
+        value = 3
+    return min(_RECENT_SUMMARY_MAX_DAYS, max(1, value))
+
+
+def _window_label(days: int) -> str:
+    return "the last three days" if days == 3 else (
+        "the last day" if days == 1 else f"the last {days} days")
+
+
+def recent_priority_message_rows(*, now: float | None = None,
+                                 days: int | None = None) -> list[tuple[float, str, str]]:
+    """Important read or unread messages within the prior 72 hours (or `days` days)."""
     now = time.time() if now is None else now
+    window = _window_days(days) * 86400
     return [row for row in summary_message_rows(require_read_state=True)
-            if now - _RECENT_SUMMARY_SECONDS <= row[0] <= now]
+            if now - window <= row[0] <= now]
 
 
 def conversation_rows(context: str, *, since: float = float("-inf")) -> list[tuple[float, str, str]]:
@@ -2121,15 +2270,17 @@ def _recent_rows(rows: list, count: int) -> tuple[list, list[str]]:
     return kept, dropped
 
 
-async def summarize_messages_recent(count: int = 30) -> str:
+async def summarize_messages_recent(count: int = 30, days: int | None = None) -> str:
     from service.assistant.sync_status import ensure_sources
     await ensure_sources(("messages",))
     if messages_sync_state() != "ready":
         return _unavailable_message()
-    meaningful = sorted(recent_priority_message_rows(), key=lambda r: r[0], reverse=True)
+    window_days = _window_days(days)
+    meaningful = sorted(recent_priority_message_rows(days=window_days),
+                        key=lambda r: r[0], reverse=True)
     if not meaningful:
         now = time.time()
-        return _empty_summary(now - _RECENT_SUMMARY_SECONDS, now + 0.001, "the last three days")
+        return _empty_summary(now - window_days * 86400, now + 0.001, _window_label(window_days))
     budget = max(1, min(count, 150))
     priority_rows = sorted((row for row in meaningful if message_priority(row[2])),
                            key=lambda row: (message_priority(row[2]), row[0]), reverse=True)
@@ -2145,7 +2296,7 @@ async def summarize_messages_recent(count: int = 30) -> str:
     # the same invisible-incompleteness problem view_emails has (see
     # docs/OPTIMIZATION_BACKLOG.md). Naming the threads makes the gap actionable: the
     # user can ask about one by name.
-    label = "important messages from the last three days (read or unread)"
+    label = f"important messages from {_window_label(window_days)} (read or unread)"
     if len(priority_rows) > budget:
         label += f" — {len(priority_rows) - budget} other priority messages not shown; ask for a narrower scope"
     if dropped:
@@ -2450,13 +2601,15 @@ async def view_messages(query: str | None = None, day: str | None = None,
          "count": {"type": "integer",
                    "description": "Recent digest scan limit (default 30); unread catchup uses this display limit for every date scope and discloses omissions."},
          "unread": {"type": "boolean", "description": "Only verified unread messages, including routine replies; combines with day, period and conversation."},
+         "days": {"type": "integer",
+                  "description": "Width of the default catch-up window in days (default 3, at most 30); ignored when period, day or conversation is given."},
      }},
     category="messages_read",
 )
 async def summarize_messages(day: str | None = None, count: int = 30,
                              period: str | None = None,
                              conversation: str | None = None,
-                             unread: bool = False) -> str:
+                             unread: bool = False, days: int | None = None) -> str:
     if unread:
         return await _summarize_unread_messages(day, count, period, conversation)
     if conversation:
@@ -2466,7 +2619,7 @@ async def summarize_messages(day: str | None = None, count: int = 30,
         return await summarize_messages_for_period(period)
     if day:
         return await summarize_messages_for_day(day)
-    return await summarize_messages_recent(count)
+    return await summarize_messages_recent(count, days)
 
 
 @register(

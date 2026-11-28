@@ -372,3 +372,76 @@ def test_persistent_only_task_claim_falls_back_without_repeating_source_reads(ev
     assert client.calls == 3 and "Tomorrow's only task" not in out
     assert 'Vercel Ship SF' in out and 'Source coverage' in out
     assert '420615' not in out and 'task_window' not in out
+
+
+# --- audit 2.1: chronological order and reserved slots ------------------------------------
+
+def test_reserved_records_keep_priority_rows_under_the_row_cap():
+    rows = [{"n": n, "pri": n in (11, 12, 13)} for n in range(14)]
+    kept, omitted = T._reserved_records(rows, lambda row: row["pri"], limit=10)
+    assert len(kept) == 10 and omitted == 4
+    assert {11, 12, 13} <= {row["n"] for row in kept}
+    assert [row["n"] for row in kept] == sorted(row["n"] for row in kept)   # input order kept
+
+
+def test_reserved_records_keep_priority_rows_under_the_byte_cap():
+    filler = [{"n": n, "pad": "x" * 300, "pri": False} for n in range(8)]
+    late = {"n": 99, "pad": "x" * 300, "pri": True}
+    kept, _ = T._reserved_records(filler + [late], lambda row: row["pri"], budget=1_000)
+    assert late in kept
+
+
+@pytest.fixture
+def evidence_store(tmp_path, monkeypatch):
+    from service.assistant.store import AssistantStore, parse_undated_snapshot
+    from service.tools import assistant_tools, everyday
+    store = AssistantStore(tmp_path / "assistant.db")
+    monkeypatch.setattr(assistant_tools, "assistant_store", store)
+    monkeypatch.setattr(everyday, "_native_receipt_current", lambda receipt, now: True)
+    yield store, parse_undated_snapshot
+    store._db.close()
+
+
+def test_week_window_keeps_today_overdue_and_undated_over_far_future(evidence_store):
+    store, parse = evidence_store
+    now = time.time()
+    day = 86400
+    midnight = time.mktime(time.localtime(now)[:3] + (0, 0, 0, 0, 0, -1))
+    window_start, window_end = midnight, midnight + 7 * day
+    # 30 invented events later in the week, then one today. Newest-first would drop today's.
+    future = [dict(source_id=f"far-{n}", title=f"Far event {n}", kind="event",
+                   when_ts=midnight + 2 * day + n * 600, end_ts=midnight + 2 * day + n * 600 + 300)
+              for n in range(30)]
+    today = dict(source_id="today-1", title="Invented standup", kind="event",
+                 when_ts=now + 600, end_ts=now + 1200)
+    store.sync_source("calendar", future + [today], diagnostics={
+        "snapshot_started_at": now, "coverage_start": window_start - day, "coverage_end": window_end + day})
+    overdue = dict(source_id="rem-overdue", title="Invented overdue form", kind="reminder",
+                   when_ts=now - 3 * 3600)
+    store.sync_source("reminders", [overdue], diagnostics={"authorized": True, "count": 1,
+                      "snapshot_started_at": now},
+                      undated=parse([{"source_id": "u1", "title": "Invented someday idea",
+                                      "context": "Reminders"}], 1))
+    cal = T._native_source("calendar", now=now, start=window_start, end=window_end, query="",
+                           include_overdue=True, include_undated=False)
+    rem = T._native_source("reminders", now=now, start=window_start, end=window_end, query="",
+                           include_overdue=True, include_undated=True)
+    titles = [row["title"] for row in cal["records"]]
+    assert len(titles) <= 10 and "Invented standup" in titles
+    assert titles == sorted(titles, key=lambda t: next(r["when_ts"] for r in future + [today] if r["title"] == t))
+    rem_titles = {row["title"] for row in rem["records"]}
+    assert {"Invented overdue form", "Invented someday idea"} <= rem_titles
+
+
+# --- audit 2.1: the fallback keeps mail, message and notes summaries ------------------------
+
+def test_fallback_keeps_mail_message_and_notes_summaries(pacific):
+    data = json.loads(payload())
+    data["sources"]["email"] = {"records": [{"sender": "billing@example.com", "subject": "Invented invoice due",
+                                             "body": "SECRET-BODY-TEXT"}]}
+    data["sources"]["notes"] = {"records": [{"title": "Invented trip plan", "body": "SECRET-NOTE-TEXT"}]}
+    text = T.render_evidence_text(json.dumps(data))
+    assert "Your mail: 1 read, from billing@example.com" in text
+    assert "Your notes: 1 read" in text and "Your messages: 1 read, from 36726" in text
+    assert "Invented invoice due" not in text and "Invented trip plan" not in text
+    assert "SECRET-BODY-TEXT" not in text and "SECRET-NOTE-TEXT" not in text and "420615" not in text

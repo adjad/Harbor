@@ -224,12 +224,17 @@ final class BrowserHistoryReader {
         }
     }
 
+    /// A browser that is open holds its History file briefly; wait instead of
+    /// failing the read at once.
+    static let busyTimeoutMs: Int32 = 2000
+
     private func readBrowsers() -> [String: Any] {
         let home = NSHomeDirectory() as NSString
         guard isEnabled else { return [:] }
         let safari = readSafari(home.appendingPathComponent("Library/Safari/History.db"))
         guard isEnabled else { return [:] }
-        let chrome = readChrome(home.appendingPathComponent("Library/Application Support/Google/Chrome/Default/History"))
+        let chrome = readChromeProfiles(
+            root: home.appendingPathComponent("Library/Application Support/Google/Chrome"))
         func entry(_ rows: [String]?) -> [String: Any] {
             ["lines": rows?.joined(separator: "\n") ?? "",
              "diagnostics": ["available": rows != nil,
@@ -250,6 +255,7 @@ final class BrowserHistoryReader {
             return nil
         }
         defer { sqlite3_close(db) }
+        sqlite3_busy_timeout(db, Self.busyTimeoutMs)
 
         let cutoff = Date().timeIntervalSince1970 - Double(days) * 86400 - Self.appleEpochOffset
         let sql = """
@@ -282,6 +288,47 @@ final class BrowserHistoryReader {
 
     // MARK: - Chrome
 
+    /// Every Chrome profile's History file under `root`: Default first, then
+    /// Profile 1, Profile 2, ... in numeric order. A person who signs in with
+    /// a second Chrome profile keeps its history there, not in Default.
+    static func chromeHistoryPaths(root: String, fileManager: FileManager = .default) -> [String] {
+        guard let entries = try? fileManager.contentsOfDirectory(atPath: root) else { return [] }
+        func rank(_ name: String) -> Int? {
+            if name == "Default" { return 0 }
+            guard name.hasPrefix("Profile "), let n = Int(name.dropFirst("Profile ".count)), n > 0
+            else { return nil }
+            return n
+        }
+        return entries.compactMap { name -> (Int, String)? in
+            guard let r = rank(name) else { return nil }
+            let path = (root as NSString).appendingPathComponent(name + "/History")
+            return fileManager.fileExists(atPath: path) ? (r, path) : nil
+        }.sorted { $0.0 < $1.0 }.map { $0.1 }
+    }
+
+    /// All profiles merged newest-first under one cap. nil only when no
+    /// profile could be read (Chrome missing, or no Full Disk Access).
+    private func readChromeProfiles(root: String, limit: Int = 5000) -> [String]? {
+        let paths = Self.chromeHistoryPaths(root: root)
+        var merged: [String] = []
+        var readAny = false
+        for path in paths {
+            guard isEnabled else { return nil }
+            if let rows = readChrome(path, limit: limit) {
+                readAny = true
+                merged.append(contentsOf: rows)
+            }
+        }
+        guard readAny else { return nil }
+        // Each line starts with its Unix time, so a numeric sort interleaves
+        // the profiles correctly.
+        func stamp(_ line: String) -> Double {
+            Double(line.prefix(while: { $0 != " " })) ?? 0
+        }
+        merged.sort { stamp($0) > stamp($1) }
+        return Array(merged.prefix(limit))
+    }
+
     // visits.visit_time / urls.last_visit_time are Chrome-epoch microseconds.
     private func readChrome(_ path: String, days: Int = 30, limit: Int = 5000) -> [String]? {
         var db: OpaquePointer?
@@ -290,6 +337,7 @@ final class BrowserHistoryReader {
             return nil
         }
         defer { sqlite3_close(db) }
+        sqlite3_busy_timeout(db, Self.busyTimeoutMs)
 
         let cutoffUs = Int64((Date().timeIntervalSince1970
                               - Double(days) * 86400 + Self.chromeEpochOffset) * 1_000_000)

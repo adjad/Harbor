@@ -98,3 +98,48 @@ def test_global_scope_behavior_is_unchanged():
                         CHUNKS, PICKS, scope="global")
     assert "[" not in text
     assert used == []
+
+
+def test_contracted_negation_matches_the_spelled_out_passage():
+    # P2 says "has not confirmed renewal terms"; the contraction is the same claim.
+    text, used = verify("The landlord hasn't confirmed renewal terms.", CHUNKS, PICKS)
+    assert text.endswith("[2].") and used == [1]
+
+
+def test_contracted_negation_is_not_cited_to_a_positive_claim():
+    chunks = [Chunk(idx=0, text="The supplier didn't ship the lot on March 18.", start=0, end=45)]
+    assert verify("The supplier shipped the lot on March 18.", chunks, [0]) == (NOT_FOUND, [])
+    text, _ = verify("The supplier didn't ship the lot on March 18.", chunks, [0])
+    assert "didn't" in text
+
+
+def test_cant_is_a_negation():
+    chunks = [Chunk(idx=0, text="The team cannot approve refunds above 500 dollars.", start=0, end=50)]
+    text, _ = verify("The team can't approve refunds above 500 dollars.", chunks, [0])
+    assert text.startswith("The team can't")
+
+
+def test_quotation_spanning_sentences_is_kept_whole():
+    src = 'The memo ends: "We ship Friday. Nobody leaves early." Signed, ops.'
+    chunks = [Chunk(idx=0, text=src, start=0, end=len(src))]
+    text, used = verify('The memo says "We ship Friday. Nobody leaves early." [1]', chunks, [0])
+    assert "Nobody leaves early" in text and used == [0]
+    # A fabricated second half is still dropped.
+    assert verify('The memo says "We ship Friday. Everyone stays late." [1]',
+                  chunks, [0]) == (NOT_FOUND, [])
+
+
+def test_abbreviation_does_not_split_a_sentence():
+    chunks = [Chunk(idx=0, text="Dr. Rivera approved the budget on March 3.", start=0, end=42)]
+    text, _ = verify("Dr. Rivera approved the budget on March 3 [1].", chunks, [0])
+    assert text == "Dr. Rivera approved the budget on March 3 [1]."
+
+
+def test_global_scope_keeps_an_inflected_name_but_not_an_invented_one():
+    src = "Rivera led the Romans through the winter; Marta kept the ledger."
+    chunks = [Chunk(idx=0, text=src, start=0, end=len(src))]
+    kept, _ = verify("The story follows a Roman general and Marta.", chunks, [0], scope="global")
+    assert "Marta" in kept
+    kept, _ = verify("Their leader was Romans-born Rivera, praised by Quentin.",
+                     chunks, [0], scope="global")
+    assert kept == NOT_FOUND

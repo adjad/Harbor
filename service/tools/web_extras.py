@@ -15,9 +15,12 @@ dropped search_email/list_reminders/translate_text in Phase 1.
 """
 from __future__ import annotations
 
+from urllib.parse import quote
+
 import httpx
 
 from service.tools.registry import register
+from service.tools.untrusted import WEB_PAGE, fence, neutralize
 
 _UA = "Harbor/1.0 (local macOS assistant; personal use)"
 _TIMEOUT = 12
@@ -93,8 +96,9 @@ async def rain_next_hours_at(lat: float, lon: float, name: str, hours: int = 6) 
     lines = []
     for t, p, a in zip(times, prob, amt):
         hour = str(t).split("T")[-1][:5]
-        lines.append(f"  {hour}  {p:>3}% chance" + (f", {a}mm" if a else ""))
-    any_rain = any((p or 0) >= 40 for p in prob)
+        chance = f"{p:>3}% chance" if isinstance(p, (int, float)) else "  chance unavailable"
+        lines.append(f"  {hour}  {chance}" + (f", {a}mm" if a else ""))
+    any_rain = any(isinstance(p, (int, float)) and p >= 40 for p in prob)
     lead = (f"Rain likely in the next {hrs}h:" if any_rain
             else f"Mostly dry for the next {hrs}h:")
     return lead + "\n" + "\n".join(lines)
@@ -121,7 +125,7 @@ async def wikipedia_summary(topic: str) -> str:
     if not term:
         return "(error: wikipedia_summary needs a `topic`.)"
     data = await _json(
-        f"https://en.wikipedia.org/api/rest_v1/page/summary/{term.replace(' ', '_')}",
+        f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote(term.replace(' ', '_'), safe='')}",
         headers={"User-Agent": _WIKIMEDIA_UA})
     if isinstance(data, str):
         if data == "__404__":
@@ -136,7 +140,9 @@ async def wikipedia_summary(topic: str) -> str:
         return f"Found {title!r} on Wikipedia but it has no summary text."
     disambiguation = data.get("type") == "disambiguation"
     note = "\n(This name is ambiguous — ask for a more specific topic.)" if disambiguation else ""
-    return f"{title}: {extract}{note}"
+    # Wikipedia's text is third-party content: fenced like the other web tools,
+    # with Harbor's own note outside the fence.
+    return f"{neutralize(str(title))}:\n{fence(extract, WEB_PAGE)}{note}"
 
 
 # --------------------------------------------------------------------------

@@ -22,6 +22,7 @@ def loaded_bundled_skills(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     original = skills.all_skills()
     saved = (dict(REGISTRY), dict(TOOL_PARTS), set(skill_tools._registered))
     monkeypatch.setattr(skills, "SKILLS_DIR", tmp_path / "user-skills")
+    monkeypatch.setattr(skills.trust, "TRUST_PATH", tmp_path / "moe" / "skill_trust.json")
     loaded = skills.load()
     try:
         yield loaded

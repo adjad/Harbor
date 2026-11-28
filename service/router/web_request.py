@@ -730,12 +730,37 @@ def _compose(text: str, clauses: tuple[Clause, ...]) -> Composition:
     return finish(source, delivery)
 
 
+# The user's own stores, bare: "any important notes today?", "are there any
+# urgent reminders?", "any to-dos for me?". Notes, reminders, tasks and the
+# calendar are the user's as surely as mail is; these were EXTERNAL with only
+# web_search allowed. "news", "headlines" and named topics are not sources here.
+_PERSONAL_SOURCE_NOUN = (
+    r"(?:e-?mails?|mail|texts?|messages?|imessages?|dms?|notes?|reminders?|tasks?|to-?\s?dos?|"
+    r"calendar(?:\s+(?:events?|items?|entries))?|meetings?|appointments?|deadlines?)")
+_PERSONAL_TIME_TAIL = (
+    r"(?:\s+(?:today|tonight|tomorrow|yet|so\s+far|right\s+now|this\s+(?:morning|afternoon|evening|week)|"
+    r"for\s+(?:me|us|today|tomorrow)|on\s+my\s+plate|i\s+(?:should|need\s+to)\s+(?:know|see)|"
+    r"since\s+(?:this\s+morning|yesterday|lunch)))*")
 _PERSONAL_INBOX_QUESTION = (
-    r"(?:(?:are\s+there|is\s+there|do\s+i\s+have|did\s+i\s+get|have\s+i\s+got|got)\s+)?"
-    r"any\s+(?:(?:new|unread|important|recent|urgent|more|other)\s+)*"
-    r"(?:e-?mails?|mail|texts?|messages?|imessages?|dms?)"
-    r"(?:\s+(?:today|yet|tonight|so\s+far|this\s+(?:morning|afternoon|evening|week)|"
-    r"for\s+me|since\s+(?:this\s+morning|yesterday|lunch)))?")
+    r"(?:(?:(?:are\s+there|is\s+there|do\s+i\s+have|did\s+i\s+get|have\s+i\s+got|got)\s+)?"
+    r"any\s+(?:(?:new|unread|important|recent|urgent|priority|high[- ]priority|pending|overdue|"
+    r"open|outstanding|upcoming|more|other)\s+)*"
+    + _PERSONAL_SOURCE_NOUN + _PERSONAL_TIME_TAIL
+    # "what important notes do I have today?", "which messages did I get?"
+    + r"|(?:what|which)\s+(?:(?:new|unread|important|recent|urgent|priority|pending|overdue|open|"
+    r"outstanding|upcoming)\s+)*" + _PERSONAL_SOURCE_NOUN
+    + r"\s+(?:do|did|have|should)\s+(?:i|we)\s+(?:have|get|got|gotten|receive[d]?|miss(?:ed)?)"
+    + _PERSONAL_TIME_TAIL + r")")
+# Triage with no subject at all is the user's own day: "what's important
+# today?", "anything urgent for me?", "what are my priorities". A topic keeps
+# it public ("important news today", "what's important in tech today").
+_PERSONAL_TRIAGE_QUESTION = (
+    r"(?:(?:what's|whats|what\s+is|what\s+are|is\s+there\s+anything|"
+    r"is\s+anything|anything|any(?:thing)?\s+else)\s+)?"
+    r"(?:(?:the|my|most|really|very|super)\s+)*"
+    r"(?:important|urgent|pressing|a\s+priority|priority|priorities|high[- ]priority|"
+    r"top\s+priorit(?:y|ies)|time[- ]sensitive)"
+    r"(?:\s+(?:things?|items?|stuff))?" + _PERSONAL_TIME_TAIL)
 
 # Keep source ownership and current-information detection on the same grammar.
 # A modal is not an external subject in "what must we do today?".
@@ -808,6 +833,8 @@ def _provenance(source: str, *, fragment: bool = False) -> tuple[Provenance, boo
     # "got any texts" is the user's own inbox, not current public information
     # (it was a router-direct web search). The complete shape is required.
     if re.fullmatch(_PERSONAL_INBOX_QUESTION + r"[.!?]*", _root(t), re.I):
+        return Provenance.PRIVATE, False
+    if re.fullmatch(_PERSONAL_TRIAGE_QUESTION + r"[.!?]*", _root(t), re.I):
         return Provenance.PRIVATE, False
     # Replying to someone answers the user's own correspondence, whatever the
     # dictated body says ("answer the landlord's email: is the laundry room

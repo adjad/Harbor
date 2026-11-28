@@ -18,10 +18,11 @@ IMPORTANT rules:
   - "appointment": a dated appointment, flight, check-in, reservation, interview,
                    exam, court or jury date, permission slip or overdue item.
   - "deadline":    a plain deadline or due date, from a person or Mail's
-                   Transactions category only.
+                   Transactions or Updates category (a school, a city office, an
+                   account's notice files there).
 - Never shown: suspicious items, and automated mail (bulk, a no-reply sender, or
   Mail's Transactions or Updates category) that reads as a sale or offer. A plain
-  deadline in a newsletter is held back.
+  deadline in a newsletter (Promotions, or bulk mail with no category) is held back.
 - Code decides, from the item's verbatim quote and the email's index metadata.
   The model is never asked whether something matters.
 """
@@ -73,5 +74,5 @@ def judge(item: dict, message: dict) -> tuple[bool, str]:
     if _APPOINTMENT.search(text):
         return True, "appointment"
     if _DEADLINE.search(text):
-        return (True, "deadline") if category == TRANSACTIONS else (False, "held:newsletter_deadline")
+        return (True, "deadline") if category in (TRANSACTIONS, UPDATES) else (False, "held:newsletter_deadline")
     return False, "held:no_signal"

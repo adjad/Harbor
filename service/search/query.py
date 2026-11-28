@@ -31,7 +31,10 @@ _SPLIT_RE = re.compile(
 )
 _HARD_SPLIT_RE = re.compile(r"\s*[?;]\s*")
 
-_FILTER_RE = re.compile(r"\b(after|before|in|from|type):(\S+)", re.I)
+_FILTER_RE = re.compile(r'\b(after|before|in|from|type):("[^"]+"|\S+)', re.I)
+# Filters written after a regex: pattern ("regex:error\d+ after:2024"). Only a
+# trailing run is taken, so a pattern that merely contains "in:" is left alone.
+_TRAILING_FILTER_RE = re.compile(r'\s+(?:after|before|in|from|type):(?:"[^"]+"|\S+)\s*$', re.I)
 _QUOTED_RE = re.compile(r'"([^"]+)"')
 _NEGATED_RE = re.compile(r"(?:^|\s)-(\w[\w'-]*)")
 
@@ -85,11 +88,13 @@ class ParsedQuery:
     #            evidence is a structural sample (front matter + a spread),
     #            not the chunks that happen to share words with the query.
     scope: str = "span"
+    # `regex:` query: `clean` is a pattern, not text.
+    regex: bool = False
 
     def to_dict(self) -> dict:
         return {"raw": self.raw, "clean": self.clean, "subqueries": self.subqueries,
                 "mode": self.mode, "exclude": self.exclude, "filters": self.filters,
-                "exact": self.exact, "scope": self.scope}
+                "exact": self.exact, "scope": self.scope, "regex": self.regex}
 
 
 def _decompose(text: str) -> list[str]:
@@ -110,19 +115,29 @@ def parse(raw: str) -> ParsedQuery:
     if not text:
         return ParsedQuery(raw=raw, clean="", subqueries=[], mode="navigate")
 
-    exact = _QUOTED_RE.findall(text)
-    filters = {k.lower(): v for k, v in _FILTER_RE.findall(text)}
-    exclude = _NEGATED_RE.findall(text)
+    if text.startswith("regex:"):
+        # The rest is a pattern: quotes, "-" and "in:" inside it are regex, not
+        # query syntax. Only filters trailing the pattern are lifted out.
+        pattern = text[6:].strip()
+        filters: dict[str, str] = {}
+        while (m := _TRAILING_FILTER_RE.search(pattern)):
+            k, _, v = m.group(0).strip().partition(":")
+            filters.setdefault(k.lower(), v.strip('"'))
+            pattern = pattern[:m.start()].rstrip()
+        return ParsedQuery(raw=raw, clean=pattern, subqueries=[], mode="literal",
+                           filters=filters, regex=True)
 
-    clean = _QUOTED_RE.sub(lambda m: m.group(1), text)
-    clean = _FILTER_RE.sub("", clean)
+    # Filters first, so a quoted filter value ("in:\"release notes\"") is not
+    # read as an exact-phrase query.
+    filters = {k.lower(): v.strip('"') for k, v in _FILTER_RE.findall(text)}
+    body = _FILTER_RE.sub("", text)
+    exact = _QUOTED_RE.findall(body)
+    exclude = _NEGATED_RE.findall(body)
+
+    clean = _QUOTED_RE.sub(lambda m: m.group(1), body)
     clean = _NEGATED_RE.sub("", clean)
     clean = re.sub(r"\s{2,}", " ", clean).strip()
 
-    if text.startswith("regex:"):
-        return ParsedQuery(raw=raw, clean=text[6:].strip(), subqueries=[],
-                           mode="literal", exclude=exclude, filters=filters,
-                           exact=exact)
     # A fully-quoted query is an explicit demand for exactness — honor it and
     # stay out of the way.
     if exact and not clean.replace(exact[0], "").strip():

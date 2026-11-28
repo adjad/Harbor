@@ -183,3 +183,33 @@ def test_the_cleanup_trap_survives_an_unset_server_pid():
     result = _bash(script)
     assert result.returncode == 0 and result.stdout.strip() == "STOPPED", result.stderr
     assert 'SANDBOX_PID=""' in text.split("cleanup()")[0], "must be initialised before the trap function"
+
+
+# ------------------------------------------- tools audit 5.1: no secrets to children
+
+_FIXTURE_ENV = {
+    "PATH": "/usr/bin:/bin", "HOME": "/Users/fixture", "LANG": "en_US.UTF-8", "LC_ALL": "C",
+    "TMPDIR": "/private/var/folders/xx/T/", "USER": "fixture",
+    "OPENAI_API_KEY": "sk-invented", "ANTHROPIC_API_KEY": "invented", "GH_TOKEN": "invented",
+    "HARBOR_BRAVE_SEARCH_API_KEY": "invented", "DB_PASSWORD": "invented", "MY_SECRET": "invented",
+    "AWS_SECRET_ACCESS_KEY": "invented", "AWS_ACCESS_KEY_ID": "invented",
+    "GOOGLE_APPLICATION_CREDENTIALS": "/x.json", "SOMEAPIKEY": "invented",
+    "HARBOR_LAUNCH_NONCE": "nonce", "PYTHONNOUSERSITE": "1",
+    "HARBOR_REMOTE_ONLY": "1", "HARBOR_GOOGLE_KEYCHAIN": "on", "EDITOR": "vi",
+}
+_SECRETS = {"OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GH_TOKEN", "HARBOR_BRAVE_SEARCH_API_KEY",
+            "DB_PASSWORD", "MY_SECRET", "AWS_SECRET_ACCESS_KEY", "AWS_ACCESS_KEY_ID",
+            "GOOGLE_APPLICATION_CREDENTIALS", "SOMEAPIKEY"}
+
+
+def test_child_environment_drops_secret_variables_and_keeps_the_rest():
+    env = identity.child_environment(_FIXTURE_ENV)
+    assert not (_SECRETS & set(env))
+    assert "HARBOR_LAUNCH_NONCE" not in env and "PYTHONNOUSERSITE" not in env
+    assert env["PATH"] == "/usr/bin:/bin" and env["EDITOR"] == "vi"
+    assert env["HARBOR_GOOGLE_KEYCHAIN"] == "on"          # a setting, not a key
+
+
+def test_a_skill_gets_only_the_allowlisted_environment():
+    env = identity.skill_environment(_FIXTURE_ENV)
+    assert set(env) == {"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER"}

@@ -144,6 +144,38 @@ def test_failed_source_cannot_reach_approval(delivery, source):
     assert not delivery.effects and not delivery.approved
 
 
+PARTIAL = ("Harbor could not check Reminders. Allow Harbor in System Settings > Privacy & Security "
+           "> Reminders. This schedule may be incomplete.\n"
+           "- TOMORROW (Tue Sep 22) 9:00 AM (in 1 d) meeting: Dentist [Calendar event]")
+
+
+def test_one_source_that_could_not_be_checked_carries_a_warning_instead_of_aborting(delivery):
+    delivery.source = PARTIAL
+    result = run_delivery(delivery)
+    assert result.status == "completed"
+    assert len(delivery.effects) == len(delivery.approved) == 1
+    text = delivery.effects[0]["text"]
+    assert delivery.effects[0] == delivery.approved[0]["args"]          # the approved args are what is sent
+    assert "Dentist" in text
+    note = "Note: Reminders could not be checked, so this may be incomplete."
+    assert note not in text and "may be incomplete" not in text, "the recipient never gets the note"
+    assert "System Settings" not in text and "Harbor could not check" not in text
+    assert note in delivery.approved[0]["preview"], "the user sees it before approving"
+    assert note in str(result.response), "and in what Harbor reports back"
+
+
+@pytest.mark.parametrize("source", [
+    "Harbor could not check Calendar and Reminders. This schedule may be incomplete.\n"
+    "No scheduled items were found in the sources that could be checked.",
+    "Harbor could not check Calendar. This schedule may be incomplete.\nHarbor is still syncing your calendar\n- x",
+])
+def test_a_partial_read_with_no_rows_or_another_failure_still_cannot_reach_approval(delivery, source):
+    delivery.source = source
+    result = run_delivery(delivery)
+    assert result.status == "failed"
+    assert not delivery.effects and not delivery.approved
+
+
 def test_dry_run_executes_nothing(delivery):
     result = run_delivery(delivery, test_mode=True)
     assert result.status == "planned"

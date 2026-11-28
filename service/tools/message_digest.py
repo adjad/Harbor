@@ -528,5 +528,5 @@ def render(groups: list[Conversation], label: str, *, topics: dict[str, list[str
         output.append(section_text)
         shown += 1
     if shown < len(groups):
-        output.append(f"Showing {shown} of {len(groups)} conversations; {len(groups) - shown} more are included in the count. Ask for a narrower period for more detail.")
+        output.append(f"Showing {shown} of {len(groups)} conversations (+{len(groups) - shown} more); {len(groups) - shown} more are included in the count. Ask for a narrower period for more detail.")
     return "\n\n".join(output)

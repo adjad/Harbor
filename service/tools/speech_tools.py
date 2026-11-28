@@ -44,6 +44,10 @@ def text_to_speech(text: str, voice: str = "", save_to: str = "") -> str:
     if save_to.strip():
         from pathlib import Path
         out_path = Path(save_to).expanduser()
+        if save_to.strip().endswith(("/", "\\")) or out_path.is_dir():
+            # A folder is not a file name: "~/Desktop" must not become
+            # "~/Desktop.aiff".
+            out_path = out_path / "Speech.aiff"
         if out_path.suffix.lower() != ".aiff":
             out_path = out_path.with_suffix(".aiff")
         argv += ["-o", str(out_path)]

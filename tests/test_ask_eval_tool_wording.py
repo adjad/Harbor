@@ -30,8 +30,34 @@ def test_a_catch_all_query_lists_every_reminder(monkeypatch):
             {"title": "Call the dentist", "source": "reminders", "when_ts": 2}]
     monkeypatch.setattr(A.assistant_store, "active_between", lambda *a, **k: list(rows))
     for q in ("all", "*", "everything", "tasks", " ALL "):
-        assert [r["title"] for r in A.reminders_matching("all", q)] == ["Pay rent", "Call the dentist"]
-    assert [r["title"] for r in A.reminders_matching("all", "rent")] == ["Pay rent"]
+        assert [r["title"] for r in A.reminders_matching("all", q, listing_words=True)] == [
+            "Pay rent", "Call the dentist"]
+    assert [r["title"] for r in A.reminders_matching("all", "rent", listing_words=True)] == ["Pay rent"]
+
+
+def test_a_removal_keeps_catch_all_words_literal(monkeypatch):
+    # clear_reminders(scope="all", query="todo") must not widen into every reminder.
+    import asyncio
+    from service.tools import assistant_tools as A
+    rows = [{"id": "r1", "title": "Pay rent", "source": "reminders", "when_ts": 1},
+            {"id": "r2", "title": "Todo: call the dentist", "source": "reminders", "when_ts": 2}]
+    monkeypatch.setattr(A.assistant_store, "active_between", lambda *a, **k: list(rows))
+    for q in ("todo", "tasks", "due", "open", "everything"):
+        assert [r["title"] for r in A.reminders_matching("all", q)] == (
+            ["Todo: call the dentist"] if q == "todo" else []), q
+    retired = []
+
+    async def retire(c):
+        retired.append(c["id"])
+    monkeypatch.setattr(A, "_retire", retire)
+    from service.assistant.hub import hub
+    async def publish(_event):
+        return None
+    monkeypatch.setattr(hub, "publish", publish)
+    assert "Cleared 1 reminder" in asyncio.run(A.clear_reminders("all", "todo"))
+    assert retired == ["r2"]
+    assert "No active reminders found" in asyncio.run(A.clear_reminders("all", "tasks"))
+    assert retired == ["r2"]
 
 
 def test_voice_questions_point_to_harbors_own_shortcut():

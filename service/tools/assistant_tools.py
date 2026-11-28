@@ -345,8 +345,11 @@ def _agenda_item(item: dict, *, now: float | None = None,
     started_before_day = (display_day_start is not None
                           and float(item["when_ts"]) < display_day_start
                           and float(item.get("end_ts") or 0) > display_day_start)
+    in_progress = (not started_before_day and item.get("source") == "calendar"
+                   and float(item["when_ts"]) < now <= float(item.get("end_ts") or 0))
     clock = ("All day" if item.get("all_day") else
              f"Started {when.strftime('%a')} {_agenda_clock(when, now)}" if started_before_day else
+             f"{_agenda_clock(when, now)} (in progress)" if in_progress else
              _agenda_clock(when, now))
     location = _agenda_text(item.get("location"))
     suffix = f" · {location}" if location else ""
@@ -539,7 +542,9 @@ def _format_calendar_end_times(items: list[dict], *, now: float, window_label: s
 async def get_upcoming(days: int = 7, account: str | None = None,
                        include_holidays: bool = False, period: str = "",
                        calendar_only: bool = False, query: str = "",
-                       boundary: str = "start") -> str:
+                       boundary: str = "start", *, _covered_until: float | None = None) -> str:
+    """``_covered_until`` (internal, never in the schema) cuts the window at the end of
+    the Calendar read's verified coverage, for a caller that shows a partly covered range."""
     if boundary not in {"start", "end"} or (boundary == "end" and (not calendar_only or not query)):
         return "(error: scheduled end projection requires a named Calendar-only query)"
     from service.assistant.sync_status import ensure_sources
@@ -578,6 +583,8 @@ async def get_upcoming(days: int = 7, account: str | None = None,
         except BadPeriod as exc:
             return f"(error: {exc})"
         today_period = start == today_start and end == today_end
+        if _covered_until is not None and start < _covered_until < end:
+            end = _covered_until
         # A named period such as "this month" describes the forward agenda
         # from this moment, not a historical month-to-date dump. Preserve the
         # period's end/boundary semantics while removing elapsed entries.
@@ -596,6 +603,8 @@ async def get_upcoming(days: int = 7, account: str | None = None,
         # raw Calendar occurrences instead, retaining the existing inclusive
         # elapsed-seconds horizon (explicit periods remain half-open).
         end = now + days * 86400
+        if _covered_until is not None and now < _covered_until < end:
+            end = _covered_until
         brief_start = now
         calendar_rows = assistant_store.calendar_events_overlapping(
             now, math.nextafter(end, math.inf))
@@ -638,9 +647,12 @@ async def get_upcoming(days: int = 7, account: str | None = None,
         items = day_agenda.merge(items, day_rows)
     # `upcoming()` normally makes this redundant, but the tool must not
     # describe a just-elapsed entry as "upcoming" when a source returns one.
+    # A Calendar event already under way (started, not yet over) is still on the schedule:
+    # "what's next" during a long meeting must not skip the one the user is in.
     items = _collapse_schedule_rows(
         [item for item in items
          if float(item.get("when_ts") or 0) >= now
+         or (item.get("source") == "calendar" and float(item.get("end_ts") or 0) >= now)
          or ((period or boundary == "end") and item.get("source") in ("calendar", "day")
              and (item.get("kind") != "due" or item.get("source") == "calendar"))])
     # Dated to-dos the Brief read from mail, texts and notes (a family lunch
@@ -906,6 +918,23 @@ async def update_reminder(title: str = "", when_iso: str = "", day: str = "",
         candidates = [c for c in candidates
                       if str(c.get("id") or "") == expected_id
                       or expected_id in {str(value) for value in c.get("duplicate_ids") or []}]
+    # An incomplete Apple reminder with no due date is a reminder too: find it in the
+    # current undated list (it is never in the dated rows above).
+    undated = _undated_targets(title, expected_id, candidates) if (title.strip() or expected_id) else []
+    if undated:
+        if title.strip():
+            wanted = " ".join(title.split()).casefold()
+            exact_dated = [c for c in candidates if " ".join(c["title"].split()).casefold() == wanted]
+            exact_undated = [u for u in undated if " ".join(u["title"].split()).casefold() == wanted]
+            if exact_dated or exact_undated:
+                candidates, undated = exact_dated, exact_undated
+        if len(candidates) + len(undated) > 1:
+            choices = "; ".join(
+                [f"{c['title']} ({datetime.fromtimestamp(c['when_ts']).strftime('%a %-I:%M %p')})"
+                 for c in candidates[:5]] + [f"{u['title']} (no due date)" for u in undated[:5]])
+            return not_done(f"Several reminders match “{title}”: {choices}. Which one?")
+        if undated:
+            return await _update_undated_reminder(undated[0], when_iso, day, new_title)
     if not candidates:
         if expected_id:
             return not_done("(error: the selected reminder changed before it could be updated; "
@@ -1009,12 +1038,86 @@ async def update_reminder(title: str = "", when_iso: str = "", day: str = "",
     return f"Reminder updated: “{final_title}” — {when_label}."
 
 
+def _undated_targets(title: str, expected_id: str, dated: list[dict]) -> list[dict]:
+    """Undated Apple reminders an update may target: from a CURRENT undated list only
+    (a stale list could name one that already changed), matching the title words or the
+    exact selected id, and never a native id that also has an active dated row."""
+    try:
+        view = assistant_store.undated_view()
+        if view.get("freshness") != "current":
+            return []
+        rows = (assistant_store.undated_reminders(title if not expected_id else "")
+                + assistant_store.undated_reminders(title if not expected_id else "", policy_hidden=True))
+    except Exception:  # noqa: BLE001 - no undated list is no undated target
+        return []
+    if expected_id:
+        rows = [r for r in rows if r["source_id"] == expected_id]
+    dated_ids = {str(c.get("source_id") or "") for c in dated}
+    try:
+        dated_ids |= {str(c.get("source_id") or "") for c in reminders_matching("all", "", include_stale=True)}
+    except Exception:  # noqa: BLE001
+        pass
+    seen, out = set(), []
+    for row in rows:
+        if row["source_id"] in dated_ids or row["source_id"] in seen:
+            continue
+        seen.add(row["source_id"])
+        out.append(row)
+    return out
+
+
+async def _update_undated_reminder(row: dict, when_iso: str, day: str, new_title: str) -> str:
+    """Give an undated Apple reminder a due time (and optionally a new title). The native
+    writer checks it still has this title, still has no due date and is still open; the
+    target says so with expected_due_ts null."""
+    from service.assistant.verified_reminders import valid_due_date, due_timestamp, validate_result
+    if not when_iso:
+        if day in {"today", "tomorrow"}:
+            return not_done(f"“{row['title']}” has no due time to keep; what time {day} should it be?",
+                            question=f"What time {day} should “{row['title']}” be due?")
+        return not_done(f"(error: “{row['title']}” is a reminder with no due date, and Harbor can "
+                        "only change it by giving it a due date or time; pass when_iso. Nothing "
+                        "was changed.)")
+    date_only = valid_due_date(when_iso)
+    try:
+        target = datetime.fromisoformat(when_iso)
+    except ValueError:
+        return not_done(f"(error: bad when_iso {when_iso!r} — use e.g. 2026-08-27T09:00)")
+    if date_only:
+        new_when = due_timestamp({'all_day': True, 'due_date': target.date().isoformat()})
+        if target.date() < datetime.now().date():
+            return not_done("(error: that date has passed; the reminder was not changed.)")
+    else:
+        new_when = target.timestamp()
+        if new_when < time.time() - 60:
+            return not_done(f"(error: {target:%a %b %-d at %-I:%M %p} is in the past; the reminder "
+                            "was not changed.)")
+    final_title = new_title.strip() or row["title"]
+    payload = {"source_id": row["source_id"], "expected_title": row["title"],
+               "expected_due_ts": None, "title": final_title,
+               **({'all_day': True, 'due_date': target.date().isoformat()} if date_only
+                  else {'due_ts': new_when})}
+    from service.assistant.outbox import request as app_request
+    from service.assistant.hub import hub
+    result = await app_request("update_reminder", payload)
+    if result.get("ok") is not True:
+        return f"(error: {result.get('error') or 'Reminder update was not verified'}; check the exact reminder before another attempt.)"
+    try:
+        validate_result('update_reminder', payload, result)
+    except (KeyError, TypeError, ValueError):
+        return '(error: the reminder update was not verified; check Reminders before retrying.)'
+    await hub.publish({"type": "changed"})
+    when_label = (target.strftime('%a %b %-d, %Y') + ' (all day; no timed alarm)' if date_only
+                  else target.strftime('%a %b %-d at %-I:%M %p'))
+    return f"Reminder updated: “{final_title}” — {when_label}."
+
+
 @register(
     "add_calendar_event",
     "Create a REAL event in the user's macOS Calendar (it syncs to their other "
     "devices via iCloud/Google). Use this when the user wants an actual calendar "
-    "event or meeting — as opposed to add_reminder, which only makes a private "
-    "Harbor reminder. The Harbor app performs the write, so it also appears in the "
+    "event or meeting — add_reminder makes an Apple Reminders to-do, not an event. "
+    "The Harbor app performs the write, so it also appears in the "
     "upcoming list on the next sync.",
     {"type": "object",
      "properties": {
@@ -1172,8 +1275,8 @@ def prepare_event_move(args: dict) -> dict:
                           "description": "new length in minutes, only when the user asks for one; omit to keep it"},
          "current_when_iso": {"type": "string",
                               "description": "the event's CURRENT local start, only when several events share the title"},
-         "location": {"type": "string", "description": "not supported; leave empty"},
-         "new_title": {"type": "string", "description": "not supported; leave empty"},
+         # No location or new_title: a move changes only the time, and event_move_plan
+         # refuses either one, so offering them only invited a call that must fail.
      },
      "required": ["title", "when_iso"]},
     category="calendar_write",
@@ -1607,14 +1710,23 @@ _REMINDER_SOURCES = frozenset({"manual", "reminders"})
 # listed as a current reminder by a read.
 STALE_HARBOR_ONLY_DAYS = 14
 _REMINDER_SCOPES = frozenset({"today", "tomorrow", "past_due", "upcoming", "all"})
+_LISTING_WORDS = frozenset({"all", "*", "any", "everything", "reminder", "reminders", "my reminders",
+                            "tasks", "task", "to-dos", "todos", "to do", "todo", "due", "due soon",
+                            "upcoming", "overdue", "open", "pending", "incomplete"})
 
 
 def reminders_matching(scope: str = "all", query: str = "",
-                       *, now: float | None = None, include_stale: bool = False) -> list[dict]:
+                       *, now: float | None = None, include_stale: bool = False,
+                       listing_words: bool = False) -> list[dict]:
     """Active Harbor/Reminders.app items in a deterministic time scope.
 
     Calendar events are excluded. A Harbor reminder can carry a task-like kind,
     so source provenance—not the display kind—is the safe boundary.
+
+    ``listing_words=True`` is for READS only: a query like "all", "tasks" or "todo"
+    then means "list them", not a title. A removal (clear_reminders and its
+    confirmation preview) keeps the words literal, so "clear my todo reminders"
+    never widens into deleting every reminder.
     """
     scope = (scope or "all").strip().lower()
     if scope not in _REMINDER_SCOPES:
@@ -1642,27 +1754,30 @@ def reminders_matching(scope: str = "all", query: str = "",
     needle = (query or "").strip().lower()
     # "all", "*" or "everything" from the model means list them all, not a
     # reminder titled "all" (2026-10-29 Ask run: "you have no reminders").
-    if needle in {"all", "*", "any", "everything", "reminder", "reminders", "my reminders",
-                  "tasks", "task", "to-dos", "todos", "to do", "todo", "due", "due soon",
-                  "upcoming", "overdue", "open", "pending", "incomplete"}:
+    if listing_words and needle in _LISTING_WORDS:
         needle = ""
     if needle:
         items = [c for c in items if needle in (c.get("title") or "").lower()]
     return items
 
 
-def _drop_stale_harbor_only(items: list[dict], now: float | None = None
-                          ) -> tuple[list[dict], int]:
-    """Split off long-overdue Harbor-only records; return (kept, hidden count)."""
+def _split_stale_harbor_only(items: list[dict], now: float | None = None
+                             ) -> tuple[list[dict], list[dict]]:
+    """(kept, long-overdue Harbor-only records), in input order."""
     cutoff = (time.time() if now is None else float(now)) - STALE_HARBOR_ONLY_DAYS * 86400
-    kept = []
+    kept, older = [], []
     for item in items:
         sources = {str(item.get("source") or "")} | set(item.get("duplicate_sources") or [])
         harbor_only = "manual" in sources and not ({"reminders", "calendar"} & sources)
-        if harbor_only and float(item.get("when_ts") or 0) < cutoff:
-            continue
-        kept.append(item)
-    return kept, len(items) - len(kept)
+        (older if harbor_only and float(item.get("when_ts") or 0) < cutoff else kept).append(item)
+    return kept, older
+
+
+def _drop_stale_harbor_only(items: list[dict], now: float | None = None
+                          ) -> tuple[list[dict], int]:
+    """Split off long-overdue Harbor-only records; return (kept, hidden count)."""
+    kept, older = _split_stale_harbor_only(items, now)
+    return kept, len(older)
 
 
 _UNDATED_NOT_INCLUDED = ("Reminders without a due date were not included in the latest read, "
@@ -1718,6 +1833,56 @@ def _stale_note(hidden: int) -> str:
             "(no Apple Reminders copy is confirmed). Ask to clear past-due items to remove them.")
 
 
+def _older_harbor_section(items: list[dict]) -> str:
+    """A direct read lists the long-overdue Harbor-only records too, apart and labelled."""
+    if not items:
+        return ""
+    lines = [f"- {item['title']} — {datetime.fromtimestamp(float(item['when_ts'])):%a %b %-d, %Y at %-I:%M %p}"
+             for item in items]
+    return (f"\nOlder Harbor-only records, overdue by more than {STALE_HARBOR_ONLY_DAYS} days (no "
+            "Apple Reminders copy is confirmed; Harbor no longer brings them up on its own). Ask to "
+            "clear past-due items to remove them:\n" + "\n".join(lines))
+
+
+def _quiet_reminders(scope: str, query: str, shown: list[dict]) -> list[dict]:
+    """Reminders in scope that the stale-reminder policy keeps out of briefs, nudges and
+    plans (a week or more overdue, never marked Keep). A direct read still lists them."""
+    shown_ids = {item.get("id") for item in shown}
+    return [item for item in reminders_matching(scope, query, include_stale=True, listing_words=True)
+            if item.get("id") not in shown_ids]
+
+
+def _quiet_undated(query: str, scope: str) -> str:
+    """Undated Apple reminders a week old or more that the stale policy keeps quiet."""
+    if scope != "all":
+        return ""
+    try:
+        view, rows = assistant_store.undated_listing(query, policy_hidden=True)
+    except Exception:  # noqa: BLE001
+        return ""
+    if view.get("freshness") != "current" or not rows:
+        return ""
+    lines = [f"- {item['title']}" + (f" ({item['context']})" if item.get("context") else "")
+             for item in rows]
+    return ("Older Apple Reminders with no due date (a week old or more and not marked Keep; "
+            "Harbor no longer brings them up on its own, but they are still open):\n" + "\n".join(lines))
+
+
+# "important", "urgent" or "priority" from the model is a request to see what needs
+# attention, not a title word. Apple's priority and flag are not part of the synced
+# reminder rows, so the browse is by due time: overdue first, then due soon, plus any
+# reminder whose title carries the word itself.
+_PRIORITY_WORDS = frozenset({
+    "important", "urgent", "priority", "priorities", "high priority", "high-priority",
+    "important reminders", "urgent reminders", "priority reminders", "important tasks",
+    "urgent tasks", "most important", "critical", "asap", "flagged", "pressing"})
+PRIORITY_SOON_DAYS = 3
+
+
+def _is_priority_browse(query: str) -> bool:
+    return (query or "").strip().lower() in _PRIORITY_WORDS
+
+
 # A time word passed as the query is a time scope, not a title: "overdue" listed
 # every reminder and the model called them all overdue (0.5.0 dev8 audit).
 _OVERDUE_WORDS = frozenset({"overdue", "past due", "past-due", "late", "missed"})
@@ -1729,6 +1894,8 @@ def _reminder_query_scope(query: str, scope: str) -> tuple[str, str, int | None]
     """(query, scope, horizon in days) with a time word in the query applied as a
     scope: "overdue" → past_due, "due soon" → upcoming within DUE_SOON_DAYS."""
     needle = (query or "").strip().lower()
+    if needle in _PRIORITY_WORDS:
+        return "", scope, None
     if (scope or "all").strip().lower() == "all":
         if needle in _OVERDUE_WORDS:
             return "", "past_due", None
@@ -1741,7 +1908,7 @@ def _reminder_query_scope(query: str, scope: str) -> tuple[str, str, int | None]
     "search_reminders",
     "The user's to-dos, tasks and reminders: open, pending, overdue, due soon. Leave query "
     "empty to list them; set it only to words from a reminder's title (never 'due', 'tasks' "
-    "or a date). Searches Apple Reminders and retained Harbor-only records by title, overdue "
+    "or a date; 'urgent' lists overdue/due). Searches Apple Reminders and retained Harbor-only records by title, overdue "
     "included; calendar events are excluded. A Harbor-only record may mirror a deleted Apple "
     "item: show it separately, never as a current Apple item. Source labels do not say who "
     "created a reminder. Brief to-dos from email, texts and notes are listed apart; they are not "
@@ -1785,6 +1952,7 @@ def _reminders_brief(query: str, scope: str) -> str:
 
 
 async def _search_reminders(query: str, scope: str) -> str:
+    priority_word = (query or "").strip() if _is_priority_browse(query) else ""
     query, scope, horizon = _reminder_query_scope(query, scope)
     from service.assistant.sync_status import ensure_sources
     readiness = await ensure_sources(("reminders",), timeout_seconds=4.0)
@@ -1804,11 +1972,34 @@ async def _search_reminders(query: str, scope: str) -> str:
         notice = ""
     # Harbor's own records remain searchable while Apple Reminders cannot be
     # verified; only the native snapshot is withheld.
-    items, hidden = _drop_stale_harbor_only(reminders_matching(scope, query))
+    shown = reminders_matching(scope, query, listing_words=True)
+    # The stale-reminder policy keeps these out of briefs and nudges; a read lists them.
+    quiet = _quiet_reminders(scope, query, shown)
+    if notice:
+        quiet = _without_withheld_sources(quiet, {"reminders"})
+    items, older = _split_stale_harbor_only(shown)
     if horizon is not None:
         cutoff = time.time() + horizon * 86400
         items = [c for c in items if float(c.get("when_ts") or 0) <= cutoff]
-    stale_note = _stale_note(hidden)
+        quiet = [c for c in quiet if float(c.get("when_ts") or 0) <= cutoff]
+    priority_note = ""
+    if priority_word:
+        soon = time.time() + PRIORITY_SOON_DAYS * 86400
+        needle = priority_word.lower()
+
+        def pressing(c: dict) -> bool:
+            return (float(c.get("when_ts") or 0) <= soon
+                    or needle in (c.get("title") or "").lower())
+        items = [c for c in items if pressing(c)]
+        priority_note = (f"Asked for {priority_word!r} reminders: Apple Reminders' priority and flag "
+                         "are not synced to Harbor, so this lists what is overdue or due in the next "
+                         f"{PRIORITY_SOON_DAYS} days (plus any titled {priority_word!r}), soonest first.")
+    stale_note = _older_harbor_section(older)
+    if quiet:
+        quiet_lines = [f"- {c['title']} — {datetime.fromtimestamp(float(c['when_ts'])):%a %b %-d, %Y at %-I:%M %p}"
+                       for c in quiet]
+        stale_note += ("\nOverdue a week or more and not marked Keep (Harbor no longer brings these "
+                       "up on its own, but they are still open):\n" + "\n".join(quiet_lines))
     if notice:
         items = _without_withheld_sources(items, {"reminders"})
         harbor_lines = []
@@ -1821,6 +2012,17 @@ async def _search_reminders(query: str, scope: str) -> str:
                 "Apple Reminders couldn't be checked; they may still be active):\n"
                 + "\n".join(harbor_lines) + stale_note)
     undated_section, undated_caveat = _undated_report(query, scope)
+    if priority_word and undated_section and scope == "all":
+        # Nothing undated is due, so none is pressing by time; count them instead of
+        # burying the overdue and due-soon ones under the whole undated list.
+        count = undated_section.count("\n- ")
+        undated_section = (f"{count} Apple reminder{'s' if count != 1 else ''} with no due date "
+                           f"{'are' if count != 1 else 'is'} not listed here; ask for all reminders "
+                           f"to see {'them' if count != 1 else 'it'}.")
+    elif not notice:
+        quiet_undated = _quiet_undated(query, scope)
+        if quiet_undated:
+            stale_note += "\n" + quiet_undated
     filtered = ("Only reminders already overdue (due before now) are listed." if scope == "past_due"
                 and not query else f"Only reminders due in the next {horizon} days are listed."
                 if horizon is not None else "")
@@ -1841,6 +2043,8 @@ async def _search_reminders(query: str, scope: str) -> str:
         (native_lines if "reminders" in sources else harbor_lines).append(line)
     sections = ["A fresh Apple Reminders read supersedes older remembered claims. "
                 "These lists describe storage, not who created an item."]
+    if priority_note:
+        sections.append(priority_note)
     if filtered:
         sections.append(filtered)
     sections.append("Apple Reminders incomplete-item matches:\n" +

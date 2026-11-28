@@ -522,6 +522,30 @@ def test_a_hinted_request_does_not_import_unrelated_families():
     assert not {"harbor_mcp", "set_display", "list_bluetooth_devices"} & set(menu)
 
 
+_EVERYDAY = {"update_reminder", "complete_reminder", "find_free_time", "get_past_events",
+             "draft_email", "forward_email"}
+
+
+def test_menu_family_heads_keep_the_everyday_calendar_and_mail_tools():
+    from service.router.menu import CORE, head_size
+    heads = set(CORE["calendar"][:head_size("calendar")]) | set(CORE["mail"][:head_size("mail")])
+    assert _EVERYDAY <= heads
+
+
+def test_a_busy_compound_menu_still_carries_the_everyday_tools():
+    from service.router.menu import MAX_MENU, build_menu
+    menu = build_menu("draft an email to sam and forward the lease email to dana@example.com, "
+                      "and check my calendar and texts")
+    assert _EVERYDAY <= set(menu) and len(menu) <= MAX_MENU
+
+
+def test_menu_has_a_recent_activity_family():
+    from service.router.menu import CORE, build_menu
+    assert CORE["harbor_activity"] == ("get_recent_activity",)
+    assert "get_recent_activity" in build_menu("what's new?")
+    assert "get_recent_activity" in build_menu("catch me up on what I missed")
+
+
 def test_menu_respects_forbidden_and_cap():
     from service.router.menu import build_menu, MAX_MENU
     menu = build_menu("text mom and email dad and check my calendar and notes",

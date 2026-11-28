@@ -41,7 +41,8 @@ Rules:
   leaves unused flows to the next. It says what it left out and why.
 - Emails dated more than 36 hours ahead are real scheduled mail: left out of "recent"
   results unless the person gave a date range. Tiny images (logos, signature icons) are
-  skipped unless named.
+  skipped unless named, or unless the request is for receipts, QR codes, tickets or passes,
+  which are often that small.
 """
 from __future__ import annotations
 
@@ -70,6 +71,11 @@ MAX_READS = 8
 DEADLINE_S = 150.0
 RESULT_BUDGET_CHARS = 6000
 TINY_IMAGE_BYTES = 20_000
+# Receipts, QR codes, tickets and passes are often pictures under TINY_IMAGE_BYTES:
+# when the request names one, small pictures are kept, not skipped as logos.
+_SMALL_WANTED = re.compile(
+    r"\b(?:e-?)?(?:receipts?|qr(?:[\s-]?codes?)?|bar[\s-]?codes?|tickets?|boarding[\s-]+pass(?:es)?|"
+    r"passes|vouchers?|coupons?)\b", re.I)
 FUTURE_HOURS = 36
 DEFAULT_COUNT = 5
 _RESERVE = 450                      # room kept for the "left out" notes
@@ -1984,12 +1990,13 @@ class _Found:
 
 async def find(query: str | None = None, name: str | None = None, start: float | None = None,
                end: float | None = None, account: str | None = None, count: int = DEFAULT_COUNT,
-               source: str = "mail", most: int = MAX_EMAILS) -> tuple[list[_Email], list[str]]:
+               source: str = "mail", most: int = MAX_EMAILS, asks: str = "") -> tuple[list[_Email], list[str]]:
     """The emails (or, with source="messages", the messages) that hold matching files, newest first,
     at most `count` and never more than `most`, and the notes about what was left out. Searches only;
-    no model is used and no file is fetched."""
+    no model is used and no file is fetched. `asks` is the person's question, read only to tell
+    whether small pictures (receipts, QR codes) are wanted."""
     found = await _find(query, name, start, end, account, count, "messages" if source == "messages" else "mail",
-                        most)
+                        most, asks)
     return found.chosen, found.notes
 
 
@@ -1998,15 +2005,20 @@ _MESSAGES_SEARCH_S = 12.0           # the Messages search and its one retry, tog
 _SENDER_NOTES = ("Looked for files sent by", "Nothing from ")
 
 
-async def _find(query, name, start, end, account, count, source: str, most: int) -> _Found:
+def _wants_small(*texts) -> bool:
+    """The request is for something often sent as a small picture: a receipt, a QR code, a ticket."""
+    return any(isinstance(t, str) and _SMALL_WANTED.search(t) for t in texts)
+
+
+async def _find(query, name, start, end, account, count, source: str, most: int, asks: str = "") -> _Found:
     """`_find_core`; in Messages, when words that name contacts were turned into senders and that found
     nothing, once more with the words as plain terms and no senders."""
     if source != "messages":
-        return await _find_core(query, name, start, end, account, count, source, most, True)
+        return await _find_core(query, name, start, end, account, count, source, most, True, asks)
     began = time.monotonic()
     slow = _Found([], ["Messages couldn't be searched: it took too long."], terms_of(query), [], "", [], True)
     try:
-        found = await asyncio.wait_for(_find_core(query, name, start, end, account, count, source, most, True),
+        found = await asyncio.wait_for(_find_core(query, name, start, end, account, count, source, most, True, asks),
                                        _MESSAGES_SEARCH_S)
     except (TimeoutError, asyncio.TimeoutError):
         return slow
@@ -2015,7 +2027,7 @@ async def _find(query, name, start, end, account, count, source: str, most: int)
         # Both searches together get _MESSAGES_SEARCH_S, so the reads that follow still have time.
         try:
             again = await asyncio.wait_for(
-                _find_core(query, name, start, end, account, count, source, most, False), left)
+                _find_core(query, name, start, end, account, count, source, most, False, asks), left)
         except (TimeoutError, asyncio.TimeoutError):
             return slow
         again.notes = [f"Nothing from {_names_text(found.senders)}, so looked for the word instead.", *again.notes]
@@ -2023,7 +2035,8 @@ async def _find(query, name, start, end, account, count, source: str, most: int)
     return found
 
 
-async def _find_core(query, name, start, end, account, count, source: str, most: int, contacts: bool) -> _Found:
+async def _find_core(query, name, start, end, account, count, source: str, most: int, contacts: bool,
+                     asks: str = "") -> _Found:
     from service import gmail_source
     messages = source == "messages"
     noun = "message" if messages else "email"
@@ -2097,6 +2110,7 @@ async def _find_core(query, name, start, end, account, count, source: str, most:
                          "ahead (scheduled mail) not counted as recent.")
         emails = [e for e in emails if e.ts <= cutoff]
     named = str(name or "").strip().casefold()
+    small_wanted = _wants_small(query, name, asks)
     tiny = 0
     for e in emails:
         kept = []
@@ -2104,7 +2118,7 @@ async def _find_core(query, name, start, end, account, count, source: str, most:
             if named:
                 if named not in f.name.casefold():
                     continue
-            elif (_is_picture(f.name, f.mime) and 0 < f.size < TINY_IMAGE_BYTES):
+            elif (not small_wanted and _is_picture(f.name, f.mime) and 0 < f.size < TINY_IMAGE_BYTES):
                 tiny += 1
                 continue
             kept.append(f)
@@ -2140,7 +2154,8 @@ async def _run(query, name, start, end, label, count, account, question, list_on
         question = question or f"Find this in the file: {words}"
         fell_through = ("Nothing Harbor had already read matched, so these are listed instead." if list_only
                         else "Nothing Harbor had already read matched, so it read these now.")
-    found = await _find(query, name, start, end, account, count, source, MAX_EMAILS)
+    found = await _find(query, name, start, end, account, count, source, MAX_EMAILS,
+                        " ".join(str(x) for x in (question, inside) if x))
     chosen, notes, terms, accounts, named = found.chosen, found.notes, found.terms, found.accounts, found.named
     if fell_through:
         notes.append(fell_through)
@@ -2539,7 +2554,8 @@ async def _run_across(query, name, start, end, label, account, question, source)
         return _LOCAL_ONLY
     deadline = time.monotonic() + DEADLINE_S
     work = deadline - _ACROSS_SPARE_S
-    found = await _find(query, name, start, end, account, _ACROSS_FILES, source, _ACROSS_FILES)
+    found = await _find(query, name, start, end, account, _ACROSS_FILES, source, _ACROSS_FILES,
+                        str(question or ""))
     if not found.chosen:
         return _nothing_found(found, name, label, messages)
     flat = [(e, f) for e in found.chosen for f in e.files]

@@ -23,7 +23,7 @@ from service.tools.registry import register
     "often they email — the closest thing to 'what am I subscribed to' "
     "without a dedicated unsubscribe-tracking service. Counts and current "
     "unread flags do not establish that a sender's messages were never opened. "
-    "Use unsubscribe to inspect a candidate link for review.",
+    "Harbor can't unsubscribe; the sender's own email has the link.",
     {"type": "object",
      "properties": {
          "limit": {"type": "integer", "description": "How many senders to list. Default 15."},

@@ -309,3 +309,83 @@ def test_before_after_sizes(capsys):
         assert len(text) > LIMIT
     with capsys.disabled():
         print("\n" + "\n".join(lines))
+
+
+# ------------------------------------------------- digests, notes and intent words
+
+from service.agent.result_filter import SHAPED_TOOLS, _terms  # noqa: E402
+
+_DIGEST_TOOLS = ("search_notes", "search_reminders", "get_upcoming", "summarize_emails",
+                 "summarize_messages", "triage_inbox", "get_my_day_plan", "recall")
+
+
+def test_every_personal_digest_has_a_shaper():
+    assert set(_DIGEST_TOOLS) <= SHAPED_TOOLS
+
+
+def test_two_letter_acronyms_are_terms_and_lowercase_fillers_are_not():
+    terms = _terms("What did the TA say about the HR form, my AI class and the ID card? ok an")
+    assert {"ta", "hr", "ai", "id", "form"} <= set(terms)
+    assert "ok" not in terms and "an" not in terms
+
+
+def test_importance_words_are_intent_not_search_terms():
+    assert _terms("any important or urgent notes? priority items") == ("items",)
+
+
+def _reminder_digest(n: int, needle_at: int) -> str:
+    lines = ["Overdue:"]
+    lines += [f"- Renew library card {i} — due Mon Mar {1 + i % 27}" + " filler" * 12
+              for i in range(n)]
+    lines += ["", "Open, no date:"]
+    lines += [f"- Water the plants {i}" + " filler" * 12 for i in range(n)]
+    lines[needle_at] = "- Send the TA the lab report — due Fri Mar 6"
+    return "\n".join(lines)
+
+
+def test_reminder_digest_keeps_the_matching_row_past_the_head():
+    text = _reminder_digest(80, 150)
+    assert len(text) > LIMIT
+    out = shape_result(text, "search_reminders", LIMIT, "did I send the TA my report?")
+    assert len(out) <= LIMIT
+    assert "Send the TA the lab report" in out          # row 150 survives the cut
+    assert "Overdue:" in out and "Open, no date:" in out
+    assert "more reminders not shown" in out and "This is NOT all of it" in out
+
+
+def test_digest_with_no_matching_words_samples_every_section():
+    text = _reminder_digest(80, 1)
+    out = shape_result(text, "get_my_day_plan", LIMIT, "what's important today?")
+    assert "Water the plants 0" in out                   # the second section is not starved
+    assert "Renew library card 1" in out
+    assert out.count("more here not shown") == 2
+
+
+def test_literal_important_does_not_outrank_the_named_item():
+    rows = [f"- Newsletter {i} — IMPORTANT update inside, important offer" + " x" * 40
+            for i in range(120)]
+    rows[90] = "- Grace Hopper — budget review for the HR audit"
+    text = "Senders by importance:\n" + "\n".join(rows)
+    out = shape_result(text, "triage_inbox", LIMIT, "any important mail about the HR audit?")
+    assert len(out) <= LIMIT and "Newsletter 119" not in out
+    assert "budget review for the HR audit" in out
+
+
+def test_notes_shaper_keeps_the_matching_note_and_says_what_is_missing():
+    blocks = []
+    for i in range(40):
+        title = "Packing list for the AI conference" if i == 33 else f"Grocery list {i}"
+        blocks.append(f"Title: {title} [Personal]\nModified: Sun Mar 1, 2026 9:00 AM\n\n"
+                      + ("eggs, milk, bread. " * 12))
+    text = "\n\n---\n\n".join(blocks)
+    assert len(text) > LIMIT
+    out = shape_result(text, "search_notes", LIMIT, "what's on my AI conference packing list?")
+    assert len(out) <= LIMIT
+    assert "Packing list for the AI conference" in out
+    assert "more notes not shown" in out
+
+
+def test_digest_shaper_never_touches_fenced_text():
+    text = (f"{begin_marker(EMAIL_BODY)}\n" + "\n".join(f"- row {i} " + "y" * 80 for i in range(120))
+            + f"\n{end_marker(EMAIL_BODY)}")
+    assert shape_result(text, "summarize_emails", LIMIT, "row 7") == text

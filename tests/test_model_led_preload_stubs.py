@@ -271,3 +271,33 @@ def test_forbidden_stub_with_fitting_arguments_does_not_run(synthetic):
     effects, _ = synthetic
     run([[call("view_emails")], "Synthetic answer."], forbidden_tools=frozenset({"view_emails"}))
     assert effects == []
+
+
+def test_schema_expansion_keeps_the_system_message_and_sends_new_rules_in_the_receipt(synthetic):
+    from service.agent import loop
+    client, _, _ = run([[call("view_emails", guess=1)], "Synthetic answer."],
+                       model_led_preload=["get_upcoming"])
+    first, second = client.requests[0]["messages"][0], client.requests[1]["messages"][0]
+    assert first["role"] == "system" and second == first   # prompt prefix unchanged mid-turn
+    [receipt] = receipts(client.requests[1])
+    expected = loop.system_rules_delta({"get_upcoming"}, {"get_upcoming", "view_emails"})
+    assert "`view_emails`" in expected and expected not in first["content"]
+    assert receipt["rules_for_loaded_tools"] == expected.strip()
+
+
+def test_explicit_discovery_keeps_the_system_message_too(synthetic):
+    client, _, _ = run([[discover("mail", "view_emails")], "Synthetic answer."],
+                       model_led_preload=["get_upcoming"])
+    assert client.requests[1]["messages"][0] == client.requests[0]["messages"][0]
+    [receipt] = receipts(client.requests[1])
+    assert "`view_emails`" in receipt["rules_for_loaded_tools"]
+
+
+def test_new_rules_ride_on_one_receipt_when_several_stubs_load_together(synthetic):
+    client, _, _ = run([[call("view_emails", guess=1), call("view_messages", guess=1)],
+                        "Synthetic answer."])
+    assert client.requests[1]["messages"][0] == client.requests[0]["messages"][0]
+    with_rules = [r for r in receipts(client.requests[1]) if "rules_for_loaded_tools" in r]
+    assert len(with_rules) == 1
+    assert "`view_emails`" in with_rules[0]["rules_for_loaded_tools"]
+    assert "`view_messages`" in with_rules[0]["rules_for_loaded_tools"]

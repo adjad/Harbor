@@ -2511,6 +2511,32 @@ def _previous_user_text(messages: list[dict], current: dict) -> str:
     return ""
 
 
+def _ask_skill_tools(prompt: str) -> tuple[list[str], list[str]]:
+    """Skill tools for an Ask head start: (lead, stubs). The lead is every
+    registered tool of the skills this prompt triggers, then use_skill; the
+    stubs are use_skill and harbor_skills by name. Only registered names are
+    returned, and the agent loop's skill boundary still removes all of them
+    wherever skill content may not be offered (remote mode, a literal
+    envelope)."""
+    from service.tools.registry import REGISTRY
+    try:
+        from service.skills import all_skills, turn_skill_names
+        triggered = [all_skills()[name] for name in turn_skill_names(prompt) if name in all_skills()]
+    except Exception:  # noqa: BLE001 — skills are optional
+        triggered = []
+    lead: list[str] = []
+    for skill in triggered:
+        for spec in skill.tools or []:
+            name = str((spec or {}).get("name") or "").strip().lower()
+            tool = REGISTRY.get(name)
+            if tool is not None and tool.category == "skill_tool" and name not in lead:
+                lead.append(name)
+    if triggered and "use_skill" in REGISTRY:
+        lead.append("use_skill")
+    stubs = [n for n in ("use_skill", "harbor_skills") if n in REGISTRY and n not in lead]
+    return lead, stubs
+
+
 def _ask_tool_rank(prompt: str, previous: str = "") -> tuple[list[str], list[str]]:
     """Model-only Ask head start: (preload, stub rank). The preload is
     _model_led_preload's shortlist cut to ASK_PRELOAD real schemas; the stub
@@ -2595,13 +2621,18 @@ def _ask_tool_rank(prompt: str, previous: str = "") -> tuple[list[str], list[str
         if lead_reads := [n for n in reply_reads(prompt) if n in REGISTRY]:
             # A reply draft reads the conversation it answers before drafting.
             head = [*lead_reads, *(n for n in head if n not in lead_reads)]
+        skill_lead, skill_stubs = _ask_skill_tools(prompt)
+        if skill_lead:
+            # "@inbox-cleanup", or a skill's trigger phrase: its own tools and
+            # use_skill lead, so the skill can run from the first step.
+            head = [*skill_lead, *(n for n in head if n not in skill_lead)]
         preload = head[:ASK_PRELOAD]
         try:
             ranked = _reranker.ranked_lexical_candidates(text, writing=writing,
                                                          k=ASK_PRELOAD + ASK_STUBS)
         except Exception:  # noqa: BLE001
             ranked = []
-        stubs = [n for n in dict.fromkeys([*head[ASK_PRELOAD:], *ranked]) if n not in preload]
+        stubs = [n for n in dict.fromkeys([*head[ASK_PRELOAD:], *skill_stubs, *ranked]) if n not in preload]
         return preload, stubs[:ASK_STUBS]
     except Exception:  # noqa: BLE001 — a missing head start must never fail the turn
         return [], []
@@ -3953,8 +3984,11 @@ async def agent(body: dict[str, Any]):
                     sysp = (ROLE_SYSTEM.get(decision.role, ROLE_SYSTEM["general"])
                             + _profile_block(target.endpoint)
                             + memory_block(query=prompt, mail_facts=_mail_facts_ride(target.endpoint))
-                            + _plain_chat_skill_blocks(prompt, active_skill, role=decision.role,
-                                                       literal_envelope=literal_envelope)
+                            + (_plain_chat_skill_blocks(prompt, active_skill, role=decision.role,
+                                                        literal_envelope=literal_envelope)
+                               # The same rule as a tool turn's allow_skill_context:
+                               # skill text leaves the Mac only under Cloud "Everything".
+                               if remote_only_profile() is None or cloud_everything_active() else "")
                             + now_line())
                     msgs = [{"role": "system", "content": sysp}] + messages
                 # "fast" is TRIVIAL_RE's positive match only (greetings, thanks,

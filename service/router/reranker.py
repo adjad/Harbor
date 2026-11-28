@@ -29,7 +29,9 @@ from service.search.chunker import Chunk
 from service.search.embedder import embedding_model
 from service.config.endpoints import role_target, EndpointConfigurationError
 from service.search.lexical import BM25
-from service.tools.registry import REGISTRY, is_tool_routable, is_tool_searchable
+# Read through the module at call time, like semantic.py and the registry helpers.
+from service.tools import registry as _registry
+from service.tools.registry import is_tool_routable, is_tool_searchable
 
 DEFAULT_SHORTLIST = 60
 DEFAULT_K = 12
@@ -104,7 +106,7 @@ _LEXICAL: _LexicalIndex | None = None
 
 def _signature() -> tuple[tuple[str, tuple[str, ...], str], ...]:
     return tuple((name, tuple(tool.aliases), tool.effective_retrieval_description)
-                 for name, tool in REGISTRY.items() if is_tool_searchable(name))
+                 for name, tool in _registry.REGISTRY.items() if is_tool_searchable(name))
 
 
 def _lexical_index() -> _LexicalIndex:
@@ -113,8 +115,8 @@ def _lexical_index() -> _LexicalIndex:
     sig = _signature()
     if _LEXICAL is not None and _LEXICAL.signature == sig:
         return _LEXICAL
-    names = [name for name in REGISTRY if is_tool_searchable(name)]
-    docs = [" ".join(_docs(REGISTRY[name])) for name in names]
+    names = [name for name in _registry.REGISTRY if is_tool_searchable(name)]
+    docs = [" ".join(_docs(_registry.REGISTRY[name])) for name in names]
     chunks = [Chunk(i, doc, 0, len(doc)) for i, doc in enumerate(docs)]
     _LEXICAL = _LexicalIndex(names, docs, BM25(chunks), sig)
     return _LEXICAL
@@ -148,7 +150,7 @@ def lexical_candidates(text: str, *, writing: bool, k: int = 20,
     """Zero-model routing fallback, measured before the optional cross-encoder."""
     open_gate = _gate_open(text, writing=writing)
     picked = [name for name in lexical_shortlist(text, limit=k)
-              if name in REGISTRY and name not in _PINNED
+              if name in _registry.REGISTRY and name not in _PINNED
               and _allowed(name, writing=open_gate)
               and gated_tool_allowed(name, text, context_open=context_open)]
     picked.extend(name for name in _PINNED if is_tool_routable(name))
@@ -161,7 +163,7 @@ def ranked_lexical_candidates(text: str, *, writing: bool, k: int,
     pinned extras: a model-led preload head start, cut to its top k."""
     open_gate = _gate_open(text, writing=writing)
     picked = [name for name in lexical_shortlist(text, limit=max(k * 3, k))
-              if name in REGISTRY and name not in _PINNED
+              if name in _registry.REGISTRY and name not in _PINNED
               and _allowed(name, writing=open_gate)
               and gated_tool_allowed(name, text, context_open=context_open)]
     return list(dict.fromkeys(picked))[:k]
@@ -205,7 +207,7 @@ async def _evict_embedder_locked(client: httpx.AsyncClient, headers: dict[str, s
 
 async def _rank_one(client: httpx.AsyncClient, headers: dict[str, str], query: str,
                     names: list[str], *, top_n: int, model: str | None = None) -> list[tuple[str, float]]:
-    docs = [" ".join(_docs(REGISTRY[name])) for name in names]
+    docs = [" ".join(_docs(_registry.REGISTRY[name])) for name in names]
     try:
         with engine_epoch.operation():      # the engine loads the reranker on demand
             response = await client.post(
@@ -240,7 +242,7 @@ async def candidates(text: str, *, writing: bool, k: int = DEFAULT_K,
     clauses = _action_clauses(text)
     pool = lexical_shortlist(text, limit=shortlist)
     open_gate = _gate_open(text, writing=writing)
-    pool = [n for n in pool if n in REGISTRY and n not in _PINNED
+    pool = [n for n in pool if n in _registry.REGISTRY and n not in _PINNED
             and _allowed(n, writing=open_gate)
             and gated_tool_allowed(n, text, context_open=context_open)]
     if not pool:

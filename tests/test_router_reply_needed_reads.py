@@ -63,3 +63,60 @@ def test_reply_needed_question_is_a_read(prompt, sources):
 ])
 def test_actions_and_filters_keep_their_owner(prompt):
     assert attention_read(prompt) is None
+
+
+# App audit 1.3.2: importance is the intent, not a word the source must
+# contain, and Notes and Reminders can hold the important item too.
+from service.workflows.workflow20 import priority_read  # noqa: E402
+
+IMPORTANT = {
+    "any important notes today?": ("notes",),
+    "are there any important reminders today?": ("reminders",),
+    "any important emails?": ("email",),
+    "what important messages did I get?": ("messages",),
+    "which notes are important?": ("notes",),
+    "any urgent reminders for tomorrow?": ("reminders",),
+    "do I have any important notes or reminders this week?": ("notes", "reminders"),
+}
+
+
+@pytest.mark.parametrize("prompt,sources", sorted(IMPORTANT.items()))
+def test_important_source_questions_read_that_source(prompt, sources):
+    read = attention_read(prompt)
+    assert read is not None and read.sources == sources
+    args = read.bindings["collect_task_evidence"]
+    assert {name for name in ("email", "messages", "calendar", "notes", "reminders")
+            if args["include_" + name]} == set(sources)
+    # An overdue or undated reminder can be the important one.
+    assert args["include_overdue"] is args["include_undated"] is ("reminders" in sources)
+    decision = asyncio.run(route(prompt))
+    assert decision.reason == "source-grounded personal priorities"
+    assert set(decision.tool_subset) == {"collect_task_evidence"}
+    assert "web_search" in decision.forbidden_tools
+
+
+def test_an_important_question_keeps_its_named_day():
+    assert attention_read("any urgent reminders for tomorrow?").bindings[
+        "collect_task_evidence"]["period"] == "tomorrow"
+
+
+@pytest.mark.parametrize("prompt", ["what's important today?", "anything important for me today?",
+                                    "is there anything urgent?", "what's important tomorrow?"])
+def test_whats_important_reads_every_source(prompt):
+    read = priority_read(prompt)
+    assert read is not None and set(read.sources) == {"email", "messages", "calendar", "notes", "reminders"}
+    decision = asyncio.run(route(prompt))
+    assert set(decision.tool_subset) == {"collect_task_evidence"}
+    assert "web_search" in decision.forbidden_tools
+
+
+@pytest.mark.parametrize("prompt", ["any important emails from Sam?", "what's important in tech today?",
+                                    "any important news today?", "any important notes? Draft a summary."])
+def test_filters_topics_and_actions_keep_their_owner(prompt):
+    assert attention_read(prompt) is None and priority_read(prompt) is None
+
+
+@pytest.mark.parametrize("prompt", ["any important news today?", "important news today"])
+def test_important_news_stays_a_web_search(prompt):
+    decision = asyncio.run(route(prompt))
+    assert "web_search" in (decision.tool_subset or ())

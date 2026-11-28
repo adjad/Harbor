@@ -205,6 +205,7 @@ def test_skill_runner_returns_a_host_receipt_only_on_exit_zero(monkeypatch, tmp_
         return Proc(next(codes))
     monkeypatch.setattr(skill_tools.asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setattr(skill_tools.sandbox, "available", lambda: False)
+    monkeypatch.setattr(skill_tools.sandbox, "refusal", lambda: "")
     runner = skill_tools._make_runner(tmp_path, {"command": "lockit"}, "mac_lock_x")
     tool = registry.Tool("mac_lock_x", "d", {"type": "object", "properties": {}}, "skill_tool", runner)
     monkeypatch.setattr(skill_tools, "_registered", {"mac_lock_x"})

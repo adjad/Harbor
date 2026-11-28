@@ -117,3 +117,103 @@ def test_scratch_is_allowed_under_both_spellings_of_a_linked_home(tmp_path, monk
     profile = sandbox.build_profile(folder, [], [])
     for base in (linked, real.resolve()):
         assert f'(allow file-write* (subpath "{base / "skill-scratch" / "fixture"}"))' in profile
+
+
+def test_apple_events_stay_denied_by_default_and_open_only_to_named_targets(skill):
+    plain = sandbox.build_profile(skill, [], [])
+    assert "(deny appleevent-send)" in plain and "appleevent-destination" not in plain
+    assert "com.apple.coreservices.appleevents" in plain and "com.apple.tccd" in plain
+
+    dests = sandbox.apple_event_destinations(["System Events", "Spotify", "Terminal", "nonsense"])
+    assert dests == ["com.apple.systemevents", "com.spotify.client"]   # Terminal grants nothing
+    opened = sandbox.build_profile(skill, [], [], dests)
+    lines = opened.splitlines()
+    allow = '(allow appleevent-send (appleevent-destination "com.apple.systemevents" "com.spotify.client"))'
+    assert allow in lines
+    # Last matching rule wins, so the narrow allow must come after the blanket deny.
+    assert lines.index(allow) > lines.index("(deny appleevent-send)")
+    # Nothing else opens: Launch Services, the pasteboard and open-by-URL stay refused.
+    assert "(deny lsopen)" in lines and "com.apple.coreservices.launchservicesd" in opened
+    assert "com.apple.pasteboard.1" in opened and "com.apple.coreservices.appleevents" not in opened
+
+
+def test_only_a_bundled_skill_can_declare_apple_events(skill, monkeypatch):
+    import asyncio
+    from service.skills import tools as skill_tools
+    seen = []
+    monkeypatch.setattr(skill_tools.sandbox, "available", lambda: True)
+    monkeypatch.setattr(skill_tools.sandbox, "build_profile",
+                        lambda *a, **k: seen.append(a[3] if len(a) > 3 else k.get("apple_events")) or "(version 1)\n")
+    monkeypatch.setattr(skill_tools.sandbox, "wrap_argv", lambda argv, _p: ["/usr/bin/true"])
+    spec = {"script": "tool.py", "apple_events": ["System Events"]}
+    from service.skills import trust
+    trust.approve(skill)          # a user skill runs only as the person approved it
+    for bundled in (False, True):
+        asyncio.run(skill_tools._make_runner(skill, spec, "fixture_tool", bundled=bundled)())
+    assert seen == [[], ["com.apple.systemevents"]]
+
+
+def test_mac_controls_declares_only_the_apps_it_scripts():
+    spec = S.BUNDLED_SKILLS_DIR / "mac-controls" / "SKILL.md"
+    tools = {t["name"]: t for t in S._parse(spec, bundled=True).tools}
+    assert tools, "mac-controls tools did not parse"
+    for name, tool in tools.items():
+        declared = {d.lower() for d in tool["apple_events"]}
+        assert declared <= {"system events", "music", "spotify"}, name
+    assert {d.lower() for d in tools["mac_media"]["apple_events"]} == {"music", "spotify"}
+    assert {d.lower() for d in tools["mac_lock_screen"]["apple_events"]} == {"system events"}
+
+
+def test_harbor_and_engine_ports_are_blocked_on_every_address(skill, monkeypatch):
+    # The profile language can't name this Mac's LAN address, so only "*:port" keeps
+    # a skill off an engine listening there (an outside host on the port is the cost).
+    from service.safety import shell_sandbox
+    monkeypatch.setattr(shell_sandbox, "harbor_ports", lambda: [8765])
+    monkeypatch.setattr(shell_sandbox, "engine_ports", lambda: [8000])
+    profile = sandbox.build_profile(skill, [], [])
+    assert '(deny network-outbound (remote ip "*:8765"))' in profile
+    assert '(deny network-outbound (remote ip "*:8000"))' in profile
+
+
+def test_sandbox_probe_uses_absolute_paths_and_names_a_nested_sandbox(monkeypatch):
+    class Done:
+        def __init__(self, code, err=""):
+            self.returncode, self.stderr = code, err
+    monkeypatch.setenv("PATH", "/nonexistent")           # no /usr/bin on PATH
+    cases = [(Done(0), "ready", True, ""),
+             (Done(71, "sandbox_apply: Operation not permitted"), "nested", False, "already running inside a sandbox"),
+             (Done(1, "something else"), "broken", False, "could not be started")]
+    for done, state, avail, refuse in cases:
+        monkeypatch.setattr(sandbox, "_probe_cache", {})
+        monkeypatch.setattr(sandbox.os.path, "isfile", lambda p: True)
+        monkeypatch.setattr(sandbox.os, "access", lambda p, m: True)
+        monkeypatch.setattr(sandbox.subprocess, "run", lambda *a, _d=done, **k: _d)
+        assert sandbox._probe() == state
+        assert sandbox.available() is avail
+        assert (refuse in sandbox.refusal()) and bool(sandbox.refusal()) == bool(refuse)
+    monkeypatch.setattr(sandbox, "_probe_cache", {})
+    monkeypatch.setattr(sandbox.os.path, "isfile", lambda p: False)
+    assert sandbox._probe() == "missing" and sandbox.refusal() == ""
+
+
+@pytest.mark.skipif(not _kernel_sandbox_works(), reason="a sandbox cannot be applied inside another sandbox")
+def test_the_apple_events_profile_compiles_and_runs_a_no_op(skill, tmp_path):
+    profile = tmp_path / "ae.sb"
+    profile.write_text(sandbox.build_profile(
+        skill, [], [], sandbox.apple_event_destinations(["System Events", "Music", "Spotify"])))
+    done = subprocess.run([sandbox.SANDBOX_EXEC, "-f", str(profile), "/usr/bin/true"],
+                          capture_output=True, text=True, timeout=30, cwd="/")
+    assert done.returncode == 0, done.stderr
+
+
+def test_a_user_skill_changed_after_approval_does_not_run(skill, monkeypatch):
+    import asyncio
+    from service.skills import tools as skill_tools, trust
+    started = []
+    monkeypatch.setattr(skill_tools.sandbox, "available", lambda: True)
+    monkeypatch.setattr(skill_tools.sandbox, "build_profile", lambda *a, **k: "(version 1)\n")
+    monkeypatch.setattr(skill_tools.sandbox, "wrap_argv", lambda argv, _p: started.append(argv) or ["/usr/bin/true"])
+    trust.approve(skill)
+    (skill / "tool.py").write_text("print('swapped after approval')\n")
+    result = asyncio.run(skill_tools._make_runner(skill, {"script": "tool.py"}, "fixture_tool")())
+    assert started == [] and result.startswith("(")

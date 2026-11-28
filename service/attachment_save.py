@@ -16,7 +16,7 @@ Rules:
 - The folder must be a real existing directory inside the home folder (symlinks resolved), outside
   ~/Library, ~/Applications, any hidden folder and any application bundle, and must pass the same location
   rules the safety floor applies to a write (`policy._PATH_DENY`, `policy.credential_path_hit`). It is never
-  created. It is checked at the card and again right before the write, and the write goes through a
+  created: a missing one is refused with a sentence naming it and the folder above it that does exist. It is checked at the card and again right before the write, and the write goes through a
   directory file descriptor of the verified folder, so a link swapped in afterwards cannot redirect it.
 - The new file is created exclusively (never overwrites; " (2)", " (3)" ... up to 99), without following a
   link, 0600 while it is written, marked `com.apple.quarantine` (downloaded, not yet approved) before it
@@ -219,12 +219,27 @@ def check_folder(folder: str | None) -> tuple[str, str]:
         if _policy_refuses(real) or _policy_refuses(spelled):
             return "", _FOLDER_RULE
         if not os.path.isdir(real):
-            return "", "That folder doesn't exist, and Harbor doesn't create folders."
+            return "", _missing_folder(real, home)
         if not os.access(real, os.W_OK | os.X_OK):
             return "", "Harbor can't write to that folder."
         return real, ""
     except (OSError, ValueError, RuntimeError):
         return "", _FOLDER_RULE
+
+
+def _missing_folder(real: str, home: str) -> str:
+    """Why a folder that passed every location rule but isn't there yet is refused, naming the folder that
+    does exist. Harbor never creates one: the card names one destination and the save writes only into it,
+    so a folder the person never saw approved is never made."""
+    here = os.path.dirname(real)
+    while here.casefold().startswith(home.casefold() + os.sep) and not os.path.isdir(here):
+        here = os.path.dirname(here)
+    wanted = _show(_relative(real), 120)
+    base = _relative(here) if here.casefold().startswith(home.casefold() + os.sep) else ""
+    hint = (f" Make it in Finder first, or save into {_show(base, 120)}." if base
+            else " Make it in Finder first, or save into Downloads.")
+    return (f"There's no folder {wanted} yet, and Harbor doesn't create folders, so nothing was saved."
+            + hint)
 
 
 def _relative(folder: str) -> str:
@@ -344,8 +359,11 @@ async def prepare(query=None, name=None, start=None, end=None, account=None,
         if not real:
             return {"ok": False, "reason": why, "question": ""}
         try:
+            # As many messages as a search may hold, not only the newest five: an older file
+            # that matches is found, and more than one match still asks which.
             emails, _notes = await mail_attachments.find(query=query, name=name, start=start, end=end,
-                                                         account=account, count=5, source=where, most=5)
+                                                         account=account, count=mail_attachments.MAX_EMAILS,
+                                                         source=where, most=mail_attachments.MAX_EMAILS)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001

@@ -27,7 +27,8 @@ than implying a containment that isn't there.
 """
 from __future__ import annotations
 
-import shutil
+import os
+import subprocess
 from pathlib import Path
 
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
@@ -41,25 +42,58 @@ _ALWAYS_WRITE = [
     '(literal "/dev/dtracehelper")',
 ]
 
+# Apple Events a BUNDLED skill tool may send, by the name a skill declares in a
+# tool's `apple_events:` list, to the bundle id the kernel filters on. A closed
+# set on purpose: a skill cannot name Terminal, Finder, Mail or any other app,
+# and a user-installed or generated skill cannot use the key at all (see
+# tools.register_skill_tools). Only the mac-controls skill declares any.
+APPLE_EVENT_TARGETS = {
+    "system events": "com.apple.systemevents",
+    "music": "com.apple.Music",
+    "spotify": "com.spotify.client",
+}
+
+
+def apple_event_destinations(names) -> list[str]:
+    """Bundle ids for the declared target names; an unknown name is dropped, so a
+    typo or an attempt to name another app grants nothing."""
+    out = []
+    for name in names or ():
+        bundle = APPLE_EVENT_TARGETS.get(str(name).strip().lower())
+        if bundle and bundle not in out:
+            out.append(bundle)
+    return out
+
+
 # No handing work to a process outside the box (pentest #3): Launch Services
 # (`open`, which can start an app or a .command file), Apple Events (osascript),
 # the pasteboard, privacy grants and the secrets broker, and no new launchd jobs.
 # The same denies the Ideate profile uses (service/ideate/sandbox.py).
-_MACH_DENY = [
-    '(deny mach-lookup (global-name "com.apple.coreservices.launchservicesd")'
-    ' (global-name "com.apple.coreservices.appleevents") (global-name "com.apple.pasteboard.1")'
-    ' (global-name-prefix "com.apple.lsd."))',
-    '(deny mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.nsurlsessiond")'
-    ' (global-name "com.apple.tccd") (global-name-prefix "com.apple.securityd")'
-    ' (global-name-prefix "com.apple.windowserver") (global-name-prefix "com.apple.screencapture"))',
-    "(deny job-creation)",
-    # An allow-default profile must also refuse these outright: sending an Apple
-    # Event and asking Launch Services to open something do not need the
-    # mach-lookups above once a port is known (checked: osascript still reached
-    # System Events without them).
-    "(deny appleevent-send)",
-    "(deny lsopen)",
-]
+def _mach_deny(apple_events: bool) -> list[str]:
+    # Sending an Apple Event needs the Apple Events service and the privacy
+    # service that checks the Automation grant. Both are opened ONLY for a tool
+    # that declares destinations; the destination filter below is what limits
+    # where the events may go.
+    events = "" if apple_events else ' (global-name "com.apple.coreservices.appleevents")'
+    tccd = "" if apple_events else ' (global-name "com.apple.tccd")'
+    return [
+        '(deny mach-lookup (global-name "com.apple.coreservices.launchservicesd")'
+        f'{events} (global-name "com.apple.pasteboard.1")'
+        ' (global-name-prefix "com.apple.lsd."))',
+        '(deny mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.nsurlsessiond")'
+        f'{tccd} (global-name-prefix "com.apple.securityd")'
+        ' (global-name-prefix "com.apple.windowserver") (global-name-prefix "com.apple.screencapture"))',
+        "(deny job-creation)",
+        # An allow-default profile must also refuse these outright: sending an Apple
+        # Event and asking Launch Services to open something do not need the
+        # mach-lookups above once a port is known (checked: osascript still reached
+        # System Events without them).
+        "(deny appleevent-send)",
+        "(deny lsopen)",
+    ]
+
+
+_MACH_DENY = _mach_deny(False)
 
 
 def scratch_dir(skill_dir: Path) -> Path:
@@ -79,7 +113,7 @@ def scratch_dir(skill_dir: Path) -> Path:
 # mounted external and network volumes, the shared temp dirs, root's home);
 # what stays readable is OS and application code, which holds nothing personal.
 _READ_DENY_ROOTS = [
-    "/Users", "/Volumes", "/private/tmp", "/private/var/root",
+    "/Users", "/Volumes", "/private/tmp", "/private/var/tmp", "/private/var/root",
     # Every app's per-user temp and cache folders; a tool's own temp is its scratch.
     "/private/var/folders",
 ]
@@ -108,8 +142,52 @@ _NEVER_READ_HARBOR = ["sessions.db", "facts.db", "assistant.db", "gmail.json", "
 _NETWORK_DENY = ['(deny network-outbound (remote ip "localhost:*"))']
 
 
+_probe_cache: dict[str, str] = {}
+
+
+def _probe() -> str:
+    """'ready', 'missing', 'nested' (this process is already inside a sandbox, so
+    a second one cannot be applied) or 'broken'. By absolute path, so a PATH
+    without /usr/bin changes nothing; cached for the process."""
+    if "state" in _probe_cache:
+        return _probe_cache["state"]
+    if not (os.path.isfile(SANDBOX_EXEC) and os.access(SANDBOX_EXEC, os.X_OK)):
+        state = "missing"
+    else:
+        try:
+            done = subprocess.run([SANDBOX_EXEC, "-p", "(version 1)(allow default)", "/usr/bin/true"],
+                                  capture_output=True, text=True, timeout=10)
+            err = done.stderr or ""
+            if done.returncode == 0:
+                state = "ready"
+            elif "Operation not permitted" in err or "already sandboxed" in err:
+                state = "nested"
+            else:
+                state = "broken"
+        except (OSError, subprocess.SubprocessError):
+            state = "broken"
+    _probe_cache["state"] = state
+    return state
+
+
 def available() -> bool:
-    return Path(SANDBOX_EXEC).exists() and shutil.which("sandbox-exec") is not None
+    return _probe() == "ready"
+
+
+def refusal() -> str:
+    """Why a skill tool must not run unsandboxed, or "" when it may. Where the
+    sandbox binary is simply absent (a future OS) or this process is already
+    inside a sandbox, running without a second one is the documented fallback;
+    where the binary exists but does not work, running anyway would silently drop
+    the containment the confirmation card promises."""
+    state = _probe()
+    if state == "broken":
+        return "the sandbox that contains skill tools exists on this Mac but could not be started"
+    if state == "nested":
+        # Harbor is itself inside a sandbox, so a second one cannot be applied.
+        # Running the tool anyway would drop the containment the card promises.
+        return "skill tools can't be contained here (Harbor is already running inside a sandbox)"
+    return ""
 
 
 def _q(path: Path) -> str:
@@ -118,13 +196,17 @@ def _q(path: Path) -> str:
 
 
 def build_profile(skill_dir: Path, read_scopes: list[Path],
-                  write_scopes: list[Path]) -> str:
+                  write_scopes: list[Path], apple_events: list[str] | None = None) -> str:
     """A sandbox profile allowing reads/writes only within the given scopes.
 
     The skill's own folder is readable but never writable: it holds the
     SKILL.md (with the tool's scopes) and the script the person approved, so a
     tool may not widen its own scopes or rewrite itself (pentest #2). Its
     writable scratch is scratch_dir().
+
+    `apple_events` is a list of bundle ids (apple_event_destinations) the tool
+    may send Apple Events to, and nothing else; empty keeps every Apple Event
+    denied.
     """
     home = Path.home()
     scratch = scratch_dir(skill_dir)
@@ -146,8 +228,12 @@ def build_profile(skill_dir: Path, read_scopes: list[Path],
         f'(allow file-read* (subpath "{_q(skill_dir.resolve())}"))',
         *(f'(allow file-read* (subpath "{_q(p)}"))' for p in scratches),
         *(f'(allow file-read* (subpath "{_q(p)}"))' for p in readable),
-        *_MACH_DENY,
+        *_mach_deny(bool(apple_events)),
     ]
+    if apple_events:
+        # Last matching rule wins: this narrows the blanket deny just above.
+        lines.append("(allow appleevent-send (appleevent-destination "
+                     + " ".join(f'"{_q(Path(b))}"' for b in apple_events) + "))")
     # Re-deny the sensitive paths LAST so they win even if a granted scope
     # (e.g. all of ~) would otherwise cover them. In SBPL the last matching
     # rule applies, so ordering here is load-bearing, not stylistic.
@@ -178,6 +264,10 @@ def build_profile(skill_dir: Path, read_scopes: list[Path],
         ports = dict.fromkeys([*shell_sandbox.harbor_ports(), *shell_sandbox.engine_ports()])
     except Exception:  # noqa: BLE001 - the loopback deny above still applies
         ports = {}
+    # Every host. The profile language accepts just "*" or "localhost" as a host,
+    # and this Mac's LAN address cannot be named, so "*:port" is the only rule
+    # that keeps a skill off an engine listening on that address. The cost is
+    # that an outside host on one of these ports is unreachable from a skill too.
     lines += [f'(deny network-outbound (remote ip "*:{port}"))' for port in ports]
     return "\n".join(lines) + "\n"
 

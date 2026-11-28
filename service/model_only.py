@@ -231,6 +231,11 @@ ASK_CORE_STUBS = frozenset({
     # draft_* or an invented memory.forget.
     "send_email", "send_message", "schedule_send", "forget", "create_note", "find_free_time",
     "harbor_status",
+    # Reachable by name in every Ask turn: installed skills (the system prompt
+    # tells the model to call use_skill), message attachments, past events,
+    # files, earlier chats and knowledge notes. Every name is a registered tool.
+    "use_skill", "harbor_skills", "read_message_attachments", "get_past_events", "find_files", "read_file",
+    "search_conversations", "read_knowledge",
 })
 
 DAY_PLAN_TOOL = "get_my_day_plan"
@@ -285,12 +290,18 @@ def normalize_day_words(prompt: str) -> str:
     return _TOMORROW_TYPO.sub("tomorrow", prompt or "")
 
 
+# The system prompt's aggregate rule reads every source; this hint says which
+# read comes first, not which reads are banned. The day plan is the Brief's
+# merged view, but it caps each section ("…and N more"), stops at a fixed
+# length ("- …") and has no mail or texts while the Brief is unavailable.
 ASK_DAY_PLAN_HINT = (
-    "DAY PLAN: call get_my_day_plan once for the day or range asked about (day='tomorrow', "
-    "a weekday like 'saturday', a date, or 'this_week') and answer from it, including the "
+    "DAY PLAN: call get_my_day_plan first, once, for the day or range asked about (day='tomorrow', "
+    "a weekday like 'saturday', a date, or 'this_week') and build the answer from it, including the "
     "items it found in email and texts; for a follow-up like 'and friday?' call it again "
-    "for that day; do not read the calendar, mail, messages and "
-    "notes one by one unless it says the plan is unavailable. predict_my_day is "
+    "for that day. If the plan is unavailable, says mail and texts have not been analyzed, ends a "
+    "section with '…and N more' or ends cut off with '- …', also read the sources it could not cover "
+    "(get_upcoming, search_reminders, summarize_emails or view_emails, summarize_messages, search_notes) "
+    "in the same step and merge them in; otherwise the plan already covers them. predict_my_day is "
     "learned habits only, never the plan. Answer as a short prioritized list: one "
     "lead line, then 3-6 bullets — time-bound items first (with times), then "
     "overdue items, then people waiting on a reply, then suggestions and tasks, "
@@ -784,10 +795,13 @@ def emails_to_answer_question(prompt: str) -> bool:
 
 
 EMAILS_TO_ANSWER_HINT = (
-    "EMAILS TO ANSWER: call get_my_day_plan(day='today') once and answer from its people-waiting-on-a-reply "
-    "items: those are the same emails the Brief marks as needing a reply. Name each sender and what they "
-    "asked, newest first. Do not answer from a plain mail search, which cannot tell what needs a reply; say "
-    "there are none only when the plan lists nobody waiting."
+    "EMAILS TO ANSWER: call get_my_day_plan(day='today') first and start from its "
+    "people-waiting-on-a-reply items: those are the threads the Brief marks as needing a reply. "
+    "That list is capped. If the plan is unavailable, says mail and texts have not been analyzed, "
+    "shows '…and N more' under the waiting list, or ends cut off with '- …', also read the mail itself "
+    "(view_emails or summarize_emails, and summarize_messages for texts) and add the threads that ask "
+    "the user something and have no reply yet. Name each sender and what they asked, newest first. "
+    "Say there are none only when the plan lists nobody waiting and any mail you read shows nobody either."
 )
 
 
@@ -1121,13 +1135,35 @@ def reply_reads(prompt: str) -> list[str]:
     return ["view_messages", "view_emails"]
 
 
+# A draft about a day, a date, an event or a person in the user's working life
+# needs what the user has on record about it: "Draft an email to my boss about
+# Thursday" lost the calendar, mail and texts that say what Thursday is. The
+# day or date must be the draft's subject or deadline, so "late to dinner" in a
+# fully dictated message stays plain writing.
+_DRAFT_DAY = (r"(?:today|tonight|tomorrow|yesterday|(?:this|next|last)\s+(?:week(?:end)?|month)|"
+              r"(?:(?:this|next|last)\s+)?(?:mon|tues|wednes|thurs|fri|satur|sun)day|"
+              r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{1,2}(?:st|nd|rd|th)?|"
+              r"the\s+\d{1,2}(?:st|nd|rd|th)|\d{1,2}/\d{1,2}(?:/\d{2,4})?)")
+_DRAFT_SUBJECT = re.compile(
+    r"\b(?:about|regarding|re:?|on|for|before|after|until|by)\s+(?:the\s+)?" + _DRAFT_DAY + r"\b"
+    r"|\b(?:about|regarding|re:?)\s+(?:the|our|my|this|next|that)\s+(?:[\w-]+\s+){0,2}"
+    r"(?:meeting|call|appointment|event|party|interview|deadline|trip|flight|visit|review|"
+    r"presentation|project|class|exam|launch|offsite|conference|wedding|reservation|booking|invoice|order)s?\b"
+    r"|\b(?:about|regarding|re:?)\s+(?-i:[A-Z][a-z]+)['’]s\s+\w"
+    r"|\b(?:about|regarding|re:?)\s+(?:my|our)\s+(?:boss|manager|team|coworkers?|colleagues?|clients?|"
+    r"landlord|advisor|tutor|coach|teacher|doctor|dentist)\b",
+    re.I)
+
+
 def pure_writing(prompt: str) -> bool:
     """"Write a short thank-you note to my professor", "Draft a LinkedIn post
     about my new job": the request supplies everything, so no read tool helps;
     a placeholder covers any personal detail. False when the text must draw on
-    the user's stored content (their notes, an email, the calendar)."""
+    the user's stored content (their notes, an email, the calendar), or is
+    about a day, an event or a person the user's records describe."""
     text = prompt or ""
-    return bool(_WRITING.match(text)) and not _STORED_CONTENT.search(text)
+    return (bool(_WRITING.match(text)) and not _STORED_CONTENT.search(text)
+            and not _DRAFT_SUBJECT.search(text))
 
 
 # Reads withheld from a pure writing request. Contact lookups stay available so
@@ -1136,7 +1172,9 @@ WRITING_FORBIDDEN_READ_CATEGORIES = frozenset({
     "assistant_read", "email_read", "email_triage", "notes_read", "browser_history_read",
     "fs_read", "web_read", "system_read",
 })
-WRITING_ALLOWED_READS = frozenset({"lookup_contact", "list_contacts"})
+# use_skill loads an installed skill's instructions (a writing style, a
+# template); it is not a read of the user's data, so writing keeps it.
+WRITING_ALLOWED_READS = frozenset({"lookup_contact", "list_contacts", "use_skill"})
 WRITING_FORBIDDEN_READS = frozenset({"view_messages", "summarize_messages"})
 
 
@@ -1202,9 +1240,10 @@ def ask_forbidden_tools(prompt: str, registry: dict) -> frozenset[str]:
 # Read tools whose result is the user's own current data.
 PERSONAL_SOURCE_CATEGORIES = frozenset({
     "assistant_read", "email_read", "messages_read", "notes_read", "browser_history_read",
+    "fs_read",  # the user's own files, knowledge notes and past chats
 })
 PERSONAL_SOURCE_TOOLS = frozenset({
-    "recall", "search_memory", "search_conversations", "read_knowledge", "describe_me",
+    "recall", "search_conversations", "read_knowledge", "describe_me",
 })
 
 
@@ -1315,9 +1354,26 @@ def _plain_line(line: str) -> str:
     return text
 
 
+# A tool notice in parentheses: "(error: ...)", "(no matching notes)",
+# "(Mail is not available)". A result that merely opens with a parenthetical
+# header ("(3 of 9 shown)" then rows) is data and stays in the fallback.
+_RESULT_NOTICE = re.compile(
+    r"\((?:[\w'’.-]+\s+){0,3}(?:errors?\b|no\b|nothing\b|none\b|not\b|could\s*n[o']?t\b|can(?:no|')?t\b|unable\b|"
+    r"failed\b|unavailable\b|blocked\b|denied\b|skipped\b|refused\b)", re.I)
+
+
+def _result_notice(text: str) -> bool:
+    if not text.startswith("("):
+        return False
+    return bool(_RESULT_NOTICE.match(text)) or ("\n" not in text and text.endswith(")"))
+
+
+# The fallback is shown on this Mac when the model wrote no answer, so it can
+# carry more than a glance: ten rows a source and 2,000 characters keep a
+# capped list readable in the panel. It stays far below a raw dump.
 def compact_results(results: list[tuple[str, str]], labels: dict[str, str], *,
-                    lines_per_source: int = 6, line_chars: int = 160,
-                    total_chars: int = 1200) -> str:
+                    lines_per_source: int = 10, line_chars: int = 160,
+                    total_chars: int = 2000) -> str:
     """A short, readable fallback over tool results: the first lines of each
     usable source under a friendly label, never a full dump. Error notices,
     policy blocks and timeouts are skipped. "" when nothing usable remains."""
@@ -1325,7 +1381,8 @@ def compact_results(results: list[tuple[str, str]], labels: dict[str, str], *,
     seen: set[str] = set()
     for name, result in results:
         text = str(result or "").strip()
-        if (name in seen or not text or text.startswith(("(", "BLOCKED", "The user denied"))
+        if (name in seen or not text or _result_notice(text)
+                or text.startswith(("BLOCKED", "The user denied"))
                 or "timed out" in text[:200].lower()):
             continue
         seen.add(name)
@@ -1561,7 +1618,8 @@ def advice_question(prompt: str) -> bool:
     return bool(_KNOWLEDGE.match(text) and _ADVICE.search(text)
                 and not re.search(r"\b(?:my|mine|me)\b", text, re.I)
                 and not _LIVE.search(_PRONOUNS.sub("", text))
-                and not _SOURCE_RECORD.search(text) and not _DEVICE_STATE.search(text))
+                and not _SOURCE_RECORD.search(text) and not _PERSONAL_RECORD.search(text)
+                and not _DEVICE_STATE.search(text))
 
 
 def knowledge_question(prompt: str) -> bool:
@@ -1577,7 +1635,8 @@ def knowledge_question(prompt: str) -> bool:
         return not _ABOUT_HARBOR.search(text) and not _SECOND_CLAUSE.search(text)
     rest = text[head.end():]  # "How do I" itself is not first-person data
     return (not _LIVE.search(rest) and not _ABOUT_HARBOR.search(text)
-            and not _SOURCE_RECORD.search(rest) and not _SECOND_CLAUSE.search(rest)
+            and not _SOURCE_RECORD.search(rest) and not _PERSONAL_RECORD.search(text)
+            and not _SECOND_CLAUSE.search(rest)
             and not asks_personal_data(text))
 
 
@@ -1588,9 +1647,46 @@ def knowledge_question(prompt: str) -> bool:
 _SOURCE_RECORD = re.compile(
     r"\b(?:e-?mails?|mail|inbox|messages?|texts?|imessages?|reminders?|notes?|events?|"
     r"meetings?|appointments?|contacts?|files?|documents?|attachments?|threads?|chats?)\b", re.I)
+# The user's schedule, tasks, birthdays and projects are records too ("What
+# time is the project review?", "When is Sam's birthday?"). Only an indefinite
+# "a/an" before one of those words reads as general ("What is a project
+# charter?", "How do I make a to-do list?"). Matched on the whole prompt, so
+# the article the question head consumed still counts.
+_PERSONAL_RECORD = re.compile(
+    r"(?<!\ba\s)(?<!\ban\s)\b(?:schedules?|calendars?|agendas?|tasks?|to-?dos?|todos?|birthdays?|"
+    r"projects?|deadlines?|anniversar(?:y|ies)|assignments?|homework)\b", re.I)
 _SECOND_CLAUSE = re.compile(r"[;]|\b(?:and|then|also)\s+(?:please\s+)?(?:delete|remove|clear|send|"
                             r"text|e-?mail|add|create|set|remind|cancel|move|mark|reply|forward|save|"
                             r"schedule|open|show|read|summari[sz]e|check)\b", re.I)
+
+
+# "Can you check my important notes?", "Can you read my important emails?" and
+# "What can you find in my emails?" ask for the data, phrased politely. They
+# were short "can you" questions, so they got the Harbor self sheet and no
+# source read. A data-action verb aimed at the user's own source is a request;
+# "Can you read my email?" (no qualifier) still asks whether Harbor can.
+_DATA_SOURCE = (r"(?:e-?mails?|mail|inbox|notes?|reminders?|messages?|texts?|imessages?|calendar|"
+                r"schedule|agenda|events?|meetings?|files?|documents?|docs?|contacts?|to-?dos?|tasks?|"
+                r"chats?|threads?|downloads|desktop)")
+_DATA_QUALIFIER = (r"(?:important|urgent|priority|new|unread|latest|recent|last|newest|pending|overdue|"
+                   r"upcoming|open|today'?s|tomorrow'?s|this\s+week'?s)")
+_DATA_REQUEST = re.compile(
+    r"^(?:can|could|will|would)\s+(?:you|u)\s+(?:please\s+)?(?:quickly\s+)?"
+    r"(?:check|find|search|look\s+(?:at|through|in|into|over|for)|show(?:\s+me)?|list|pull\s+up|"
+    r"go\s+(?:through|over)|scan|summari[sz]e|recap|tell\s+me\s+(?:about|what'?s\s+in))\b"
+    r"[^?.!]*?\b(?:my|our)\s+(?:[\w'-]+\s+){0,2}" + _DATA_SOURCE + r"\b"
+    r"|^(?:can|could|will|would)\s+(?:you|u)\s+(?:please\s+)?(?:read|see|open|get)\s+(?:me\s+)?"
+    r"(?:my|our)\s+(?:[\w'-]+\s+){0,1}" + _DATA_QUALIFIER + r"\s+(?:[\w'-]+\s+){0,1}" + _DATA_SOURCE + r"\b"
+    r"|^(?:so\s+)?(?:what|which)\s+(?:\w+\s+){0,2}(?:can|could)\s+(?:you|u)\s+"
+    r"(?:find|see|tell\s+me|show\s+me|pull\s+up|dig\s+up|get|spot)\s+"
+    r"(?:in|on|from|about|across|inside)\s+(?:my|our)\s+(?:[\w'-]+\s+){0,2}" + _DATA_SOURCE + r"\b",
+    re.I)
+
+
+def data_request(prompt: str) -> bool:
+    """A polite request for the user's own data ("Can you check my notes?",
+    "What can you find in my emails?"), not a question about Harbor."""
+    return bool(_DATA_REQUEST.search(" ".join((prompt or "").replace("\u2019", "'").split())))
 
 
 def capability_question(prompt: str) -> bool:
@@ -1600,6 +1696,8 @@ def capability_question(prompt: str) -> bool:
     text = (prompt or "").strip().lower()
     # "do you know my birthday?" asks what Harbor remembers, not what it can do.
     if re.match(r"^(?:do|did)\s+you\s+(?:know|remember|recall)\s+(?:my|me|who|what|when|where)\b", text):
+        return False
+    if data_request(text):
         return False
     if re.match(r"^(?:so\s+)?(?:what|which)\s+(?:\w+\s+){0,2}(?:can|could|do)\s+you\s+(?:do|help|handle|access|see|read|check)\b", text):
         return True

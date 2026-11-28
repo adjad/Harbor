@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import codecs
+import contextvars
 import os
 import stat
 import shutil
@@ -23,8 +24,51 @@ MAX_OUTPUT = 12_000  # chars returned to the model
 _PDF_MAX_PAGES = 200
 
 
+# One read_file call's window onto the text it extracts: (character offset,
+# character limit). The format readers all end in _clip, so the window is applied
+# there and every format pages the same way.
+_MAX_PAGE_CHARS = 48_000
+_PAGE: contextvars.ContextVar[tuple[int, int]] = contextvars.ContextVar(
+    "read_file_page", default=(0, MAX_OUTPUT))
+
+
 def _clip(s: str) -> str:
-    return s if len(s) <= MAX_OUTPUT else s[:MAX_OUTPUT] + f"\n…[truncated {len(s)-MAX_OUTPUT} chars]"
+    offset, limit = _PAGE.get()
+    if offset == 0 and len(s) <= limit:
+        return s
+    if offset >= len(s):
+        return f"(offset {offset:,} is past the end: the text is {len(s):,} characters long.)"
+    end = offset + limit
+    body = s[offset:end]
+    head = f"[characters {offset:,}-{offset + len(body):,} of {len(s):,}]\n" if offset else ""
+    if end >= len(s):
+        return head + body
+    return (head + body + f"\n…[truncated {len(s) - end} chars; call read_file again with "
+            f"offset={end} for the next page]")
+
+
+def _detect_utf16(head: bytes) -> str | None:
+    """The codec for UTF-16 text (a BOM, or ASCII-range text stored two bytes a
+    character), or None. NUL bytes alone do not make a file binary."""
+    if head[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return "utf-16"
+    pairs = len(head) // 2
+    if pairs < 4:
+        return None
+    even = sum(1 for b in head[0:pairs * 2:2] if b == 0)
+    odd = sum(1 for b in head[1:pairs * 2:2] if b == 0)
+    if odd >= pairs * 0.3 and even <= pairs * 0.05:
+        codec = "utf-16-le"
+    elif even >= pairs * 0.3 and odd <= pairs * 0.05:
+        codec = "utf-16-be"
+    else:
+        return None
+    try:
+        text = head[:pairs * 2].decode(codec)
+    except UnicodeDecodeError:
+        return None
+    printable = sum(1 for c in text if c.isprintable() or c in "\r\n\t")
+    return codec if text and printable / len(text) >= 0.95 else None
 
 
 # macOS blocks Documents / Desktop / Downloads / iCloud Drive per-app under
@@ -195,6 +239,7 @@ def run_shell(cmd: str) -> str:
             # at run time is not in the text.
             argv, contained = shell_sandbox.contain(["/bin/sh", "-c", cmd])
             p = subprocess.run(argv, shell=False, capture_output=True, text=True,
+                               stdin=subprocess.DEVNULL,
                                timeout=120, cwd=str(Path.home()), env=child_environment())
             note = shell_sandbox.explain(contained, p.returncode, p.stderr)
         out = (p.stdout or "") + (("\n[stderr]\n" + p.stderr) if p.stderr else "")
@@ -293,15 +338,19 @@ def _read_pdf(p: Path) -> str:
         return f"(couldn't parse {p} as a PDF: {e})"
 
     if reader.is_encrypted:
-        # pypdf can sometimes still open an encrypted PDF with an empty owner
-        # password (common for "restrict editing, not reading" exports) — try
-        # that before giving up, rather than reporting unreadable when it isn't.
+        # Many PDFs are "encrypted" only to restrict editing or printing: they
+        # open with an empty user password. `is_encrypted` stays True after a
+        # successful decrypt, so the verdict is decrypt()'s own result (0 means
+        # the password did not fit), never a second look at the flag.
         try:
-            reader.decrypt("")
-        except Exception:  # noqa: BLE001
-            pass
-    if reader.is_encrypted:
-        return f"({p} is password-protected — Harbor can't read it without the password.)"
+            opened = int(reader.decrypt(""))
+        except Exception as e:  # noqa: BLE001 — a missing AES backend is not "wrong password"
+            if "cryptography" in str(e).lower() or "pycryptodome" in str(e).lower():
+                return (f"({p} is encrypted with a method this Harbor build can't open. "
+                        "Tell the user plainly.)")
+            opened = 0
+        if not opened:
+            return f"({p} is password-protected — Harbor can't read it without the password.)"
 
     pages = reader.pages[:_PDF_MAX_PAGES]
     texts = [(page.extract_text() or "").strip() for page in pages]
@@ -364,19 +413,40 @@ def _read_xlsx(p: Path) -> str:
         return f"(couldn't parse {p} as an .xlsx file — it may be corrupt or not a real Excel workbook)"
 
     sheets = []
-    for name in wb.sheetnames:
-        ws = wb[name]
-        rows = []
-        for row in ws.iter_rows(values_only=True):
-            cells = [str(c) for c in row if c is not None]
-            if cells:
-                rows.append(" | ".join(cells))
-        if rows:
-            sheets.append(f"[Sheet: {name}]\n" + "\n".join(rows))
+    try:
+        for name in wb.sheetnames:
+            ws = wb[name]
+            rows = []
+            for row in ws.iter_rows(values_only=True):
+                cells = [str(c) for c in row if c is not None]
+                if cells:
+                    rows.append(" | ".join(cells))
+            if rows:
+                sheets.append(f"[Sheet: {name}]\n" + "\n".join(rows))
+    finally:
+        wb.close()   # a read-only workbook keeps the file open until closed
     text = "\n\n".join(sheets)
     if not text:
         return f"({p} has no data in any sheet.)"
     return _clip(text)
+
+
+def _pptx_shape_lines(shapes) -> list[str]:
+    """Text of each shape, descending into groups and reading table cells."""
+    lines: list[str] = []
+    for shape in shapes:
+        if getattr(shape, "shapes", None) is not None and not getattr(shape, "has_text_frame", False):
+            lines.extend(_pptx_shape_lines(shape.shapes))      # a group
+            continue
+        if getattr(shape, "has_table", False) and shape.has_table:
+            for row in shape.table.rows:
+                cells = [c.text.strip() for c in row.cells if c.text.strip()]
+                if cells:
+                    lines.append(" | ".join(cells))
+        if getattr(shape, "has_text_frame", False) and shape.has_text_frame \
+                and shape.text_frame.text.strip():
+            lines.append(shape.text_frame.text)
+    return lines
 
 
 def _read_pptx(p: Path) -> str:
@@ -391,8 +461,7 @@ def _read_pptx(p: Path) -> str:
 
     slides = []
     for i, slide in enumerate(deck.slides, 1):
-        lines = [shape.text_frame.text for shape in slide.shapes
-                if shape.has_text_frame and shape.text_frame.text.strip()]
+        lines = _pptx_shape_lines(slide.shapes)
         if slide.has_notes_slide:
             notes = (slide.notes_slide.notes_text_frame.text or "").strip()
             if notes:
@@ -408,6 +477,7 @@ def _read_pptx(p: Path) -> str:
 # read_file looks at the start of a file only. PDF and Office readers load the
 # whole document, so they get a size cap instead of a prefix.
 _TEXT_READ_BYTES = MAX_OUTPUT * 4
+_MAX_TEXT_PAGE_BYTES = 16 * 1024 * 1024
 _MAX_DOCUMENT_BYTES = 100 * 1024 * 1024
 
 
@@ -432,11 +502,28 @@ _STRUCTURED_READERS = {
     "in Ask for Harbor to look at it. Older .doc/.xls/.ppt (no 'x') "
     "are NOT supported — tell the user to re-save as the newer format.",
     {"type": "object",
-     "properties": {"path": {"type": "string"}},
+     "properties": {"path": {"type": "string"},
+                    "offset": {"type": "integer",
+                               "description": "character to start from (default 0); a truncated read names the offset of its next page"},
+                    "limit": {"type": "integer",
+                              "description": "characters to return (default 12000, at most 48000)"}},
      "required": ["path"]},
     category="fs_read",
 )
-def read_file(path: str) -> str:
+def read_file(path: str, offset: int = 0, limit: int = MAX_OUTPUT) -> str:
+    try:
+        offset = max(0, int(offset or 0))
+        limit = min(_MAX_PAGE_CHARS, max(1, int(limit or MAX_OUTPUT)))
+    except (TypeError, ValueError):
+        return "(offset and limit must be whole numbers)"
+    token = _PAGE.set((offset, limit))
+    try:
+        return _read_file_page(path, offset, limit)
+    finally:
+        _PAGE.reset(token)
+
+
+def _read_file_page(path: str, offset: int, limit: int) -> str:
     if (msg := _wrong_account_path(path)):
         return msg
     p = Path(path).expanduser()
@@ -475,7 +562,8 @@ def read_file(path: str) -> str:
         size = 0
     try:
         with p.open("rb") as fh:
-            raw = fh.read(_TEXT_READ_BYTES)
+            # A later page needs more of the file than the first one does.
+            raw = fh.read(min(_MAX_TEXT_PAGE_BYTES, max(_TEXT_READ_BYTES, (offset + limit) * 4)))
     except PermissionError:
         return _tcc_message(p, "reading")
     except Exception as e:  # noqa: BLE001
@@ -511,20 +599,31 @@ def read_file(path: str) -> str:
     # decoded with errors="replace" LOOKS like a string, and nothing before
     # this would have stopped it from being handed to the model as if it were
     # the document's actual content.
-    if b"\x00" in head:
+    utf16 = _detect_utf16(head) if b"\x00" in head or head[:2] in (b"\xff\xfe", b"\xfe\xff") else None
+    if b"\x00" in head and utf16 is None:
         kind = p.suffix.lstrip(".") or "binary"
         return (f"({p} is a {kind} file, not text — Harbor can't read its contents. "
                 "This tool cannot read image files: tell the user this plainly and "
                 "that they can attach the picture in Ask for Harbor to look at it; "
                 "do not retry with another tool.)")
 
+    codec = utf16 or "utf-8"
     if size <= len(raw):
-        return _clip(raw.decode("utf-8", errors="replace"))
+        return _clip(raw.decode(codec, errors="replace"))
     # Only the start was read. The incremental decoder drops a multi-byte
     # character cut at the end instead of turning it into a replacement mark.
-    text = codecs.getincrementaldecoder("utf-8")("replace").decode(raw, final=False)
-    return (text[:MAX_OUTPUT]
-            + f"\n…[truncated: the file is {size:,} bytes; this is the start of it]")
+    text = codecs.getincrementaldecoder(codec)("replace").decode(raw, final=False)
+    end = offset + limit
+    if offset >= len(text):
+        return (f"(offset {offset:,} is past the part of the file Harbor reads "
+                f"({len(text):,} characters of a {size:,}-byte file).)")
+    window = text[offset:end]
+    head_note = f"[characters {offset:,}-{offset + len(window):,}]\n" if offset else ""
+    if end < len(text):
+        return (head_note + window + f"\n…[truncated: the file is {size:,} bytes; call read_file "
+                f"again with offset={end} for the next page]")
+    return (head_note + window
+            + f"\n…[truncated: the file is {size:,} bytes; this is as far as Harbor reads it]")
 
 
 # Description length is load-bearing here, not padding. At its original 32
@@ -622,14 +721,14 @@ def list_dir(path: str, recursive: bool = False, max_depth: int = 3,
             break
     if _blocked and not lines:
         return _tcc_message(p, "listing")
-    if _blocked:
-        lines.append(f"…[{len(_blocked)} subfolder(s) skipped — macOS denied "
-                     "access; see Full Disk Access in System Settings]")
+    # First, so a long listing's truncation can never cut it off.
+    notice = (f"…[{len(_blocked)} subfolder(s) skipped — macOS denied "
+              "access; see Full Disk Access in System Settings]\n") if _blocked else ""
     if cut:
-        return "\n".join(lines)[:MAX_OUTPUT] + (
+        return notice + "\n".join(lines)[:MAX_OUTPUT - len(notice)] + (
             "\n…[listing cut: this folder is large. List a subfolder, or use "
             "find_files, to see more]")
-    return _clip("\n".join(lines) or "(empty)")
+    return notice + _clip("\n".join(lines) or "(empty)")
 
 
 # A folder's size is a walk of everything under it, so the walks of one
@@ -792,15 +891,37 @@ def move_path(source: str, destination: str) -> str:
         if (msg := _wrong_account_path(candidate)):
             return msg
     src = Path(source).expanduser()
-    if not src.exists():
+    try:
+        os.lstat(src)      # lstat: a broken symlink is a real thing to move
+    except PermissionError:
+        return _tcc_message(src, "moving")
+    except FileNotFoundError:
+        try:
+            os.listdir(src.parent)
+        except PermissionError:
+            return _tcc_message(src, "moving")
+        except OSError:
+            pass
         return f"(no such path: {src})"
+    except OSError as e:
+        return f"(can't reach {src}: {e})"
     dst = Path(destination).expanduser()
+    # A rename that only changes letter case (notes.txt -> Notes.txt) names the
+    # same file on a case-insensitive volume, so it is not "already exists".
+    if (not destination.endswith(("/", os.sep)) and dst.name != src.name
+            and dst.name.lower() == src.name.lower() and dst.parent == src.parent
+            and os.path.lexists(dst) and os.path.samefile(src, dst)):
+        try:
+            os.rename(src, dst)
+            return f"moved {src} -> {dst}"
+        except Exception as e:  # noqa: BLE001
+            return f"(error moving {src} to {dst}: {e})"
     # "into this folder" vs "to this exact path". A trailing separator or an
     # existing directory means the former — the shape `mv` itself uses, and the
     # one a model reaching for "move X into Y/" naturally writes.
     if destination.endswith(("/", os.sep)) or dst.is_dir():
         dst = dst / src.name
-    if dst.exists():
+    if os.path.lexists(dst):
         return (f"(refusing to overwrite {dst} — it already exists. "
                 f"Move it somewhere else or pick a different name.)")
     try:

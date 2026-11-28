@@ -124,6 +124,9 @@ async def _arrival_provider(request: dict) -> dict:
     return {"status": "unavailable", "error": "Native Maps ETA provider is not connected"}
 
 
+_UNWIRED_ARRIVAL_PROVIDER = _arrival_provider
+
+
 def _arrival_identity(value: str) -> str:
     name = " ".join(value.casefold().split())
     if name in {"sfo", "san francisco international airport", "san francisco international airport (sfo)"}:
@@ -232,6 +235,13 @@ async def route_to_arrive(destination: str, arrive_by: str, timezone: str = "",
             raise ValueError("arrival planning supports only the next seven days")
     except (ValueError, ZoneInfoNotFoundError, OverflowError, OSError) as exc:
         return f"(ask the user to clarify the arrival date/time: {exc})"
+    if _arrival_provider is _UNWIRED_ARRIVAL_PROVIDER:
+        # No native ETA provider is connected in this build; say so up front
+        # instead of calling a stub that can only fail.
+        origin_note = " Current location is unavailable; ask the user for a starting address." if not origin else ""
+        return ("(traffic-aware arrival-time routing is unavailable: no ETA provider is connected, "
+                "so no departure estimate was computed. travel_time gives a free-flow drive "
+                "estimate without live traffic." + origin_note + ")")
     origin_request = origin or "current_location"
     request = {"request_id": uuid.uuid4().hex, "origin": origin_request,
                "destination": destination, "arrival_at": target.isoformat(),
@@ -276,6 +286,18 @@ async def route_to_arrive(destination: str, arrive_by: str, timezone: str = "",
             f"Apple Maps expected-traffic estimate: {_mins(duration)}; lookup age {age}s. "
             "Traffic and arrival can change; this is not a guaranteed arrival.\n"
             f"[View driving directions in Maps]({link})")
+
+
+def _overpass_regex_literal(text: str) -> str:
+    """Make `text` a literal inside an Overpass `name~"..."` regex.
+
+    Regex metacharacters (including backslash) are escaped for the regex
+    engine, then backslashes are doubled for the QL string literal. Quotes
+    are dropped.
+    """
+    text = text.replace('"', '')
+    rx = re.sub(r'([\\.^$|?*+()\[\]{}])', r'\\\1', text)
+    return rx.replace('\\', '\\\\')
 
 
 @register(
@@ -357,11 +379,11 @@ async def find_place(what: str, near: str, radius_km: float = 3.0) -> str:
         clause = (f'node[{selector}](around:{metres},{lat},{lon});'
                   f'way[{selector}](around:{metres},{lat},{lon});')
     else:
-        esc = key.replace('"', '')
+        esc = _overpass_regex_literal(key)
         clause = (f'node[name~"{esc}",i](around:{metres},{lat},{lon});'
                   f'way[name~"{esc}",i](around:{metres},{lat},{lon});')
 
-    query = f"[out:json][timeout:20];({clause});out center 25;"
+    query = f"[out:json][timeout:20];({clause});out center 100;"
     data = await _get("https://overpass-api.de/api/interpreter",
                       params={"data": query})
     if isinstance(data, str):
@@ -379,8 +401,9 @@ async def find_place(what: str, near: str, radius_km: float = 3.0) -> str:
         name = t.get("name")
         if not name:
             continue
-        elat = el.get("lat") or (el.get("center") or {}).get("lat")
-        elon = el.get("lon") or (el.get("center") or {}).get("lon")
+        center = el.get("center") or {}
+        elat = el.get("lat") if el.get("lat") is not None else center.get("lat")
+        elon = el.get("lon") if el.get("lon") is not None else center.get("lon")
         if elat is None or elon is None:
             continue
         # Equirectangular approximation — at these radii the error is metres,

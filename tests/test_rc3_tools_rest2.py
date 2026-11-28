@@ -243,3 +243,102 @@ def test_text_to_speech_wait_scales_with_length_and_timeout_is_a_sentence(monkey
     assert speech_tools._timeout_for("short", False) == 60
     assert speech_tools._timeout_for("x" * 10**6, False) <= 600
     assert speech_tools._timeout_for("x" * 10**6, True) == 60
+
+
+# --- tools audit 5.6: create_tool names, parameters, thinking, utilities -------
+
+@pytest.mark.parametrize("task", [
+    "validate an email address",
+    "check email addresses in a csv file",
+    "count the days between two calendar dates",
+    "generate an ics calendar file from a title and a date",
+    "print a reminder message with a timestamp",
+])
+def test_utilities_that_mention_mail_calendar_or_reminders_are_not_redirected(task):
+    redirect, _ = ta._capability_check("helper", "", task)
+    assert redirect == "", task
+
+
+@pytest.mark.parametrize("task,expect", [
+    ("read my emails", "view_emails"), ("list unread emails", "view_emails"),
+    ("show my calendar for tomorrow", "get_upcoming"), ("list my upcoming events", "get_upcoming"),
+    ("list my reminders", "add_reminder"), ("add a reminder", "add_reminder"),
+])
+def test_reading_the_users_mail_calendar_or_reminders_is_still_redirected(task, expect):
+    redirect, _ = ta._capability_check("helper", "", task)
+    assert expect in redirect, task
+
+
+def test_a_parameter_marked_false_as_text_is_optional():
+    clean, err = ta._validate_params([{"name": "a", "required": "false"},
+                                      {"name": "b", "required": "true"},
+                                      {"name": "c"}])
+    assert not err and [p["required"] for p in clean] == [False, True, False]
+
+
+def _isolated_skills(monkeypatch, tmp_path):
+    from service import skills
+    from service.skills import trust
+    monkeypatch.setattr(ta, "SKILLS_DIR", tmp_path / "skills")
+    monkeypatch.setattr(skills, "SKILLS_DIR", tmp_path / "skills")
+    monkeypatch.setattr(trust, "TRUST_PATH", tmp_path / "moe" / "skill_trust.json")
+    (tmp_path / "skills").mkdir()
+
+
+def test_a_built_in_name_is_refused_even_with_a_skill_folder_of_that_name(monkeypatch, tmp_path):
+    import asyncio
+    _isolated_skills(monkeypatch, tmp_path)
+    (tmp_path / "skills" / "run_shell").mkdir()
+    (tmp_path / "skills" / "run_shell" / "leftover.py").write_text("print('left')\n")
+
+    async def never(*a, **k):
+        raise AssertionError("no draft for a taken name")
+    monkeypatch.setattr(ta, "_generate", never)
+    err = asyncio.run(ta.prepare_draft({"name": "run_shell", "description": "d", "task": "t"}))
+    assert "already called" in err
+
+
+def test_a_leftover_folder_is_never_approved_with_a_new_tool(monkeypatch, tmp_path):
+    import asyncio
+    from service.skills import trust
+    _isolated_skills(monkeypatch, tmp_path)
+    leftover = tmp_path / "skills" / "fixture_leftover_tool"
+    leftover.mkdir()
+    (leftover / "helper.py").write_text("print('left')\n")
+
+    async def never(*a, **k):
+        raise AssertionError("no draft for a taken name")
+    monkeypatch.setattr(ta, "_generate", never)
+    assert "already exists" in asyncio.run(ta.prepare_draft(
+        {"name": "fixture_leftover_tool", "description": "d", "task": "t"}))
+    # A draft cached before the folder appeared is refused at install time too.
+    ta._pending["fixture_leftover_tool"] = {"code": "print(1)\n", "description": "d", "parameters": [],
+                                            "warning": "", "read_scopes": [], "write_scopes": [],
+                                            "ts": __import__("time").time()}
+    out = asyncio.run(ta.create_tool("fixture_leftover_tool", "d", "t", []))
+    assert "already exists" in out
+    assert trust._read() == {} and sorted(p.name for p in leftover.iterdir()) == ["helper.py"]
+
+
+def test_drafting_asks_for_no_think_block_and_strips_one(monkeypatch):
+    import asyncio
+    from service.config.endpoints import Endpoint, Target
+    sent: list[dict] = []
+
+    class Fake:
+        async def ensure_only(self, *a, **k):
+            pass
+
+        async def chat(self, model, messages, **kwargs):
+            sent.append(kwargs)
+            return {"choices": [{"message": {"content": "<think>plan the code</think>\nprint('ok')\n"}}]}
+
+    target = Target("agent", Endpoint("local", "http://127.0.0.1:8000", "local_omlx", managed=True),
+                    "fixture-model", context_window=8192)
+    monkeypatch.setattr(ta, "role_target", lambda role: target)
+    monkeypatch.setattr(ta, "_c", lambda: Fake())
+    monkeypatch.setattr(ta, "no_thinking_kwargs",
+                        lambda model: {"chat_template_kwargs": {"enable_thinking": False}})
+    code, err = asyncio.run(ta._generate("fixture_tool", "print ok", []))
+    assert not err and code == "print('ok')"
+    assert sent[0]["chat_template_kwargs"] == {"enable_thinking": False}

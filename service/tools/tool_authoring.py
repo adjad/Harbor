@@ -47,10 +47,10 @@ import time
 
 import yaml
 
-from service.config import role_to_model
+from service.config import no_thinking_kwargs, role_to_model
 from service.inference.omlx_client import OMLXClient
 from service.config.endpoints import local_role_target, role_target
-from service.skills import SKILLS_DIR, load as reload_skills
+from service.skills import BUNDLED_SKILLS_DIR, SKILLS_DIR, load as reload_skills, parse_flag
 from service.skills.sandbox import available as sandbox_available
 from service.skills.scopes import describe as describe_scopes, parse_scopes
 from service.tools.registry import REGISTRY, register
@@ -115,6 +115,19 @@ def _strip_fences(code: str) -> str:
 # john@example.com', which Harbor then presented to the user as their real
 # address book. Redirecting to the tool that genuinely has the data fixes the
 # capability gap AND the fabrication in one move.
+#
+# Mail, calendar and reminders match only as the user's own data (my inbox,
+# read my emails, upcoming events, set a reminder): a utility that merely works
+# WITH an email address, a calendar date or a reminder message ("validate an
+# email address", "days between two calendar dates", "make an .ics file")
+# reads nothing of theirs and is a fine tool to build.
+_READ_WORDS = (r"read|fetch|list|search|scan|summari[sz]e|check|show|get|count|find|open|"
+               r"browse|export|sync|access|go through")
+_READ_VERB = rf"(?:{_READ_WORDS})"
+# Mail as messages, not an email address, format or template a utility handles.
+_MAIL = (r"(?:e-?mails?|mail)\b(?!\s*(?:address|addresses|format|syntax|domain|domains|header|"
+         r"headers|template|templates|regex|string|strings|field|validation|validator|signature|"
+         r"list|lists|merge)\b)")
 _NATIVE_CAPABILITY: list[tuple[str, str]] = [
     (r"\bcontacts?\b|\baddress book\b|\bphone ?numbers?\b",
      "list_contacts (list/browse everyone) or lookup_contact (one person's number/email)"),
@@ -124,13 +137,21 @@ _NATIVE_CAPABILITY: list[tuple[str, str]] = [
      r"\b(?:recent|unread|latest|new) texts\b|\btexts \w+ sent\b|"
      r"\bsms\b|\bchat\.db\b",
      "view_messages / summarize_messages"),
-    (r"\bemails?\b|\binbox\b|\bmail\.app\b|\bmailbox\b",
+    (r"\binbox(?:es)?\b|\bmail\.app\b|\bmailbox(?:es)?\b|\bgmail\b|"
+     rf"\bmy (?:\w+ )?{_MAIL}|\b(?:e-?mails?|mail) (?:from|to me|i (?:got|received|sent))\b|"
+     rf"\b(?:unread|recent|new|latest|incoming|sent|received) {_MAIL}|"
+     rf"\b{_READ_VERB} (?:(?:my|the|all|any|every|our) )?(?:\w+ )?{_MAIL}",
      "view_emails / summarize_emails"),
-    (r"\bcalendars?\b|\bupcoming events?\b|\bmy schedule\b",
+    (r"\bcalendar\.app\b|\bupcoming (?:events?|meetings?|appointments?)\b|"
+     r"\bmy (?:\w+ )?(?:calendars?|schedule|events|meetings|appointments|agenda)\b|"
+     rf"\b{_READ_VERB} (?:(?:my|the|today's|tomorrow's|this week's) )?(?:calendars?|agenda)\b|"
+     r"\b(?:calendar|events?|meetings?) (?:for|on) (?:today|tomorrow|this week|next week)\b",
      "get_upcoming / get_past_events"),
     (r"\bnotes\.app\b|\bmy notes\b",
      "search_notes"),
-    (r"\breminders?\b",
+    (r"\breminders\.app\b|\bmy (?:\w+ )?reminders?\b|\b(?:overdue|open|pending|due) reminders?\b|"
+     rf"\b(?:{_READ_WORDS}|add|create|set|make|schedule|complete|clear|delete) "
+     r"(?:(?:a|an|my|the|all|new) )?reminders?\b|\bremind me\b",
      "add_reminder / get_upcoming"),
 ]
 
@@ -217,7 +238,8 @@ def _validate_params(parameters: list) -> tuple[list[dict], str]:
             "name": name,
             "type": str(p.get("type") or "string"),
             "description": str(p.get("description") or ""),
-            "required": bool(p.get("required", False)),
+            # "false" (a string) is a no: bool("false") would make it required.
+            "required": parse_flag(p.get("required"), False),
         })
     return clean, ""
 
@@ -266,11 +288,16 @@ async def _generate(name: str, task: str, params: list[dict],
     c = _c() if target.endpoint.managed else OMLXClient(target=target)
     messages = [{"role": "system", "content": _CODER_SYS},
                 {"role": "user", "content": prompt}]
+    # Code, not a plan: no think block (a local model's chat template takes the
+    # switch; a remote payload takes no template kwargs), and any reasoning that
+    # still arrives is stripped below before the code is compiled.
+    extra = no_thinking_kwargs(coder) if target.endpoint.managed else {}
     try:
         await c.ensure_only(coder)
         resp = await c.chat(
             coder, messages,
             max_tokens=6000,
+            **extra,
         )
         # A previously-uninstrumented code-generation path, so this gets
         # the exact same debug_capture treatment: recorded BEFORE any of the
@@ -280,9 +307,11 @@ async def _generate(name: str, task: str, params: list[dict],
         # email_tools.py/imessage_tools.py.
         from service import debug_capture
         debug_capture.record("model_call", model=coder,
-                             request={"messages": messages, "max_tokens": 6000},
+                             request={"messages": messages, "max_tokens": 6000, **extra},
                              response=resp)
         code = (resp["choices"][0]["message"].get("content") or "").strip()
+        from service.behavior.phraser import strip_think
+        code = strip_think(code)
     except Exception as e:  # noqa: BLE001
         return "", f"the coding model failed: {e}"
     finally:
@@ -306,6 +335,23 @@ async def _generate(name: str, task: str, params: list[dict],
     return code, ""
 
 
+def _name_taken(name: str) -> str:
+    """Why `name` can't be a new tool's name, or "". Any tool Harbor already has
+    (built in, from a skill or MCP), any skill's name or folder, bundled or the
+    user's, is taken: a new folder there would hold leftover files approved along
+    with the new code, or take a bundled skill's place."""
+    if name in REGISTRY:
+        return f"a tool is already called {name!r} — pick another name"
+    if (SKILLS_DIR / name).exists() or (SKILLS_DIR / name).is_symlink():
+        return f"a skill folder named {name!r} already exists — pick another name"
+    if (BUNDLED_SKILLS_DIR / name).exists():
+        return f"a skill that ships with Harbor is called {name!r} — pick another name"
+    from service.skills import all_skills
+    if name in all_skills():
+        return f"a skill is already called {name!r} — pick another name"
+    return ""
+
+
 async def prepare_draft(args: dict, *, managed_only: bool = False) -> str:
     """Generate and cache the code for a proposed tool, WITHOUT installing it.
 
@@ -319,8 +365,8 @@ async def prepare_draft(args: dict, *, managed_only: bool = False) -> str:
     if not _NAME_RE.match(name):
         return (f"bad tool name {name!r} — use lowercase letters, digits, and "
                 "underscores, starting with a letter")
-    if name in REGISTRY and not (SKILLS_DIR / name).exists():
-        return f"a built-in tool is already called {name!r} — pick another name"
+    if (taken := _name_taken(name)):
+        return taken
 
     clean_params, err = _validate_params(args.get("parameters") or [])
     if err:
@@ -456,9 +502,22 @@ async def create_tool(name: str, description: str = "", task: str = "",
             return f"(couldn't create this tool: {err})"
         draft = _pending[name]
 
+    # Checked again now: the name may have been taken since the draft was made.
+    if (taken := _name_taken(name)):
+        _pending.pop(name, None)
+        return f"(couldn't create this tool: {taken})"
     skill_dir = SKILLS_DIR / name
     try:
-        skill_dir.mkdir(parents=True, exist_ok=True)
+        SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+        # A new, empty folder or nothing: what is approved below is exactly the two
+        # files written here, never something already lying in the folder.
+        skill_dir.mkdir()
+    except FileExistsError:
+        _pending.pop(name, None)
+        return f"(couldn't create this tool: a skill folder named {name!r} already exists)"
+    except OSError as e:
+        return f"(couldn't write the new tool to disk: {e})"
+    try:
         (skill_dir / "tool.py").write_text(draft["code"])
         # Built as a dict and dumped with yaml.safe_dump. A hand-rolled
         # f-string of repr()'d text parsed fine in testing by luck of Python's
@@ -490,6 +549,9 @@ async def create_tool(name: str, description: str = "", task: str = "",
         from service.skills import trust
         trust.approve(skill_dir)
     except Exception as e:  # noqa: BLE001
+        # Half a tool must not stay behind to be approved with a later one.
+        import shutil
+        shutil.rmtree(skill_dir, ignore_errors=True)
         return f"(couldn't write the new tool to disk: {e})"
 
     reload_skills()

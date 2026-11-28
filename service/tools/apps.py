@@ -7,13 +7,24 @@ in view-only mode they're denied; otherwise they require the user's confirmation
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 
 from service.tools.registry import register
 
 
+def _timed_out(argv: list[str], secs: float) -> subprocess.CompletedProcess:
+    """What a command that ran out of time looks like to the callers below: a
+    failure with a sentence, instead of an exception that ends the tool call."""
+    return subprocess.CompletedProcess(
+        argv, 124, "", f"it did not answer within {secs:g} seconds")
+
+
 def _osascript(script: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["osascript", "-e", script],
-                          capture_output=True, text=True, timeout=20)
+    argv = ["osascript", "-e", script]
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=20)
+    except subprocess.TimeoutExpired:
+        return _timed_out(argv, 20)
 
 
 def _as_str(value: str) -> str:
@@ -40,7 +51,10 @@ def _as_str(value: str) -> str:
 
 
 def _run(argv: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(argv, capture_output=True, text=True, timeout=20)
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=20)
+    except subprocess.TimeoutExpired:
+        return _timed_out(argv, 20)
 
 
 # Spoken names that differ from the installed app's name ("Apple TV" is "TV").
@@ -67,7 +81,14 @@ def open_app(name: str, target: str | None = None) -> str:
     name = _APP_NAME_ALIASES.get((name or "").strip().lower(), name)
     argv = ["open", "-a", name]
     if target:
-        argv.append(target)
+        if "://" not in target and not target.lower().startswith("mailto:"):
+            from service.tools.builtin import _wrong_account_path
+            if (msg := _wrong_account_path(target)):
+                return msg
+            target = str(Path(target).expanduser())
+        # "--" ends the options, so a target such as "-W" or "--args" is a
+        # file name for the app, not a flag for `open`.
+        argv += ["--", target]
     p = _run(argv)
     if p.returncode != 0:
         return f"(could not open {name!r}: {p.stderr.strip() or 'unknown error'})"
@@ -83,6 +104,7 @@ def open_app(name: str, target: str | None = None) -> str:
     category="app_control",
 )
 def quit_app(name: str) -> str:
+    name = _APP_NAME_ALIASES.get((name or "").strip().lower(), name)
     p = _osascript(f'tell application {_as_str(name)} to quit')
     if p.returncode != 0:
         return f"(could not quit {name!r}: {p.stderr.strip() or 'unknown error'})"

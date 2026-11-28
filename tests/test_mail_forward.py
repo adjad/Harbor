@@ -36,7 +36,7 @@ def no_real_effects(monkeypatch):
         raise AssertionError("no network or native process in forward tests")
     monkeypatch.setattr(socket.socket, "connect", forbidden)
     monkeypatch.setattr(subprocess, "Popen", forbidden)
-    monkeypatch.setattr(A, "_own_address_guard", lambda *a: "")
+    monkeypatch.setattr(A, "_own_address_guard", lambda *a, **k: "")
     monkeypatch.setattr(A, "_unreviewed", lambda: False)
     yield
     assert not outbox._pending and not outbox._pending_waiters

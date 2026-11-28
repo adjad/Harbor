@@ -30,7 +30,39 @@ _REFUSED_ROOTS = {
     Path("/"), Path("/System"), Path("/usr"), Path("/bin"), Path("/sbin"),
     Path("/etc"), Path("/private/etc"), Path("/var"), Path("/private/var"),
     Path("/Library"), Path("/Applications"),
+    # Shared temp folders (anyone on the Mac can plant files there) and the
+    # mount point of every external and network volume.
+    Path("/tmp"), Path("/private/tmp"), Path("/var/tmp"), Path("/private/var/tmp"),
+    Path("/Volumes"),
 }
+
+
+def _homes() -> list[Path]:
+    """The home folder as written and as resolved: when HOME is a link, a scope
+    resolved through it must still be recognised as home (or inside it)."""
+    home = Path.home()
+    out = [home]
+    try:
+        out.append(home.resolve())
+    except (OSError, RuntimeError):
+        pass
+    return list(dict.fromkeys(out))
+
+
+def _credential_places() -> list[Path]:
+    """The key and credential folders the sandbox never lets a skill read
+    (sandbox._NEVER_READ), under each spelling of home, and resolved."""
+    from service.skills.sandbox import _NEVER_READ
+    out: list[Path] = []
+    for raw in _NEVER_READ:
+        for home in _homes():
+            place = Path(raw.replace("~", str(home), 1)) if raw.startswith("~") else Path(raw)
+            out.append(place)
+            try:
+                out.append(place.resolve())
+            except (OSError, RuntimeError):
+                pass
+    return list(dict.fromkeys(out))
 
 
 def _protected_places() -> list[Path]:
@@ -47,27 +79,39 @@ def _protected_places() -> list[Path]:
     return list(dict.fromkeys(out))
 
 
-def _code_run_overlap(path: Path) -> str:
-    home = Path.home()
-    for place in _protected_places():
+def _home_or_above(path: Path) -> bool:
+    return any(path == home or path in home.parents for home in _homes())
+
+
+def _overlap(path: Path, places: list[Path]) -> str:
+    for place in places:
         if path == place or path.is_relative_to(place):
             return str(place)
         # Containing one counts, but home and the folders above it hold them all
         # and are refused (or allowed) by the rules below.
-        if place.is_relative_to(path) and path not in (home, *home.parents):
+        if place.is_relative_to(path) and not _home_or_above(path):
             return str(place)
     return ""
 
 
+def _code_run_overlap(path: Path) -> str:
+    return _overlap(path, _protected_places())
+
+
 def _refused(path: Path) -> str:
-    home = Path.home()
+    homes = _homes()
     if path in _REFUSED_ROOTS:
         return f"{path} is too broad or too sensitive to grant a generated tool"
-    if path == home:
+    if path in homes:
         return ("your whole home folder is too broad to grant — name the "
                 "specific folder the tool needs (e.g. ~/Downloads)")
-    if path == home.parent:                     # /Users
+    if any(path == home.parent for home in homes):      # /Users
         return "every user's home folder is too broad to grant"
+    # Keys and credentials: the sandbox never lets a tool read them, so a scope
+    # naming one (or holding one) would tell the person something untrue.
+    hit = _overlap(path, _credential_places())
+    if hit:
+        return f"{path} reaches {hit}, which holds keys or credentials a generated tool never reads"
     # Harbor's own folder and the places whose files run as code later (login
     # items, shell startup files, git config, the app bundle): a scope that is
     # one, sits inside one, or contains one is refused. A skill granted
@@ -120,10 +164,12 @@ def describe(read_scopes: list[Path], write_scopes: list[Path],
                 "file access. Read the code carefully.")
 
     def fmt(paths: list[Path]) -> str:
-        home = Path.home()
-        return ", ".join(
-            f"~/{p.relative_to(home)}" if p.is_relative_to(home) else str(p)
-            for p in paths)
+        def one(p: Path) -> str:
+            for home in _homes():
+                if p.is_relative_to(home):
+                    return f"~/{p.relative_to(home)}"
+            return str(p)
+        return ", ".join(one(p) for p in paths)
 
     if not read_scopes and not write_scopes:
         return "Sandboxed: cannot read or write any of your files."

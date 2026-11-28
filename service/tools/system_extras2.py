@@ -10,12 +10,15 @@ _TIMEOUT = 20
 
 
 def _run(argv: list[str], timeout: int = _TIMEOUT) -> subprocess.CompletedProcess:
-    return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            argv, 124, "", f"it did not answer within {timeout} seconds")
 
 
 def _osa(script: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["osascript", "-e", script], capture_output=True,
-                          text=True, timeout=_TIMEOUT)
+    return _run(["osascript", "-e", script])
 
 
 def appearance_mode(mode: str) -> str:
@@ -24,9 +27,9 @@ def appearance_mode(mode: str) -> str:
     if m not in ("light", "dark", "auto"):
         return f"(error: unknown mode {m!r}. Use light, dark, or auto.)"
     if m == "auto":
-        script = ('tell application "System Events" to tell appearance preferences '
-                  'to set dark mode to true\n'
-                  'do shell script "defaults write NSGlobalDomain '
+        # Switch on automatic appearance only. It follows the time of day, so
+        # the current look is not forced to dark first.
+        script = ('do shell script "defaults write NSGlobalDomain '
                   'AppleInterfaceStyleSwitchesAutomatically -bool true"')
     else:
         # Turning automatic switching off first. The key is usually unset,
@@ -47,13 +50,20 @@ def appearance_mode(mode: str) -> str:
 
 def network_details() -> str:
     """Local/public IP and connection type (system_status section; public IP is a network call)."""
+    from service.tools.system_control import ethernet_interfaces, wifi_interface
     lines = []
-    p = _run(["ipconfig", "getifaddr", "en0"])
-    if p.returncode == 0 and p.stdout.strip():
-        lines.append(f"Local IP (Wi-Fi): {p.stdout.strip()}")
-    ssid_p = _run(["networksetup", "-getairportnetwork", "en0"])
-    if ":" in ssid_p.stdout:
-        lines.append(f"Wi-Fi network: {ssid_p.stdout.split(':', 1)[-1].strip()}")
+    wifi = wifi_interface()
+    if wifi:
+        p = _run(["ipconfig", "getifaddr", wifi])
+        if p.returncode == 0 and p.stdout.strip():
+            lines.append(f"Local IP (Wi-Fi): {p.stdout.strip()}")
+        ssid_p = _run(["networksetup", "-getairportnetwork", wifi])
+        if ":" in ssid_p.stdout:
+            lines.append(f"Wi-Fi network: {ssid_p.stdout.split(':', 1)[-1].strip()}")
+    for device in ethernet_interfaces():
+        p = _run(["ipconfig", "getifaddr", device])
+        if p.returncode == 0 and p.stdout.strip():
+            lines.append(f"Local IP (Ethernet, {device}): {p.stdout.strip()}")
     try:
         import httpx
         r = httpx.get("https://api.ipify.org", timeout=6)

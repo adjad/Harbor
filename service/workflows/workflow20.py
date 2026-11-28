@@ -81,7 +81,10 @@ def priority_read(text: str) -> PersonalRead | None:
         r"\s*(?:(?:please|can you|could you)\s+)?(?:what\s+(?:should\s+I\s+"
         r"(?:work\s+on|focus\s+on|do|prioriti[sz]e|tackle)|do\s+I\s+need\s+to\s+do)|"
         r"help\s+me\s+prioriti[sz]e(?:\s+my\s+(?:work|tasks))?|"
-        r"what\s+are\s+my\s+priorities|what\s+needs\s+(?:me|my\s+attention))"
+        r"what\s+are\s+my\s+priorities|what\s+needs\s+(?:me|my\s+attention)|"
+        # "what's important today?" names no topic, so it is the user's day.
+        r"what(?:'s|’s|\s+is)\s+(?:most\s+)?(?:important|urgent|pressing)(?:\s+for\s+me)?|"
+        r"(?:is\s+there\s+)?anything\s+(?:important|urgent|pressing)(?:\s+for\s+me)?)"
         r"(?:\s+(?P<period>now|today|tomorrow|tommorow|tommorrow|tomorow|tommrow|tmrow|tmrw|(?:this|next)\s+(?:week|month)))?"
         r"(?:\s+(?:using|from)\s+(?P<include>[^.!?;\n]+?)(?:\s+only)?)?"
         r"(?:\s*,?\s*(?:without|excluding|skip)\s+(?P<exclude>[^.!?;\n]+))?[.!?\s]*", text, re.I)
@@ -129,6 +132,29 @@ def attention_read(text: str) -> PersonalRead | None:
         if match := re.fullmatch(prefix + pattern + r"[.!?\s]*", text, re.I):
             sources = _evidence_sources(match["sources"], None, ("email", "messages"))
             break
+    # "any important notes today?", "are there any urgent reminders?", "what
+    # important messages did I get?": importance is the intent, not a word the
+    # source must contain. The source list must parse completely, and any
+    # source may be important ("which notes are important?"), not only mail.
+    day = "today"
+    important = r"(?:important|urgent|pressing|priority|high[- ]priority|time[- ]sensitive)"
+    period = (r"(?:\s+(?:for\s+me\s+)?(?:for\s+)?(?P<period>today|tonight|tomorrow|this\s+(?:morning|afternoon|evening|week)))?"
+              r"(?:\s+for\s+me)?")
+    if not sources:
+        for pattern in (
+                any_ + important + r"\s+(?P<sources>.+?)" + period,
+                r"(?:what|which)\s+" + important + r"\s+(?P<sources>.+?)\s+(?:do|did|have)\s+I\s+"
+                r"(?:have|get|got|gotten|receive[d]?|miss(?:ed)?)" + period,
+                r"(?:what|which)\s+(?P<sources>.+?)\s+(?:are|is)\s+" + important + period):
+            if match := re.fullmatch(prefix + pattern + r"[.!?\s]*", text, re.I):
+                sources = _evidence_sources(match["sources"], None, tuple(_SOURCE))
+                if match["period"] and sources and {"email", "messages"} & set(sources):
+                    # The task window cannot filter mail or texts by receipt
+                    # day, so a dated mail question keeps its existing owner.
+                    return None
+                named = (match["period"] or "today").casefold()
+                day = named if named in {"tomorrow", "this week"} else "today"
+                break
     if re.fullmatch(prefix + r"what\s+should\s+I\s+(?:reply|respond)\s+to\s+first[.!?\s]*", text, re.I):
         sources = ("email", "messages")
     if re.fullmatch(prefix + r"(?:is\s+there\s+)?anything\s+(?:that\s+)?I\s+(?:still\s+)?" + must
@@ -136,7 +162,10 @@ def attention_read(text: str) -> PersonalRead | None:
         sources = ("email", "messages")
     if not sources:
         return None
-    args = {"period": "today", "include_overdue": False, "include_undated": False,
+    # A reminder that is already overdue or has no date can still be the
+    # important one; only task-shaped sources carry those flags.
+    tasks = "reminders" in sources
+    args = {"period": day, "include_overdue": tasks, "include_undated": tasks,
             **{f"include_{source}": source in sources for source in _SOURCE}}
     return PersonalRead(sources, ("collect_task_evidence",), (frozenset({"collect_task_evidence"}),),
                         {"collect_task_evidence": args})

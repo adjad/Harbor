@@ -77,6 +77,7 @@ def test_runner_reports_a_rejected_level_without_acting(loaded, monkeypatch) -> 
     # inside an already-sandboxed reviewer or CI process.
     from service.skills import sandbox
     monkeypatch.setattr(sandbox, "available", lambda: False)
+    monkeypatch.setattr(sandbox, "refusal", lambda: "")
     out = asyncio.run(REGISTRY["mac_set_volume"].func(level="50 & beep"))
     assert "0 to 100" in out
 

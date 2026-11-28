@@ -1853,13 +1853,21 @@ class TestRemindersDueEarlierToday:
         assert "1 reminder already past due." in card
         assert "Next: Water the plants" in card
 
-    def test_a_done_or_earlier_day_reminder_is_not_added(self, agenda_store):
+    def test_a_done_reminder_is_not_added(self, agenda_store):
         now = _today_at(20)
         done = agenda_store.add_manual("Return the library book", _today_at(9))
         agenda_store.set_status(done["id"], "done")
-        agenda_store.add_manual("Renew the bus pass", _today_at(9) - 86400)
         assert B._agenda(now)["reminders"] == []
         assert "past due" not in B._today_card(now)
+
+    def test_an_open_reminder_from_an_earlier_day_stays_as_overdue(self, agenda_store):
+        # Due yesterday and still open: overdue work today, not gone at midnight.
+        now = _today_at(20)
+        agenda_store.add_manual("Renew the bus pass", _today_at(9) - 86400)
+        assert [item["title"] for item in B._agenda(now)["reminders"]] == ["Renew the bus pass"]
+        row = next(line for line in B._schedule_section(now).splitlines() if "Renew the bus pass" in line)
+        assert row.endswith("overdue")
+        assert "1 reminder already past due." in B._today_card(now)
 
     def test_an_earlier_calendar_event_is_listed_once_and_not_as_a_reminder(self, agenda_store):
         now = _today_at(20)
@@ -1885,18 +1893,9 @@ class TestRemindersDueEarlierToday:
         assert [item["title"] for item in B._agenda(now)["reminders"]] == ["Call the landlord"]
         assert "Dentist appointment" not in B._schedule_section(now)
 
-    def test_nothing_is_read_before_five_past_midnight(self, agenda_store, monkeypatch):
-        calls = []
-        real = agenda_store.active_between
-
-        def counted(*args, **kwargs):
-            calls.append(args)
-            return real(*args, **kwargs)
-        monkeypatch.setattr(agenda_store, "active_between", counted)
-        B._agenda(_today_at(0, 3))
-        assert calls == []
-        B._agenda(_today_at(0, 10))
-        assert len(calls) == 1
+    def test_just_after_midnight_yesterdays_open_reminder_is_still_read(self, agenda_store):
+        agenda_store.add_manual("Send the form", _today_at(23) - 86400)
+        assert [item["title"] for item in B._agenda(_today_at(0, 3))["reminders"]] == ["Send the form"]
 
 
 class TestTodayCardNextLine:

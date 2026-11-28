@@ -1160,7 +1160,7 @@ def test_nothing_harbor_runs_inherits_the_launch_nonce(monkeypatch):
     builtin = (root / "service" / "tools" / "builtin.py").read_text()
     assert "timeout=120, cwd=str(Path.home()), env=child_environment())" in builtin
     skills = (root / "service" / "skills" / "tools.py").read_text()
-    assert 'env={**child_environment(), "HARBOR_SKILL_DIR": str(skill_dir),' in skills
+    assert 'env={**skill_environment(), "HARBOR_SKILL_DIR": str(skill_dir),' in skills
     assert "**os.environ" not in skills
 
 

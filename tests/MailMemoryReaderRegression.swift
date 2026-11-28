@@ -667,6 +667,76 @@ enum MailMemoryReaderRegression {
                                               attachmentID: "1", name: "..") == nil, "a directory is never a file")
 
 
+        // MARK: Archive search (kind "archive_search"): mail outside the Inbox and Sent, headers only
+
+        let archiveRoot = "\(root)/archive"
+        try FileManager.default.createDirectory(atPath: "\(archiveRoot)/V10/MailData", withIntermediateDirectories: true)
+        let archiveDB = makeDB("archivefixture", """
+        CREATE TABLE mailboxes (ROWID INTEGER PRIMARY KEY, url TEXT);
+        CREATE TABLE subjects (ROWID INTEGER PRIMARY KEY, subject TEXT);
+        CREATE TABLE addresses (ROWID INTEGER PRIMARY KEY, address TEXT, comment TEXT);
+        CREATE TABLE labels (message_id INTEGER, mailbox_id INTEGER);
+        CREATE TABLE messages (ROWID INTEGER PRIMARY KEY, subject INTEGER, sender INTEGER, date_received REAL,
+          mailbox INTEGER, deleted INTEGER, global_message_id INTEGER);
+        CREATE TABLE message_global_data (ROWID INTEGER PRIMARY KEY, message_id_header TEXT);
+        INSERT INTO mailboxes VALUES (1, 'imap://A/INBOX'), (2, 'imap://A/Archive'), (3, 'imap://GM/%5BGmail%5D/All%20Mail'),
+          (4, 'imap://GM/INBOX'), (5, 'imap://A/Sent%20Messages'), (6, 'imap://A/Trash'), (7, 'imap://GM/%5BGmail%5D/Trash');
+        INSERT INTO subjects VALUES (1, 'Lease renewal'), (2, 'Lease signed'), (3, 'Lease question'), (4, 'Lease archived'),
+          (5, 'Lease trash'), (6, 'Lease deleted'), (7, 'Lease reply'), (8, 'Dinner'), (9, 'Lease binned label');
+        INSERT INTO addresses VALUES (1, 'leasing@quayside.example', 'Quayside Homes'), (2, 'pat@example.com', 'Pat Doe');
+        INSERT INTO message_global_data VALUES (1, '<signed@x>'), (2, '<archived@x>');
+        INSERT INTO messages VALUES (1, 1, 1, \(now - 100), 1, 0, NULL);
+        INSERT INTO messages VALUES (2, 2, 1, \(now - 5000), 2, 0, 1);
+        INSERT INTO messages VALUES (3, 3, 2, \(now - 200), 3, 0, NULL);
+        INSERT INTO messages VALUES (4, 4, 2, \(now - 300), 3, 0, 2);
+        INSERT INTO messages VALUES (5, 5, 1, \(now - 100), 6, 0, NULL);
+        INSERT INTO messages VALUES (6, 6, 1, \(now - 100), 2, 1, NULL);
+        INSERT INTO messages VALUES (7, 7, 2, \(now - 100), 5, 0, NULL);
+        INSERT INTO messages VALUES (8, 8, 2, \(now - 100), 2, 0, NULL);
+        INSERT INTO messages VALUES (9, 9, 2, \(now - 100), 3, 0, NULL);
+        INSERT INTO labels VALUES (3, 4), (9, 7);
+        """)
+        try FileManager.default.copyItem(atPath: archiveDB, toPath: "\(archiveRoot)/V10/MailData/Envelope Index")
+        func archiveRequest(_ over: [String: Any] = [:]) -> [String: Any] {
+            var base: [String: Any] = ["type": "mail_memory_read", "request_id": "abcdefghijklmnop", "kind": "archive_search",
+                                       "terms": ["lease"], "since": 0, "until": 0, "limit": 20]
+            for (k, v) in over { base[k] = v }
+            return base
+        }
+        check(MailMemoryReader.request(archiveRequest())?.kind == "archive_search", "archive_search parses")
+        check(MailMemoryReader.request(archiveRequest(["terms": []])) == nil, "archive_search needs a term")
+        check(MailMemoryReader.request(archiveRequest(["terms": ["a", "b", "c", "d", "e", "f"]])) == nil,
+              "archive_search: at most five terms")
+        check(MailMemoryReader.request(archiveRequest(["limit": 51])) == nil, "archive_search: at most 50 rows")
+        check(MailMemoryReader.request(archiveRequest(["limit": true])) == nil, "archive_search: a boolean limit is refused")
+        check(MailMemoryReader.request(archiveRequest(["terms": ["a\nb"]])) == nil, "archive_search: no control characters")
+        check(MailMemoryReader.request(archiveRequest(["rowid": 1])) == nil, "archive_search: strict keys")
+        let archivePair = makeReader(archiveRoot)
+        let archived = archivePair.1.ask(archivePair.0, archiveRequest())
+        let archivedRows = archived["rows"] as? [[String: Any]] ?? []
+        check(archived["ok"] as? Bool == true && archived["kind"] as? String == "archive_search"
+              && archivedRows.map { $0["subject"] as? String ?? "" } == ["Lease archived", "Lease signed"],
+              "archive_search finds Archive and unlabelled All Mail only, newest first: \(archived)")
+        check(archivedRows.first?["mailbox"] as? String == "All Mail" && archivedRows.first?["account"] as? String == "GM"
+              && archivedRows.first?["sender"] as? String == "pat@example.com"
+              && archivedRows.first?["sender_name"] as? String == "Pat Doe"
+              && archivedRows.first?["rfc_message_id"] as? String == "<archived@x>"
+              && archivedRows.last?["mailbox"] as? String == "Archive", "archive rows carry headers: \(archivedRows)")
+        check(archivedRows.allSatisfy { $0["body"] == nil && $0["rowid"] == nil }, "archive rows carry no body or rowid")
+        let archiveByName = archivePair.1.ask(archivePair.0, archiveRequest(["terms": ["quayside"]]))
+        check((archiveByName["rows"] as? [[String: Any]] ?? []).map { $0["subject"] as? String ?? "" } == ["Lease signed"],
+              "archive_search matches the sender: \(archiveByName)")
+        let archiveCapped = archivePair.1.ask(archivePair.0, archiveRequest(["limit": 1]))
+        check((archiveCapped["rows"] as? [[String: Any]])?.count == 1 && archiveCapped["capped"] as? Bool == true, "archive_search caps")
+        let recent = archivePair.1.ask(archivePair.0, archiveRequest(["since": now - 1000]))
+        check((recent["rows"] as? [[String: Any]] ?? []).map { $0["subject"] as? String ?? "" } == ["Lease archived"],
+              "archive_search honours since")
+        let noIndex = makeReader("\(root)/nowhere-archive")
+        check(noIndex.1.ask(noIndex.0, archiveRequest())["error"] as? String == "no_mail_index", "archive_search: no index")
+        do { _ = try MailMemoryReader.archiveRows(dbPath: junk, terms: ["x"], since: 0, until: 0, limit: 5)
+             check(false, "archiveRows: a junk file throws") }
+        catch { check(error is MailMemoryReader.IndexFailure, "archiveRows: not a database throws") }
+
         // MARK: Messages attachments (kinds "message_attachments" and "message_attachment")
         func msgListRequest(_ over: [String: Any] = [:]) -> [String: Any] {
             var base: [String: Any] = ["type": "mail_memory_read", "request_id": "abcdefghijklmnop", "kind": "message_attachments",

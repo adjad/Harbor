@@ -370,13 +370,22 @@ def candidates(records: list[dict], rows: list[dict], *, now: float, tz: str,
         if item.direction != 'incoming' or not now - LOOKBACK_S <= item.ts <= now:
             continue
         trusted_school = item.id in institutional
+        # A phone number, address or link is how a stranger points the user somewhere, so it
+        # never becomes a Calendar or Reminders entry on its own. It is also how a clinic, a
+        # contractor or a portal gives real instructions, so the plan is not dropped: it stays
+        # a preview the person adds with a tap. Promo, scam and automated still drop it.
+        needs_tap = False
         if trusted_school:
             # An individual course announcement may be machine-sent. Other exclusion
             # signals retain their force; no global relaxation of the Messages screen.
             if _PROMO.search(item.text) or _SCAM_PHRASES.search(item.text):
                 continue
-        elif screen(item) or not contacts.importance(item).eligible:
-            continue
+        else:
+            if screen(item, contact_ok=True):
+                continue
+            needs_tap = screen(item) == 'contact_vector'
+            if not contacts.importance(item).eligible:
+                continue
         text = re.sub(r'\b(' + '|'.join(_TYPOS) + r')\b', lambda m: _TYPOS[m[0].lower()], item.text, flags=re.I)
         event_cue = _EVENT.search(text) or (_GENERIC_EVENT.search(text) and not _GENERIC_UNCERTAIN.search(text))
         if not event_cue or _CANCEL.search(text) or _WITHDRAW.search(text) or _NEGATED.search(text):
@@ -431,8 +440,11 @@ def candidates(records: list[dict], rows: list[dict], *, now: float, tz: str,
         course = re.search(r'\b((?!(?:EXAM|QUIZ|FINAL|COURSE)\b)[A-Z]{2,8})[- ]?(\d{1,4})\b', item.text.split('\n')[0])
         scope = 'course:' + digest(course[1].lower() + course[2]) if course else 'thread:' + digest(item.conversation.casefold())
         key = 'capture:' + digest(f'{scope}|{r.day}|{r.start.timestamp() if r.start else "date"}|{semantic}')
-        automatic_eligible = item.source == 'messages' or bool(course and re.search(r'\b(?:exam|quiz|midterm|final|class)\b', text, re.I))
-        if not automatic_eligible:
+        automatic_eligible = (not needs_tap and (item.source == 'messages' or bool(
+            course and re.search(r'\b(?:exam|quiz|midterm|final|class)\b', text, re.I))))
+        if needs_tap:
+            when += ' · has a phone number, address or link: review before adding'
+        elif not automatic_eligible:
             when += ' · review participation before adding'
         elif item.source != 'messages' and not MAIL_CAPTURES_ITSELF:
             when += ' · from email: waits for your tap'

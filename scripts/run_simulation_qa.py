@@ -526,6 +526,15 @@ ADDITIONAL_FULL_TESTS = {
     # LoRA dataset splits keep whole conversations on one side: invented sessions in
     # a tmp_path sessions.db, the router stubbed; no model, network or user data.
     "tests/test_lora_dataset_split.py",
+    # App audit regressions, all on invented data with mocked HTTP, subprocess and
+    # stores: web/maps/reference tools, compute and system tools, read_file paging,
+    # router source subsets, tool-outcome refusals and overdue reminder completion.
+    "tests/test_app_audit_web.py",
+    "tests/test_app_audit_system.py",
+    "tests/test_read_file_paging.py",
+    "tests/test_router_source_subsets.py",
+    "tests/test_tool_outcome_refusals.py",
+    "tests/test_task_engine_complete_overdue.py",
     # The send queue overwrites what it removes: an assistant.db in tmp_path, no
     # network, engine or real send.
     "tests/test_outbound_queue_secure_delete.py",
