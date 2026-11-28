@@ -1163,3 +1163,133 @@ def test_personal_fact_answered_from_a_status_read_still_says_it_does_not_know(s
                        prompt="How heavy is my backpack?", model_led_preload=["system_status", "get_upcoming"])
     assert executed(effects, "system_status") == [{}]
     assert answer == mo.ASK_UNKNOWN_MESSAGE
+
+
+# --- App audit 1.3.3-1.3.5, 1.2.1-1.2.2 and 1.4 (synthetic prompts only) -----
+
+@pytest.mark.parametrize("prompt", [
+    "Can you check my important notes?", "Can you check my important emails?", "Can you read my important emails?",
+    "What can you find in my emails?", "can you check my calendar for tomorrow?", "could you look through my notes",
+    "Can you summarize my unread messages?", "What can you see in my reminders?"])
+def test_a_polite_data_request_is_not_a_question_about_harbor(prompt):
+    assert mo.data_request(prompt)
+    assert not mo.capability_question(prompt)
+    assert not mo.harbor_self_question(prompt)
+
+
+@pytest.mark.parametrize("prompt", [
+    "Can you read my email?", "What can you do with my calendar?", "What can you do?",
+    "Can you send texts for me?", "can you send texts?", "what are you good at"])
+def test_questions_about_harbor_itself_still_match(prompt):
+    assert not mo.data_request(prompt)
+    assert mo.capability_question(prompt)
+
+
+@pytest.mark.parametrize("prompt", [
+    "Draft an email to my boss about Thursday", "Write a note to Sam about Priya's visit",
+    "Draft a message to Dana about the offsite", "Write an email to the team regarding next week",
+    "Draft a text to Lee about my landlord", "Compose an email to Ana about the 14th"])
+def test_a_draft_about_a_day_event_or_person_keeps_its_reads(prompt):
+    assert not mo.pure_writing(prompt)
+    forbidden = mo.ask_forbidden_tools(prompt, _FAKE_REGISTRY)
+    assert not {"get_upcoming", "view_emails", "view_messages", "search_notes"} & forbidden
+
+
+@pytest.mark.parametrize("prompt", [
+    "What is the agenda for the review?", "What are the tasks for the launch?",
+    "What are the steps on the to-do for the move?", "What is the project status?",
+    "How far along is the project?", "What's the homework for chemistry?",
+    "What's on my schedule?", "When is Sam's birthday?"])
+def test_personal_record_words_keep_their_tools(prompt):
+    assert not mo.knowledge_question(prompt)
+
+
+@pytest.mark.parametrize("prompt", ["What is a project charter?", "How do I make a to-do list?",
+                                    "How many ounces are in a cup?"])
+def test_general_questions_with_an_indefinite_record_word_stay_knowledge(prompt):
+    assert mo.knowledge_question(prompt)
+
+
+@pytest.mark.parametrize("hint", ["ASK_DAY_PLAN_HINT", "EMAILS_TO_ANSWER_HINT"])
+def test_day_plan_hints_read_first_and_fall_back_to_the_sources(hint):
+    text = getattr(mo, hint)
+    assert "get_my_day_plan" in text and "first" in text
+    # No ban on reading the sources: the aggregate rule and these hints agree.
+    assert "do not read" not in text.lower() and "do not answer from a plain mail search" not in text.lower()
+    for marker in ("unavailable", "…and N more", "- …"):
+        assert marker in text
+    assert "view_emails" in text and "summarize_emails" in text
+
+
+def test_ask_core_stubs_add_the_reachable_readers_and_name_only_registered_tools():
+    import service.skills.tools  # noqa: F401  (registers use_skill)
+    import service.tools  # noqa: F401
+    from service.tools.registry import REGISTRY
+    added = {"use_skill", "harbor_skills", "read_message_attachments", "get_past_events", "find_files", "read_file",
+             "search_conversations", "read_knowledge"}
+    assert added <= mo.ASK_CORE_STUBS
+    assert mo.ASK_CORE_STUBS <= set(REGISTRY)
+    assert "fs_read" in mo.PERSONAL_SOURCE_CATEGORIES
+    assert mo.PERSONAL_SOURCE_TOOLS <= set(REGISTRY)
+    assert "search_memory" not in mo.PERSONAL_SOURCE_TOOLS
+
+
+def test_compact_results_keeps_parenthetical_headers_and_skips_notices():
+    results = [
+        ("search_notes", "(3 of 9 notes shown)\n- Rent: pay by the 1st\n- Car: book service"),
+        ("search_reminders", "(no matching reminders)"),
+        ("get_upcoming", "(error: Calendar is not available)"),
+        ("view_emails", "(Mail could not be read right now; try again)\nDetails follow"),
+    ]
+    text = mo.compact_results(results, {"search_notes": "From your notes"})
+    assert "From your notes:" in text and "Rent: pay by the 1st" in text
+    assert "no matching" not in text and "error" not in text and "could not" not in text
+
+
+def test_compact_results_shows_ten_rows_a_source():
+    rows = "\n".join(f"- Item {i}" for i in range(12))
+    text = mo.compact_results([("search_reminders", rows)], {})
+    assert "Item 9" in text and "Item 10" not in text and "…and 2 more" in text
+    assert len(mo.compact_results([("search_notes", "\n".join("x" * 150 for _ in range(40))),
+                                   ("view_emails", "\n".join("y" * 150 for _ in range(40)))], {})) <= 2010
+
+
+# --- Tools/skills audit 5.7 (synthetic skill and tool only) -------------------
+
+def test_pure_writing_keeps_use_skill():
+    registry = {**_FAKE_REGISTRY, "use_skill": _T("assistant_read")}
+    forbidden = mo.ask_forbidden_tools("Write a short thank-you note to my professor for the extension.", registry)
+    assert "use_skill" not in forbidden and "get_upcoming" in forbidden
+
+
+def test_ask_head_start_offers_skill_tools(monkeypatch):
+    from pathlib import Path
+    from service import main as service_main, skills
+    from service.tools import registry
+    import service.skills.tools  # noqa: F401  (registers use_skill)
+
+    async def runner(**_):
+        return "ok"
+    monkeypatch.setitem(registry.REGISTRY, "zz_tidy_receipts",
+                        registry.Tool("zz_tidy_receipts", "tidy receipts", {"type": "object", "properties": {}},
+                                      "skill_tool", runner))
+    skill = skills.Skill("receipt-tidy", "Tidy receipts", "Step 1.", Path("/nonexistent/receipt-tidy"),
+                         triggers=["tidy my receipts"], tools=[{"name": "zz_tidy_receipts", "command": "true"}])
+    monkeypatch.setattr(skills, "_skills", {skill.name: skill})
+    preload, stubs = service_main._ask_tool_rank("please tidy my receipts", "")
+    assert preload[:2] == ["zz_tidy_receipts", "use_skill"]
+    _, plain_stubs = service_main._ask_tool_rank("what's the weather in Lisbon?", "")
+    assert {"use_skill", "harbor_skills"} <= set(plain_stubs)
+
+
+def test_plain_chat_skill_text_follows_the_tool_turn_rule():
+    """Plain chat adds skill text only where a tool turn would allow skill
+    context: on this Mac, or under Cloud "Everything"."""
+    import inspect
+    import re as _re
+    from service import main as service_main
+    source = inspect.getsource(service_main)
+    call = source.index("+ (_plain_chat_skill_blocks(prompt, active_skill")
+    guard = source[call:call + 600]
+    assert _re.search(r"if remote_only_profile\(\) is None or cloud_everything_active\(\) else \"\"", guard)
+    assert source.count("_plain_chat_skill_blocks(prompt, active_skill") == 1

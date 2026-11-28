@@ -650,3 +650,38 @@ def test_the_loop_runs_no_web_tool_behind_a_holiday(synthetic, prompt):
         [call("web_fetch", url="https://example.com")], "Synthetic reply."], prompt=prompt, approval=approval)
     assert not [name for name, _ in effects if name in PRIVATE_WEB_TOOLS], effects
     assert not approval.calls
+
+
+# App audit 1.3.1: a bare status question about the user's own notes,
+# reminders, tasks or day ("any important notes today?") was EXTERNAL with
+# only web_search allowed, which forbade every personal read. A topic keeps
+# the question public ("important news today", "best gifts for dad").
+PERSONAL_TRIAGE = [
+    "any important notes today?", "are there any important reminders today?", "what's important today?",
+    "any important tasks today?", "any to-dos for me today?", "anything important for me today?",
+    "what's urgent today?", "any priority reminders?", "any notes today?", "any meetings today?",
+    "any important deadlines this week?", "what important notes do I have today?",
+    "what important messages did I get?", "do I have any important reminders today?",
+    "anything urgent for me?", "what's the priority today?", "any important emails today?",
+]
+
+
+@pytest.mark.parametrize("prompt", PERSONAL_TRIAGE)
+def test_personal_status_and_triage_questions_are_never_web_only(prompt):
+    request = classify(prompt)
+    assert request.provenance == Provenance.PRIVATE
+    assert not request.allowed and request.query is None
+
+
+@pytest.mark.parametrize("prompt", [
+    "any important news today?", "important news today", "what's the important news today?",
+    "what's important in the news today?", "what's important in tech today?", "what's urgent in Ukraine today?",
+    "what's trending today?", "what's new in AI today?"])
+def test_public_importance_questions_stay_on_the_web(prompt):
+    request = classify(prompt)
+    assert request.provenance == Provenance.EXTERNAL and request.allowed
+    assert "web_search" in request.authorized_tools
+
+
+def test_a_public_gift_question_is_still_public():
+    assert classify("best gifts for dad").provenance == Provenance.EXTERNAL
