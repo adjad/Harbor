@@ -146,6 +146,8 @@ def test_only_a_bundled_skill_can_declare_apple_events(skill, monkeypatch):
                         lambda *a, **k: seen.append(a[3] if len(a) > 3 else k.get("apple_events")) or "(version 1)\n")
     monkeypatch.setattr(skill_tools.sandbox, "wrap_argv", lambda argv, _p: ["/usr/bin/true"])
     spec = {"script": "tool.py", "apple_events": ["System Events"]}
+    from service.skills import trust
+    trust.approve(skill)          # a user skill runs only as the person approved it
     for bundled in (False, True):
         asyncio.run(skill_tools._make_runner(skill, spec, "fixture_tool", bundled=bundled)())
     assert seen == [[], ["com.apple.systemevents"]]
@@ -201,3 +203,16 @@ def test_the_apple_events_profile_compiles_and_runs_a_no_op(skill, tmp_path):
     done = subprocess.run([sandbox.SANDBOX_EXEC, "-f", str(profile), "/usr/bin/true"],
                           capture_output=True, text=True, timeout=30, cwd="/")
     assert done.returncode == 0, done.stderr
+
+
+def test_a_user_skill_changed_after_approval_does_not_run(skill, monkeypatch):
+    import asyncio
+    from service.skills import tools as skill_tools, trust
+    started = []
+    monkeypatch.setattr(skill_tools.sandbox, "available", lambda: True)
+    monkeypatch.setattr(skill_tools.sandbox, "build_profile", lambda *a, **k: "(version 1)\n")
+    monkeypatch.setattr(skill_tools.sandbox, "wrap_argv", lambda argv, _p: started.append(argv) or ["/usr/bin/true"])
+    trust.approve(skill)
+    (skill / "tool.py").write_text("print('swapped after approval')\n")
+    result = asyncio.run(skill_tools._make_runner(skill, {"script": "tool.py"}, "fixture_tool")())
+    assert started == [] and result.startswith("(")

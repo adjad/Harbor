@@ -31,7 +31,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from service.identity import child_environment
+from service.identity import skill_environment
 from service.skills import sandbox, scopes
 from service.tools.registry import REGISTRY, register
 
@@ -150,6 +150,26 @@ def _build_argv(template: str, args: dict) -> list[str] | str:
     return ["" if x is None else x for x in out]
 
 
+def _run_time_problem(skill_dir: Path) -> str:
+    """Why this skill's tool must not start now, or "". A loaded skill is
+    re-checked in full (skills.verify_before_run). A folder no loaded skill
+    owns may still run only when it is outside the user's skills folder (a
+    bundled skill); a user folder must still match what the person approved."""
+    from service import skills as _skills
+    from service.skills import trust
+    try:
+        here = skill_dir.resolve()
+    except (OSError, RuntimeError):
+        return "this skill's folder can't be read"
+    if any(_skills._same_path(s.path, here) for s in _skills.all_skills().values()):
+        return _skills.verify_before_run(skill_dir)
+    try:
+        here.relative_to(_skills.SKILLS_DIR.resolve())
+    except (ValueError, OSError, RuntimeError):
+        return ""
+    return trust.problem(skill_dir)
+
+
 def _make_runner(skill_dir: Path, spec: dict, name: str = "", *, bundled: bool = False):
     template = str(spec.get("command") or "")
     script = str(spec.get("script") or "")
@@ -165,6 +185,9 @@ def _make_runner(skill_dir: Path, spec: dict, name: str = "", *, bundled: bool =
     write_scopes, _ = scopes.parse_scopes(spec.get("write_scopes"))
 
     async def run(**args) -> str:
+        # Re-check trust at run time: a script changed after load must not run.
+        if (why := _run_time_problem(skill_dir)):
+            return f"({why})"
         if script:
             path = (skill_dir / script).resolve()
             # Containment check: a skill's own folder is the only place it may
@@ -226,7 +249,7 @@ def _make_runner(skill_dir: Path, spec: dict, name: str = "", *, bundled: bool =
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
                     cwd=str(skill_dir),
-                    env={**child_environment(), "HARBOR_SKILL_DIR": str(skill_dir),
+                    env={**skill_environment(), "HARBOR_SKILL_DIR": str(skill_dir),
                          "HARBOR_SKILL_SCRATCH": str(scratch), "TMPDIR": str(scratch) + "/",
                          # No .pyc beside the skill: its folder is fingerprinted (skills/trust.py).
                          "PYTHONDONTWRITEBYTECODE": "1"},
@@ -419,4 +442,7 @@ async def use_skill(name: str) -> str:
         # A reply style, added to plain chat replies by Harbor itself; a
         # tool-using turn doesn't follow it (skills.Skill.always).
         return f"(the '{skill.name}' skill is a reply style Harbor applies to plain chat replies on its own; there's nothing to load)"
+    from service import skills as _skills
+    if (why := _skills.verify_before_run(skill)):
+        return f"({why})"
     return f"Instructions from the '{skill.name}' skill:\n\n{skill.body}"

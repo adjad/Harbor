@@ -113,7 +113,7 @@ def scratch_dir(skill_dir: Path) -> Path:
 # mounted external and network volumes, the shared temp dirs, root's home);
 # what stays readable is OS and application code, which holds nothing personal.
 _READ_DENY_ROOTS = [
-    "/Users", "/Volumes", "/private/tmp", "/private/var/root",
+    "/Users", "/Volumes", "/private/tmp", "/private/var/tmp", "/private/var/root",
     # Every app's per-user temp and cache folders; a tool's own temp is its scratch.
     "/private/var/folders",
 ]

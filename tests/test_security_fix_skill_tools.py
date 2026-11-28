@@ -131,7 +131,7 @@ def test_script_tools_use_this_python_pass_bare_flags_and_safe_dash_values(tmp_p
     (folder / "t.py").write_text("import sys; print(sys.executable); print(sys.argv[1:])\n")
     monkeypatch.setattr(_skill_tools.sandbox, "available", lambda: False)
     monkeypatch.setattr(_skill_tools.sandbox, "refusal", lambda: "")
-    monkeypatch.setattr(_skill_tools, "child_environment", lambda: dict(__import__("os").environ))
+    monkeypatch.setattr(_skill_tools, "skill_environment", lambda: dict(__import__("os").environ))
     monkeypatch.setenv("PATH", "/nonexistent")
     out = _asyncio.run(_skill_tools._make_runner(folder, {"script": "t.py"}, "fx_tool")(
         verbose=True, quiet=False, note="-x", city="Oslo", unset=None))
@@ -167,7 +167,7 @@ def test_a_sandbox_denial_is_named_even_when_it_is_past_the_output_cap(tmp_path,
         "import sys\nprint('x' * 9000)\nprint('PermissionError: [Errno 1] Operation not permitted', file=sys.stderr)\nsys.exit(1)\n")
     monkeypatch.setattr(_skill_tools.sandbox, "available", lambda: False)
     monkeypatch.setattr(_skill_tools.sandbox, "refusal", lambda: "")
-    monkeypatch.setattr(_skill_tools, "child_environment", lambda: dict(__import__("os").environ))
+    monkeypatch.setattr(_skill_tools, "skill_environment", lambda: dict(__import__("os").environ))
     out = _asyncio.run(_skill_tools._make_runner(folder, {"script": "t.py"}, "fx_tool")())
     assert str(out).startswith("(blocked by the sandbox")
 
