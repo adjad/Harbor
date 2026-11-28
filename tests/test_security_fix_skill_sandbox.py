@@ -166,12 +166,10 @@ def test_blocked_ports_apply_to_this_mac_only_not_outside_hosts(skill, monkeypat
     from service.safety import shell_sandbox
     monkeypatch.setattr(shell_sandbox, "harbor_ports", lambda: [8765])
     monkeypatch.setattr(shell_sandbox, "engine_ports", lambda: [8000])
-    monkeypatch.setattr(sandbox, "_own_addresses", lambda: ["localhost", "192.0.2.7"])
     profile = sandbox.build_profile(skill, [], [])
     assert '(remote ip "*:8765")' not in profile and '(remote ip "*:8000")' not in profile
-    for host in ("localhost", "192.0.2.7"):
-        assert f'(deny network-outbound (remote ip "{host}:8765"))' in profile
-        assert f'(deny network-outbound (remote ip "{host}:8000"))' in profile
+    assert '(deny network-outbound (remote ip "localhost:8765"))' in profile
+    assert '(deny network-outbound (remote ip "localhost:8000"))' in profile
 
 
 def test_sandbox_probe_uses_absolute_paths_and_names_a_nested_sandbox(monkeypatch):
@@ -193,3 +191,13 @@ def test_sandbox_probe_uses_absolute_paths_and_names_a_nested_sandbox(monkeypatc
     monkeypatch.setattr(sandbox, "_probe_cache", {})
     monkeypatch.setattr(sandbox.os.path, "isfile", lambda p: False)
     assert sandbox._probe() == "missing" and sandbox.refusal() == ""
+
+
+@pytest.mark.skipif(not _kernel_sandbox_works(), reason="a sandbox cannot be applied inside another sandbox")
+def test_the_apple_events_profile_compiles_and_runs_a_no_op(skill, tmp_path):
+    profile = tmp_path / "ae.sb"
+    profile.write_text(sandbox.build_profile(
+        skill, [], [], sandbox.apple_event_destinations(["System Events", "Music", "Spotify"])))
+    done = subprocess.run([sandbox.SANDBOX_EXEC, "-f", str(profile), "/usr/bin/true"],
+                          capture_output=True, text=True, timeout=30, cwd="/")
+    assert done.returncode == 0, done.stderr

@@ -258,25 +258,13 @@ def build_profile(skill_dir: Path, read_scopes: list[Path],
         ports = dict.fromkeys([*shell_sandbox.harbor_ports(), *shell_sandbox.engine_ports()])
     except Exception:  # noqa: BLE001 - the loopback deny above still applies
         ports = {}
-    # Only this Mac's own addresses: "*:port" would also have refused every
-    # outside host that happens to listen on 8000 or 8765.
-    for host in _own_addresses():
-        lines += [f'(deny network-outbound (remote ip "{host}:{port}"))' for port in ports]
+    # Loopback only. The profile language accepts just "*" or "localhost" as a
+    # host, so "*:port" (every host, outside ones that happen to listen on 8000
+    # or 8765 included) and "localhost:port" are the only choices; a Mac's own
+    # LAN address cannot be named, so this Mac's services are reached on
+    # loopback only, which is where Harbor and the engines bind.
+    lines += [f'(deny network-outbound (remote ip "localhost:{port}"))' for port in ports]
     return "\n".join(lines) + "\n"
-
-
-def _own_addresses() -> list[str]:
-    """localhost plus this Mac's own IPv4 addresses (its LAN address included)."""
-    import socket
-    hosts = ["localhost"]
-    try:
-        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-            addr = info[4][0]
-            if addr not in hosts:
-                hosts.append(addr)
-    except OSError:
-        pass
-    return hosts
 
 
 def _spellings(paths) -> list[Path]:
