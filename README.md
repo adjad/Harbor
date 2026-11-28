@@ -22,7 +22,7 @@
   </tr>
 </table>
 
-<p align="center"><sub>Shown with made-up people and plans. Harbor reads your own data on your Mac.</sub></p>
+
 
 Harbor is a private assistant for the Mac. It lives in the notch (or the menu bar on a Mac without
 one), reads your mail, messages, calendar and reminders on the Mac, and works out what needs you
