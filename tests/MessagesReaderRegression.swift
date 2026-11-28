@@ -351,17 +351,18 @@ enum MessagesReaderRegression {
                 .joined(separator: "\n")
                 .write(toFile: wirePath, atomically: false, encoding: .utf8)
         }
-        sql("WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x<2001) " +
+        sql("WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x<10001) " +
             "INSERT INTO message (date, text, is_from_me, is_read, associated_message_type, guid) " +
             "SELECT \(date) - (x+3)*1000000000, 'Synthetic row', 0, 1, 0, 'bulk-'||x FROM seq")
-        let bounded = reader.readRecentMessages(limit: 5000)!
-        precondition(bounded.attempted == 2028 + literalCases.count && bounded.skipped == 1
-                     && bounded.structured.count == 2000
+        let bounded = reader.readRecentMessages(limit: 20000)!
+        precondition(bounded.attempted == 10028 + literalCases.count && bounded.skipped == 1
+                     && bounded.structured.count == 10_000
                      && bounded.truncated >= 27 + literalCases.count,
                      "Structured carrier has an explicit row cap and partial coverage")
         try checkTypedStream(root: root)
         checkDelivery(root: root)
         checkOwnTapbacks(root: root)
+        checkAttachmentsRetractionAndEmojiTapbacks(root: root)
         checkPipeInChatName(root: root)
         checkBackendRetry()
         print("MessagesReader: synthetic read-only regression passed")
@@ -552,6 +553,58 @@ enum MessagesReaderRegression {
         let expected = Double(base + 60_000_000_000) / 1_000_000_000 + 978307200
         precondition(abs(scan.acknowledged["tap-chat-a"]! - expected) < 0.01, "The tapback's own time")
         precondition(!scan.lines.contains { $0.contains("Liked") }, "A tapback is never a conversation line")
+    }
+
+    /// Attachment-only messages keep a marker, a retracted message drops its
+    /// text, and the emoji tapbacks (2006/2007) count like the other types.
+    static func checkAttachmentsRetractionAndEmojiTapbacks(root: URL) {
+        let path = root.appendingPathComponent("attach.db").path
+        var db: OpaquePointer?
+        precondition(sqlite3_open(path, &db) == SQLITE_OK)
+        defer { sqlite3_close(db) }
+        func sql(_ statement: String) {
+            precondition(sqlite3_exec(db, statement, nil, nil, nil) == SQLITE_OK,
+                         "Fixture SQL failed: \(statement)")
+        }
+        sql("CREATE TABLE message (date INTEGER, text TEXT, attributedBody BLOB, " +
+            "is_from_me INTEGER, handle_id INTEGER, is_read INTEGER, " +
+            "associated_message_type INTEGER, guid TEXT, date_edited INTEGER, date_retracted INTEGER)")
+        sql("CREATE TABLE handle (id TEXT)")
+        sql("CREATE TABLE chat (display_name TEXT, chat_identifier TEXT, guid TEXT)")
+        sql("CREATE TABLE chat_message_join (chat_id INTEGER, message_id INTEGER)")
+        sql("CREATE TABLE chat_handle_join (chat_id INTEGER, handle_id INTEGER)")
+        sql("CREATE TABLE attachment (mime_type TEXT)")
+        sql("CREATE TABLE message_attachment_join (message_id INTEGER, attachment_id INTEGER)")
+        sql("INSERT INTO handle VALUES ('+15555550144')")
+        sql("INSERT INTO chat VALUES ('', 'a', 'att-chat-a')")
+        sql("INSERT INTO chat_handle_join VALUES (1, 1)")
+        sql("INSERT INTO attachment VALUES ('image/heic'), ('application/pdf')")
+        let base = Int64((Date().timeIntervalSince1970 - 978307200 - 600) * 1_000_000_000)
+        // 1: photo only (object-replacement text). 2: pdf only (NULL text).
+        // 3: unsent, its old text still present. 4: plain text.
+        // 5: my emoji tapback (2006). 6: my removed emoji tapback (3006).
+        sql("INSERT INTO message VALUES (\(base), '\u{FFFC}', NULL, 0, 1, 1, 0, 'att-1', 0, 0)")
+        sql("INSERT INTO message VALUES (\(base + 1_000_000_000), NULL, NULL, 0, 1, 1, 0, 'att-2', 0, 0)")
+        sql("INSERT INTO message VALUES (\(base + 2_000_000_000), 'the secret plan', NULL, 0, 1, 1, 0, 'att-3', 0, \(base))")
+        sql("INSERT INTO message VALUES (\(base + 3_000_000_000), 'See you at 5', NULL, 0, 1, 1, 0, 'att-4', 0, 0)")
+        sql("INSERT INTO message VALUES (\(base + 4_000_000_000), 'Reacted to x', NULL, 1, 0, 1, 2006, 'att-5', 0, 0)")
+        sql("INSERT INTO message VALUES (\(base + 5_000_000_000), 'Removed x', NULL, 1, 0, 1, 3006, 'att-6', 0, 0)")
+        for id in 1...6 { sql("INSERT INTO chat_message_join VALUES (1, \(id))") }
+        sql("INSERT INTO message_attachment_join VALUES (1, 1), (2, 2)")
+        let scan = MessagesReader(dbPath: path).readRecentMessages()!
+        let joined = scan.lines.joined(separator: "\n")
+        precondition(scan.lines.count == 4, "Four conversation lines: \(scan.lines)")
+        precondition(joined.contains("[attachment: photo]"), "Photo-only message kept")
+        precondition(joined.contains("[attachment: document]"), "PDF-only message kept")
+        precondition(joined.contains(MessagesReader.unsentMarker) && !joined.contains("secret plan"),
+                     "Retracted message drops its text")
+        precondition(joined.contains("See you at 5"))
+        precondition(scan.acknowledged.keys.contains("att-chat-a"),
+                     "An emoji tapback (2006) acknowledges the chat")
+        let acked = scan.acknowledged["att-chat-a"]!
+        let expected = Double(base + 4_000_000_000) / 1_000_000_000 + 978307200
+        precondition(abs(acked - expected) < 0.01, "Removal 3006 does not move the acknowledgement")
+        precondition(!joined.contains("Reacted") && !joined.contains("Removed x"))
     }
 
     /// A group named with " | " must not shift the V2 fields into the text.
