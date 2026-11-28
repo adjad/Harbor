@@ -280,7 +280,7 @@ final class MailDBReader {
                 if inHistory { scan.historySkipped[accountKey, default: 0] += 1 }
                 continue
             }
-            let messageID = text(stmt, 6) ?? ""
+            let messageID = Self.safeIdentifier(text(stmt, 6) ?? "")
             let nativeID = "db:\(sqlite3_column_int64(stmt, 7))"
 
             // Trim to an int for display — fractional seconds don't exist in
@@ -288,9 +288,13 @@ final class MailDBReader {
             // "1787537314.0", which the backend's numeric-prefix parser (see
             // MailReader.epoch()) still accepts fine, but keeping it a clean
             // integer matches what the AppleScript path emits.
+            // A subject or name folded over two lines, or carrying a control character, is
+            // still the user's mail: its separators become spaces instead of dropping the row.
+            // An address or Message-ID that holds one is no address at all and is left out.
             let fields = ["H2", String(Int64(epoch)), readFlag, account,
-                          accountID, sender, address, messageID, subject, nativeID]
-            // A malformed header cannot be allowed to forge another record.
+                          accountID, Self.safeText(sender), Self.safeIdentifier(address), messageID,
+                          Self.safeText(subject), nativeID]
+            // A malformed account label or ID cannot be allowed to forge another record.
             guard fields.allSatisfy({ !$0.contains("\u{01}") && !$0.contains("\n")
                                       && !$0.contains("\r") }) else {
                 scan.skippedByAccount[accountKey, default: 0] += 1
@@ -307,6 +311,21 @@ final class MailDBReader {
             return nil
         }
         return scan
+    }
+
+    /// Display text with the record separators (\u{01}, line feed, carriage return) turned
+    /// into single spaces, so one odd character never costs the whole header. Pure.
+    static func safeText(_ value: String) -> String {
+        guard value.contains(where: { $0 == "\u{01}" || $0 == "\n" || $0 == "\r" || $0 == "\r\n" }) else {
+            return value
+        }
+        return value.split(whereSeparator: { $0 == "\u{01}" || $0 == "\n" || $0 == "\r" || $0 == "\r\n" })
+            .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }.joined(separator: " ")
+    }
+
+    /// An identifier (address, Message-ID) kept only when it holds no separator; "" otherwise. Pure.
+    static func safeIdentifier(_ value: String) -> String {
+        value.contains(where: { $0 == "\u{01}" || $0 == "\n" || $0 == "\r" || $0 == "\r\n" }) ? "" : value
     }
 
     private func safeMarkerFields(_ scan: IndexScan, _ key: String) -> (String, String) {

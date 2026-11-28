@@ -221,7 +221,8 @@ def test_parse_metadata_tolerates_junk_and_keeps_its_place():
 def test_persisted_rows_keep_their_field_counts():
     meta = G.parse_metadata(_message(auth=(gh("dmarc=pass header.from=friend.com"),)))
     assert len(G.header_line(meta, "me@gmail.com", False).split("\x01")) == 10
-    assert len(G.raw_record(_message(auth=(gh("dmarc=pass"),)), "me@gmail.com").split("\x01")) == 9
+    # Ten fields: the raw record carries Cc last, as MailReader.swift's does (app audit 2.1.4).
+    assert len(G.raw_record(_message(auth=(gh("dmarc=pass"),)), "me@gmail.com").split("\x01")) == 10
 
 
 @pytest.fixture

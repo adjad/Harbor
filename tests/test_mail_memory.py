@@ -470,8 +470,13 @@ def test_importance_bar():
     assert _judge("Renew passport", "your passport expires Nov 20", bulk=True, category=2) == (True, "account")
     assert _judge("Dentist appointment", "appointment on Nov 20", bulk=True, category=1) == (True, "appointment")
     assert _judge("Return the form", "the form is due Nov 20", bulk=True, category=1) == (True, "deadline")
+    # A plain deadline in Mail's Updates category (a school, a city office) is shown (app audit 2.2.2).
+    assert _judge("Submit the housing form", "the housing form deadline is Nov 20", bulk=True, category=2) == (
+        True, "deadline")
     # Held: newsletter deadlines, sales, nothing concrete, anything suspicious.
-    assert _judge("Register for the webinar", "registration deadline Nov 20", bulk=True, category=2) == (
+    assert _judge("Register for the webinar", "registration deadline Nov 20", bulk=True, category=3) == (
+        False, "held:newsletter_deadline")
+    assert _judge("Register for the webinar", "registration deadline Nov 20", bulk=True, category=-1) == (
         False, "held:newsletter_deadline")
     assert _judge("Use the code", "offer ends Nov 20", bulk=True, category=2, subject="Fall sale: 30% off") == (
         False, "held:promotional")

@@ -119,7 +119,7 @@ def test_playstation_lookup_is_strict_and_empty_result_bypasses_model():
 
     async def empty_lookup(query=None, count=5, strict_match=False):
         ran.append({"query": query, "count": count, "strict_match": strict_match})
-        return "No emails matching “PlayStation” were found in the recent inbox Harbor searched."
+        return "No emails matching “PlayStation” were found in the mail Harbor searched."
 
     REGISTRY["view_emails"] = Tool(
         name="view_emails", description="fixture", parameters={
@@ -155,7 +155,7 @@ def test_strict_email_lookup_returns_no_match_instead_of_unrelated_mail():
         answer = asyncio.run(email_tools.view_emails_impl(
             query="PlayStation", count=10, strict_match=True))
     # This text goes straight to the user, and says what was searched.
-    assert answer.startswith("No emails matching “PlayStation” were found in the recent inbox Harbor searched")
+    assert answer.startswith("No emails matching “PlayStation” were found in the mail Harbor searched")
     assert "anything older was not." in answer
 
 

@@ -11,7 +11,9 @@ import SQLite3
 /// IMPORTANT rules:
 /// - Read-only. The Envelope Index is opened SQLITE_OPEN_READONLY; .emlx files
 ///   are only read. Mail.app is never scripted or launched from here.
-/// - Eight requests only: `index` (metadata for a window of days, no bodies),
+/// - Nine requests only: `archive_search` (headers of mail outside the Inbox and Sent, Archive
+///   and other folders, matching a search's words; never Trash, Junk or Drafts, never a body),
+///   `index` (metadata for a window of days, no bodies),
 ///   `body` (one message's raw RFC 822 bytes, capped; the backend parses MIME),
 ///   `sent` (the user's own sent mail for a few weeks: when, to whom, subject; no
 ///   bodies), which answers Ask's "what did I send" (view_emails mailbox='sent'),
@@ -43,6 +45,8 @@ final class MailMemoryReader {
     static let maxAttachmentRFCIDs = 40
     static let maxAttachmentRows = 400
     static let maxMessageHandles = 10
+    static let maxArchiveTerms = 5
+    static let maxArchiveRows = 50
     static let maxRecognizeBytes = 4_194_304
     /// Base64 of `maxRecognizeBytes` bytes: 4 characters per 3 bytes, rounded up.
     static let maxRecognizeBase64 = (maxRecognizeBytes + 2) / 3 * 4
@@ -173,6 +177,17 @@ final class MailMemoryReader {
             return Request(id: id, kind: kind, days: 0, rowid: 0, terms: terms, since: since, until: until,
                            rfcIDs: rfcIDs, limit: limit)
         }
+        if kind == "archive_search" {
+            guard keys == ["type", "request_id", "kind", "terms", "since", "until", "limit"],
+                  let terms = payload["terms"] as? [String], (1...maxArchiveTerms).contains(terms.count),
+                  terms.allSatisfy(isValidHandle),
+                  !isBoolean(payload["since"]), !isBoolean(payload["until"]), !isBoolean(payload["limit"]),
+                  let since = (payload["since"] as? NSNumber)?.doubleValue, since.isFinite, since >= 0,
+                  let until = (payload["until"] as? NSNumber)?.doubleValue, until.isFinite, until >= 0,
+                  let limit = payload["limit"] as? Int, (1...maxArchiveRows).contains(limit) else { return nil }
+            return Request(id: id, kind: kind, days: 0, rowid: 0, terms: terms, since: since, until: until,
+                           limit: limit)
+        }
         if kind == "message_attachments" {
             guard keys == ["type", "request_id", "kind", "terms", "handles", "since", "until", "limit"],
                   let terms = payload["terms"] as? [String], terms.count <= maxAttachmentTerms,
@@ -228,6 +243,21 @@ final class MailMemoryReader {
         if request.kind == "message_attachments" { return answerMessageAttachments(request) }
         if request.kind == "message_attachment" { return answerMessageAttachment(request) }
         if request.kind == "attachments" { return answerAttachments(request) }
+        if request.kind == "archive_search" {
+            guard let path = MailMemoryReader.envelopeIndexPath(mailRoot) else {
+                return ["ok": false, "error": "no_mail_index"]
+            }
+            do {
+                let (rows, capped) = try MailMemoryReader.archiveRows(
+                    dbPath: path, terms: request.terms, since: request.since, until: request.until,
+                    limit: request.limit)
+                return ["ok": true, "rows": rows, "capped": capped]
+            } catch let failure as IndexFailure {
+                return ["ok": false, "error": failure.rawValue]
+            } catch {
+                return ["ok": false, "error": IndexFailure.unreadable.rawValue]
+            }
+        }
         if request.kind == "attachment" { return answerAttachment(request) }
         if request.kind == "recognize" { return MailMemoryReader.answerRecognize(request.imageB64) }
         if request.kind == "sent" {
@@ -623,6 +653,129 @@ final class MailMemoryReader {
                 "name": name,
                 "on_disk": size != nil,
                 "size": size ?? 0,
+            ])
+        }
+        guard step == SQLITE_DONE else { throw IndexFailure.unreadable }
+        return (rows, false)
+    }
+
+    /// The last path component of a mailbox URL, percent-decoded ("Archive", "All Mail").
+    static func mailboxName(url: String) -> String {
+        let decoded = url.removingPercentEncoding ?? url
+        guard let scheme = decoded.range(of: "://") else { return "" }
+        let rest = decoded[scheme.upperBound...]
+        guard let slash = rest.firstIndex(of: "/") else { return "" }
+        return rest[rest.index(after: slash)...].split(separator: "/", omittingEmptySubsequences: true)
+            .last.map(String.init) ?? ""
+    }
+
+    /// Mail OUTSIDE the Inbox and Sent: Archive and the person's other folders, and a
+    /// Gmail-over-IMAP account's All Mail rows with no Inbox label (its archived mail).
+    /// Never a deleted message, nor one in Trash, Junk, Spam or Drafts (by mailbox or by
+    /// label). Each `terms` entry must match the subject, sender address or sender name
+    /// (case-insensitive, escaped, bound); `since`/`until` bound date_received (0 = none).
+    /// Newest first, at most `limit` (`capped` says there were more). Headers only:
+    /// ts, account (the mailbox URL host), mailbox, subject, sender, sender_name, rfc_message_id.
+    static func archiveRows(dbPath: String, terms: [String], since: Double, until: Double,
+                            limit: Int) throws -> ([[String: Any]], Bool) {
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(dbPath, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
+            sqlite3_close(db)
+            throw IndexFailure.unreadable
+        }
+        defer { sqlite3_close(db) }
+        sqlite3_busy_timeout(db, 2000)
+        guard exists(db, table: "messages", column: "date_received"),
+              exists(db, table: "messages", column: "mailbox"),
+              exists(db, table: "mailboxes", column: "url") else { throw IndexFailure.unsupportedSchema }
+        var inboxIDs: [Int64] = []
+        var sentIDs: [Int64] = []
+        var hiddenIDs: [Int64] = []
+        var list: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT ROWID, url FROM mailboxes", -1, &list, nil) == SQLITE_OK else {
+            sqlite3_finalize(list)
+            throw IndexFailure.unreadable
+        }
+        while sqlite3_step(list) == SQLITE_ROW {
+            let rowid = sqlite3_column_int64(list, 0)
+            let url = text(list, 1)
+            if isSentMailbox(url: url) { sentIDs.append(rowid) }
+            else if isHiddenMailbox(url: url) { hiddenIDs.append(rowid) }
+            else if mailboxName(url: url).lowercased() == "inbox" { inboxIDs.append(rowid) }
+        }
+        sqlite3_finalize(list)
+        // Mailbox ROWIDs come from the index itself (integers), never from the request.
+        let excluded = inboxIDs + sentIDs + hiddenIDs
+        let excludedList = excluded.isEmpty ? "-1" : excluded.map(String.init).joined(separator: ",")
+        let labels = exists(db, table: "labels", column: "mailbox_id") && exists(db, table: "labels", column: "message_id")
+        let notDeleted = exists(db, table: "messages", column: "deleted") ? "IFNULL(m.deleted, 0) = 0" : "1"
+        let outside = labels
+            ? "m.mailbox NOT IN (\(excludedList)) AND m.ROWID NOT IN (SELECT message_id FROM labels WHERE mailbox_id IN (\(excludedList)))"
+            : "m.mailbox NOT IN (\(excludedList))"
+        let hasSubject = exists(db, table: "messages", column: "subject") && exists(db, table: "subjects", column: "subject")
+        let subject = hasSubject ? "IFNULL(s.subject, '')" : "''"
+        let subjectJoin = hasSubject ? "LEFT JOIN subjects s ON m.subject = s.ROWID" : ""
+        let hasAddress = exists(db, table: "messages", column: "sender") && exists(db, table: "addresses", column: "address")
+        let address = hasAddress ? "IFNULL(a.address, '')" : "''"
+        let hasComment = hasAddress && exists(db, table: "addresses", column: "comment")
+        let comment = hasComment ? "IFNULL(a.comment, '')" : "''"
+        let addressJoin = hasAddress ? "LEFT JOIN addresses a ON m.sender = a.ROWID" : ""
+        let global = exists(db, table: "message_global_data", column: "message_id_header")
+            && exists(db, table: "messages", column: "global_message_id")
+        let rfcID = global ? "IFNULL(g.message_id_header, '')" : "''"
+        let globalJoin = global ? "LEFT JOIN message_global_data g ON g.ROWID = m.global_message_id" : ""
+        var clauses = [notDeleted, outside]
+        var binds: [Bind] = []
+        for term in terms where !term.isEmpty {
+            var fields = ["\(subject) LIKE ? ESCAPE '\\'"]
+            if hasAddress { fields.append("\(address) LIKE ? ESCAPE '\\'") }
+            if hasComment { fields.append("\(comment) LIKE ? ESCAPE '\\'") }
+            clauses.append("(" + fields.joined(separator: " OR ") + ")")
+            for _ in fields { binds.append(.text(likePattern(term))) }
+        }
+        if since > 0 { clauses.append("m.date_received > ?"); binds.append(.double(since)) }
+        if until > 0 { clauses.append("m.date_received < ?"); binds.append(.double(until)) }
+        binds.append(.int(Int64(limit + 1)))
+        let sql = """
+        SELECT IFNULL(mb.url, ''), m.date_received, \(subject), \(address), \(comment), \(rfcID)
+        FROM messages m
+        JOIN mailboxes mb ON m.mailbox = mb.ROWID
+        \(globalJoin)
+        \(subjectJoin)
+        \(addressJoin)
+        WHERE \(clauses.joined(separator: " AND "))
+        ORDER BY m.date_received DESC, m.ROWID DESC
+        LIMIT ?
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            sqlite3_finalize(stmt)
+            throw IndexFailure.unreadable
+        }
+        defer { sqlite3_finalize(stmt) }
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        for (i, bind) in binds.enumerated() {
+            let slot = Int32(i + 1)
+            switch bind {
+            case .text(let value): sqlite3_bind_text(stmt, slot, value, -1, transient)
+            case .double(let value): sqlite3_bind_double(stmt, slot, value)
+            case .int(let value): sqlite3_bind_int64(stmt, slot, value)
+            }
+        }
+        var rows: [[String: Any]] = []
+        var step = sqlite3_step(stmt)
+        while step == SQLITE_ROW {
+            defer { step = sqlite3_step(stmt) }
+            if rows.count == limit { return (rows, true) }
+            let url = text(stmt, 0)
+            rows.append([
+                "ts": sqlite3_column_double(stmt, 1),
+                "account": URL(string: url)?.host ?? "",
+                "mailbox": mailboxName(url: url),
+                "subject": text(stmt, 2),
+                "sender": text(stmt, 3),
+                "sender_name": text(stmt, 4),
+                "rfc_message_id": text(stmt, 5),
             ])
         }
         guard step == SQLITE_DONE else { throw IndexFailure.unreadable }

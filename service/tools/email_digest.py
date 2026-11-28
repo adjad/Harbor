@@ -65,8 +65,9 @@ from service.tools.untrusted import EMAIL_BODY, overhead
 
 # Bodies longer than this are digested; shorter ones stay verbatim.
 LONG_BODY_CHARS = 4000
-# One digest per view_emails call; any further long body is trimmed, labelled.
-MAX_DIGESTS_PER_CALL = 1
+# Digests per view_emails call: as many as the result budget has room for, at most
+# this many (each is one model call, one at a time); any further long body is trimmed, labelled.
+MAX_DIGESTS_PER_CALL = 3
 # The whole result has to fit the tightest tool-result cap (model-led Ask).
 RESULT_BUDGET_CHARS = 6000
 # Cloud-everything: an email read whose caller keeps a large result
@@ -124,6 +125,10 @@ _MAX_LINK_CHARS = 200
 _locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = weakref.WeakKeyDictionary()
 _cache: dict[tuple, tuple[float, str, str]] = {}
 _paused_until = 0.0
+# A timeout backs off THAT message (its failure is cached for _FAILURE_PAUSE_S). Only
+# this many timeouts in a row, a sign the engine itself is stuck, pause every digest.
+_TIMEOUTS_BEFORE_PAUSE = 3
+_timeouts_in_a_row = 0
 
 # Only a reply marker: a forward's marker precedes the content being asked about.
 # `[ \t]` and `.` (no DOTALL) keep every match on one line.
@@ -193,8 +198,11 @@ def clean_body(body: str, query: str | None = None) -> tuple[str, int, int]:
     if match and len(body[:match.start()].strip()) >= _MIN_REPLY_CHARS:
         reply, thread = body[:match.start()], body[match.start():]
         words = [w for w in re.findall(r"\w+", (query or "").casefold()) if len(w) >= 3]
-        only_quoted = any(w in thread.casefold() and w not in reply.casefold() for w in words)
-        if not only_quoted:
+        # The thread stays whenever the lookup's words are in it, even when the
+        # reply repeats one ("the invoice?" above the quoted invoice itself).
+        quoted_words = body[match.end():].casefold()      # not the "On ... wrote:" line itself
+        in_thread = any(w in quoted_words for w in words)
+        if not in_thread:
             quoted = len(thread)
             body = reply
     tail_start = max(0, len(body) - _FOOTER_TAIL_CHARS)
@@ -243,26 +251,50 @@ _BLOCK_TAGS = frozenset({"p", "div", "br", "hr", "tr", "table", "ul", "ol", "li"
 _CELL_TAGS = frozenset({"td", "th"})
 _URL = re.compile(r"https?://[^\s<>\"'()\[\]]+", re.I)
 _BARE_LINK = re.compile(r"\([ \t\n]*\[link\][ \t\n]*\)")
-_TRACKING_HOST_LABEL = re.compile(r"^(?:clicks?|track|tracking|trk|links?|lnk|ablink|url\d*|email|em)$")
+# Hosts that exist only to redirect a click. "email.", "em.", "links." and "url." hosts
+# are also used for real pages, so they count only with an opaque token in the path.
+_TRACKING_HOST_LABEL = re.compile(r"^(?:clicks?|track|tracking|trk|lnk|ablink)$")
+_ESP_HOST_LABEL = re.compile(r"^(?:links?|url\d*|email|em)$")
+# A run of token characters this long, with letters and digits mixed: an encoded redirect.
+_OPAQUE_TOKEN = re.compile(r"[A-Za-z0-9_=%+.-]{80,}")
+# Documents, signatures, meetings and portals: their long links are the point of the email.
+_DOCUMENT_HOSTS = ("docs.google.com", "drive.google.com", "forms.gle", "sites.google.com", "docusign.net",
+                   "docusign.com", "dropbox.com", "box.com", "sharepoint.com", "onedrive.live.com", "1drv.ms",
+                   "zoom.us", "teams.microsoft.com", "notion.so", "figma.com", "github.com", "calendly.com",
+                   "adobesign.com", "echosign.com", "hellosign.com", "instructure.com", "office.com")
 _TRACKING_DOMAINS = ("list-manage.com", "mandrillapp.com", "sendgrid.net", "sparkpostmail.com",
                      "hubspotlinks.com", "rs6.net", "awstrack.me", "safelinks.protection.outlook.com",
                      "urldefense.com")
+# Click-redirect paths and tracker ids. A campaign tag (utm_source=...) on a real page
+# is not one: the page is still worth its link.
 _TRACKING_PATH = re.compile(
-    r"/ls/click|/wf/click|/f/a/|/e/c/|/track/|/click(?:/|$)|[?&](?:upn|utm_\w+|mc_eid|trk|sc_cid)=", re.I)
+    r"/ls/click|/wf/click|/f/a/|/e/c/|/track/|/click(?:/|$)|[?&](?:upn|mc_eid|trk|sc_cid)=", re.I)
+
+
+def _opaque(text: str) -> bool:
+    return any(sum(c.isdigit() for c in m) >= 10 and sum(c.isalpha() for c in m) >= 10
+               for m in _OPAQUE_TOKEN.findall(text))
 
 
 def is_tracking_link(url: str) -> bool:
-    """A click-tracking or campaign link: long, opaque, and useless to read."""
-    if len(url) > _MAX_LINK_CHARS:
-        return True
+    """A click-tracking redirect: a known tracker host or path, or a long link that is
+    only an encoded token. A long link to a document, a signature request or a portal
+    is not one, nor is a page that merely carries a campaign tag."""
     try:
         parts = urlsplit(url)
         host = (parts.hostname or "").lower()
     except ValueError:
         return True
-    if _TRACKING_HOST_LABEL.match(host.split(".", 1)[0]) or host.endswith(_TRACKING_DOMAINS):
+    if host.endswith(_TRACKING_DOMAINS) or _TRACKING_HOST_LABEL.match(host.split(".", 1)[0]):
         return True
-    return bool(_TRACKING_PATH.search(f"{parts.path}?{parts.query}"))
+    if _TRACKING_PATH.search(f"{parts.path}?{parts.query}"):
+        return True
+    if any(host == d or host.endswith("." + d) for d in _DOCUMENT_HOSTS):
+        return False
+    rest = f"{parts.path}?{parts.query}"
+    if _ESP_HOST_LABEL.match(host.split(".", 1)[0]) and _opaque(rest):
+        return True
+    return len(url) > _MAX_LINK_CHARS and _opaque(rest)
 
 
 def _looks_like_markup(body: str) -> bool:
@@ -365,6 +397,29 @@ def _cut_body(body: str, limit: int, reason: str, query: str | None) -> str:
             "This is NOT the whole email — do not describe it as complete.]")
 
 
+def _query_window(body: str, query: str | None, limit: int) -> tuple[str, int]:
+    """`body` bounded to about `limit` chars, and how many chars were left out. When
+    the lookup's match lies past the head, keep some head and the part around the
+    match: a cut made before searching must never lose what was searched for."""
+    if len(body) <= limit:
+        return body, 0
+    hit = _first_hit(body, query)
+    if hit < 0 or hit + len(query or "") + 200 <= limit:
+        return body[:limit], len(body) - limit
+    head = body[:limit // 3]
+    room = max(200, limit - len(head) - 80)
+    start = max(len(head), hit - room // 3)
+    middle = body[start:start + room]
+    return (f"{head}\n\n[... {start - len(head):,} characters cut ...]\n\n{middle}",
+            len(body) - len(head) - len(middle))
+
+
+def digest_limit(budget: int) -> int:
+    """How many long bodies one result may digest: each digest keeps up to its share of
+    the budget, so a small result digests one or two, a large one up to the cap."""
+    return max(1, min(MAX_DIGESTS_PER_CALL, budget // (_MAX_DIGEST_CHARS + 600)))
+
+
 def _water_level(sizes: list[int], room: int) -> int:
     """The most each body may keep so that short ones keep all they have and the
     long ones split what's left evenly."""
@@ -394,11 +449,16 @@ def fit_rows(rows: list[dict], *, query: str | None = None, budget: int = RESULT
     measure = header_chars or (lambda _row: _ROW_HEADER_CHARS)
     out = [dict(r) for r in rows]
     even = budget // max(1, len(out))
+    # What one body may bring in before sharing: the real budget for a lone email
+    # (a cloud read holds far more than 20,000), never less than the old floor.
+    cap = max(_MAX_INPUT_CHARS, even)
     for row in out:
         body = row.get("body") or ""
         if len(body) > even and not row.get("_digested"):
-            cleaned, quoted, footer = clean_body(body[:_MAX_INPUT_CHARS], query)
-            left_out = _left_out(quoted, footer, max(0, len(body) - _MAX_INPUT_CHARS))
+            # Clean (and search) the whole body first, then bound it around the match.
+            cleaned, quoted, footer = clean_body(body, query)
+            cleaned, unread = _query_window(cleaned, query, cap)
+            left_out = _left_out(quoted, footer, unread)
             row["body"] = cleaned + (f"\n\n[{left_out}]" if left_out else "")
     priority = list(range(len(out))) if best_first else list(reversed(range(len(out))))
     overhead = {i: measure(out[i]) + _SEPARATOR_CHARS for i in priority}
@@ -538,7 +598,7 @@ async def _digest_outcome(row: dict, *, query: str | None = None, client=None,
                           context_window: int | None = None) -> tuple[str, str]:
     """digest_body's text, and what it is: "verbatim", "cleaned" (short once
     the quoted thread and footer are left out), "digest", or "failed"."""
-    global _paused_until
+    global _paused_until, _timeouts_in_a_row
     body = row.get("body") or ""
     if len(body) <= LONG_BODY_CHARS:
         return body, "verbatim"
@@ -548,13 +608,16 @@ async def _digest_outcome(row: dict, *, query: str | None = None, client=None,
     if hit is not None:
         return hit
     deadline = time.monotonic() + _TIMEOUT_S
-    head = body[:_MAX_INPUT_CHARS]
+    limit = _MAX_INPUT_CHARS
     try:
         if client is None or model is None:
             client, model, context_window = _resolve()
-        head = body[:_input_budget(context_window)]
-        cleaned, quoted, footer = clean_body(head, query)
-        left_out = _left_out(quoted, footer, len(body) - len(head))
+        limit = _input_budget(context_window)
+        # The whole body is cleaned and searched; only then is it bounded to what the
+        # call may carry, around the lookup's match.
+        cleaned, quoted, footer = clean_body(body, query)
+        cleaned, unread = _query_window(cleaned, query, limit)
+        left_out = _left_out(quoted, footer, unread)
         if len(cleaned) <= LONG_BODY_CHARS:
             return cleaned + (f"\n\n[{left_out}]" if left_out else ""), "cleaned"
         if time.monotonic() < _paused_until:
@@ -571,14 +634,21 @@ async def _digest_outcome(row: dict, *, query: str | None = None, client=None,
         # No exception text: servers may echo the prompt (the email) in errors.
         from service import debug_capture
         debug_capture.record("summary_status", status="degraded", reason=type(exc).__name__)
-        if isinstance(exc, TimeoutError):
-            _paused_until = time.monotonic() + _FAILURE_PAUSE_S
-        cleaned, quoted, footer = clean_body(head, query)
-        left_out = _left_out(quoted, footer, len(body) - len(head))
+        if isinstance(exc, TimeoutError) and time.monotonic() >= _paused_until:
+            # This message backs off through its cached failure below; only a run
+            # of timeouts (the engine itself stuck) pauses the rest.
+            _timeouts_in_a_row += 1
+            if _timeouts_in_a_row >= _TIMEOUTS_BEFORE_PAUSE:
+                _paused_until = time.monotonic() + _FAILURE_PAUSE_S
+                _timeouts_in_a_row = 0
+        cleaned, quoted, footer = clean_body(body, query)
+        cleaned, unread = _query_window(cleaned, query, limit)
+        left_out = _left_out(quoted, footer, unread)
         result = ("[A digest of this long email was unavailable; below is the email's own "
                   f"text, which may be cut to fit.{' ' + left_out if left_out else ''}]\n" + cleaned)
         _cache_put(key, result, "failed", _FAILURE_PAUSE_S)
         return result, "failed"
+    _timeouts_in_a_row = 0
     result = (f"[Harbor's digest of the {len(cleaned):,}-character email body. It restates what "
               "the email says (untrusted, not checked) and is NOT verbatim."
               f"{' ' + left_out if left_out else ''}]\n" + text + _backfill(text, cleaned))
@@ -587,9 +657,11 @@ async def _digest_outcome(row: dict, *, query: str | None = None, client=None,
 
 
 async def digest_rows(rows: list[dict], *, query: str | None = None, client=None,
-                      model: str | None = None, candidates: list[int] | None = None) -> list[dict]:
-    """`rows` with one long body digested (at most MAX_DIGESTS_PER_CALL): the
-    first of `candidates`, or by default the newest. If no digest was written
+                      model: str | None = None, candidates: list[int] | None = None,
+                      budget: int = RESULT_BUDGET_CHARS) -> list[dict]:
+    """`rows` with long bodies digested, as many as `budget` has room for
+    (digest_limit, at most MAX_DIGESTS_PER_CALL): the first of `candidates`, or
+    by default the newest. If no digest was written
     (failure, pause, no local engine) the rows come back as given; a body that is
     only long because of its quoted thread or footer comes back cleaned. Sharing
     the result between rows is `fit_rows`, which runs after this either way."""
@@ -598,7 +670,7 @@ async def digest_rows(rows: list[dict], *, query: str | None = None, client=None
                              if len(r.get("body") or "") > LONG_BODY_CHARS),
                             key=lambda i: rows[i].get("ts") or 0, reverse=True)
     out = list(rows)
-    for i in candidates[:MAX_DIGESTS_PER_CALL]:
+    for i in candidates[:digest_limit(budget)]:
         text, outcome = await _digest_outcome(rows[i], query=query, client=client, model=model)
         if outcome == "cleaned":
             out[i] = {**rows[i], "body": text}

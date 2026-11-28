@@ -110,12 +110,11 @@ _email_sync_pending: bool = False
 _email_read_source: str = ""
 
 # Raw, full-content emails for view_emails (verbatim lookups) — a SEPARATE,
-# smaller batch than _headers: MailReader.swift's rawScript pulls ~50 messages
-# total, split evenly across linked accounts (fetching `content of m` for all
-# 200 header-scan messages would make every 5-min sync noticeably slower).
-# Unlike _headers this is a shared budget, not per-account depth: full bodies
-# are the expensive fetch, so linking a second account shouldn't double the
-# cost of every sync. Records are
+# smaller batch than _headers: MailReader.swift's rawScript pulls the newest 50
+# Inbox messages of EACH Mail account (fetching `content of m` for all 200
+# header-scan messages would make every sync noticeably slower), and each linked
+# Gmail account adds its newest 50 plus its past week. A search with a query
+# also asks Gmail's All Mail and Apple Mail's Archive (_search_beyond_inbox). Records are
 # separated by ASCII \x02, fields within a record by \x01 — a raw email body
 # routinely contains "|" and newlines, which the header format gets away with
 # only because subjects don't.
@@ -1076,8 +1075,12 @@ def is_machine_sender(sender: str) -> bool:
 # Summary views should not spend space on codes, promotions, or duplicate
 # arrivals.  This is deliberately separate from `is_machine_sender`: a payment
 # receipt or security alert may be automatic yet still be useful in a summary.
+# "offer" is marketing ("special offer", "our offer ends"), but never a job or an
+# admission: "Job offer", "Your offer letter", "Offer of employment" are the user's own.
 _MARKETING_SUBJECT = re.compile(
-    r"\b(?:sale|deal|offer|promo(?:tion)?|discount|coupon|save \d|"
+    r"\b(?:sale|deal|(?<!job )(?<!internship )(?<!employment )(?<!admission )"
+    r"offer(?!\s+(?:letter|of (?:employment|admission)|accepted|declined|deadline))|"
+    r"promo(?:tion)?|discount|coupon|save \d|"
     r"shop now|new arrivals|limited time|newsletter|digest|unsubscribe)\b",
     re.IGNORECASE)
 _AUTOMATED_SIGNAL = re.compile(
@@ -1181,7 +1184,7 @@ def _native_catalog_inventory() -> tuple[tuple[str, str], ...]:
 def _scan_failure_diagnostics(value) -> tuple[tuple[str, int], ...]:
     """Fixed diagnostic vocabulary only; never retain native error text/labels."""
     stages = {'mail_closed', 'account_inventory', 'duplicate_account_labels',
-              'mail_closed_during_scan', 'body_scan'}
+              'mail_closed_during_scan', 'body_scan', 'body_record_skipped'}
     if not isinstance(value, (list, tuple)):
         return ()
     result = []
@@ -2452,13 +2455,50 @@ _ORG_NAME_RE = re.compile(
     r"bank|inc|llc|ltd|corp|company|group|club|association|society|program|programs)\b", re.I)
 
 
+# The local part of a role or robot address: never one person's own mailbox.
+_ROLE_LOCAL = re.compile(
+    r"^(?:no[-_.]?reply|do[-_.]?not[-_.]?reply|donotreply|noreply|mailer[-_.]?daemon|postmaster|bounces?|"
+    r"notifications?|notify|alerts?|news|newsletters?|info|hello|hi|hey|team|marketing|updates?|digest|"
+    r"mail|mailer|support|help|helpdesk|service|services|contact|community|events?|announce(?:ments?)?|"
+    r"promo(?:tions?)?|offers?|deals?|sales|store|shop|orders?|billing|accounts?|admin|administrator|"
+    r"office|outreach|campaigns?|members?|membership|subscriptions?|welcome|feedback|jobs?|careers?|"
+    r"recruiting|hr|invitations?|reminders?|calendar|messages?|security|privacy|legal|press|webmaster|"
+    r"admissions?|registrar|advising|staff|students?|alumni|enquiries|inquiries|reply|robot|bot|system)"
+    r"(?:[-_.+].*)?$", re.I)
+# A personal mailbox: name-like letters with dots, dashes or underscores, maybe a few digits.
+_PERSONAL_LOCAL = re.compile(r"^[^\W\d_]{2,}(?:[._-][^\W\d_]+){0,3}\d{0,4}$")
+
+
+def _personal_address(address: str) -> bool:
+    """A bare address that reads like one person's (alice@acme.com, jane.doe@x.org),
+    never a role or robot mailbox (noreply@, news@, info@, support@)."""
+    local, _, domain = (address or "").strip().strip("<>").casefold().partition("@")
+    if not local or "." not in domain or _ROLE_LOCAL.match(local):
+        return False
+    return bool(_PERSONAL_LOCAL.match(local))
+
+
 def _looks_like_person(name: str, address: str) -> bool:
     """A display name that reads like a human's: 1-4 plain words, no organisation
-    words, no digits, not a shouted brand. Headers only; deliberately conservative,
+    words, no digits, not a shouted brand; "Last, First" counts. With no display
+    name (or one that is only the address), a bare personal address counts,
+    but never a role address. Headers only; deliberately conservative,
     because mistaking a broadcast for a person floods the attention section."""
-    name = unicodedata.normalize("NFC", re.sub(r"\s*<[^>]*>", "", name or "")).strip()
-    if not name or name.casefold() == (address or "").casefold() or "@" in name:
-        return False
+    raw = unicodedata.normalize("NFC", name or "").strip()
+    address = (address or "").strip()
+    name = re.sub(r"\s*<[^>]*>", "", raw).strip()
+    if not name or name.casefold() == address.casefold():
+        # No display name: a personal address (alice@acme.com) is a person, a role one is not.
+        return _personal_address(address or _sender_real_address(raw))
+    if "@" in name:
+        # A bare address as the whole From (no separate address field) counts when it is
+        # a personal one; a display name posing as an address never does.
+        return not address and bool(_CLEAN_ADDRESS.fullmatch(name)) and _personal_address(name)
+    # "Smith, Jane" (and "Smith, Jane A."): a directory's Last, First order.
+    if name.count(",") == 1:
+        last, first = (part.strip() for part in name.split(","))
+        if last and first:
+            name = f"{first} {last}"
     words = name.split()
     if not 1 <= len(words) <= 4 or _ORG_NAME_RE.search(name) or re.search(r"\d", name):
         return False
@@ -2645,14 +2685,18 @@ def critical_account_mail(row: dict) -> str | None:
     subject = str(row.get("subject") or "")
     sender = str(row.get("sender") or "")
     identity = f"{sender} {row.get('sender_address', '') or ''}"
-    if (_NEWSLETTER_RE.search(identity) or _MARKETING_SUBJECT.search(subject) or _CRITICAL_PROMO.search(subject)
-            or is_broadcast(row)):
+    if _NEWSLETTER_RE.search(identity) or _MARKETING_SUBJECT.search(subject) or _CRITICAL_PROMO.search(subject):
         return None
+    # Banks and services send real alerts from bulk-mail hosts (alerts@email.bank...).
+    # From such a sender only the narrow phrases about the reader's OWN account count.
+    broadcast = is_broadcast(row)
     domain = str(row.get("sender_address", "") or "").lower().rpartition("@")[2]
     if _SOCIAL_RE.search(domain) or _SOCIAL_RE.search(sender):
         # A social network's mail quotes other people's posts: only words
         # outside a framed post title are about the reader's own account.
         subject = _social_account_security_subject(subject)
+    if broadcast and not (_ACCOUNT_SECURITY_RE.search(subject) or _PAYMENT_PROBLEM_RE.search(subject)):
+        return None
     for kind, pattern in _CRITICAL_MAIL:
         if pattern.search(subject):
             return kind
@@ -3556,8 +3600,14 @@ def _is_list_mail(row: dict) -> bool:
 
 
 def _search_words(query: str) -> list[str]:
-    """The meaningful words of a query, for when the phrase itself isn't found."""
-    words = [w for w in re.findall(r"\w+", query.casefold()) if len(w) >= 3 and w not in _SEARCH_FILLER]
+    """The meaningful words of a query, for when the phrase itself isn't found. A
+    short word counts when it is an acronym or a number as typed ("HR", "AI",
+    "W2", "5"): those are what a search is about, not filler."""
+    words = []
+    for word in re.findall(r"\w+", query or ""):
+        short_kept = len(word) >= 2 and (word.isupper() or any(c.isdigit() for c in word)) or word.isdigit()
+        if (len(word) >= 3 or short_kept) and word.casefold() not in _SEARCH_FILLER:
+            words.append(word.casefold())
     return list(dict.fromkeys(words))
 
 
@@ -3573,8 +3623,10 @@ def _rank_tier(needles: list[str], header: str, other: str) -> int:
 
 def _search_rows(query: str, rows: list[dict]) -> tuple[list[dict], bool]:
     """Rows that match, best first, with readable bodies; and whether they
-    matched by word because the exact phrase was nowhere. Read status plays no
-    part: a read email is as findable as an unread one."""
+    matched only by word because the exact phrase was nowhere. Exact-phrase
+    hits come first, then the emails that hold every word: one newsletter
+    carrying the phrase never hides the emails about it. Read status plays no
+    part: a read email is as findable as an unread one. Cc is searched with To."""
     from service.tools.email_digest import readable_body
 
     def search(needles: list[str]) -> list[dict]:
@@ -3582,7 +3634,7 @@ def _search_rows(query: str, rows: list[dict]) -> tuple[list[dict], bool]:
         for row in rows:
             sender, subject, to = (row.get(k) or "" for k in ("sender", "subject", "to"))
             header = f"{sender} {subject}".casefold()
-            recipient = to.casefold()
+            recipient = f"{to} {row.get('cc') or ''}".casefold()
             raw = (row.get("body") or "").casefold()
             if not all(n in header or n in recipient or n in raw for n in needles):
                 continue
@@ -3599,10 +3651,17 @@ def _search_rows(query: str, rows: list[dict]) -> tuple[list[dict], bool]:
 
     phrase = query.strip().casefold()
     found = search([phrase]) if phrase else []
-    if found:
-        return found, False
     words = _search_words(query)
-    return (search(words), True) if words and words != [phrase] else ([], False)
+    if not words or words == [phrase]:
+        return found, False
+    by_word = search(words)
+    if not found:
+        return by_word, bool(by_word)
+    # Each search makes its own clean copies, so a word hit is matched back to a phrase hit by its identity.
+    def key(row: dict) -> tuple:
+        return (row.get("account_id"), row.get("message_id"), row.get("ts"), row.get("subject"), row.get("sender"))
+    shown = {key(row) for row in found}
+    return found + [row for row in by_word if key(row) not in shown], False
 
 
 def _subject_key(subject: str | None) -> str:
@@ -3610,10 +3669,12 @@ def _subject_key(subject: str | None) -> str:
 
 
 def _header_matches(query: str, found: list[dict], account: str | None,
-                    start: float | None, end: float | None) -> tuple[list[dict], float | None]:
+                    start: float | None, end: float | None,
+                    unread: bool = False) -> tuple[list[dict], float | None]:
     """Mail matching by sender or subject in the header caches, which reach far
     past the saved bodies, leaving out what `found` already has; and how far back
-    those caches go. Newest first, with list mail after the rest."""
+    those caches go. Newest first, with list mail after the rest. `unread` keeps
+    only headers whose last sync marked them unread."""
     records = _parse_header_records(_headers) + _history_records()
     oldest = min((r["ts"] for r in records), default=None)
     shown = {_norm_mid(r.get("message_id") or "") for r in found} - {""}
@@ -3640,6 +3701,7 @@ def _header_matches(query: str, found: list[dict], account: str | None,
             text = f"{record['sender']} {record.get('sender_address', '')} {record['subject']}".casefold()
             if (all(n in text for n in needles)
                     and (start is None or start <= record["ts"] < end)
+                    and (not unread or record.get("unread") is True)
                     and not already_shown(record)):
                 hits.append(record)
         return hits
@@ -3653,6 +3715,84 @@ def _header_matches(query: str, found: list[dict], account: str | None,
     return sorted(hits, key=lambda r: (_is_list_mail(r), -r["ts"])), oldest
 
 
+# A search reaches past the synced Inbox: Gmail's All Mail (archived, labelled and Skip
+# Inbox mail, with its text) and Apple Mail's Archive and other folders (sender and
+# subject only: Harbor reads no bodies outside the Inbox and Sent there). Never Spam,
+# Trash or Drafts. Bounded, and best effort: a source that can't answer is said, not hidden.
+_BEYOND_GMAIL_LIMIT = 10
+_BEYOND_ARCHIVE_LIMIT = 20
+_BEYOND_TIMEOUT_S = 8.0
+
+
+def _beyond_reach_text() -> str:
+    """What a search reaches past the saved Inbox bodies, for its coverage line."""
+    parts = []
+    try:
+        from service import gmail_source
+        if gmail_source.connected_accounts():
+            parts.append("Gmail's All Mail (archived mail included)")
+    except Exception:  # noqa: BLE001
+        pass
+    if native_email_accounts():
+        parts.append("the sender and subject of Apple Mail's Archive and other folders")
+    return (", plus " + " and ".join(parts)) if parts else ""
+
+
+async def _search_beyond_inbox(query: str, account: str | None, start: float | None,
+                               end: float | None) -> tuple[list[dict], list[dict], list[str]]:
+    """(Gmail rows with bodies, Apple Mail archive header records, notes on what
+    could not be searched). Rows outside the Inbox carry `_mailbox`."""
+    words = _search_words(query)[:5] or [query.strip()[:80]]
+    gmail_rows: list[dict] = []
+    archive: list[dict] = []
+    notes: list[str] = []
+
+    async def gmail() -> None:
+        from service import gmail_source
+        if not gmail_source.connected_accounts():
+            return
+        try:
+            hits = await asyncio.wait_for(gmail_source.search_all_mail(
+                words, start=start, end=end, limit=_BEYOND_GMAIL_LIMIT), _BEYOND_TIMEOUT_S)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — a failed widen never fails the search
+            notes.append("Gmail's All Mail (archived mail) couldn't be searched just now")
+            return
+        for hit in hits:
+            for row in _parse_raw_text(hit["record"]):
+                if not hit.get("in_inbox"):
+                    row["_mailbox"] = "All Mail"
+                gmail_rows.append(row)
+
+    async def apple() -> None:
+        if not native_email_accounts():
+            return
+        from service.mail_memory import bridge
+        try:
+            rows, _capped = await bridge.read_archive(words, since=start or 0.0, until=end or 0.0,
+                                                      limit=_BEYOND_ARCHIVE_LIMIT, timeout=_BEYOND_TIMEOUT_S)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — the app is closed, or Mail's index can't be read
+            notes.append("Apple Mail's Archive couldn't be searched just now")
+            return
+        names = {item["id"]: item["name"] for item in native_email_accounts()}
+        for r in rows:
+            address = _normalized_address(r.get("sender") or "")
+            archive.append({"ts": r["ts"], "account": names.get(r.get("account")) or "Mail",
+                            "account_id": r.get("account") or "", "sender": r.get("sender_name") or address
+                            or "Unknown sender", "sender_address": address,
+                            "message_id": r.get("rfc_message_id") or "", "native_id": "",
+                            "subject": r.get("subject") or "", "unread": None,
+                            "_mailbox": r.get("mailbox") or "Archive"})
+
+    await asyncio.gather(gmail(), apple())
+    gmail_rows = _filter_account_records(gmail_rows, account)
+    archive = _filter_account_records(archive, account)
+    return gmail_rows, archive, notes
+
+
 def _mail_line(row: dict) -> str:
     """One email as a single line, for rows shown without a body."""
     when = datetime.fromtimestamp(row["ts"]).strftime("%a %b %-d, %Y %-I:%M %p")
@@ -3664,6 +3804,8 @@ def _mail_line(row: dict) -> str:
     line = f"- {when} | {_clip(sender, 70)} | {_clip(row.get('subject') or '(no subject)', 90)}"
     if message_id and len(message_id) <= 60:
         line += f" | Message-ID: {message_id}"
+    if row.get("_mailbox"):
+        line += f" | in {_clip(str(row['_mailbox']), 30)}, not the Inbox"
     return neutralize(" ".join(line.split()))
 
 
@@ -3730,6 +3872,7 @@ async def view_emails_impl(query: str | None = None, day: str | None = None,
              else "") if start is None else f"in {label}"
     by_words = False
     header_hits: list[dict] = []
+    note_beyond = ""
     # Scope the query before assessing read-status coverage. Unknown flags in
     # unrelated mail must not inflate the exclusion count for this lookup.
     if query and corpus_identifier is not None:
@@ -3738,30 +3881,51 @@ async def view_emails_impl(query: str | None = None, day: str | None = None,
             return (f"No emails matching “{query}” were found in the recent "
                     "inbox Harbor searched.")
     elif query:
+        # Past the synced Inbox: Gmail's All Mail with its text, Apple Mail's Archive by
+        # sender and subject. A message the saved bodies already hold is not read twice.
+        reach = _beyond_reach_text()
+        scope += reach
+        beyond, archived, beyond_notes = await _search_beyond_inbox(query, account, start, end)
+        held = {_norm_mid(r.get("message_id") or "") for r in rows} - {""}
+        for row in beyond:
+            mid = _norm_mid(row.get("message_id") or "")
+            if mid and mid in held:
+                continue
+            held.add(mid)
+            rows.append(row)
         rows, by_words = await asyncio.to_thread(_search_rows, query, rows)
-        # Older mail keeps its sender and subject long after its text is gone.
-        # An unread search stays out of it: old read flags are only as good as
-        # the last history sync.
-        headers_back_to = None
-        if not unread:
-            header_hits, headers_back_to = await asyncio.to_thread(
-                _header_matches, query, rows, account, start, end)
+        # Older mail keeps its sender and subject long after its text is gone. An
+        # unread search keeps only headers whose last sync marked them unread.
+        header_hits, headers_back_to = await asyncio.to_thread(
+            _header_matches, query, rows, account, start, end, unread)
+        shown_ids = ({_norm_mid(r.get("message_id") or "") for r in rows + header_hits} - {""})
+        archive_hits = [r for r in archived if not unread
+                        and _norm_mid(r.get("message_id") or "") not in shown_ids
+                        and any(all(w in f"{r['sender']} {r['sender_address']} {r['subject']}".casefold()
+                                    for w in needles)
+                                for needles in ([query.strip().casefold()], _search_words(query)) if needles)]
+        header_hits = header_hits + archive_hits
+        if beyond_notes:
+            note_beyond = "; ".join(beyond_notes) + ". "
         if not rows:
             text_scope = (f"the text of {searched} saved {'email' if searched == 1 else 'emails'} {scope}"
                           if searched else "the saved email text, which has nothing in this range")
             header_scope = (f", and the sender and subject of saved headers from "
                             f"{_short_date(headers_back_to)} on" if headers_back_to is not None else "")
+            reach = "" if searched else reach
             if not header_hits:
-                return (f"No emails matching “{query}” were found in the recent inbox Harbor searched: "
-                        f"{text_scope}{header_scope}. Read and unread mail were both searched; "
-                        "anything older was not.")
+                return (f"No emails matching “{query}” were found in the mail Harbor searched: "
+                        f"{text_scope}{reach}{header_scope}. "
+                        + ("Unread mail only was searched; " if unread else "Read and unread mail were both searched; ")
+                        + "anything older was not." + (f" {note_beyond.strip()}" if note_beyond else ""))
             lines = "\n".join(_mail_line(r) for r in header_hits[:MAX_HEADER_LINES])
             more = len(header_hits) - min(len(header_hits), MAX_HEADER_LINES)
-            return (f"Result coverage: nothing matching “{_clip(query, 60)}” in {text_scope}, but "
+            return (f"Result coverage: nothing matching “{_clip(query, 60)}” in {text_scope}{reach}, but "
                     f"{len(header_hits)} older {'email matches' if len(header_hits) == 1 else 'emails match'} "
                     "by sender or subject. Only these headers are saved, not the text, so say that "
                     f"plainly and point the user to Mail for the rest.\n\n{lines}"
-                    + (f"\n(+{more} more)" if more > 0 else ""))
+                    + (f"\n(+{more} more)" if more > 0 else "")
+                    + (f"\n\n{note_beyond.strip()}" if note_beyond else ""))
     note = ""
     if unread:
         # Same rule as summarize_emails: read status only exists for what's
@@ -3796,8 +3960,9 @@ async def view_emails_impl(query: str | None = None, day: str | None = None,
     if not ranked:
         rows.sort(key=lambda r: r["ts"])
     if not rows:
-        return (f"No emails found for {label} (note: raw content only covers "
-                "roughly the 50 most recent emails — try summarize_emails for older mail).")
+        return (f"No emails found for {label} (note: saved text only covers about the "
+                "50 newest Inbox emails of each account — search with a word, or try "
+                "summarize_emails, for older mail).")
     # ``count`` is a display limit, not evidence that only that many matched.
     # Keep the newest rows as before, but disclose the cut in user-facing text
     # so neither the model nor the user can mistake a partial raw result for a
@@ -3836,7 +4001,8 @@ async def view_emails_impl(query: str | None = None, day: str | None = None,
         rows = await mail_attachments.annotate_rows(rows)
     except Exception:
         pass
-    rows = await digest_rows(rows, query=query, candidates=candidates)
+    rows = await digest_rows(rows, query=query, candidates=candidates,
+                             budget=result_budget_chars() if whole else RESULT_BUDGET_CHARS)
     extra_lines = [_mail_line(r) for r in header_hits[:_HEADER_MATCHES_SHOWN]]
     reserved = (len(note) + len(email_freshness_warning(account, part="raw")) + 2
                 + (_COVERAGE_CHARS if ranked or omitted else 0)
@@ -3859,6 +4025,12 @@ async def view_emails_impl(query: str | None = None, day: str | None = None,
                     "by sender or subject, headers only, text not saved:\n" + "\n".join(extra_lines))
         if len(header_hits) > len(extra_lines):
             trailer += f"\n(+{len(header_hits) - len(extra_lines)} more)"
+    outside = sum(1 for r in fitted.rows if r.get("_mailbox"))
+    if outside:
+        trailer += (f"\n\n{outside} of the emails above {'is' if outside == 1 else 'are'} archived "
+                    "(in Gmail's All Mail, not the Inbox).")
+    if note_beyond:
+        trailer += f"\n\n{note_beyond.strip()}"
     return note + coverage + "\n\n---\n\n".join(blocks) + trailer
 
 
@@ -3903,10 +4075,9 @@ def _omission_line(query: str | None, returned: int, available: int, limit: int,
     "keyword (e.g. a person's name, 'order', 'birthday'); pass `period` for a "
     "date RANGE ('this month', 'last week') or `day` for one specific day; "
     "pass `account` if the user asks about a SPECIFIC linked email account and "
-    "more than one is linked; omit any/all for the most recent emails. Covers "
-    "roughly the 50 most-recently-received emails (shared across the linked "
-    "accounts when more than one) — for anything older, fall back to "
-    "summarize_emails (which reaches back about two years). mailbox='sent' "
+    "more than one is linked; omit any/all for the most recent emails. Text: the "
+    "newest ~50 Inbox emails per account. A query also searches older headers "
+    "and archived mail; the result says what it searched. mailbox='sent' "
     "lists the user's OWN sent mail instead (recipient, subject, time; no "
     "bodies) from Apple Mail's Sent mailboxes and linked Gmail: the last week "
     "by default, up to a month back with day or period. An email with files "

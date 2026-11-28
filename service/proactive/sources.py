@@ -328,11 +328,13 @@ def split_threads(messages: list[dict], mine) -> list[list[dict]]:
 
 def dedupe_copies(rows: list[dict], linked: set[str]) -> list[dict]:
     """One row per message. The same email often arrives twice — through a
-    Google-linked account (read-only) and through Mail.app — so a Mail.app copy
-    (the one Harbor can reply from) wins, then a copy with a body."""
+    Google-linked account (read-only) and through Mail.app. A copy with a body
+    wins, so a header-only Mail.app row never replaces the text the Google copy
+    carries; between copies alike in that, the Mail.app copy (the one Harbor can
+    reply from) wins."""
     def rank(row):
         native = not fetched_by_gmail(row, linked)
-        return (native, bool(row.get("body")), bool(row.get("account_id")))
+        return (bool(row.get("body")), native, bool(row.get("account_id")))
     best: dict[str, dict] = {}
     loose: dict[tuple, dict] = {}
     for row in rows:
@@ -488,8 +490,13 @@ _PERSONAL_NOTICE = re.compile(
     r"\b(?:confirm|reminder:?|upcoming|your) (?:\w+ )?appointment\b|"
     r"\b(?:your )?application\b[^.!?]{0,30}\b(?:status|update|received|decision|next steps|under review|"
     r"incomplete|was submitted)\b|\binterview (?:invitation|request|scheduled|confirm\w*)\b|\boffer letter\b|"
+    r"\b(?:job|employment|internship) offer\b|\boffer of (?:employment|admission)\b|"
     r"\b(?:you(?:'|’)ve|you have) used \d{2,3}% of\b|\bstorage (?:is )?(?:almost )?full\b|"
     r"\b(?:quota|limit) (?:reached|exceeded)\b", re.I)
+
+
+_JOB_OFFER = re.compile(r"\boffer letter\b|\b(?:job|employment|internship) offer\b|"
+                        r"\boffer of (?:employment|admission)\b", re.I)
 
 
 def personal_notice(row: dict) -> bool:
@@ -500,9 +507,12 @@ def personal_notice(row: dict) -> bool:
     if not _PERSONAL_NOTICE.search(subject):
         return False
     identity = f"{row.get('sender') or ''} {_address(row)}"
+    # A job offer comes from a recruiter's mailbox (recruiting@, careers@), which reads as
+    # a job-board sender: for an offer only the subject's own promo words rule it out.
+    offer = bool(_JOB_OFFER.search(subject))
     return not (_MARKETING_SUBJECT.search(subject) or _CRITICAL_PROMO.search(subject) or _PROMO_SUBJECT.search(subject)
-                or _NEWSLETTER_RE.search(identity) or _PROMO_SENDER.search(identity) or _SOCIAL_RE.search(identity)
-                or is_broadcast(row))
+                or _NEWSLETTER_RE.search(identity) or (_PROMO_SENDER.search(identity) and not offer)
+                or _SOCIAL_RE.search(identity) or is_broadcast(row))
 
 
 # A collaborator's comment in a shared Google doc arrives from Google's
@@ -522,17 +532,48 @@ def doc_comment(row: dict) -> bool:
     return not (_DOC_RESOLVED_ONLY.search(body) and not _DOC_NEW.search(body))
 
 
+# A government, university or department sender (the registrar, financial aid, a
+# city office): bulk by its form, but its deadlines and requests are the user's own.
+_INSTITUTION_NAME = re.compile(r"\b(?:university|college|school|department|dept|office|registrar|bursar|"
+                               r"financial aid|admissions|advising|advisors?|student services|city of|county|"
+                               r"state of|court|clerk)\b", re.I)
+
+
+def institution_notice(row: dict) -> bool:
+    """A .gov/.edu/.mil sender, or a university or government office by name,
+    whose subject or opening asks for something (a deadline, an action, the
+    user's own appointment or application). Never a promotion or a newsletter."""
+    from service.assistant.daily_workspace import _PROMO_SUBJECT, _QUOTED_HISTORY
+    from service.tools.email_tools import _INSTITUTION_DOMAIN, _MARKETING_SUBJECT, _NEWSLETTER_RE
+    if odd_sender(row):
+        return False                      # a name dressed up as someone else's address vouches for nothing
+    address = _address(row)
+    # The display name only, never an address written into it ("x <a@school.edu>").
+    sender = re.sub(r"<[^>]*>|\S+@\S+", " ", str(row.get("sender") or ""))
+    subject = str(row.get("subject") or "")
+    if not (_INSTITUTION_DOMAIN.search(address.rpartition("@")[2]) or _INSTITUTION_NAME.search(sender)):
+        return False
+    if _MARKETING_SUBJECT.search(subject) or _PROMO_SUBJECT.search(subject) or _NEWSLETTER_RE.search(subject):
+        return False
+    lead = _QUOTED_HISTORY.split(str(row.get("body") or ""))[0][:600]
+    return (_deadline(row) or bool(_SCHOOL_ACTION.search(f"{subject} {lead}"))
+            or bool(_PERSONAL_NOTICE.search(subject)))
+
+
 def recall_reason(row: dict) -> str | None:
     """Why automated mail that the bulk filters drop is still read: "school"
     (a course or the school asking for something), "notice" (the user's own
-    appointment, bill, application or account), "doc_comment" (a person's
-    comment in a shared doc). None for everything else."""
+    appointment, bill, application, job offer or account, or a government or
+    university office asking for something),
+    "doc_comment" (a person's comment in a shared doc). None for everything else.
+    A recalled item is shown to the user, never treated as a person: nothing is
+    done on its own from it (followups and auto-add need `person`)."""
     try:
         if school_mail(row) and school_action(row):
             return "school"
         if doc_comment(row):
             return "doc_comment"
-        if personal_notice(row):
+        if personal_notice(row) or institution_notice(row):
             return "notice"
     except Exception:  # noqa: BLE001 — a classifier failure recalls nothing
         return None

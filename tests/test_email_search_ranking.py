@@ -131,9 +131,10 @@ def test_several_words_match_when_the_exact_phrase_is_nowhere():
     rows = [_row("Winter enrollment", body="Pick your classes soon."), _row("Other")]
     out = _view(rows, query="class enrollment")
     assert _order(out) == ["Winter enrollment"] and "all of the words, not the exact phrase" in out
-    # An exact phrase hit keeps today's precision.
+    # An exact phrase hit comes first, and the emails holding every word still follow it:
+    # one phrase hit must not hide the rest.
     rows.append(_row("Class enrollment opens", ts=NOW - DAY))
-    assert _order(_view(rows, query="class enrollment")) == ["Class enrollment opens"]
+    assert _order(_view(rows, query="class enrollment")) == ["Class enrollment opens", "Winter enrollment"]
 
 
 def test_a_listing_without_a_query_stays_in_date_order_and_keeps_the_newest():
@@ -299,7 +300,8 @@ def test_tracking_links_go_and_plain_text_otherwise_stays_byte_for_byte():
     assert D.readable_body(plain) == plain
     assert D.readable_body(f"Save big ( {PROMO_LINK} ) now") == "Save big [link] now"
     assert D.readable_body(f"Go {TRACKER} now") == "Go [link] now"
-    assert D.readable_body("Go https://x.example.com/?utm_source=a now") == "Go [link] now"
+    # A campaign tag on a real page is not a tracker (tools audit 3.5): the link stays.
+    assert D.readable_body("Go https://x.example.com/?utm_source=a now") == "Go https://x.example.com/?utm_source=a now"
     assert D.readable_body("Zoom https://school.zoom.example.us/j/123?pwd=abc") == \
         "Zoom https://school.zoom.example.us/j/123?pwd=abc"
 
@@ -368,7 +370,7 @@ def test_a_miss_says_what_was_searched():
     rows = [_row("Other", ts=NOW - 3 * DAY)]
     out = _view(rows, query="zebra", headers=_header("Unrelated", ts=NOW - DAY),
                 history=_header("Also unrelated", ts=NOW - 700 * DAY))
-    assert out.startswith("No emails matching “zebra” were found in the recent inbox Harbor searched")
+    assert out.startswith("No emails matching “zebra” were found in the mail Harbor searched")
     assert "the text of 1 saved email from " in out and "sender and subject of saved headers from " in out
     assert "Read and unread mail were both searched; anything older was not." in out
 
@@ -439,3 +441,61 @@ def test_local_index_headers_with_numeric_ids_do_not_repeat_shown_mail():
     assert "Order refund processed" in trailer
     assert "Your order" not in trailer
     assert "Message-ID: -" not in out
+
+
+# --- app audit 2.1 / 2.2.4: search reach and search words -----------------------------
+
+
+def test_a_search_finds_a_copied_person_in_cc():
+    rows = [{**_row("Budget review"), "cc": "Robin Vale <robin@example.org>"}, _row("Other")]
+    assert _order(_view(rows, query="robin@example.org")) == ["Budget review"]
+
+
+def test_short_acronyms_and_numbers_are_search_words():
+    assert E._search_words("HR forms") == ["hr", "forms"]
+    assert E._search_words("W2 for 2026") == ["w2", "2026"]
+    assert E._search_words("my AI class") == ["ai", "class"]
+    assert E._search_words("go to it") == []          # plain short words stay filler
+    rows = [_row("Forms from HR", body="Please sign."), _row("Forms for the trip", body="Bring them.")]
+    out = _view(rows, query="HR the forms")
+    assert _order(out) == ["Forms from HR"]
+
+
+def test_an_unread_search_still_reads_unread_headers():
+    headers = (_header("Parking permit renewal", ts=NOW - 2 * DAY, message_id="<u@x>", flag="U") + "\n"
+               + _header("Parking permit receipt", ts=NOW - 3 * DAY, message_id="<r@x>", flag="R"))
+    out = _view([_row("Other", unread=True)], query="parking permit", unread=True, headers=headers)
+    assert "Parking permit renewal" in out and "Parking permit receipt" not in out
+
+
+def test_a_search_reaches_gmail_all_mail_and_apple_mail_archive():
+    archived_record = "\x01".join([str(int(NOW - 90 * DAY)), "R", "me@example.com", "me@example.com",
+                                   "Lee Park <lee@example.net>", "me@example.com", "Kayak rental receipt",
+                                   "<kayak@x>", "Your kayak rental code is KX-5512.", ""])
+    archive_rows = [{"ts": NOW - 200 * DAY, "account": "native-acct", "mailbox": "Archive",
+                     "subject": "Kayak club dues", "sender": "club@example.org", "sender_name": "Kayak Club",
+                     "rfc_message_id": "<dues@x>"}]
+
+    async def all_mail(terms, **_):
+        assert terms == ["kayak"]
+        return [{"account": "me@example.com", "record": archived_record, "in_inbox": False}]
+
+    from service import gmail_source
+    from service.mail_memory import bridge
+    with patch.object(gmail_source, "connected_accounts", return_value={"me@example.com": {}}), \
+            patch.object(gmail_source, "search_all_mail", side_effect=all_mail), \
+            patch.object(bridge, "read_archive", new=AsyncMock(return_value=(archive_rows, False))), \
+            patch.object(E, "native_email_accounts", return_value=[{"id": "native-acct", "name": "Home"}]):
+        out = _view([_row("Other")], query="kayak")
+    assert _order(out) == ["Kayak rental receipt"] and "KX-5512" in out
+    assert "archived (in Gmail's All Mail, not the Inbox)" in out
+    assert "Kayak club dues" in out and "in Archive, not the Inbox" in out
+    assert "Gmail's All Mail (archived mail included)" in out
+
+
+def test_a_failed_archive_search_is_said_not_hidden():
+    from service.mail_memory import bridge
+    with patch.object(bridge, "read_archive", new=AsyncMock(side_effect=bridge.BridgeError("app_not_connected"))), \
+            patch.object(E, "native_email_accounts", return_value=[{"id": "native-acct", "name": "Home"}]):
+        out = _view([_row("Kayak trip", body="Paddles.")], query="kayak")
+    assert _order(out) == ["Kayak trip"] and "Apple Mail's Archive couldn't be searched just now" in out
