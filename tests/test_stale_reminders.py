@@ -210,17 +210,20 @@ def test_get_endpoint_shape(store):
 
 # --- delete -----------------------------------------------------------------------------
 
-def test_only_delete_may_target_an_undated_reminder():
+def test_undated_targets_need_an_explicit_null_and_no_all_day_date():
     base = {"action_id": "a1", "source_id": "ek", "expected_title": "T", "expected_due_ts": None}
-    assert validate_payload("delete_reminder", {"type": "delete_reminder", **base})
-    for kind in ("complete_reminder",):
-        with pytest.raises(ValueError):
-            validate_payload(kind, {"type": kind, **base})
-    with pytest.raises(ValueError):
-        validate_payload("update_reminder", {"type": "update_reminder", **base,
-                                             "title": "U", "due_ts": 2_000_000_000.0})
-    with pytest.raises(ValueError):
-        validate_payload("delete_reminder", {"type": "delete_reminder", **base, "expected_due_ts": 0})
+    for kind in ("delete_reminder", "complete_reminder"):
+        assert validate_payload(kind, {"type": kind, **base})
+    assert validate_payload("update_reminder", {"type": "update_reminder", **base,
+                                                "title": "U", "due_ts": 2_000_000_000.0})
+    for kind in ("delete_reminder", "complete_reminder"):
+        with pytest.raises(ValueError):          # zero is not "undated"
+            validate_payload(kind, {"type": kind, **base, "expected_due_ts": 0})
+        with pytest.raises(ValueError):          # a floating date is a dated target
+            validate_payload(kind, {"type": kind, **base, "expected_due_date": "2026-10-11"})
+    with pytest.raises(ValueError):              # create never targets an existing reminder
+        validate_payload("create_reminder", {"type": "create_reminder", "action_id": "a1",
+                         "title": "T", "commitment_kind": "reminder", "expected_due_ts": None})
 
 
 def _native_request():
@@ -762,3 +765,45 @@ def test_the_guard_itself_refuses_non_json_and_any_origin():
             stale_reminders_api._native_only(bad)
         assert refused.value.status_code == code
     stale_reminders_api._native_only(request((b"content-type", b"Application/JSON; charset=utf-8")))
+
+
+# --- audit 2.2: completing an undated reminder --------------------------------------------
+
+def test_complete_reminder_completes_an_undated_reminder_through_the_native_path(store, monkeypatch):
+    from service.tools import schedule_extras
+    _sync(store, [_row("u-1", "Invented someday errand", FRESH)])
+    monkeypatch.setattr(schedule_extras, "_store", store)
+    native = AsyncMock(return_value={"ok": True, "status": "succeeded", "error": "",
+                                     "source_id": "u-1", "is_completed": True})
+    monkeypatch.setattr(outbox, "request", native)
+    text = asyncio.run(schedule_extras.complete_reminder("someday errand"))
+    assert text == "Marked “Invented someday errand” done."
+    kind, payload = native.await_args.args
+    assert kind == "complete_reminder"
+    assert payload == {"source_id": "u-1", "expected_title": "Invented someday errand", "expected_due_ts": None}
+    validate_payload(kind, {"type": kind, "action_id": "a1", **payload})
+
+
+def test_complete_commitment_refuses_a_row_that_is_not_a_current_undated_reminder(store, monkeypatch):
+    from service.tools import schedule_extras
+    _sync(store, [_row("u-1", "Invented someday errand", FRESH)])
+    native = AsyncMock(side_effect=AssertionError("must not reach the native writer"))
+    monkeypatch.setattr(outbox, "request", native)
+    for row in ({"id": "x", "source": "reminders", "source_id": "gone", "title": "Invented someday errand", "when_ts": None},
+                {"id": "x", "source": "reminders", "source_id": "u-1", "title": "Renamed", "when_ts": None}):
+        done, message = asyncio.run(schedule_extras.complete_commitment(row, store))
+        assert done is False and "not a current undated reminder" in message
+    native.assert_not_awaited()
+
+
+def test_complete_reminder_still_reports_no_match_for_unknown_titles(store, monkeypatch):
+    from service.tools import schedule_extras
+    _sync(store, [_row("u-1", "Invented someday errand", FRESH)])
+    monkeypatch.setattr(schedule_extras, "_store", store)
+    assert "Nothing active matches" in asyncio.run(schedule_extras.complete_reminder("quarterly taxes"))
+
+
+def test_terminal_retry_state_for_an_undated_completion(store):
+    _sync(store, [_row("u-1", "Invented someday errand", FRESH)])
+    payload = {"source_id": "u-1", "expected_title": "Invented someday errand", "expected_due_ts": None}
+    assert store.reminder_terminal_retry_state("complete_reminder", payload) == "expected"

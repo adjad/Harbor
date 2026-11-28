@@ -136,6 +136,27 @@ def _records(rows: list[dict], *, budget: int = 1_700) -> tuple[list[dict], int]
     return kept, len(rows) - len(kept)
 
 
+def _reserved_records(rows: list[dict], reserved, *, limit: int = 10, budget: int = 1_700) -> tuple[list[dict], int]:
+    """Cap rows like `_records`, but rows `reserved` selects claim slots first.
+
+    Today's events, overdue reminders and undated reminders must survive the
+    row/byte cap; the rest fill whatever room remains. Output keeps the input
+    (chronological) order.
+    """
+    sizes = [len(json.dumps(row, ensure_ascii=True)) for row in rows]
+    chosen, used = set(), 0
+    for want_reserved in (True, False):
+        for index, row in enumerate(rows):
+            if bool(reserved(row)) is not want_reserved:
+                continue
+            if len(chosen) >= limit or used + sizes[index] > budget:
+                continue
+            chosen.add(index)
+            used += sizes[index]
+    kept = [row for index, row in enumerate(rows) if index in chosen]
+    return kept, len(rows) - len(kept)
+
+
 def _native_source(source: str, *, now: float, start: float, end: float, query: str,
                    include_overdue: bool, include_undated: bool) -> dict:
     """Capture one selected source's rows and receipt in one read transaction.
@@ -156,7 +177,7 @@ def _native_source(source: str, *, now: float, start: float, end: float, query: 
             total = db.execute("SELECT COUNT(*) " + sql, params).fetchone()[0]
             rows = [dict(row) for row in db.execute(
                 "SELECT c.id,c.source,c.source_id,c.title,c.context,c.account,c.when_ts,e.end_ts,c.all_day "
-                + sql + " ORDER BY c.when_ts DESC,c.source_id LIMIT 5000", params)]
+                + sql + " ORDER BY c.when_ts ASC,c.source_id LIMIT 5000", params)]
             undated, view = [], {}
         else:
             sql = ("FROM scheduled_commitments c WHERE c.source IN ('reminders','manual') AND c.status='active' "
@@ -165,7 +186,7 @@ def _native_source(source: str, *, now: float, start: float, end: float, query: 
             total = db.execute("SELECT COUNT(*) " + sql, params).fetchone()[0]
             rows = [dict(row) for row in db.execute(
                 "SELECT c.id,c.source,c.source_id,c.title,c.context,c.account,c.when_ts,c.all_day,c.due_date "
-                + sql + " ORDER BY c.when_ts DESC,c.source_id LIMIT 5000", params)]
+                + sql + " ORDER BY c.when_ts ASC,c.source_id LIMIT 5000", params)]
             view, undated = assistant_store.undated_listing(query) if include_undated else ({}, [])
             # Overdue reminders the stale policy hides are not evidence of anything.
             hidden = assistant_store.hidden_commitment_ids(now)
@@ -201,7 +222,18 @@ def _native_source(source: str, *, now: float, start: float, end: float, query: 
                 "source_status": "cached native incomplete candidate; completeness unverified"} for row in undated)
         else:
             withheld += len(undated)
-    kept, omitted = _records(candidates)
+    today = dt.datetime.fromtimestamp(now).replace(hour=0, minute=0, second=0, microsecond=0)
+    day_start, day_end = today.timestamp(), (today + dt.timedelta(days=1)).timestamp()
+
+    def reserved(row: dict) -> bool:
+        stamp = row.get("when_ts")
+        if source == "reminders":
+            return stamp is None or row.get("temporal_state") == "overdue"
+        end_ts = row.get("end_ts")
+        return stamp is not None and stamp < day_end and (stamp >= day_start or (end_ts or stamp) > day_start)
+
+    candidates.sort(key=lambda row: (row.get("when_ts") is None, row.get("when_ts") or 0))
+    kept, omitted = _reserved_records(candidates, reserved)
     _add_local_times(kept)
     return {"state": "fresh covered cached candidates; completeness unverified" if current else
             "unknown native current state; native rows withheld",
@@ -557,11 +589,24 @@ def render_evidence_text(result: str) -> str | None:
                 lines.append(f"- {label}{f' {stamp}' if stamp else ''}: {title(row)}")
         if not reminders:
             lines.append("- No Reminder records were returned; this does not establish that no tasks are due.")
-    skipped = [name for name in ("email", "messages", "notes") if name in sources and rows(name)]
-    if skipped:
+    # Mail, Messages and Notes stay visible as who/how-many only. Subjects, note
+    # titles, bodies and message text are not quoted here: they may hold codes or
+    # private detail, and this text is shown on screen when the model gave no answer.
+    def clip(value, size: int = 40) -> str:
+        text = " ".join(str(value or "").split())
+        return text if len(text) <= size else text[:size - 1].rstrip() + "\u2026"
+
+    for name, label in (("email", "mail"), ("messages", "messages"), ("notes", "notes")):
+        found = rows(name)
+        if not found:
+            continue
+        who = []
+        if name in {"email", "messages"}:
+            who = sorted({clip(row.get("sender")) for row in found if clip(row.get("sender"))})[:5]
         lines.append("")
-        lines.append("I also read your " + ", ".join(skipped)
-                     + " but couldn't summarise them this time; ask about them directly.")
+        lines.append(f"Your {label}: {len(found)} read"
+                     + (f", from {', '.join(who)}" if who else "")
+                     + "; I couldn't summarise the text this time, so ask about them directly.")
     lines.append("")
     lines.append(render_coverage_text(result))
     return "\n".join(lines)

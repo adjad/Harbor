@@ -53,6 +53,7 @@ def test_snapshot_retains_unknown_all_day_ends_and_known_overlap(tmp_path, monke
     monkeypatch.setattr('service.assistant.sync_status.ensure_sources',AsyncMock(return_value={
         'sources':[{'id':'calendar','state':'ready'},{'id':'reminders','state':'ready'}], 'reminders_fresh':True}))
     result = asyncio.run(S.find_free_time(period=day))
-    assert result.startswith('(error:') and 'missing or invalid ends' in result
-    assert '9:00 AM' not in result and 'candidate' not in result
+    # Unknown-end rows are skipped with a note, not an abort; the note says slots may overlap them.
+    assert not result.startswith('(error:')
+    assert 'had invalid times' in result and 'no end time' in result and 'may overlap' in result
     store._db.close()

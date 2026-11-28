@@ -54,6 +54,21 @@ def expected_matches(row, payload: dict) -> bool:
                     == payload['expected_due_date']))
 
 
+_UNDATED_KINDS = frozenset({"delete_reminder", "complete_reminder", "update_reminder"})
+
+
+def is_undated_target(store, source_id: str, title: str) -> bool:
+    """True only when ``source_id`` is a stored undated reminder titled ``title`` and
+    has no active dated row: the null-due target must match what Harbor holds."""
+    if not isinstance(source_id, str) or not source_id or not isinstance(title, str):
+        return False
+    if not any(item.get("source_id") == source_id and item.get("title") == title
+               for item in store.undated_reminders()):
+        return False
+    return not any(row.get("source_id") == source_id and row.get("when_ts") is not None
+                   for row in store.active_between(None, None, include_stale=True))
+
+
 def validate_payload(kind: str, payload: dict) -> dict:
     if not isinstance(kind, str) or kind not in KINDS or not isinstance(payload, dict):
         raise ValueError("unsupported reminder action")
@@ -86,9 +101,12 @@ def validate_payload(kind: str, payload: dict) -> dict:
             or ("source_id" in keys and not _text(payload.get("source_id")))
             or ("expected_title" in keys and not _text(payload.get("expected_title")))
             or ("expected_due_ts" in keys and not _timestamp(payload.get("expected_due_ts"))
-                # Only a delete may target a reminder with no due date, and it says so
-                # with an explicit null; the native writer then requires it still be undated.
-                and not (kind == "delete_reminder" and payload.get("expected_due_ts") is None))
+                # A reminder with no due date is targeted with an explicit null; the native
+                # writer then requires it still be undated. Delete, complete and update may.
+                # A null never goes with an all-day date: that target is dated, and the
+                # expected_due_date check above already requires a timestamp for it.
+                and not (kind in _UNDATED_KINDS and payload.get("expected_due_ts") is None
+                         and "expected_due_date" not in payload))
             or ("title" in keys and not _text(payload.get("title")))
             or ("due_ts" in keys and not _timestamp(payload.get("due_ts")))):
         raise ValueError("invalid exact reminder payload")

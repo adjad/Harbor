@@ -57,19 +57,30 @@ def _search(store, query: str, course_id: str | None, limit: int) -> list[dict]:
     return list(search(query, course_id=course_id, limit=limit) or [])
 
 
-def _course(store, course: str) -> dict | None:
-    """The course the user named ("CS 20", "biology"), by code or name; None if unclear."""
+def _course_matches(store, course: str) -> list[dict]:
+    """Courses the user's wording names: the exact code/name match if there is one, else
+    every course whose code or name contains it. Empty when nothing matches."""
     want = _WS.sub(" ", str(course or "")).strip().casefold()
     if not want:
-        return None
+        return []
     rows = list(store.courses() or [])
     exact = [c for c in rows if want in {str(c.get("code") or "").casefold(),
                                          str(c.get("name") or "").casefold()}]
     if len(exact) == 1:
-        return exact[0]
-    loose = [c for c in rows if want in str(c.get("code") or "").casefold()
-             or want in str(c.get("name") or "").casefold()]
-    return loose[0] if len(loose) == 1 else None
+        return exact
+    return [c for c in rows if want in str(c.get("code") or "").casefold()
+            or want in str(c.get("name") or "").casefold()]
+
+
+def _course(store, course: str) -> dict | None:
+    """The course the user named ("CS 20", "biology"), by code or name; None if unclear."""
+    found = _course_matches(store, course)
+    return found[0] if len(found) == 1 else None
+
+
+def _course_list(courses: list[dict]) -> str:
+    names = [_line(" ".join(part for part in (c.get("code"), c.get("name")) if part), 80) for c in courses[:8]]
+    return "; ".join(name for name in names if name)
 
 
 def _where(hit: dict) -> str:
@@ -118,7 +129,19 @@ async def study_slides(query: str, course: str = "") -> str:
     store = await asyncio.to_thread(_store)
     if store is None:
         return NO_STUDY
-    picked = await asyncio.to_thread(_course, store, course) if course else None
+    picked = None
+    if course and course.strip():
+        found = await asyncio.to_thread(_course_matches, store, course)
+        if len(found) == 1:
+            picked = found[0]
+        elif found:
+            return (f"“{_line(course, 60)}” matches more than one course: {_course_list(found)}. "
+                    "Nothing was searched; ask which course, or search without a course.")
+        else:
+            every = await asyncio.to_thread(lambda: list(store.courses() or []))
+            return (f"No course matches “{_line(course, 60)}”."
+                    + (f" Courses on this Mac: {_course_list(every)}." if every else "")
+                    + " Nothing was searched; ask which course, or search without a course.")
     hits = await asyncio.to_thread(_search, store, query, (picked or {}).get("id"), SEARCH_LIMIT)
     if not hits:
         return f"Nothing found in the student's slides for “{_line(query, 120)}”."

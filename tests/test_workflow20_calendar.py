@@ -100,7 +100,7 @@ def test_availability_fails_closed_for_unverified_sources(state, ready, monkeypa
     monkeypatch.setattr("service.assistant.sync_status.ensure_sources", AsyncMock(return_value={
         "sources": [{"id": "calendar", "state": state}, {"id": "reminders", "state": "ready"}], "reminders_fresh": True}))
     result = asyncio.run(S.find_free_time(period="next week"))
-    assert "No study slot has been verified" in result and ready == []
+    assert "No slot has been verified" in result and ready == []
     assert "candidate slots" not in result
 
 

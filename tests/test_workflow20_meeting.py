@@ -631,3 +631,19 @@ def test_recursive_capability_redaction_scrubs_keys_and_preserves_clean_identity
     clean = {"display": display, "items": ["clean", 30]}
     assert S.redact_meeting_capabilities(clean) is clean
     assert S.redact_meeting_capabilities(display) is display
+
+
+@pytest.mark.parametrize("quote", ["Schedule a private meeting after the dentist tomorrow.",
+    "Please book a personal event for Friday at noon.", "Add a private event after lunch.",
+    "Create a personal calendar block for the afternoon."])
+def test_private_meeting_and_personal_event_wordings_are_accepted(quote):
+    from service.tools.schedule_extras import _private_block_request
+    assert _private_block_request(quote) is True
+
+
+@pytest.mark.parametrize("quote", ["Schedule a private meeting and invite Morgan.",
+    "Don't book a personal event.", "Explain how to schedule a private meeting.",
+    "Book a meeting with Morgan.", 'Schedule a meeting named "private meeting".'])
+def test_private_meeting_wordings_keep_the_invitation_and_negation_guards(quote):
+    from service.tools.schedule_extras import _private_block_request
+    assert _private_block_request(quote) is False

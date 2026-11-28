@@ -1671,8 +1671,9 @@ class AssistantStore:
     def reminder_terminal_retry_state(self, kind: str, payload: dict) -> str:
         """Classify the current occurrence, ignoring historical completed rows."""
         from service.assistant.verified_reminders import expected_matches
-        if kind == "delete_reminder" and payload.get("expected_due_ts") is None:
+        if kind in {"delete_reminder", "complete_reminder"} and payload.get("expected_due_ts") is None:
             # An undated reminder lives only in the undated list, never in commitments.
+            finished = "dismissed" if kind == "delete_reminder" else "done"
             with self._lock:
                 terminal = self._db.execute(
                     "SELECT status FROM assistant_reminder_terminals WHERE source_id=?",
@@ -1682,7 +1683,7 @@ class AssistantStore:
                     (payload["source_id"],)).fetchone()
             if row is not None:
                 return "expected" if row["title"] == payload["expected_title"] else "other"
-            return "desired" if terminal and terminal["status"] == "dismissed" else "other"
+            return "desired" if terminal and terminal["status"] == finished else "other"
         with self._lock:
             rows = self._db.execute(
                 "SELECT title,when_ts,status,all_day FROM scheduled_commitments WHERE source='reminders' "
@@ -2195,7 +2196,7 @@ class AssistantStore:
                     self._db.execute(
                         "DELETE FROM assistant_reminder_writes WHERE source_id=?",
                         (payload["source_id"],))
-                    if kind == "delete_reminder" and payload["expected_due_ts"] is None:
+                    if kind in {"delete_reminder", "complete_reminder"} and payload["expected_due_ts"] is None:
                         removed = self._db.execute(
                             "DELETE FROM assistant_undated_reminders WHERE source_id=?",
                             (payload["source_id"],)).rowcount
