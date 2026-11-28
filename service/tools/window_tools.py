@@ -22,8 +22,12 @@ _TIMEOUT = 20
 
 
 def _osa(script: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["osascript", "-e", script],
-                          capture_output=True, text=True, timeout=_TIMEOUT)
+    argv = ["osascript", "-e", script]
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            argv, 124, "", f"the app did not answer within {_TIMEOUT} seconds")
 
 
 def _as_str(value: str) -> str:
@@ -93,6 +97,52 @@ def list_running_apps() -> str:
     return f"{len(names)} apps open: {listed}." + (f" Frontmost: {front}." if front else "")
 
 
+def _tile_script(target: str, action: str) -> str:
+    x_expr = "vx" if action == "left" else "vx + vw / 2"
+    return (
+        'use framework "AppKit"\n'
+        'use scripting additions\n'
+        'tell application "System Events"\n'
+        f'  set win to front window of {target}\n'
+        '  set {wx, wy} to position of win\n'
+        '  set {ww, wh} to size of win\n'
+        'end tell\n'
+        'set cx to wx + ww / 2\n'
+        'set cy to wy + wh / 2\n'
+        'try\n'
+        '  set scrs to current application\'s NSScreen\'s screens()\n'
+        '  set primaryH to item 2 of item 2 of ((scrs\'s objectAtIndex:0)\'s frame() as list)\n'
+        '  set chosen to (scrs\'s objectAtIndex:0)\n'
+        '  repeat with i from 0 to ((scrs\'s |count|()) - 1)\n'
+        '    set s to (scrs\'s objectAtIndex:i)\n'
+        '    set f to s\'s frame() as list\n'
+        '    set fx to item 1 of item 1 of f\n'
+        '    set fw to item 1 of item 2 of f\n'
+        '    set fh to item 2 of item 2 of f\n'
+        '    set axTop to primaryH - ((item 2 of item 1 of f) + fh)\n'
+        '    if cx >= fx and cx < fx + fw and cy >= axTop and cy < axTop + fh then\n'
+        '      set chosen to s\n'
+        '      exit repeat\n'
+        '    end if\n'
+        '  end repeat\n'
+        '  set v to chosen\'s visibleFrame() as list\n'
+        '  set vx to item 1 of item 1 of v\n'
+        '  set vw to item 1 of item 2 of v\n'
+        '  set vh to item 2 of item 2 of v\n'
+        '  set vy to primaryH - ((item 2 of item 1 of v) + vh)\n'
+        'on error\n'
+        '  tell application "Finder" to set screenBounds to bounds of window of desktop\n'
+        '  set vx to 0\n'
+        '  set vw to item 3 of screenBounds\n'
+        '  set vy to 25\n'
+        '  set vh to (item 4 of screenBounds) - 25\n'
+        'end try\n'
+        'tell application "System Events"\n'
+        f'  set position of win to {{{x_expr}, vy}}\n'
+        '  set size of win to {vw / 2, vh}\n'
+        'end tell')
+
+
 @register(
     "window_control",
     "Act on the frontmost window: close, minimize, zoom (maximize), enter or "
@@ -126,19 +176,13 @@ def window_control(action: str, app: str = "") -> str:
 
     if action in ("left", "right"):
         # Tiling has no AppleScript verb; it is a position+size write on the
-        # window, which is why this needs the screen's usable bounds rather than
-        # its pixel dimensions — subtracting the menu bar is what stops the
-        # window sitting underneath it.
-        script = (
-            'tell application "Finder" to set screenBounds to bounds of window of desktop\n'
-            'set screenW to item 3 of screenBounds\n'
-            'set screenH to item 4 of screenBounds\n'
-            'set menuBar to 25\n'
-            'tell application "System Events"\n'
-            f'  set win to front window of {target}\n'
-            f'  set position of win to {{{"0" if action == "left" else "screenW / 2"}, menuBar}}\n'
-            '  set size of win to {screenW / 2, screenH - menuBar}\n'
-            'end tell')
+        # window. The target is the VISIBLE frame of the screen the window is
+        # on (menu bar, notch and Dock already excluded, any monitor), not a
+        # fixed menu-bar height on the main display. Cocoa measures y from the
+        # bottom of the main screen and System Events from its top, so the
+        # script converts. If the screen lookup fails it falls back to the
+        # main display's bounds minus a standard menu bar.
+        script = _tile_script(target, action)
         p = _osa(script)
         if (e := _guard(p)) is not None:
             return e
