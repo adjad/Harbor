@@ -707,5 +707,113 @@ class SearchLifecycleTests(SearchCase):
         self.assertTrue(answer["citations"])
 
 
+def _pad(seed: str) -> str:
+    return " ".join(f"{seed} filler sentence number {i} about nothing in particular." for i in range(24))
+
+
+FILTER_DOC = "\n\n".join([
+    "From: alice@example.com\nDate: 2023-02-01\n" + _pad("alpha") + " The harvest report is blue.",
+    "From: bob@example.com\nDate: 2024-06-15\n" + _pad("bravo") + " The harvest report is green.",
+    "From: carol@example.com\n# Appendix\n```\nharvest = report()\n```\n" + _pad("charlie") + " The harvest report is red.",
+])
+
+
+class SearchFilterTests(LazyLexicalTests):
+    async def literal(self, query):
+        events = await self.collect(text=FILTER_DOC, query=query, want_answer=False)
+        return next(e for e in events if e["event"] == "literal"), events
+
+    def colors(self, event):
+        return sorted(r["suffix"].split()[0] if r["suffix"] else r["match"] for r in event["results"])
+
+    async def test_after_and_before_filters_select_chunks(self):
+        lit, _ = await self.literal('"harvest report is" after:2024')
+        self.assertGreater(lit["count"], 0)
+        self.assertTrue(all("green" in r["suffix"] or "red" in r["suffix"] for r in lit["results"]))
+        lit, _ = await self.literal('"harvest report is" before:2024')
+        self.assertTrue(lit["results"])
+        self.assertTrue(all("blue" in r["suffix"] for r in lit["results"]))
+
+    async def test_from_filter(self):
+        lit, _ = await self.literal('"harvest report is" from:bob')
+        self.assertTrue(lit["results"])
+        self.assertTrue(all("green" in r["suffix"] for r in lit["results"]))
+
+    async def test_in_code_and_type_filters(self):
+        lit, _ = await self.literal('"harvest" in:code')
+        self.assertTrue(lit["results"])
+        self.assertTrue(all(r["line"] >= 7 for r in lit["results"]))
+        lit2, _ = await self.literal('"harvest" type:code')
+        self.assertEqual(lit["count"], lit2["count"])
+
+    async def test_unreadable_filter_is_reported_not_silently_dropped(self):
+        lit, _ = await self.literal('"harvest" type:banana')
+        self.assertEqual(lit["unapplied_filters"], ["type"])
+
+    async def test_lexical_filter_applies_before_the_limit(self):
+        _, events = await self.collect_lex("harvest report after:2024")
+        lex = next(e for e in events if e["event"] == "lexical")
+        self.assertTrue(lex["results"])
+        self.assertFalse(any("blue" in r["suffix"] or "blue" in r["match"] for r in lex["results"]))
+
+    async def collect_lex(self, query):
+        events = await self.collect(text=FILTER_DOC, query=query, want_answer=False)
+        return None, events
+
+    async def test_exclusion_runs_before_the_limit(self):
+        # 40 chunks all mention "needle"; only the last mentions "rare". Excluding
+        # "rare" must leave results, not an emptied top-30.
+        doc = "\n\n".join(_pad("needle") for _ in range(40)) + "\n\nneedle rare"
+        events = await self.collect(text=doc, query="needle -rare", want_answer=False)
+        lex = next(e for e in events if e["event"] == "lexical")
+        self.assertEqual(len(lex["results"]), 20)
+        events = await self.collect(text="needle rare " * 3 + "\n\n" + _pad("needle"),
+                                    query="needle -rare", want_answer=False)
+        lex = next(e for e in events if e["event"] == "lexical")
+        self.assertTrue(lex["results"])
+
+
+class SearchRegexTests(LazyLexicalTests):
+    async def lit(self, query, text="Order A-1042 shipped. Order B-77 pending. Ticket 9001."):
+        events = await self.collect(text=text, query=query, want_answer=False)
+        return next(e for e in events if e["event"] == "literal")
+
+    async def test_regex_is_a_real_search(self):
+        lit = await self.lit(r"regex:[A-Z]-\d+")
+        self.assertEqual([r["match"] for r in lit["results"]], ["A-1042", "B-77"])
+
+    async def test_regex_error_is_reported(self):
+        lit = await self.lit("regex:(unclosed")
+        self.assertEqual(lit["count"], 0)
+        self.assertIn("invalid pattern", lit["regex_error"])
+
+    async def test_catastrophic_patterns_are_refused(self):
+        for bad in ("(a+)+$", "(a|a)*b", "(.*)*x", r"(\w+)\1", "a" * 300):
+            lit = await self.lit("regex:" + bad, text="a" * 5000 + "!")
+            self.assertEqual(lit["count"], 0, bad)
+            self.assertTrue(lit["regex_error"], bad)
+
+    async def test_filters_after_the_pattern_are_not_part_of_it(self):
+        from service.search import query as qmod
+        pq = qmod.parse(r"regex:err\w+ after:2024")
+        self.assertEqual((pq.clean, pq.filters, pq.regex), (r"err\w+", {"after": "2024"}, True))
+        self.assertEqual(qmod.parse(r"regex:a-b in:x").clean, "a-b")
+
+
+class UnicodeLexicalTests(unittest.TestCase):
+    def test_non_latin_text_is_indexed(self):
+        for word, other in (("\u043f\u0440\u0438\u0432\u0435\u0442", "\u043c\u0438\u0440"),
+                            ("\u4f60\u597d", "\u4e16\u754c"), ("\u3053\u3093\u306b\u3061\u306f", "\u4e16\u754c"),
+                            ("\ud55c\uad6d\uc5b4", "\uc601\uc5b4"), ("\u03b5\u03bb\u03bb\u03b7\u03bd\u03b9\u03ba\u03ac", "\u03ba\u03cc\u03c3\u03bc\u03bf\u03c2")):
+            chunks = chunk(f"{_pad('x')} {word} {_pad('y')}\n\n{other} " + _pad("z"))
+            self.assertTrue(tokenize(word), word)
+            hits = BM25(chunks).search(word)
+            self.assertTrue(hits, word)
+            self.assertIn(word, chunks[hits[0].chunk_idx].text, word)
+
+    def test_hangul_is_not_collapsed_to_one_jamo(self):
+        self.assertNotEqual(fold("\ud55c"), fold("\ud558"))
+
+
 if __name__ == "__main__":
     unittest.main()

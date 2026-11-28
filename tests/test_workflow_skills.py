@@ -353,3 +353,53 @@ def test_file_tidy_move_still_asks_under_full_access_so_its_text_needs_no_caveat
     skill = copy.deepcopy(loaded["file-tidy"])
     skill.body = skill.body.replace("full access", "other access")
     assert contracts.validate(skill) == []
+
+
+def _steps(loaded, name):
+    return loaded[name].contract["steps"]
+
+
+@pytest.mark.parametrize("name", ("meeting-prep", "week-review", "file-tidy"))
+def test_every_step_passes_arguments_the_tool_accepts_and_all_it_requires(loaded, name):
+    for step in _steps(loaded, name):
+        schema = REGISTRY[step["tool"]].parameters
+        args = step.get("args") or {}
+        assert set(args) <= set(schema["properties"]), (step["tool"], set(args) - set(schema["properties"]))
+        assert set(schema.get("required") or []) <= set(args), (step["tool"], "missing a required argument")
+        for key, value in args.items():
+            enum = schema["properties"][key].get("enum")
+            if enum:
+                assert value in enum, (step["tool"], key)
+
+
+def test_meeting_prep_looks_far_enough_ahead_and_reads_notes_reminders_attachments(loaded):
+    steps = _steps(loaded, "meeting-prep")
+    upcoming = next(s for s in steps if s["tool"] == "get_upcoming")
+    assert upcoming["args"]["days"] >= 4          # a Friday request reaches Monday
+    find = next(s for s in steps if s["tool"] == "find_files")
+    assert find["args"]["query"] and find["args"]["kind"]
+    used = {s["tool"] for s in steps}
+    assert {"search_notes", "search_reminders", "read_email_attachments"} <= used
+    assert "days: 2" not in loaded["meeting-prep"].body
+
+
+def test_week_review_covers_inbox_texts_notes_and_all_reminder_scopes(loaded):
+    steps = _steps(loaded, "week-review")
+    emails = [s["args"].get("mailbox", "inbox") for s in steps if s["tool"] == "view_emails"]
+    assert sorted(emails) == ["inbox", "sent"]
+    used = {s["tool"] for s in steps}
+    assert {"view_messages", "search_notes"} <= used
+    scopes = {s["args"]["scope"] for s in steps if s["tool"] == "search_reminders"}
+    assert scopes == {"past_due", "today", "all"}
+
+
+def test_file_tidy_always_leaves_out_downloads_in_progress_and_todays_files(loaded):
+    moves = [s for s in _steps(loaded, "file-tidy") if s["tool"] == "organize_files"]
+    assert len(moves) == 2
+    for step in moves:
+        args = step["args"]
+        assert {".download", ".crdownload", ".part"} <= set(args["exclude_extensions"].split(","))
+        assert args["min_age_hours"] >= 24
+    # The confirm call repeats the preview's filters exactly, or the preview is void.
+    keys = ("exclude_extensions", "min_age_hours", "group_by", "folder", "pattern", "destination")
+    assert {k: moves[0]["args"][k] for k in keys} == {k: moves[1]["args"][k] for k in keys}

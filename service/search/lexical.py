@@ -9,13 +9,18 @@ from __future__ import annotations
 
 import math
 import re
+import time
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 
 from service.search.chunker import Chunk
 
-_WORD_RE = re.compile(r"[a-z0-9]+")
+# Unicode-aware words: any run of letters/digits (underscore excluded). Han and
+# kana carry no spaces between words, so each such character is its own token
+# (the same split on both the document and the query keeps them matchable).
+_CJK = "\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+_WORD_RE = re.compile(rf"[{_CJK}]|[^\W_{_CJK}]+")
 _NONASCII_RE = re.compile(r"([^\x00-\x7f])")
 
 # Deliberately tiny and hand-picked. A big synonym table starts firing on the
@@ -46,6 +51,14 @@ _STOPWORDS = {
 }
 
 
+def _keeps_form(ch: str) -> bool:
+    """Scripts whose canonical decomposition must not be stripped to a base
+    letter: Hangul syllables would collapse to a single jamo and kana would lose
+    their voicing marks."""
+    o = ord(ch)
+    return 0x1100 <= o <= 0x11FF or 0xAC00 <= o <= 0xD7AF or 0x3040 <= o <= 0x30FF
+
+
 def fold(text: str) -> str:
     """Lowercase + strip diacritics, LENGTH-PRESERVING so char offsets survive.
 
@@ -64,6 +77,9 @@ def fold(text: str) -> str:
             parts[i] = parts[i].lower()
         for i in range(1, len(parts), 2):
             ch = parts[i]
+            if _keeps_form(ch):
+                parts[i] = ch.lower()
+                continue
             d = unicodedata.normalize("NFD", ch)
             parts[i] = (d[0] if d else ch).lower()
         # Lower Unicode codepoints separately: whole-string lower changes a
@@ -72,6 +88,9 @@ def fold(text: str) -> str:
 
     out = []
     for ch in text:
+        if _keeps_form(ch):
+            out.append(ch)
+            continue
         d = unicodedata.normalize("NFD", ch)
         base = d[0] if d else ch
         out.append(base.lower())
@@ -158,6 +177,64 @@ def literal_hits(text: str, query: str, *, limit: int = 200) -> list[Hit]:
     return out
 
 
+# Bounds for user-supplied `regex:` queries. Python's re has no timeout, so a
+# catastrophic pattern cannot be interrupted once running; the pattern is
+# therefore refused up front when it has the shapes that blow up (a quantified
+# group that itself repeats or alternates, backreferences) and the scan is
+# capped in length, matches and wall time between matches.
+REGEX_MAX_PATTERN = 200
+REGEX_MAX_TEXT = 2_000_000
+REGEX_MAX_SECONDS = 1.0
+_REPEAT = r"(?:[*+]|\{\d*,\d*\}|\{\d{2,}\})"
+_QUANT_GROUP_RE = re.compile(r"\(((?:[^()\\]|\\.)*)\)" + _REPEAT)
+_INNER_REPEAT_RE = re.compile(_REPEAT)
+_BACKREF_RE = re.compile(r"\\[1-9]|\(\?P=")
+
+
+class RegexRejected(ValueError):
+    """The pattern is invalid or unsafe to run; the message is user-facing."""
+
+
+def _risky_group(pattern: str) -> bool:
+    """A repeated group whose body repeats again, or alternates between
+    branches that can start the same way ("(a|a)*", "(.*|x)+")."""
+    for m in _QUANT_GROUP_RE.finditer(pattern):
+        body = m.group(1)
+        if body.startswith("?:"):
+            body = body[2:]
+        if _INNER_REPEAT_RE.search(body):
+            return True
+        if "|" in body:
+            heads = [b[:1] for b in body.split("|")]
+            if any(h == "" or h in ".[\\(" for h in heads) or len(set(heads)) < len(heads):
+                return True
+    return False
+
+
+def compile_safe_regex(pattern: str) -> re.Pattern:
+    if len(pattern) > REGEX_MAX_PATTERN:
+        raise RegexRejected(f"pattern longer than {REGEX_MAX_PATTERN} characters")
+    if _BACKREF_RE.search(pattern) or _risky_group(pattern):
+        raise RegexRejected("pattern could run for too long (nested repeats or backreference)")
+    try:
+        return re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+    except re.error as e:
+        raise RegexRejected(f"invalid pattern: {e}") from e
+
+
+def regex_hits(text: str, pattern: str, *, limit: int = 200) -> list[Hit]:
+    """T0 for `regex:` — a real, bounded re.search over the document."""
+    rx = compile_safe_regex(pattern)
+    deadline = time.monotonic() + REGEX_MAX_SECONDS
+    out: list[Hit] = []
+    for m in rx.finditer(text[:REGEX_MAX_TEXT]):
+        if m.end() > m.start():
+            out.append(Hit(-1, 1.0, m.start(), m.end(), "literal"))
+        if len(out) >= limit or time.monotonic() > deadline:
+            break
+    return out
+
+
 class BM25:
     """Standard BM25 over chunks, built once per document and cached with it."""
 
@@ -182,7 +259,10 @@ class BM25:
         }
         self.vocab = set(df)
 
-    def search(self, query: str, *, limit: int = 30) -> list[Hit]:
+    def search(self, query: str, *, limit: int = 30,
+               allow: "set[int] | None" = None) -> list[Hit]:
+        """`allow` (chunk indexes) is applied before the limit, so filters and
+        -exclusions narrow the candidates instead of thinning the top N."""
         terms = _expand(tokenize(query))
         if not terms:
             return []
@@ -204,6 +284,8 @@ class BM25:
 
         scored: list[tuple[float, int]] = []
         for i, tf in enumerate(self.docs):
+            if allow is not None and i not in allow:
+                continue
             score = 0.0
             dl = self.lens[i] or 1
             for t in resolved:

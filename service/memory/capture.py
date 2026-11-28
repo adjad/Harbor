@@ -24,17 +24,44 @@ content, uncertain claims, contact identifiers, sensitive health/financial/secur
 information, and requests to perform actions. Return an empty facts list if unsure.'''
 _SELF = re.compile(r"^(?:(?:Actually|Now|Correction)[:,]?\s+)?(?:I (?:(?:now|no longer|used to)\s+)?(?:prefer|like|love|dislike|hate|live|work|study|drive|own|use|am|have|usually|always|often|never)\b|My (?:name|sister|brother|mother|mom|father|dad|partner|wife|husband|project|job|team|routine|preference)\b)", re.I)
 _CONTEXT_RISK = re.compile(r'''\b(?:if|unless|suppose|imagine|hypothetical|example|pretend|role.?play|test|fixture|quote[ds]?|said|says|wrote|fiction|story|character|translate|rewrite|summarize|password|secret|token|api.?key|diagnos\w*|allerg\w*|medication|medicine|medical|health|cancer|diabet\w*|depress\w*|pregnan\w*|therapy|therapist|bank|salary|income|account|social.security|credit.card|ssn|passport|religio\w*|politic\w*|sexual\w*|probably|maybe|perhaps|might|guess|ignore|instruction|system|assistant)\b|["“”`>]|(?:^|\s)['‘].*?['’](?:\s|$)''', re.I | re.S)
+# Wording that frames the whole turn as something other than the user speaking
+# about themselves (an instruction to the assistant, role-play, a hypothetical).
+# These still disqualify the turn; quotations, contact details and sensitive
+# topics are judged on the sentence they sit in.
+_TURN_FRAME = re.compile(r'''\b(?:ignore|instructions?|system|assistant|pretend|role.?play|imagine|hypothetical|suppose|fiction|translate|rewrite|summarize)\b''', re.I)
 _CONTACT = re.compile(r'\b[^\s@]+@[^\s@]+\.[^\s@]+\b|\+?\d[\d ().-]{6,}\d')
 _CORRECTION = re.compile(r'\b(?:actually|instead|no longer|anymore|used to|changed|correction|now (?:prefer|live|work))\b', re.I)
 
 
-def validated_candidates(raw, source):
+_SENTENCE_SPLIT = re.compile(r'(?<=[.!?])\s+|\n+')
+
+
+def _risky(text):
+    return bool(_CONTEXT_RISK.search(text) or _CONTACT.search(text))
+
+
+def safe_statements(source):
+    """The sentences of a turn that are first-person statements and carry no
+    risk marker of their own. Context risk and contact details are judged per
+    sentence: a phone number or a quotation elsewhere in the turn no longer
+    discards an unrelated "I prefer ..." sentence, while a sentence that itself
+    holds one still does. Only these sentences go to the extractor, so the rest
+    of the turn (the number, the quote) never reaches it."""
+    if _TURN_FRAME.search(source):
+        return []
+    return [part.strip() for part in _SENTENCE_SPLIT.split(source)
+            if part.strip() and _SELF.match(part.strip()) and not _risky(part)]
+
+
+def validated_candidates(raw, source, allowed=None):
     raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw.strip()).strip()
     data = json.loads(raw)
     candidates = data.get('facts') if isinstance(data, dict) else None
     if not isinstance(candidates, list) or len(candidates) > 4:
         raise ValueError('Expected at most four facts')
     result = []
+    if _TURN_FRAME.search(source):
+        return result
     for candidate in candidates:
         if not isinstance(candidate, dict):
             raise ValueError('Invalid candidate')
@@ -53,7 +80,9 @@ def validated_candidates(raw, source):
             bool(re.search(r'[.!?]\s*$', quote)) and bool(re.match(r'\s+\S', after)))
         if not starts_sentence or not ends_sentence or not _SELF.match(quote):
             continue
-        if _CONTEXT_RISK.search(source) or _CONTACT.search(source):
+        # Judged on the sentence the fact came from (the quote is a complete
+        # sentence), not the whole turn.
+        if _risky(quote) or (allowed is not None and quote not in allowed):
             continue
         result.append({'text': quote, 'quote': quote, 'category': category,
                        'review': bool(_CORRECTION.search(source))})
@@ -91,10 +120,11 @@ class MemoryWorker:
             # job finishes instead of failing three times and showing a
             # "Failed" count that Retry can never clear.
             return 0
-        if _CONTEXT_RISK.search(source) or _CONTACT.search(source):
+        statements = safe_statements(source)
+        if not statements:
             return 0
-        if not any(_SELF.match(part.strip()) for part in re.split(r'(?<=[.!?])\s+|\n+', source)):
-            return 0
+        # The extractor sees only the sentences cleared above.
+        extract_from = '\n'.join(statements)
         # EXPERIMENT capture_think (off by default; see config/experiments.py):
         # this worker already runs idle-only (run() checks foreground_busy),
         # so a think block costs no live latency — the open question is
@@ -109,12 +139,12 @@ class MemoryWorker:
         from service.inference.power_tier import BACKGROUND, power_tier
         with power_tier(BACKGROUND):
             response = await client.chat(model, [{'role': 'system', 'content': EXTRACTION_SYSTEM},
-                {'role': 'user', 'content': source}], max_tokens=1500 if think else 650,
+                {'role': 'user', 'content': extract_from}], max_tokens=1500 if think else 650,
                 **(thinking_kwargs(model, on=True) if think else no_thinking_kwargs(model)))
         choice = response['choices'][0]
         if choice.get('finish_reason') in ('length', 'error'):
             raise ValueError('Extraction output incomplete')
-        candidates = validated_candidates(choice['message'].get('content') or '', source)
+        candidates = validated_candidates(choice['message'].get('content') or '', source, extract_from)
         # No await between final source/claim validation and the atomic batch.
         # Holding sessions first is also the order used by session deletion.
         with self.sessions._lock:

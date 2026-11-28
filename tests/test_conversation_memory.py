@@ -1582,3 +1582,66 @@ def test_suppression_view_matches_the_per_row_rules(world):
     assert view.text('Fun fact: my sister lives in Lisbon now.')
     assert view.source('conversation', 's1:4') and facts.suppressed_source('conversation', 's1:4')
     assert not view.source('conversation', 's1:5')
+
+
+def test_caller_budget_up_to_2400_is_honoured_by_render_context():
+    from service.memory.retrieval import render_context
+    rows = [{'id': i, 'origin': 'explicit', 'reviewed': 1, 'observed_at': 1.0, 'category': 'fact',
+             'text': f'Fact number {i}: ' + 'x' * 120} for i in range(1, 11)]
+    small = render_context({'facts': rows, 'passages': [], 'debug': {}}, max_chars=800)
+    full = render_context({'facts': rows, 'passages': [], 'debug': {}}, max_chars=2400)
+    assert len(small.encode()) <= 800
+    assert 800 < len(full.encode()) <= 2400
+    assert full.count('[memory ') > small.count('[memory ')
+    assert len(render_context({'facts': rows, 'passages': [], 'debug': {}}, max_chars=9000).encode()) <= 2400
+
+
+def test_a_phone_number_or_quote_elsewhere_in_the_turn_does_not_discard_a_clean_fact():
+    turn = 'Call the plumber on 555-0142. I prefer numbered notes. He said "ten o\'clock".'
+    out = validated_candidates(json.dumps({'facts': [{'quote': 'I prefer numbered notes.'}]}), turn)
+    assert [c['quote'] for c in out] == ['I prefer numbered notes.']
+
+
+def test_a_fact_that_itself_holds_contact_details_or_a_quote_is_still_suppressed():
+    for sentence in ('I live at 12 Elm Street, phone 555-0142.', 'I use jo@example.com for work.',
+                    'I like "the quiet car" on trains.'):
+        turn = f'Hello there. {sentence}'
+        assert validated_candidates(json.dumps({'facts': [{'quote': sentence}]}), turn) == []
+
+
+def test_capture_sends_the_extractor_only_the_cleared_sentences(world):
+    facts, sessions, q = world
+    sid = sessions.create_session()
+    sessions.add_turn(sid, 'user', 'Call the plumber on 555-0142. I prefer numbered notes.')
+    model = FakeModel({'facts': [{'quote': 'I prefer numbered notes.', 'category': 'preference'}]})
+    job = q.next()
+    assert asyncio.run(MemoryWorker(sessions, facts).process(job, model, 'Ling')) == 1
+    sent = model.calls[0][1][1]['content']
+    assert sent == 'I prefer numbered notes.' and '555' not in sent
+
+
+def test_more_than_one_preference_is_kept_and_only_a_conflicting_one_is_offered(world):
+    facts, _, _ = world
+
+    def auto(text, n):
+        return facts.add(text, 'preference', origin='automatic',
+                         evidence=[evidence('s', n, text)])
+    first = auto('I prefer tea in the morning.', 0)
+    second = auto('I prefer dark mode in every app.', 1)
+    assert first['status'] == 'active' and second['status'] == 'active'
+    # Same preference reworded, and its opposite, are offered as a replacement.
+    assert auto('I prefer tea in the morning always.', 2)['status'] == 'proposed'
+    from service.memory.facts import preference_conflicts
+    assert preference_conflicts('I do not prefer dark mode in every app.', 'I prefer dark mode in every app.')
+    assert not preference_conflicts('I prefer window seats.', 'I prefer tea in the morning.')
+    assert auto('I prefer window seats.', 4)['status'] == 'active'
+    assert {r['text'] for r in facts.all()} >= {
+        'I prefer tea in the morning.', 'I prefer dark mode in every app.', 'I prefer window seats.'}
+
+
+def test_single_valued_slots_still_offer_a_replacement(world):
+    facts, _, _ = world
+    facts.add('I live in Springfield.', origin='automatic', evidence=[evidence('s', 0, 'I live in Springfield.')])
+    moved = facts.add('I live in Shelbyville.', origin='automatic',
+                      evidence=[evidence('s', 1, 'I live in Shelbyville.')])
+    assert moved['status'] == 'proposed'

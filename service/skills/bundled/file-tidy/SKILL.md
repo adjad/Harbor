@@ -23,8 +23,8 @@ metadata:
       confirms: [organize_files]
       steps:
         - {tool: list_dir, args: {path: "~/Downloads", details: true, sort: modified}}
-        - {tool: organize_files, args: {pattern: "*", folder: "~/Downloads", destination: ".", group_by: extension, confirm: false}}
-        - {tool: organize_files, args: {pattern: "*", folder: "~/Downloads", destination: ".", group_by: extension, confirm: true, preview_token: from-the-preview}, confirm: plan}
+        - {tool: organize_files, args: {pattern: "*", folder: "~/Downloads", destination: ".", group_by: extension, exclude_extensions: ".download,.crdownload,.part,.partial,.opdownload,.tmp", min_age_hours: 24, confirm: false}}
+        - {tool: organize_files, args: {pattern: "*", folder: "~/Downloads", destination: ".", group_by: extension, exclude_extensions: ".download,.crdownload,.part,.partial,.opdownload,.tmp", min_age_hours: 24, confirm: true, preview_token: from-the-preview}, confirm: plan}
 ---
 
 # File tidy
@@ -52,15 +52,19 @@ out of the plan.
 
 ## 3. Show the plan (nothing moves)
 
-Call `organize_files` with `confirm: false`, `group_by: "extension"` and
-`destination: "."` (the folders are created inside the source folder), once
+Call `organize_files` with `confirm: false`, `group_by: "extension"`,
+`destination: "."` (the folders are created inside the source folder),
+`exclude_extensions: ".download,.crdownload,.part,.partial,.opdownload,.tmp"` and
+`min_age_hours: 24` (always send both; they keep files still downloading, and
+anything modified in the last 24 hours, out of the plan), once
 per file pattern that makes sense (for example `*.pdf`, `*.png`). The default
 preview changes nothing and lists every move from source to target with a
 preview token.
 
 Then present one plan in plain words: for each type, how many files, from where
 and to which folder, and the age breakdown (for example "9 PDFs, 6 older than
-three months"). Say what is left untouched and why. Age is for your summary
+three months"). Say what is left untouched and why, including the files the preview lists as not
+included (still downloading, or modified in the last day). Age is for your summary
 only; the tool groups by extension, so do not promise age-named folders.
 
 Ask: "Move these N files as shown?" and stop. Do not move anything in the same
@@ -69,7 +73,8 @@ reply as the plan.
 ## 4. Move only after a yes
 
 Only after an explicit yes to that exact plan, call `organize_files` again with
-the same `pattern`, `folder`, `destination` and `group_by`, plus `confirm: true`
+the same `pattern`, `folder`, `destination`, `group_by`, `exclude_extensions`
+and `min_age_hours`, plus `confirm: true`
 and that plan's `preview_token`. Harbor shows its own confirmation card for the
 call; do not try to avoid it. A different or edited plan needs a new preview and
 a new yes. A yes for one pattern covers only that pattern. Never ask for a

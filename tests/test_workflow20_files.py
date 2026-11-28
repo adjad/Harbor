@@ -95,12 +95,13 @@ def test_debug_grouping_uses_valid_filename_date_and_discloses_unclassified(sour
     token, result = preview(source, destination="Debug", group_by="debug_date")
     assert "no valid debug date in filename" in result
     result = confirm(source, token, destination="Debug", group_by="debug_date")
-    assert "incomplete; moved 2 of 2" in result
+    # Every planned move succeeded; the unclassified files are reported, not an error.
+    assert result.startswith("Moved 2 file(s)") and "2 other file(s) were left untouched" in result
     assert (source / "Debug/2026-10-11/harbor-debug-2026-10-11.json").exists()
     assert (source / "Debug/2026-10-12/debug_2026-10-12.log").exists()
     assert (source / "harbor-debug-2026-02-30.json").exists() and (source / "notes.txt").exists()
     assert [row["status"] for row in receipts(result)] == ["moved", "moved", "skipped", "skipped"]
-    assert classify_tool_outcome("organize_files", result).status == "failed"
+    assert classify_tool_outcome("organize_files", result).status != "failed"
 
 
 def test_debug_group_does_not_use_modification_date(source):
@@ -451,3 +452,82 @@ def test_missing_preview_token_is_rejected_before_any_move(source):
     result = files.organize_files("*", str(source), "Sorted", confirm=True)
     assert "missing, expired" in result and path.exists()
     assert not (source / "Sorted").exists()
+
+
+TIDY = dict(group_by="extension", exclude_extensions=".download,.crdownload,.part", min_age_hours=24)
+
+
+def _age(path, hours):
+    stamp = path.stat().st_mtime - hours * 3600
+    os.utime(path, (stamp, stamp))
+
+
+def test_active_downloads_and_recent_files_are_left_out_of_the_plan(source):
+    old_pdf, old_png = put(source, "report.pdf"), put(source, "photo.PNG")
+    partial, chrome, recent = put(source, "movie.mp4.part"), put(source, "setup.dmg.CRDOWNLOAD"), put(source, "today.pdf")
+    for path in (old_pdf, old_png, partial, chrome):
+        _age(path, 72)
+    token, text = preview(source, "*", destination=".", **TIDY)
+    assert "Would move 2 file(s)" in text
+    assert "report.pdf" in text and "photo.PNG" in text
+    # Named, with the reason, in the preview; nothing about them is moved.
+    assert "movie.mp4.part" in text.split("Not included", 1)[1]
+    assert "setup.dmg.CRDOWNLOAD" in text and "today.pdf" in text.split("Not included", 1)[1]
+    result = confirm(source, token, destination=".", **TIDY)
+    assert result.startswith("Moved 2 file(s)")
+    assert (source / "PDF" / "report.pdf").exists() and (source / "PNG" / "photo.PNG").exists()
+    for path in (partial, chrome, recent):
+        assert path.exists()
+
+
+def test_without_the_filters_everything_still_moves(source):
+    put(source, "a.part"); put(source, "b.pdf")
+    token, text = preview(source, "*", destination=".", group_by="extension")
+    assert "Would move 2 file(s)" in text
+
+
+def test_a_file_that_ages_out_between_preview_and_confirm_invalidates_the_plan(source):
+    path = put(source, "late.pdf")
+    _age(path, 25)
+    token, _ = preview(source, "*", destination=".", **TIDY)
+    os.utime(path, None)                       # touched again: now recent
+    assert "missing, expired or changed" in confirm(source, token, destination=".", **TIDY)
+    assert path.exists() and not (source / "PDF").exists()
+
+
+def test_future_modification_time_counts_as_recent(source):
+    path = put(source, "clock.pdf")
+    future = path.stat().st_mtime + 3600
+    os.utime(path, (future, future))
+    plan = organization.build_plan("*", str(source), ".", "extension", min_age_seconds=86400)
+    assert plan.moves == () and plan.excluded
+
+
+def test_extension_list_forms_and_bad_age():
+    assert organization.normalize_extensions(".Part, crdownload  tmp") == (".part", ".crdownload", ".tmp")
+    assert organization.normalize_extensions(["PART", ".part"]) == (".part",)
+    assert organization.normalize_extensions("") == ()
+    assert files.organize_files("*", "/nonexistent-fixture", ".", min_age_hours="soon").startswith("(error:")
+
+
+def test_skipped_files_do_not_make_a_fully_successful_move_an_error(source):
+    put(source, "a.txt")
+    target = put(source, "elsewhere.txt")
+    link = source / "link.txt"
+    link.symlink_to(target)
+    token, _ = preview(source, "*", destination="Sorted", )
+    # The symlink and elsewhere.txt: only a.txt and elsewhere.txt are regular files.
+    result = confirm(source, token)
+    assert not result.startswith("(error"), result
+    assert result.startswith("Moved 2 file(s)")
+    assert "left untouched" in result.splitlines()[0]
+    assert classify_tool_outcome("organize_files", result).status != "failed"
+    assert link.is_symlink()
+
+
+def test_a_guessed_account_folder_is_corrected_before_anything_is_read_or_moved(source):
+    guess = "/Users/definitely-not-this-account/Downloads"
+    for result in (files.organize_files("*", guess, "Sorted"), files.find_files("x", folder=guess)):
+        assert "/Users/definitely-not-this-account" in result or str(Path.home()) in result
+        assert result.startswith("(error") or "not" in result.lower()
+    assert "Use `~/Downloads` instead" in files.find_files("x", folder=guess)

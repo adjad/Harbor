@@ -66,11 +66,15 @@ _SHIPPED_BODIES: dict[str, frozenset[str]] = {
     "interview-me": frozenset({"b73e94b8ac73a65bf61b8068b1a4cbbce13cb062f3879c730346dacc000f580a"}),
     "inbox-cleanup": frozenset({"c4ea8745c3485352fd38fc7536136164655528f881f647f564d4be7fdaf59fd3",
                                 "65a3bb6f61f144d9b0ec284dba1bc04afb99e84934f174cf80b446854682a6eb"}),
-    "meeting-prep": frozenset({"7397867aba8b9dfa06eb858316113e8f5ff1514af0e18dacf1e0ace34fc81f42"}),
-    "week-review": frozenset({"93ce68365dd745a1547bf99429f4b711369d1f9cb0970b3911cf128e944d9ff8"}),
-    "file-tidy": frozenset({"e76a9cac83b64a3aa19845e5c7f2d1a3f602accc375776f2959d3c7cfd2c59f2"}),
+    "meeting-prep": frozenset({"7397867aba8b9dfa06eb858316113e8f5ff1514af0e18dacf1e0ace34fc81f42",
+                               "b502307b2cf8ac1b45ac191d9d560527ec7ae57bb32907918b9499ab0e7e6303"}),
+    "week-review": frozenset({"93ce68365dd745a1547bf99429f4b711369d1f9cb0970b3911cf128e944d9ff8",
+                              "4b6f25ab1e49575e46a1a6b0f7c4505f50f230a185ba70f20875e3d845efc9ee"}),
+    "file-tidy": frozenset({"e76a9cac83b64a3aa19845e5c7f2d1a3f602accc375776f2959d3c7cfd2c59f2",
+                            "610dd576e3fe20dcbbc7f36e66285bede37ce63cc1e3495b7d340f160fea128d"}),
     "mac-controls": frozenset({"6fe9b434bf7b76c7fec3940ecf93a2b4a43455f38e53d5a2aeeaef1b04b57240",
-                               "7968c32f1d5aa6e80101ba8217ebe1a0d0b3c9ea3be7414b20960c148283f188"}),
+                               "7968c32f1d5aa6e80101ba8217ebe1a0d0b3c9ea3be7414b20960c148283f188",
+                               "96031ca953c452c495d13b91ebd638f641fc857e411e30be2126151c0a2bd19c"}),
 }
 
 # Frontmatter is fenced by --- on its own line, same convention as every other
