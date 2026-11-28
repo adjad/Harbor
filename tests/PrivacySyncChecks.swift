@@ -194,6 +194,43 @@ enum PrivacySyncChecks {
             (name: "Sam", phones: ["555-020-0142"], emails: []),
         ])
         precondition(Set(sameEnding.values) == ["Sam (…0142)", "Sam (…0142 2)"])
+        // A handle two different people hold keeps both names; a number with
+        // another country code is not the same handle as one sharing its last ten digits.
+        let household = ContactsReader.resolveHandles([
+            (name: "Ann Lee", phones: ["+1 (555) 010-0150"], emails: []),
+            (name: "Bob Lee", phones: ["555-010-0150"], emails: ["bob@example.com"]),
+            (name: "Cy Ng", phones: ["+44 20 7946 0958"], emails: []),
+            (name: "Di Ng", phones: ["+1 207 946 0958"], emails: []),
+        ])
+        precondition(household.map["+1 (555) 010-0150"] == "Ann Lee / Bob Lee"
+                     && household.map["555-010-0150"] == "Ann Lee / Bob Lee", "\(household.map)")
+        precondition(household.shared["555-010-0150"] == ["Ann Lee", "Bob Lee"])
+        precondition(household.map["bob@example.com"] == "Bob Lee" && household.shared.count == 2)
+        precondition(household.map["+44 20 7946 0958"] == "Cy Ng" && household.map["+1 207 946 0958"] == "Di Ng")
+        precondition(ContactsReader.normalizedHandle("(555) 010-0150") == "15550100150"
+                     && ContactsReader.normalizedHandle("+44 20 7946 0958") == "442079460958")
+        let alternates = ContactsReader.alternateNames(
+            name: "Robert Smith", given: "Robert", middle: "James", family: "Smith",
+            nickname: "Bobby", organization: "Example Co")
+        precondition(alternates == ["Bobby", "Example Co", "Robert James Smith"], "\(alternates)")
+        precondition(ContactsReader.alternateNames(name: "Dana", given: "Dana", middle: "", family: "",
+                                                   nickname: "dana", organization: "").isEmpty)
+        // Every Chrome profile is read, Default first, then Profile N numerically.
+        let chromeBase = ProcessInfo.processInfo.environment["TMPDIR"]
+            .map { URL(fileURLWithPath: $0, isDirectory: true) } ?? FileManager.default.temporaryDirectory
+        let chromeRoot = chromeBase
+            .appendingPathComponent("harbor-chrome-profiles-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: chromeRoot) }
+        for name in ["Default", "Profile 10", "Profile 2", "Profile x", "System Profile", "Guest Profile"] {
+            let dir = chromeRoot.appendingPathComponent(name)
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            precondition((try? Data([0]).write(to: dir.appendingPathComponent("History"))) != nil, "fixture History file")
+        }
+        try? FileManager.default.createDirectory(at: chromeRoot.appendingPathComponent("Profile 3"),
+                                                 withIntermediateDirectories: true)   // no History file
+        let profilePaths = BrowserHistoryReader.chromeHistoryPaths(root: chromeRoot.path)
+            .map { $0.replacingOccurrences(of: chromeRoot.path + "/", with: "") }
+        precondition(profilePaths == ["Default/History", "Profile 2/History", "Profile 10/History"], "\(profilePaths)")
         print("PrivacySync: 17 synthetic contract scenarios passed")
     }
 }

@@ -2994,3 +2994,104 @@ def test_distinct_redacted_requests_keep_both_source_occurrences(monkeypatch):
             assert all(secret not in out for secret in ("1234", "5678", "report", "proposal"))
     assert all(secret not in str(records) + str(chat.call_args_list)
                for secret in ("1234", "5678", "report", "proposal"))
+
+
+# --- app-audit 5.1/5.2: handles, on-device redaction, window, contact extras ---
+
+def test_handles_match_on_the_full_number_with_its_country_code():
+    n = M._norm_handle
+    assert n("+1 (555) 010-0142") == n("555-010-0142") == n("+15550100142")
+    assert n("+44 20 7946 0958") != n("+1 207 946 0958")
+    assert n("0044 20 7946 0958") == n("+44 20 7946 0958")
+    assert n("Pat@Example.com ") == "pat@example.com"
+
+
+def test_a_number_in_another_country_is_not_named_after_a_us_number(monkeypatch):
+    monkeypatch.setattr(M, "_contacts", {})
+    monkeypatch.setattr(M.cache_store, "save", lambda *a, **k: None)
+    M.cache_contacts({"+1 207 946 0958": "Dana Example"})
+    assert M.resolve_contact("+12079460958") == "Dana Example"
+    assert M.resolve_contact("+442079460958") == "+442079460958"
+
+
+def test_contact_extras_alternate_names_relations_and_a_shared_handle(monkeypatch):
+    monkeypatch.setattr(M.cache_store, "save", lambda *a, **k: None)
+    monkeypatch.setattr(M, "_contacts", {})
+    monkeypatch.setattr(M, "_name_handles", {})
+    monkeypatch.setattr(M, "_contact_aliases", {})
+    monkeypatch.setattr(M, "_contact_relations", {})
+    M.cache_contacts(
+        {"+1 555 010 0150": "Ann Lee / Bob Lee", "555-010-0150": "Ann Lee / Bob Lee",
+         "+1 555 010 0177": "Robert Smith"},
+        shared={"+1 555 010 0150": ["Ann Lee", "Bob Lee"], "555-010-0150": ["Ann Lee", "Bob Lee"]},
+        aliases={"Robert Smith": ["Bobby", "Example Co"]},
+        relations={"Robert Smith": ["mother: Jane Smith"]})
+    ann, bob = M.find_contacts("Ann Lee"), M.find_contacts("bob lee")
+    assert ann and bob and ann[0]["handles"] == bob[0]["handles"]
+    assert set(ann[0]["handles"]) == {"+1 555 010 0150", "555-010-0150"}
+    assert not M.find_contacts("ann lee / bob lee"), "the joined label is not a contact"
+    by_nickname = M.find_contacts("Bobby")
+    assert [m["name"] for m in by_nickname] == ["Robert Smith"]
+    assert M.find_contacts("example co")[0]["handles"] == ["+1 555 010 0177"]
+    assert by_nickname[0]["relations"] == ["mother: Jane Smith"]
+    assert M.contact_names() == ["Ann Lee", "Bob Lee", "Robert Smith"]
+
+
+def test_contacts_sync_validates_and_clears_the_extras(monkeypatch):
+    monkeypatch.setattr(M.cache_store, "save", lambda *a, **k: None)
+    monkeypatch.setattr(M.cache_store, "load", lambda *a, **k: None)
+    with pytest.raises(ValueError):
+        M.apply_contacts_sync({"contacts_enabled": True, "contacts_available": True,
+                               "contacts": {}, "birthdays": {}, "aliases": {"A": "not a list"}})
+    M.apply_contacts_sync({"contacts_enabled": True, "contacts_available": True, "contacts": {"+15550100123": "Robin Example"},
+                           "birthdays": {}, "aliases": {"Robin Example": ["Rob"]}, "relations": {}, "shared_handles": {}})
+    assert M.find_contacts("rob")[0]["name"] == "Robin Example"
+    M.apply_contacts_sync({"contacts_enabled": False, "contacts_available": False})
+    assert M.find_contacts("rob") == []
+
+
+_LOGISTICS = "Landlord: URGENT parking spot B12 moves before the 2027 inspection, ZIP 94105, order 1234567."
+
+
+def test_on_device_summaries_keep_zip_years_order_numbers_short_codes_and_caps(monkeypatch):
+    monkeypatch.setattr(M, "_summary_on_device", lambda: True)
+    out = M.redact_summary_codes(_LOGISTICS)
+    assert out == _LOGISTICS
+    monkeypatch.setattr(M, "_summary_on_device", lambda: False)
+    assert M.redact_summary_codes(_LOGISTICS) != _LOGISTICS, "off this Mac the strict rules stay"
+
+
+@pytest.mark.parametrize("text", [
+    "Bank: Please review this value 748291.",
+    "Bank: Please review this value X7rQ9pLm2v.",
+    "Bank: the card 4242 4242 4242 4242 is on file",
+    "Landlord: Wifi password: Hunter-2234 for the guest room",
+    "Bank: your verification code is 482913",
+    "Landlord: see https://example.com/pay and URGENT B12",
+])
+def test_on_device_summaries_still_withhold_real_secrets_and_links(monkeypatch, text):
+    monkeypatch.setattr(M, "_summary_on_device", lambda: True)
+    out = M.redact_summary_codes(text)
+    assert out != text
+    for secret in ("748291", "X7rQ9pLm2v", "4242 4242", "Hunter-2234", "482913", "example.com"):
+        assert secret not in out
+
+
+def test_summarize_messages_widens_the_window_when_asked(monkeypatch):
+    now = time.time()
+    monkeypatch.setattr(M, "_lines", _freshness_record(
+        now - 5 * 86400, "U", 1, "Jamie", "Jamie: Please review the project outline by Thursday."))
+    client(monkeypatch, error=RuntimeError("synthetic offline"))
+    default = asyncio.run(M.summarize_messages())
+    assert "project outline" not in default and "last three days" in default
+    wide = asyncio.run(M.summarize_messages(days=7))
+    assert "project outline" in wide and "last three days" not in wide
+    assert "last 7 days" in wide
+    assert M._window_days(0) == 1 and M._window_days(999) == 30 and M._window_days("x") == 3
+
+
+def test_digest_cut_by_the_conversation_cap_says_how_many_more(monkeypatch):
+    rows = [(i, f"Chat {i}", f"Pat{i}: Please review the proposal by Friday at {i % 9 + 1} pm.")
+            for i in range(1, 16)]
+    out = summarize(rows)
+    assert "(+" in out and "more)" in out
