@@ -91,6 +91,16 @@ def test_arguments_reach_the_reader_with_resolved_dates(fake_attachments):
     assert call["label"]
 
 
+def test_list_only_still_wins_when_across_is_asked_too(fake_attachments):
+    # Tools audit 3.3: across=True used to switch list_only off, so a request to
+    # only list files opened and read up to 40 of them.
+    asyncio.run(REGISTRY[TOOL].func(across=True, list_only=True))
+    asyncio.run(REGISTRY[TOOL].func(across=True))
+    listed, read = fake_attachments.calls
+    assert listed["list_only"] is True and listed["across"] is True
+    assert read["list_only"] is False and read["across"] is True
+
+
 def test_a_period_wins_over_a_day_and_bad_dates_are_plain(fake_attachments):
     asyncio.run(REGISTRY[TOOL].func(period="last week", day="2026-11-03"))
     call = fake_attachments.calls[0]

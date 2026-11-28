@@ -43,15 +43,29 @@ _PREPARED_MAX = 16
 _PREPARED_TTL = 900.0
 
 
+_SOURCES = frozenset({"mail", "messages"})
+_UNKNOWN_SOURCE = "the source must be 'mail' or 'messages'."
+
+
 def _clean(args: dict) -> dict:
-    """The model's own fields, as short plain strings; nothing else."""
+    """The model's own fields, as short plain strings; nothing else. An absent source is
+    "mail"; any other source than "mail" or "messages" is kept as given, so it is refused
+    (`_known_source`) rather than read as Mail."""
     out: dict = {}
     for key in _PLAIN_ARGS:
         value = (args or {}).get(key)
         if isinstance(value, str) and value.strip():
             out[key] = value.strip()[:300]
-    out["source"] = "messages" if out.get("source", "").lower() == "messages" else "mail"
+    raw = (args or {}).get("source")
+    if raw is not None and not isinstance(raw, str):
+        out["source"] = repr(type(raw).__name__)
+    else:
+        out["source"] = out.get("source", "mail").lower()
     return out
+
+
+def _known_source(clean: dict) -> bool:
+    return clean.get("source") in _SOURCES
 
 
 def _key(clean: dict) -> str:
@@ -71,13 +85,22 @@ def _remember(clean: dict, frozen: dict, card: str) -> str:
 
 
 def card_for(args: dict) -> str | None:
-    """The card line made for this action's token, or None. Does not use the token up."""
+    """The card line made for this action's token, or None. Does not use the token up.
+
+    None, exactly as `_take` would refuse the save, when the token has expired or the
+    arguments are not the ones it was made for: a card never shows a file the approved
+    call could not save, or a file the changed arguments no longer name."""
     token = (args or {}).get("prepared")
     if not isinstance(token, str):
         return None
+    clean = _clean(args)
+    if not _known_source(clean):
+        return None
     with _PREPARED_LOCK:
         entry = _PREPARED.get(token)
-    return entry[3] if entry else None
+    if entry is None or time.monotonic() - entry[0] > _PREPARED_TTL or entry[1] != _key(clean):
+        return None
+    return entry[3]
 
 
 def _take(token, clean: dict) -> dict | None:
@@ -105,6 +128,8 @@ async def prepare_save_args(args: dict) -> tuple[dict, str | None]:
     if _CORPUS_MAIL_IDENTIFIER.get() is not None:
         return args, _stopped(_CORPUS_REFUSAL)
     clean = _clean(args)
+    if not _known_source(clean):
+        return args, _stopped(_UNKNOWN_SOURCE)
     span = _span(clean.get("period"), clean.get("day"))
     if isinstance(span, str):
         return args, _stopped(span)
@@ -171,6 +196,8 @@ async def save_email_attachment(query: str | None = None, name: str | None = Non
         return _stopped(_CORPUS_REFUSAL)
     clean = _clean({"query": query, "name": name, "period": period, "day": day,
                     "account": account, "source": source, "folder": folder})
+    if not _known_source(clean):
+        return _stopped(_UNKNOWN_SOURCE)
     frozen = _take(prepared, clean)
     if frozen is None:
         return _stopped("this save was not set up and approved first.")

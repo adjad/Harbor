@@ -91,3 +91,57 @@ async def test_my_address_among_several_recipients_is_caught(world):
 def test_the_guard_judges_only_what_it_is_given():
     # No identity: nothing is the user's own address.
     assert action_tools._own_address_guard("Mom", "send_message") is None
+
+
+# --- tools audit 3.2: forward_email, schedule_send and cc get the same check ---
+
+@pytest.fixture
+def ask_mode(monkeypatch):
+    from service.safety import policy
+    from service.tools import self_send
+    monkeypatch.setattr(policy, "_FULL_ACCESS", False)
+    monkeypatch.setattr(policy, "_READ_ONLY", False)
+    self_send.mark_turn("")
+    yield policy
+    self_send.mark_turn("")
+
+
+@pytest.mark.parametrize("tool, args", [
+    ("forward_email", {"message_id": "<m1@example.com>", "to": ME}),
+    ("forward_email", {"message_id": "<m1@example.com>", "to": f"{FRIEND}, {ME}"}),
+    ("schedule_send", {"channel": "email", "to": ME, "when": "tomorrow 9am", "body": "Hi"}),
+    ("schedule_send", {"channel": "message", "to": ME, "when": "tomorrow 9am", "body": "Hi"}),
+    ("send_email", {"to": FRIEND, "cc": ME, "subject": "Hi", "body": "Hi"}),
+])
+def test_every_outbound_send_to_my_own_address_is_refused_before_a_card(world, ask_mode, tool, args):
+    decision = ask_mode.decide(registry.REGISTRY[tool].category, args, tool)
+    assert decision.tier == ask_mode.Tier.DENY and "OWN" in decision.reason
+
+
+@pytest.mark.parametrize("tool, args", [
+    ("forward_email", {"message_id": "<m1@example.com>", "to": FRIEND}),
+    ("schedule_send", {"channel": "email", "to": FRIEND, "when": "tomorrow 9am", "body": "Hi"}),
+    ("send_email", {"to": FRIEND, "cc": "pat.fixture@example.com", "subject": "Hi", "body": "Hi"}),
+])
+def test_a_send_to_someone_else_still_reaches_its_card(world, ask_mode, tool, args):
+    decision = ask_mode.decide(registry.REGISTRY[tool].category, args, tool)
+    assert decision.tier == ask_mode.Tier.CONFIRM, decision.reason
+
+
+def test_a_forward_the_person_aimed_at_themselves_reaches_its_card(world, ask_mode):
+    from service.tools import self_send
+    self_send.mark_turn("Forward this to my email")
+    args = {"message_id": "<m1@example.com>", "to": ME}
+    assert ask_mode.decide(registry.REGISTRY["forward_email"].category, args,
+                           "forward_email").tier == ask_mode.Tier.CONFIRM
+
+
+@pytest.mark.parametrize("tool, args", [
+    ("forward_email", {"message_id": "<m1@example.com>", "to": "555-0100"}),
+    ("send_email", {"to": f"{FRIEND}, 555 0100 22", "subject": "Hi", "body": "Hi"}),
+    ("send_email", {"to": FRIEND, "cc": "+1 555 0100", "subject": "Hi", "body": "Hi"}),
+    ("schedule_send", {"channel": "Email", "to": "555-0100", "when": "tomorrow 9am", "body": "Hi"}),
+])
+def test_a_phone_number_is_never_an_email_recipient(world, ask_mode, tool, args):
+    decision = ask_mode.decide(registry.REGISTRY[tool].category, args, tool)
+    assert decision.tier == ask_mode.Tier.DENY and "phone number" in decision.reason

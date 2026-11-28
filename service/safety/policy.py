@@ -495,7 +495,7 @@ _PATH_DENY = [
 # by tool means a future tool that takes the same arguments is covered too.
 _PATH_ARG_KEYS = ("path", "paths", "source", "src", "destination", "dest", "archive_path",
                   "folder", "directory", "dir", "target", "output", "output_path",
-                  "file", "files")
+                  "file", "files", "save_to")
 
 
 def _path_operands(args: dict, tool: str | None = None) -> list[tuple[str, str]]:
@@ -536,6 +536,38 @@ def _path_forms(raw: str) -> list[str]:
     return sorted(forms)
 
 
+def _speech_target(save_to: str) -> Path:
+    """Where text_to_speech's `say -o` writes for this `save_to`."""
+    target = Path(save_to.strip()).expanduser()
+    return target if target.suffix.lower() == ".aiff" else target.with_suffix(".aiff")
+
+
+def speech_saves_file(tool: str | None, args: dict) -> bool:
+    """text_to_speech with `save_to` writes a file: it is judged as fs_write,
+    every floor rule included, not as the spoken app_control call."""
+    return tool == "text_to_speech" and bool(str(args.get("save_to") or "").strip())
+
+
+def _speech_save_problem(args: dict) -> str | None:
+    """Why a text_to_speech save is refused before it runs, or None: a
+    `/Users/<account>` that is not this one, or a file that already exists
+    (`say -o` replaces it without asking)."""
+    raw = str(args.get("save_to") or "").strip()
+    if "\x00" in raw:
+        return "invalid filesystem path: NUL character"
+    from service.tools.builtin import _wrong_account_path
+    if (msg := _wrong_account_path(raw)):
+        return msg
+    try:
+        target = _speech_target(raw)
+        if target.exists() or target.is_symlink():
+            return (f"(refusing to overwrite {target} — it already exists. "
+                    "Pick a different name.)")
+    except (ValueError, OSError, RuntimeError):
+        return "filesystem output path could not be safely resolved"
+    return None
+
+
 def _derived_path_operands(tool: str | None, args: dict):
     """Mirror deterministic output naming, without importing/executing tools.
 
@@ -546,7 +578,13 @@ def _derived_path_operands(tool: str | None, args: dict):
     # archive_files, convert_file and encrypt_file had branches here too; all
     # three were retired in the 182 -> 100 tool consolidation, so nothing could
     # reach them (test_every_tool_name_policy_names_is_registered keeps it so).
-    if tool in {"write_document", "spreadsheet_ops"}:
+    if tool == "text_to_speech":
+        # `say -o` writes the audio where the tool names it: an .aiff suffix
+        # replaces any other one ("~/.zshrc" stays ".zshrc.aiff" beside it).
+        if not isinstance(args.get("save_to"), str) or not args["save_to"].strip():
+            return
+        yield "derived output", str(_speech_target(args["save_to"]))
+    elif tool in {"write_document", "spreadsheet_ops"}:
         if not isinstance(args.get("path"), str):
             return
         target = Path(args["path"]).expanduser()
@@ -3852,6 +3890,8 @@ def decide(category: str, args: dict, tool: str | None = None) -> Decision:
     run, only reads run without asking; in a picture turn, only local reads."""
     if category == "shell" and len(shell_text(args)) > SHELL_TEXT_LIMIT:
         return _too_long_for_card(args)
+    if speech_saves_file(tool, args):
+        category = "fs_write"
     decision = _decide(category, args, tool)
     if category == "shell" and decision.tier is Tier.CONFIRM and len(shell_text(args)) > CARD_TEXT_LIMIT:
         return _too_long_for_card(args)
@@ -4014,6 +4054,8 @@ def _fs_change(category: str, tool: str | None, args: dict) -> str:
         return f"making {_card_text(args.get('kind'), 20)} from your slides with the Study model"
     if tool == "move_path":
         return f"moving {_card_text(args.get('source'))} to {_card_text(args.get('destination'))}"
+    if tool == "text_to_speech":
+        return f"saving spoken audio to {_card_text(args.get('save_to'))}"
     verb = "deleting" if category == "fs_delete" else "writing"
     return f"{verb} {_card_text(args.get('path'))}"
 
@@ -4134,10 +4176,17 @@ def _decide(category: str, args: dict, tool: str | None = None) -> Decision:
         return Decision(Tier.CONFIRM, "attempts approved moves; exact bytes require stable sources; "
                         "unknown results may include completed moves and must not be retried automatically")
 
-    if (tool in {"send_email", "draft_email"}
-            or (tool == "schedule_send" and args.get("channel") == "email")):
-        if re.fullmatch(r"\+?[\d().\s-]{7,}", str(args.get("to", "")).strip()):
-            return Decision(Tier.DENY, "a phone number is not an email address; ask for the recipient's email")
+    if tool == "text_to_speech" and category == "fs_write" and (problem := _speech_save_problem(args)):
+        return Decision(Tier.DENY, problem)
+
+    if (tool in {"send_email", "draft_email", "forward_email"}
+            or (tool == "schedule_send" and str(args.get("channel") or "").strip().lower() == "email")):
+        # Every recipient, cc included: "dana@example.com, 555-0100" is no more
+        # an email than the number alone.
+        for key in ("to", "cc"):
+            if any(re.fullmatch(r"\+?[\d().\s-]{7,}", part.strip())
+                   for part in re.split(r"[,;]", str(args.get(key) or "")) if part.strip()):
+                return Decision(Tier.DENY, "a phone number is not an email address; ask for the recipient's email")
 
     # A send whose `to` is literally the USER'S OWN address can never
     # succeed — service.tools.action_tools._own_address_guard refuses it
@@ -4157,12 +4206,15 @@ def _decide(category: str, args: dict, tool: str | None = None) -> Decision:
     # even considered, means a doomed call is corrected in the same turn as
     # a DENY (no card shown at all) rather than costing a wasted
     # confirmation — same outcome, one fewer prompt.
-    if tool in ("send_message", "send_email"):
+    # forward_email and schedule_send deliver to the same people send_email
+    # and send_message do, so the same check applies to them, and to a cc.
+    if tool in ("send_message", "send_email", "forward_email", "schedule_send"):
         from service.tools.action_tools import _own_address_guard
-        if (msg := _own_address_guard(
-                str(args.get("to", "")), tool,
-                confirmed_self_send=bool(args.get("confirmed_self_send", False)))):
-            return Decision(Tier.DENY, msg)
+        confirmed = bool(args.get("confirmed_self_send", False))
+        for key in ("to", "cc") if tool == "send_email" else ("to",):
+            if (msg := _own_address_guard(str(args.get(key) or ""), tool,
+                                          confirmed_self_send=confirmed)):
+                return Decision(Tier.DENY, msg)
 
     # An irreversible bulk/recursive delete (see _DESTRUCTIVE_SHELL). Computed
     # BEFORE grants so a standing "always allow run_shell" cannot lift it — a
@@ -4202,7 +4254,8 @@ def _decide(category: str, args: dict, tool: str | None = None) -> Decision:
                 and tool not in ALWAYS_CONFIRM_TOOLS and tool not in ALWAYS_CONFIRM_FILE_TOOLS
                 and tool not in ALWAYS_CONFIRM_DELETE_TOOLS
                 and not destructive and not outbound and not secret and not cut_off
-                and not persists and grants.is_grantable(tool, args)):
+                and not persists and not speech_saves_file(tool, args)
+                and grants.is_grantable(tool, args)):
             return Decision(Tier.ALLOW, f"you allowed {tool} for this target")
 
     # Irreversible and unbounded: always show the exact command, in every access

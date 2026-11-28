@@ -661,3 +661,74 @@ def test_organize_unselected_protected_alias_is_not_enumerated(organize_policy_p
             "preview_token": "synthetic-only"}
     monkeypatch.setattr(policy, "_FULL_ACCESS", False)
     assert _schema_decision("organize_files", args).tier == policy.Tier.CONFIRM
+
+
+# ------------------------------------------- tools audit 4.3: text_to_speech save_to
+
+def _mode(monkeypatch, *, full_access=False, read_only=False, keep_floor=True):
+    monkeypatch.setattr(policy, "_FULL_ACCESS", full_access)
+    monkeypatch.setattr(policy, "_READ_ONLY", read_only)
+    monkeypatch.setattr(policy, "_KEEP_FLOOR", keep_floor)
+
+
+@pytest.mark.parametrize("full_access", [False, True])
+@pytest.mark.parametrize("save_to", ["~/.ssh/id_rsa", "~/.ssh", "/etc/hosts", "~/Library/Keychains/x.aiff"])
+def test_a_speech_save_into_a_protected_place_is_refused(monkeypatch, full_access, save_to):
+    _mode(monkeypatch, full_access=full_access)
+    decision = policy.decide("app_control", {"text": "hi", "save_to": save_to}, "text_to_speech")
+    assert decision.tier == policy.Tier.DENY, decision.reason
+
+
+@pytest.mark.parametrize("full_access", [False, True])
+def test_a_speech_save_into_a_credential_or_startup_place_always_asks(monkeypatch, tmp_path, full_access):
+    _mode(monkeypatch, full_access=full_access, keep_floor=False)
+    monkeypatch.setattr(policy, "_credential_roots", lambda: [tmp_path / "creds"])
+    monkeypatch.setattr(policy, "_code_exec_roots", lambda: [tmp_path / "agents"])
+    for target in (tmp_path / "creds" / "token.aiff", tmp_path / "agents" / "job.plist"):
+        decision = policy.decide("app_control", {"text": "hi", "save_to": str(target)}, "text_to_speech")
+        assert decision.tier == policy.Tier.CONFIRM, (target, decision.reason)
+        assert "always confirmed" in decision.reason
+
+
+def test_a_speech_save_judges_the_aiff_file_say_really_writes(monkeypatch, tmp_path):
+    _mode(monkeypatch, keep_floor=False)
+    monkeypatch.setattr(policy, "_code_exec_roots", lambda: [tmp_path / "agents"])
+    operands = dict(policy._derived_path_operands("text_to_speech", {"save_to": "~/.zshrc"}))
+    assert operands["derived output"].endswith(".zshrc.aiff")
+    assert policy._path_operands({"save_to": "~/x.aiff"}) == [("save_to", "~/x.aiff")]
+
+
+def test_a_speech_save_over_an_existing_file_or_another_account_is_refused(monkeypatch, tmp_path):
+    _mode(monkeypatch, full_access=True)
+    existing = tmp_path / "memo.aiff"
+    existing.write_bytes(b"x")
+    for save_to in (str(existing), str(tmp_path / "memo.txt")):
+        decision = policy.decide("app_control", {"text": "hi", "save_to": save_to}, "text_to_speech")
+        assert decision.tier == policy.Tier.DENY and "refusing to overwrite" in decision.reason
+    other = "/Users/not-this-account-fixture/Desktop/memo.aiff"
+    decision = policy.decide("app_control", {"text": "hi", "save_to": other}, "text_to_speech")
+    assert decision.tier == policy.Tier.DENY and "~/Desktop/memo.aiff" in decision.reason
+
+
+def test_a_speech_save_is_a_file_write_and_speaking_is_not(monkeypatch, tmp_path):
+    _mode(monkeypatch)
+    new = tmp_path / "memo.aiff"
+    decision = policy.decide("app_control", {"text": "hi", "save_to": str(new)}, "text_to_speech")
+    assert decision.tier == policy.Tier.CONFIRM and "saving spoken audio to" in decision.reason
+    _mode(monkeypatch, read_only=True)
+    assert policy.decide("app_control", {"text": "hi", "save_to": str(new)},
+                         "text_to_speech").tier == policy.Tier.DENY
+    _mode(monkeypatch)
+    spoken = policy.decide("app_control", {"text": "hi", "save_to": "  "}, "text_to_speech")
+    assert spoken.tier == policy.Tier.CONFIRM and spoken.reason == "app_control action"
+
+
+def test_a_standing_speech_grant_never_covers_a_save(monkeypatch, tmp_path):
+    _mode(monkeypatch)
+    from service.safety import grants
+    monkeypatch.setattr(grants, "check", lambda tool, args: "allow")
+    monkeypatch.setattr(grants, "is_grantable", lambda tool, args=None: True)
+    assert policy.decide("app_control", {"text": "hi"}, "text_to_speech").tier == policy.Tier.ALLOW
+    saved = policy.decide("app_control", {"text": "hi", "save_to": str(tmp_path / "m.aiff")},
+                          "text_to_speech")
+    assert saved.tier == policy.Tier.CONFIRM

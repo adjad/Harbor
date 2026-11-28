@@ -54,6 +54,20 @@ TEXT, EMAIL = registry.REGISTRY["send_message"], registry.REGISTRY["send_email"]
     ("What did Dana email me yesterday?", False),
     ("Remind me to email Dana", False),
     ("Email Dana the notes", False),
+    # A relative clause or another subject before "to me": that clause's "to
+    # me", not the send's (tools audit 3.1).
+    ("Forward the invoice Bob sent to my email to Sarah", False),
+    ("Email Dan the file he sent to me", False),
+    ("Forward the email Dana forwarded to me", False),
+    ("Send Sam the photo they shared to my inbox", False),
+    ("Forward this to my email to Sarah", False),
+    ("Forward the invoice to my email to sarah@example.com", False),
+    ("Forward the note to me to him", False),
+    ("Send it to me", True),
+    ("email this to myself", True),
+    ("Send the attached file to me", True),
+    ("Send the receipt from Bob to me", True),
+    ("Send the notes to me to review", True),
     ("", False),
 ])
 def test_wording(text, names_self):
@@ -235,3 +249,32 @@ async def test_a_short_number_the_person_never_typed_is_still_refused(world):
         refused = await action_tools.send_message("12345", "Harbor test 1")
         assert registry.is_tool_error(refused) or "sent to" not in refused
     assert world == []
+
+
+# --- tools audit 3.1: a recipient the person named is never re-addressed ------------
+
+@pytest.mark.parametrize("turn, name, named", [
+    ("Text me and Dana: hi Dana", "Dana", True),
+    ("Email myself and dana the notes", "Dana", True),
+    ("Text myself: Harbor test", "Harbor test", False),
+    ("Text myself: hi Dana", "Dana", False),
+    ('Email me "Dana says hi"', "Dana", False),
+    ("Email me the notes", "", False),
+    ("Email me the notes", "Dan", False),
+    ("Email me the notes from Danae", "Dana", False),
+])
+def test_named_in_request_reads_only_the_instruction(turn, name, named):
+    self_send.mark_turn(turn)
+    try:
+        assert self_send.named_in_request(name) is named
+    finally:
+        self_send.mark_turn("")
+
+
+async def test_a_relative_clause_to_me_keeps_the_own_address_guard(world):
+    # "the invoice Bob sent to my email": the forward goes to Sarah, so a call
+    # addressed to the person's own address is still caught before any card.
+    self_send.mark_turn("Forward the invoice Bob sent to my email to Sarah")
+    assert not self_send.named_self()
+    assert action_tools._own_address_guard(ME, "send_email") is not None
+    assert action_tools._self_not_invented("someone@else.test") == "someone@else.test"
