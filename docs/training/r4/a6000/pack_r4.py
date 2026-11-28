@@ -2,13 +2,13 @@
 """Pack r4 for the Brev A6000 (the L40 profile still works): the SFT data zip, the mmeval zip and the text-picker zip. Runs on the Mac.
 
     PY=~/Desktop/Harbor_Project/.venv/bin/python
-    $PY training/ask-lora-r4/a6000/pack_r4.py --model ~/Desktop/OMLX_Model_Files/Jundot/gemma-4-E4B-it-oQ4e-mtp
+    $PY docs/training/r4/a6000/pack_r4.py --model ~/Desktop/OMLX_Model_Files/Jundot/gemma-4-E4B-it-oQ4e-mtp
 
 Inputs (each is checked FIRST; the script stops before doing any work if one is missing or empty):
     ../data/train.jsonl valid.jsonl train.meta.jsonl valid.meta.jsonl stats.json     r4 text build (ASK_LORA_ROUND=4)
     ../vision/vision_rows.jsonl (+ images beside it)                                 r4 vision rows
-    ../../ask-lora-r3/audio/audio_rows.jsonl (+ clips beside it)                     audio is reused from r3
-    ../../ask-lora-r3/gate/{vision/cases.json,audio/truth.json}                      report-only gate set for mmeval
+    ../../r3/audio/audio_rows.jsonl (+ clips beside it)                     audio is reused from r3
+    ../../r3/gate/{vision/cases.json,audio/truth.json}                      report-only gate set for mmeval
                                                                                      (--no-gate to leave it out)
 
 Outputs in --out-dir (default ./out):
@@ -37,7 +37,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 R4 = HERE.parent
 TRAINING = R4.parent
-R3 = TRAINING / "ask-lora-r3"
+R3 = TRAINING / "r3"
 FORCED = "<|channel>thought\n"       # brev/render.py FORCED: a prompt that already ends inside the thought channel
 TEXT_FILES = ("train.jsonl", "valid.jsonl", "train.meta.jsonl", "valid.meta.jsonl", "stats.json")
 
@@ -97,7 +97,7 @@ def check_inputs(data: Path, vision_rows: Path, audio_rows: Path, gate: tuple | 
     if gate is not None:
         for g in gate:
             if not nonempty(Path(g)):
-                bad.append(f"missing gate file {g} (build the gate set per ask-lora-r3/gate/README.md, or pass --no-gate)")
+                bad.append(f"missing gate file {g} (build the gate set per r3/gate/README.md, or pass --no-gate)")
     if model is not None and not (model / "chat_template.jinja").is_file():
         bad.append(f"--model {model} has no chat_template.jinja (the Gemma 4 E4B-it oQ4e-mtp folder Harbor serves)")
     return bad
@@ -248,7 +248,7 @@ def main() -> int:
         print("stage 1 (optimistic / middle / pessimistic):", [(e["total_h"], e["usd"]) for e in info["estimate_stage1"]])
     (out / "upload.json").write_text(json.dumps(info, indent=1) + "\n")
     print(json.dumps({k: v for k, v in info.items() if k.endswith(".zip")}, indent=1))
-    print(f"\nupload to ~/harbor/uploads: {zip_path.name}, mmeval-data.zip, pickers.zip, ../../ask-lora-r3/brev/vm-setup.sh, run_sft.sh"
+    print(f"\nupload to ~/harbor/uploads: {zip_path.name}, mmeval-data.zip, pickers.zip, ../../r3/brev/vm-setup.sh, run_sft.sh"
           f"\nunpack sha256 for run.sh: {info['ask-lora-data.zip']['sha256']}")
     return 0
 

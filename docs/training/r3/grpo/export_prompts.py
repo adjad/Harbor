@@ -48,7 +48,7 @@ Picture shapes (#436; reward.py "Picture shapes"), about --picture-share = 6.5% 
 
 Round 4 (--round 4; the r3 export is unchanged without it): the same files, labels with the extra fields reward.py's round-4 terms
 read, and a different mix. The data paths are configurable (--build-dir / ASK_LORA_OUT, --vision-rows, --audio-rows; for round 4 the
-defaults are ../../ask-lora-r4/data and ../../ask-lora-r4/vision/vision_rows.jsonl, output in ../../ask-lora-r4/grpo/):
+defaults are ../../r4/data and ../../r4/vision/vision_rows.jsonl, output in ../../r4/grpo/):
     mix       ~30% narrate-after-read steps, ~20% compose and safety decision steps (COMPOSE_SAFETY_FAMILIES, with
               safe_restraint, gather_then_send_r4, restraint_r4 and compose_r3 upweighted), ~15% session steps (instructions_r4 and
               session_recall_r4 at weight 2, session_chat_r4 at 1.5), ~20% other text, 15% vision and audio (picture reads
@@ -930,10 +930,10 @@ _LEAK = None
 
 
 def leak_mod():
-    """The builder's leak.py (fold, LeakIndex), loaded by path under its own name so ask-lora-r2/builder never lands on sys.path."""
+    """The builder's leak.py (fold, LeakIndex), loaded by path under its own name so r2/builder never lands on sys.path."""
     global _LEAK
     if _LEAK is None:
-        path = HERE.parent.parent / "ask-lora-r2" / "builder" / "leak.py"
+        path = HERE.parent.parent / "r2" / "builder" / "leak.py"
         spec = importlib.util.spec_from_file_location("ask_lora_builder_leak", path)
         mod = importlib.util.module_from_spec(spec)
         sys.modules["ask_lora_builder_leak"] = mod
@@ -1676,7 +1676,7 @@ def r5_setup(a, bd: Path, pairs: list, valid_ids: set, turns: dict, tool_names: 
     info["ties"] = {}
     info["clarify_in_build"] = normalise_clarify(pairs)
     metas = [m for _, m in pairs]
-    dist = Path(a.dist_dir) if a.dist_dir else HERE.parent.parent / "ask-lora-r4" / "distill"
+    dist = Path(a.dist_dir) if a.dist_dir else HERE.parent.parent / "r4" / "distill"
     info["dist"] = dist_record(dist)
     refs = None
     refs_path = a.refs_crosscheck
@@ -1929,17 +1929,17 @@ def _main(argv: list[str] | None = None) -> int:
     ap.add_argument("--build-dir", default=os.environ.get("ASK_LORA_OUT"), help="dir with all.jsonl + meta.jsonl")
     ap.add_argument("--model", required=True, help="Gemma 4 E4B-it dir with the tokenizer + chat_template.jinja")
     ap.add_argument("--round", type=int, default=3, choices=(3, 4, 5),
-                    help="4: the round-4 labels and mix (see the module docstring); data and output defaults move to ../../ask-lora-r4/. "
+                    help="4: the round-4 labels and mix (see the module docstring); data and output defaults move to ../../r4/. "
                          "5: the RL round (RL-SCOPE.md): round-5 labels (rl_kind, ceiling, unsafe_reads, recall fields), the 4.1 mix, "
                          "chat anchors from --anchor-build-dir, and the text dev set (grpo_text_dev*.jsonl)")
-    ap.add_argument("--out", default=None, help="default: ./grpo_prompts.jsonl (round 4: ../../ask-lora-r4/grpo/grpo_prompts.jsonl)")
+    ap.add_argument("--out", default=None, help="default: ./grpo_prompts.jsonl (round 4: ../../r4/grpo/grpo_prompts.jsonl)")
     ap.add_argument("--n", type=int, default=1500)
     ap.add_argument("--seed", type=int, default=20261101)
     ap.add_argument("--max-prompt-tokens", type=int, default=9000,
                     help="longer prompts are dropped (production prompts run 3k to 9k tokens, mostly tool schemas)")
     ap.add_argument("--include-valid", action="store_true", help="also use the SFT dev split's ids")
     ap.add_argument("--vision-rows", default=None,
-                    help="default: ../vision/vision_rows.jsonl (round 4: ../../ask-lora-r4/vision/vision_rows.jsonl)")
+                    help="default: ../vision/vision_rows.jsonl (round 4: ../../r4/vision/vision_rows.jsonl)")
     ap.add_argument("--audio-rows", default=None,
                     help="default: ../audio/audio_rows.jsonl when every clip it lists exists, else the fallback ./audio/audio_rows.jsonl "
                          "(make_audio_rows.py) when that is complete; never a set with clips missing")
@@ -1984,7 +1984,7 @@ def _main(argv: list[str] | None = None) -> int:
                      help="recall,never_said,anchors counts of session_chat_r4 in the whole build, before the split "
                           "(default 54,14,99; or the counts of --refs-crosscheck); 'skip' turns the check off")
     r5g.add_argument("--refs-crosscheck", default=None, help="DIST/raw/.../session_chat.refs.json: meta.recall_refs/absent/ok must equal it")
-    r5g.add_argument("--dist-dir", default=None, help="the distill dir whose choose.py reward.py imports (default ../../ask-lora-r4/distill); "
+    r5g.add_argument("--dist-dir", default=None, help="the distill dir whose choose.py reward.py imports (default ../../r4/distill); "
                                                       "its commit sha and refs sha256 go into the stats")
     r5g.add_argument("--dev-slice-counts", default=None,
                      help="tests and smoke exports only: override the dev slice sizes, e.g. 'safety=5,narrate=4,select=2,recall_dev_r4=24,"
@@ -1998,7 +1998,7 @@ def _main(argv: list[str] | None = None) -> int:
         sync_instruction_term(a.instruction_term)
     r4 = a.round >= 4
     r5 = a.round >= 5
-    r4_root = HERE.parent.parent / "ask-lora-r4"
+    r4_root = HERE.parent.parent / "r4"
     if r4 and not a.build_dir:
         a.build_dir = str(r4_root / ("data-rl" if r5 else "data"))
     if not a.build_dir:

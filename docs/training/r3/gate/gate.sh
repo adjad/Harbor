@@ -16,9 +16,9 @@
 #   LOCK         heavy-lock directory                                 (default: ${TMPDIR:-/tmp}/harbor-heavy.lock)
 #   OMLX_BASE    oMLX URL                                             (default: http://127.0.0.1:8000)
 #   OMLX_SETTINGS  oMLX per-model settings file                       (default: ~/.omlx/model_settings.json)
-#   CHATEVAL     path to chat_eval.py          (default: training/ask-lora-r4/chateval/chat_eval.py when present)
-#   CHAT_PROMPTS chat eval prompts             (default: training/ask-lora-r4/chateval/prompts_r4.yaml when present,
-#                                                else training/ask-lora-r2/chateval_prompts.yaml)
+#   CHATEVAL     path to chat_eval.py          (default: docs/training/r4/chateval/chat_eval.py when present)
+#   CHAT_PROMPTS chat eval prompts             (default: docs/training/r4/chateval/prompts_r4.yaml when present,
+#                                                else docs/training/r2/chateval_prompts.yaml)
 #   VISION_TEST_SET  which images: gate/vision/cases.json is built by make_images.py + make_images_more.py (60 cases)
 set -u
 A=${1:?usage: gate.sh <modelA> <modelB> [trials] [chat_samples]}
@@ -33,11 +33,11 @@ fi
 LOCK="${LOCK:-${TMPDIR:-/tmp}/harbor-heavy.lock}"
 OMLX_BASE="${OMLX_BASE:-http://127.0.0.1:8000}"; export OMLX_BASE
 SETTINGS="${OMLX_SETTINGS:-$HOME/.omlx/model_settings.json}"
-R4CHAT="$REPO/training/ask-lora-r4/chateval"
+R4CHAT="$REPO/docs/training/r4/chateval"
 if [ -f "$R4CHAT/chat_eval.py" ]; then
   CHATEVAL="${CHATEVAL:-$R4CHAT/chat_eval.py}"; CHAT_PROMPTS="${CHAT_PROMPTS:-$R4CHAT/prompts_r4.yaml}"
 fi
-CHAT_PROMPTS="${CHAT_PROMPTS:-$REPO/training/ask-lora-r2/chateval_prompts.yaml}"
+CHAT_PROMPTS="${CHAT_PROMPTS:-$REPO/docs/training/r2/chateval_prompts.yaml}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 OUT="${OUT:-$HERE/runs/${A}__${B}__$STAMP}"
 ONLY="${ONLY:-toolbench,chat,mtp,vision,reading,pturns,video,audio}"

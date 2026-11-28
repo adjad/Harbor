@@ -254,7 +254,8 @@ def test_a_base_clause_the_sft_already_violates_is_an_sft_defect_not_a_stop():
     assert any(n["kind"] == "sft_defect" and n["rule"] == "S-chat:name" for n in notes)
     assert r.lo <= 0.6 * 0.10 + 1e-9                                       # only the m0 clause remains
     ok, notes2 = PR.make_rules({"chat_name": {"m0": 0.5, "max": 0.5, "min": 0.5, "sd": 0.0, "n": 3}}, {"chat_name": 0.5})
-    assert not notes2 and {x.name: x for x in ok}["S-chat:name"].lo == 0.6 * 0.5 + 0.0 or True
+    assert not notes2
+    assert abs({x.name: x for x in ok}["S-chat:name"].lo - 0.6 * 0.5) < 1e-9
 
 
 def test_closer_rule_exists_only_when_the_base_closer_share_is_at_least_15_percent():

@@ -18,7 +18,7 @@ Every row here:
 
 The wording is fresh and synthetic. It is checked against the eval sets at build time (``scen_r2_act._check`` runs
 ``leak.LeakIndex`` over the eval questions, the toolbench cases and the chat eval) and by this module's test against
-``training/ask-lora-r4/chateval/prompts_r4.yaml`` and the held-out wordings (``scen_r5_debuglog.heldout_folds``).
+``docs/training/r4/chateval/prompts_r4.yaml`` and the held-out wordings (``scen_r5_debuglog.heldout_folds``).
 
 Earlier assistant turns in the short chats are scripted context only (the loss is on the final); they are written in the
 same warm, specific voice and never talk about memory.

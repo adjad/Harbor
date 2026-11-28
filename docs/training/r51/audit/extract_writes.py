@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pull every r5 row whose target makes a write (an action with an effect) into compact review records.
 
-    python extract_writes.py --build ../../ask-lora-r5/data/r5-final --out OUT --chunks 8
+    python extract_writes.py --build ../../r5/data/r5-final --out OUT --chunks 8
 
 One record per row: id, family, split, the user's messages in this turn and the conversation before it (trimmed), the
 calls and tool results already made in this turn, the target call(s), and the builder's own notes, cards and approvals.

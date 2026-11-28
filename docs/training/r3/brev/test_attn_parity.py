@@ -1,6 +1,6 @@
 """Checks for train.py's --attn switch and attention-parity gate. No GPU, no weights, no network.
 
-    python training/ask-lora-r3/brev/test_attn_parity.py        (or pytest on this file)
+    python docs/training/r3/brev/test_attn_parity.py        (or pytest on this file)
 
 The gate / selection tests are pure python and run anywhere. The tests that build tensors need torch (a CPU
 build is enough); without it they print SKIP, so the Mac main venv (no torch) still runs the rest. Run the

@@ -46,9 +46,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 TRAINING = HERE.parent.parent
-sys.path.insert(0, str(TRAINING / "ask-lora-r2" / "builder"))
+sys.path.insert(0, str(TRAINING / "r2" / "builder"))
 sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(TRAINING / "ask-lora-r5" / "gpu"))
+sys.path.insert(0, str(TRAINING / "r5" / "gpu"))
 os.environ.setdefault("ASK_LORA_ROUND", "4")
 os.environ.setdefault("ASK_LORA_R5", "1")
 
@@ -56,8 +56,8 @@ import choose_r5  # noqa: E402
 import r5_stats  # noqa: E402
 import source_contract  # noqa: E402
 
-SPLICE = TRAINING / "ask-lora-r4" / "distill" / "splice.py"
-VALIDATE = TRAINING / "ask-lora-r2" / "builder" / "validate.py"
+SPLICE = TRAINING / "r4" / "distill" / "splice.py"
+VALIDATE = TRAINING / "r2" / "builder" / "validate.py"
 PLACEHOLDER = r5_stats.PLACEHOLDER    # scen_r5_debuglog.BASE_WRITES; test_finish_r5.py compares them
 SPLITS = {"all": "meta.jsonl", "train": "train.meta.jsonl", "valid": "valid.meta.jsonl"}    # split -> its meta file
 REUSE_MODEL = "r4-served-base"

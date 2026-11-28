@@ -39,7 +39,7 @@ import leak  # noqa: E402
 import scen_r4_devsets as D  # noqa: E402
 import scen_r4_session_chat as S  # noqa: E402
 
-REPO = HERE.parents[2]
+REPO = HERE.parents[3]
 PY = sys.executable
 FAST = os.environ.get("DEVSETS_FAST") == "1"
 
@@ -217,7 +217,7 @@ def references():
 
 def _chateval_r4_turns():
     import yaml
-    path = HERE.parents[1] / "ask-lora-r4" / "chateval" / "prompts_r4.yaml"
+    path = HERE.parents[1] / "r4" / "chateval" / "prompts_r4.yaml"
     out = []
     for u in yaml.safe_load(path.read_text())["units"]:
         out += [str(t) for t in (u.get("turns") or u.get("prompts") or ([u["prompt"]] if "prompt" in u else []))]
@@ -514,7 +514,7 @@ def test_export_prompts_loaders_read_the_dev_build(dev_build):
     out, _env = dev_build
     code = ("import sys; sys.path.insert(0, %r); import export_prompts as E; from pathlib import Path; "
             "p = E.load_pairs(Path(%r)); E.normalise_clarify(p); t, _n = E.index_pairs(p, True); print(len(p), len(t))"
-            % (str(REPO / "training" / "ask-lora-r3" / "grpo"), str(out)))
+            % (str(REPO / "docs" / "training" / "r3" / "grpo"), str(out)))
     r = subprocess.run([PY, "-c", code], cwd=HERE, env=_child_env(), capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=600)
     assert r.returncode == 0 and r.stdout.strip().splitlines()[-1] == "36 36", r.stdout[-1500:] + r.stderr[-1500:]
 
@@ -523,7 +523,7 @@ def test_check_overlap_run_checks_is_clean_on_the_dev_build(dev_build):
     """The RL gate's own checker (check_overlap.run_checks) over the dev build's all.jsonl, against every training and eval
     source this file compares by hand: no hit, no review item, nothing skipped."""
     out, _env = dev_build
-    sys.path.insert(0, str(REPO / "training" / "ask-lora-r3" / "grpo"))
+    sys.path.insert(0, str(REPO / "docs" / "training" / "r3" / "grpo"))
     import check_overlap
     from scripts.toolbench.cases import heldout_shingles, load_cases
     from scripts.toolbench.world import make_facts
@@ -539,7 +539,7 @@ def test_check_overlap_run_checks_is_clean_on_the_dev_build(dev_build):
 
 # ------------------------------------------------------------------ the ideals as probe references
 def _reward():
-    sys.path.insert(0, str(REPO / "training" / "ask-lora-r3" / "grpo"))
+    sys.path.insert(0, str(REPO / "docs" / "training" / "r3" / "grpo"))
     try:
         import reward
     except Exception as exc:  # noqa: BLE001

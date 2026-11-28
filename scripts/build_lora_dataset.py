@@ -1,10 +1,18 @@
 """Build an mlx-lm LoRA dataset from real Harbor usage.
 
-Turns sessions.db (user/assistant text) + audit.jsonl (real tool calls with
-args) into mlx-lm's chat-format JSONL: {"messages": [...]} per line, with
-tool_calls attached to assistant turns where the audit log shows a tool ran
-in that window. This is real router/agent behavior on this user's actual
-traffic, not synthetic data.
+Turns sessions.db (user/assistant text) into mlx-lm's chat-format JSONL:
+{"messages": [...]} per line. This is real router/agent behavior on this
+user's actual traffic, not synthetic data.
+
+Assistant turns that ran tools are kept in the history but are not used as
+training targets: audit.jsonl records the call and its arguments but never the
+tool's result, so the turn cannot be rebuilt as call -> tool result -> answer,
+and a `tool_calls` message with no tool reply after it is not a valid
+conversation. Tool-calling examples come from harvest_training_data.py, which
+captures the real model input and output.
+
+Splits are by session: every example from one session lands in the same file,
+so a valid example never shares its history with a train example.
 
 Usage:
     python scripts/build_lora_dataset.py --out ~/lora_data --val-frac 0.1
@@ -13,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import sqlite3
@@ -25,7 +34,6 @@ from service.router.router import route
 from service.tools import tool_schemas
 
 SESSIONS_DB = Path.home() / ".moe" / "sessions.db"
-AUDIT_LOG = Path.home() / ".moe" / "audit.jsonl"
 
 MIN_ASSISTANT_CHARS = 8   # drop near-empty / truncated turns
 MAX_MESSAGE_CHARS = 4000  # drop runaway turns (bad for a 2.6B context budget)
@@ -81,25 +89,7 @@ def _write_private(path: Path, text: str) -> None:
         f.write(text)
 
 
-def load_audit_events() -> list[dict]:
-    events = []
-    if not AUDIT_LOG.exists():
-        return events
-    with AUDIT_LOG.open() as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                ev = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if ev.get("event") == "allow" and "tool" in ev:
-                events.append(ev)
-    return events
-
-
-async def build_examples(conn: sqlite3.Connection, audit: list[dict]) -> list[dict]:
+async def build_examples(conn: sqlite3.Connection) -> list[dict]:
     cur = conn.execute(
         "SELECT session_id, idx, role, content, tool_digest, created_at "
         "FROM turns ORDER BY session_id, idx"
@@ -114,7 +104,7 @@ async def build_examples(conn: sqlite3.Connection, audit: list[dict]) -> list[di
     for sid, turns in by_session.items():
         messages = [{"role": "system", "content": SYSTEM}]
         last_user_text = None
-        for i, (_, idx, role, content, tool_digest, created_at) in enumerate(turns):
+        for _, idx, role, content, tool_digest, created_at in turns:
             if not content or len(content) > MAX_MESSAGE_CHARS:
                 continue
             if role == "assistant" and len(content) < MIN_ASSISTANT_CHARS:
@@ -125,23 +115,13 @@ async def build_examples(conn: sqlite3.Connection, audit: list[dict]) -> list[di
             if role == "user":
                 last_user_text = content
 
-            if role == "assistant" and tool_digest:
-                # window = (previous turn's ts, this turn's ts] within the same session
-                prev_ts = turns[i - 1][5] if i > 0 else 0
-                calls = [
-                    ev for ev in audit
-                    if prev_ts < _ts(ev["ts"]) <= created_at + 1
-                ]
-                if calls:
-                    msg["tool_calls"] = [
-                        {
-                            "type": "function",
-                            "function": {"name": ev["tool"], "arguments": ev.get("args", {})},
-                        }
-                        for ev in calls[:4]  # cap noise from unrelated concurrent calls
-                    ]
-
             messages.append(msg)
+
+            if role == "assistant" and tool_digest:
+                # The tools ran but their results were never recorded (see the
+                # module docstring), so this turn is history only, not a target.
+                skipped_tool_turns[0] += 1
+                continue
 
             # emit one training example per completed assistant turn, using
             # everything up to and including it as the target
@@ -160,17 +140,31 @@ async def build_examples(conn: sqlite3.Connection, audit: list[dict]) -> list[di
                     decision = await route(last_user_text)
                     if decision.tool_subset:
                         tools = tool_schemas(decision.tool_subset)
-                examples.append({"messages": [m.copy() for m in messages], "tools": tools})
+                examples.append({"messages": [m.copy() for m in messages], "tools": tools,
+                                 "_session": sid})
 
     return examples
 
 
-def _ts(iso: str) -> float:
-    import datetime
-    try:
-        return datetime.datetime.fromisoformat(iso).timestamp()
-    except ValueError:
-        return 0.0
+skipped_tool_turns = [0]
+
+
+def split_by_session(examples: list[dict], val_frac: float) -> tuple[list[dict], list[dict]]:
+    """(train, valid) with whole sessions on one side, chosen by a stable hash."""
+    sessions: dict[str, list[dict]] = {}
+    for example in examples:
+        sessions.setdefault(example["_session"], []).append(example)
+    order = sorted(sessions, key=lambda sid: hashlib.sha256(sid.encode()).hexdigest())
+    want = max(1, int(len(examples) * val_frac)) if examples else 0
+    train: list[dict] = []
+    valid: list[dict] = []
+    for sid in order:
+        (valid if len(valid) < want and len(order) > 1 else train).extend(sessions[sid])
+    return train, valid
+
+
+def _public(example: dict) -> dict:
+    return {k: v for k, v in example.items() if not k.startswith("_")}
 
 
 async def main():
@@ -184,24 +178,22 @@ async def main():
     # Read-only: a missing store must not be created here with the umask.
     # Percent-encoded: a ? # or % in the path must not change which file opens.
     conn = sqlite3.connect("file:" + quote(str(SESSIONS_DB)) + "?mode=ro", uri=True)
-    audit = load_audit_events()
-    examples = await build_examples(conn, audit)
+    examples = await build_examples(conn)
 
-    n_val = max(1, int(len(examples) * args.val_frac))
-    val, train = examples[:n_val], examples[n_val:]
+    train, val = split_by_session(examples, args.val_frac)
 
     _write_private(out_dir / "train.jsonl",
-                   "\n".join(json.dumps(e) for e in train) + "\n")
+                   "\n".join(json.dumps(_public(e)) for e in train) + "\n")
     _write_private(out_dir / "valid.jsonl",
-                   "\n".join(json.dumps(e) for e in val) + "\n")
+                   "\n".join(json.dumps(_public(e)) for e in val) + "\n")
     # mlx_lm.lora requires a test.jsonl to exist even if --test isn't passed
     _write_private(out_dir / "test.jsonl",
-                   "\n".join(json.dumps(e) for e in val[: max(1, n_val // 2)]) + "\n")
+                   "\n".join(json.dumps(_public(e)) for e in val[: max(1, len(val) // 2)]) + "\n")
 
-    with_tools = sum(1 for e in examples if any("tool_calls" in m for m in e["messages"]))
     with_subset = sum(1 for e in examples if e.get("tools"))
-    print(f"{len(examples)} examples ({with_tools} with real tool_calls, "
-          f"{with_subset} with a routed tool subset) "
+    sessions = len({e["_session"] for e in examples})
+    print(f"{len(examples)} examples from {sessions} sessions ({with_subset} with a routed "
+          f"tool subset; {skipped_tool_turns[0]} tool-using turns kept as history only) "
           f"-> {len(train)} train / {len(val)} valid, written to {out_dir}")
 
 

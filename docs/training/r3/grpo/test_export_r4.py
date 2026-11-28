@@ -130,8 +130,8 @@ def test_r4_mix_copies_are_capped_and_a_thin_bucket_is_reported():
 
 
 def test_r4_defaults_point_at_the_r4_dirs():
-    root = Path(X.__file__).resolve().parent.parent.parent / "ask-lora-r4"
-    assert root.name == "ask-lora-r4" and root.parent.name == "training"
+    root = Path(X.__file__).resolve().parent.parent.parent / "r4"
+    assert root.name == "r4" and root.parent.name == "training"
 
 
 # =========================================================================== round 4: audit repairs

@@ -842,10 +842,12 @@ def test_retrieve_does_not_count_a_marker_twice_or_add_one_without_markers():
 
 def test_plan_parts_prefers_to_cut_at_a_page_marker():
     text = ("x" * 99 + "\n") * 50 + "[Page 9]\nbody\n" + ("y" * 99 + "\n") * 300
-    plan = L.plan_parts(text, passes=2, size=3000)
     marker = text.index("[Page 9]")
+    # The first window would end 100 characters before the marker; the cut moves onto it.
+    plan = L.plan_parts(text, passes=2, size=marker - 100)
     cuts = {a for a, _ in plan} | {b for _, b in plan}
-    assert L._snap(text, marker - 150) == marker and (marker in cuts or True)
+    assert L._snap(text, marker - 150) == marker
+    assert plan[0] == (0, marker) and marker in cuts
     assert L._snap("aaa\nbbb\nccc", 1) == 4
 
 

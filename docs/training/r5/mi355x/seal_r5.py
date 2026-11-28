@@ -31,7 +31,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 TRAINING = HERE.parent.parent
-sys.path.insert(0, str(TRAINING / "ask-lora-r2" / "builder"))
+sys.path.insert(0, str(TRAINING / "r2" / "builder"))
 sys.path.insert(0, str(HERE))
 os.environ.setdefault("ASK_LORA_ROUND", "4")
 os.environ.setdefault("ASK_LORA_R5", "1")
@@ -78,7 +78,7 @@ def extra_public() -> list[dict]:
     """The r4 chat eval: leak.load_chat reads the older copy."""
     import leak
     import yaml
-    path = TRAINING / "ask-lora-r4" / "chateval" / "prompts_r4.yaml"
+    path = TRAINING / "r4" / "chateval" / "prompts_r4.yaml"
     if not path.is_file():
         return []
     out = []

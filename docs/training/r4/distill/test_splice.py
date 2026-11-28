@@ -1,4 +1,4 @@
-"""Tests for splice.py on a tiny synthetic build:  python -m pytest training/ask-lora-r4/distill/test_splice.py"""
+"""Tests for splice.py on a tiny synthetic build:  python -m pytest docs/training/r4/distill/test_splice.py"""
 import json
 import os
 import sys

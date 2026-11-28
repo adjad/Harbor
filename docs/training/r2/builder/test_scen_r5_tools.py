@@ -2,7 +2,7 @@
 
 Run from this directory with a pinned service checkout (about 30 s: the family is built once, every row dry-run through /agent):
 
-    ASK_LORA_ROUND=4 ASK_LORA_R5=1 HARBOR_REPO=<repo>/training/ask-lora-r5/data/pin-722e08b9 \\
+    ASK_LORA_ROUND=4 ASK_LORA_R5=1 HARBOR_REPO=<repo>/training/r5/data/pin-722e08b9 \\
         ~/Desktop/Harbor_Project/.venv/bin/python -m pytest --noconftest --rootdir=. -q test_scen_r5_tools.py
 """
 from __future__ import annotations

@@ -365,7 +365,7 @@ def test_end_to_end_samples_then_choose(tok, tmp_path):
 
 
 def test_final_problems_copy_matches_validate():
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "ask-lora-r2", "builder"))
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "r2", "builder"))
     try:
         import validate
     except Exception as exc:  # noqa: BLE001  (needs the repo's service tree and venv)
@@ -680,10 +680,6 @@ def test_an_honest_not_found_after_an_empty_result_is_not_a_stall():
     assert choose_r5.empty_result(row("Nothing active matches 'tax form'."))
     assert not choose_r5.empty_result(row("Subject: Your W-2 tax form is ready\nHi Sam, ..."))
     assert not choose_r5.empty_result(row("Here's what Harbor can and can't do:\nYes — Send texts\nNo — Make phone calls"))
-
-
-def _call(name, args):
-    return {"function": {"name": name, "arguments": args}}
 
 
 def test_a_thought_naming_a_default_argument_the_trained_call_omits_is_rejected():

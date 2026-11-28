@@ -20,9 +20,9 @@ import thinking
 # Taken when the build starts, so a file edited while it runs can't change what the build says it ran on.
 PROVENANCE = code_provenance.describe(os.path.dirname(os.path.abspath(__file__)), H.boot.REPO)
 
-# ASK_LORA_OUT points a later round (round 3: training/ask-lora-r3) at its own data dir.
+# ASK_LORA_OUT points a later round (round 3: training/r3) at its own data dir.
 OUT = os.environ.get("ASK_LORA_OUT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# Round 4 (training/ask-lora-r4) builds on round 3: every round-3 rule below holds for it too.
+# Round 4 (training/r4) builds on round 3: every round-3 rule below holds for it too.
 R3PLUS = os.environ.get("ASK_LORA_ROUND") in ("3", "4")
 
 
@@ -426,7 +426,7 @@ def split(metas, examples=None):
 
 
 LAST_SPLIT: dict = {}
-R3_VALID_META = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "ask-lora-r3", "data", "valid.meta.jsonl")
+R3_VALID_META = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "r3", "data", "valid.meta.jsonl")
 
 
 def write_manifest(metas, train_idx, valid_idx):
@@ -503,6 +503,7 @@ def write_stats(metas, train_idx, valid_idx):
 
 
 if __name__ == "__main__":
+    code_provenance.require_clean(PROVENANCE)   # a dataset must name a commit it matches (ASK_LORA_ALLOW_DIRTY=1 overrides)
     only = set(sys.argv[1:]) or None
     examples, metas, failures, per_scen = main(only)
     print("scenarios ok per family:", dict(per_scen))

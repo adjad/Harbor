@@ -307,7 +307,6 @@ def test_lora_dataset_export_writes_private_files_and_never_creates_the_store(
     missing = tmp_path / "no-moe" / "sessions.db"
     missing.parent.mkdir()
     monkeypatch.setattr(build, "SESSIONS_DB", missing)
-    monkeypatch.setattr(build, "AUDIT_LOG", tmp_path / "no-moe" / "audit.jsonl")
     monkeypatch.setattr("sys.argv", ["build_lora_dataset.py", "--out", str(tmp_path / "lora2")])
     with pytest.raises(sqlite3.OperationalError):
         asyncio.run(build.main())
@@ -395,7 +394,6 @@ def test_lora_dataset_main_end_to_end_writes_owner_only_output(tmp_path, loose_u
     db.commit()
     db.close()
     monkeypatch.setattr(build, "SESSIONS_DB", store)
-    monkeypatch.setattr(build, "AUDIT_LOG", tmp_path / "no-audit.jsonl")
 
     async def no_route(text):
         return types.SimpleNamespace(tool_subset=None)

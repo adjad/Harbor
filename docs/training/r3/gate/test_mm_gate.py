@@ -51,7 +51,7 @@ def test_reading_scoring_flow():
     import os
     import subprocess
     import tempfile
-    repo = Path(__file__).resolve().parents[3]
+    repo = Path(__file__).resolve().parents[4]
     rr = Path(__file__).resolve().parent / "vision" / "run_reading.py"
     cases = Path(__file__).resolve().parent / "vision" / "cases.json"
     if not cases.is_file():

@@ -145,7 +145,7 @@ import leak
 import thinking
 import writes
 
-# ASK_LORA_OUT points a later round (round 3: training/ask-lora-r3) at its own data dir.
+# ASK_LORA_OUT points a later round (round 3: training/r3) at its own data dir.
 OUT = os.environ.get("ASK_LORA_OUT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DENIED = "The user denied this action."
 READ_ACTIONS = {"manage_timers": frozenset({"list", "stopwatch_read"})}
@@ -377,7 +377,7 @@ def check_thinking(meta, msgs, ctx, injected, prev_thought, bad, where):
             bad("think:policy", f"{where} decide() failed: {exc!r}"[:160])
         return prev_thought
     if meta.get("distilled"):
-        # Round 4 self-distilled chat (training/ask-lora-r4/distill): the base model's own reasoning is the thought,
+        # Round 4 self-distilled chat (docs/training/r4/distill): the base model's own reasoning is the thought,
         # kept as it came (the user likes the base model's chat). Only the injection check below applies.
         if not isinstance(text, str) or not text.strip():
             bad("think:thought_missing", where)
@@ -485,7 +485,7 @@ def final_problems_r5(text: str, meta=None, had_tool_call: bool = False) -> list
 def _source_contract():
     """gpu/source_contract.py, the one implementation the chooser and this validator share."""
     import importlib.util
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "ask-lora-r5", "gpu", "source_contract.py")
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "r5", "gpu", "source_contract.py")
     spec = importlib.util.spec_from_file_location("source_contract", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)

@@ -1,7 +1,7 @@
 #!/bin/bash
 # r5 on one RTX A6000 (about $0.60/h): base's answers (the user's choice, 2026-11-07) and training (the user's choice,
 # 2026-11-08, replacing the AMD node for training). The 8x AMD MI355X path ($24/h) still works. A thin layer over
-# ../../ask-lora-r4/a6000/run_sft.sh, the one-GPU A6000 recipe (batch 8 = 1 row x 8 accumulation, so the same optimizer steps
+# ../../r4/a6000/run_sft.sh, the one-GPU A6000 recipe (batch 8 = 1 row x 8 accumulation, so the same optimizer steps
 # on one GPU or eight), with what each card needs: on the MI355X --attn math (gfx950's fused SDPA backward fails the LoRA
 # grad-cosine check) and one training process per GPU; on the A6000 sdpa, which smoke's strict parity check compares with
 # math before anything trains (exit 8: rerun everything with ATTN=math).
@@ -25,7 +25,7 @@
 # `resume`. Never kill the pid: a kill saves nothing. The box bills while idle.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-SFT="$HERE/run_sft.sh"; [ -f "$SFT" ] || SFT="$HERE/../../ask-lora-r4/a6000/run_sft.sh"
+SFT="$HERE/run_sft.sh"; [ -f "$SFT" ] || SFT="$HERE/../../r4/a6000/run_sft.sh"
 [ -f "$SFT" ] || { echo "FAIL: run_sft.sh not found next to run_r5.sh" >&2; exit 1; }
 # Hardware. NVIDIA (the RTX A6000, sm_86): run_sft.sh's pinned cu128 stack, one GPU, attention sdpa by default, which
 # SELFCHECK (answers) and smoke (training) compare with math first. AMD (the 8x MI355X): math only.

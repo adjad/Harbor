@@ -32,7 +32,7 @@ from gen import request_hash  # noqa: E402  (the sampler's own hash: object/stri
 RECALL_KEY = "recall"        # meta field (str or list of str) of facts a reply must carry; may be renamed
 USER_NAME = "Sam"            # the synthetic user's name in the prompts
 
-# --- copied from training/ask-lora-r2/builder/validate.py (FINAL_LEAK, CHAT_RECEIPT); not imported, validate.py loads
+# --- copied from docs/training/r2/builder/validate.py (FINAL_LEAK, CHAT_RECEIPT); not imported, validate.py loads
 # --- the whole service. Keep in step by hand if validate.py changes.
 FINAL_LEAK_CALL = re.compile(r"\{\"|\bUNTRUSTED\b|haven['’]t checked (?:a |any )?current|current personal source|"
                              r"\b[a-z]+_[a-z_]+\(", re.I)

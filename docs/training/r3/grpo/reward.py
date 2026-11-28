@@ -56,7 +56,7 @@ decision, chat_anchor, session_anchor, instruction; the export writes it) and sc
     name -0.5 (third person only, never on chat or session rows)
     closer is logged and scored 0, the thinking length penalty and floor are gone, chat style and instruction terms are off,
     and a chat or session anchor is a constant 1.0 minus its hard defects (leak, needless_call, nonreply, payload_text, malformed).
-The recall, never-said and nonreply rules are imported from training/ask-lora-r4/distill/choose.py (ASK_DIST_DIR overrides the
+The recall, never-said and nonreply rules are imported from docs/training/r4/distill/choose.py (ASK_DIST_DIR overrides the
 path), never re-implemented, so the SFT picker and this reward cannot drift apart (test_reward.py cross-checks them).
 
 Picture shapes (#436, "pictures that lead to actions"), both inside the entry point `score`:
@@ -1415,7 +1415,7 @@ _DIST = None
 
 def dist_dir() -> _Path:
     """Where choose.py and gen.py live: ASK_DIST_DIR, else a `distill/` folder beside this file (how a copied grpo directory ships
-    them), else the repository's training/ask-lora-r4/distill."""
+    them), else the repository's docs/training/r4/distill."""
     env = os.environ.get("ASK_DIST_DIR")
     if env:
         return _Path(env)
@@ -1423,18 +1423,18 @@ def dist_dir() -> _Path:
     beside = here.parent / "distill"
     if (beside / "choose.py").exists():
         return beside
-    return here.parents[2] / "ask-lora-r4" / "distill"
+    return here.parents[2] / "r4" / "distill"
 
 
 def dist():
-    """training/ask-lora-r4/distill/choose.py, loaded by path (it imports its sibling gen.py, which a same-named module
+    """docs/training/r4/distill/choose.py, loaded by path (it imports its sibling gen.py, which a same-named module
     already in sys.modules, such as the builder's, would shadow). Standard library only."""
     global _DIST
     if _DIST is None:
         path = dist_dir() / "choose.py"
         if not path.exists():
             raise ImportError(f"round-5 reward needs the distill picker's rules: {path} not found "
-                              f"(copy training/ask-lora-r4/distill next to the grpo code, or set ASK_DIST_DIR)")
+                              f"(copy docs/training/r4/distill next to the grpo code, or set ASK_DIST_DIR)")
         saved = _sys.modules.pop("gen", None)
         try:
             spec = _ilu.spec_from_file_location("ask_r4_distill_choose", path)

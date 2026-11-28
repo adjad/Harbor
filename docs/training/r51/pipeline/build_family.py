@@ -4,7 +4,7 @@
     build_family.py --out DIR FAMILY [FAMILY ...]
 
 Same environment as r5's build (ASK_LORA_ROUND=4 ASK_LORA_R5=1) plus ASK_LORA_R51=1, and HARBOR_REPO defaulting to the
-pin r5 used (training/ask-lora-r5/data/pin-7e442f2d). Everything is build.py's own: ``main(only=...)`` runs the scenarios
+pin r5 used (docs/training/r5/data/pin-7e442f2d). Everything is build.py's own: ``main(only=...)`` runs the scenarios
 (same seeds, leak check against the pinned toolbench, harness, thinking), ``write`` does for_training, the split, the
 eval manifest and the adjacent-duplicate fix, ``write_stats`` records code provenance, and ``partial.jsonl`` is written as
 build.py's ``__main__`` does. Nothing here re-implements those.
@@ -26,8 +26,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 TRAINING = HERE.parent.parent
-BUILDER = TRAINING / "ask-lora-r2" / "builder"
-PIN = TRAINING / "ask-lora-r5" / "data" / "pin-7e442f2d"
+BUILDER = TRAINING / "r2" / "builder"
+PIN = TRAINING / "r5" / "data" / "pin-7e442f2d"
 
 
 def redact(why) -> str:
@@ -54,6 +54,7 @@ def main(argv=None) -> int:
     sys.path.insert(0, str(BUILDER))
     os.chdir(BUILDER)          # build.py is run from its own folder in r5
     import build               # noqa: E402
+    build.code_provenance.require_clean(build.PROVENANCE)   # ASK_LORA_ALLOW_DIRTY=1 overrides, still recorded as dirty
     import scen                # noqa: E402
 
     only = set(a.families)

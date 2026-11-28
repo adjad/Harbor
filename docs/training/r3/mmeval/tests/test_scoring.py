@@ -1,6 +1,6 @@
 """Mac-side tests for the multimodal checkpoint evaluator. Pure python, no torch, no weights, no network.
 
-    ~/Desktop/Harbor_Project/.venv/bin/python -I -m pytest training/ask-lora-r3/mmeval/tests -q
+    ~/Desktop/Harbor_Project/.venv/bin/python -I -m pytest docs/training/r3/mmeval/tests -q
     (or run this file directly)
 
 What they cover:
@@ -26,7 +26,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 MM = HERE.parent
 R3 = MM.parent
-REPO = R3.parents[1]
+REPO = R3.parents[2]
 FIX = MM / "fixtures"
 sys.path.insert(0, str(MM))
 
@@ -569,6 +569,8 @@ def test_load_eval_rows_adds_serving_copies():
 
 def test_pack_fails_loudly_without_the_gate_set():
     vr = R3 / "vision" / "vision_rows.jsonl"      # the real rows: pack needs their images
+    if not vr.is_file():
+        pytest.skip("needs private training data: r3/vision/vision_rows.jsonl (see docs/training/README.md)")
     def run(*extra):
         return subprocess.run([PY, "-I", str(MM / "pack.py"), "--vision-rows", str(vr), "--out", str(Path(_tmp()) / "z.zip"), *extra],
                               capture_output=True, text=True)

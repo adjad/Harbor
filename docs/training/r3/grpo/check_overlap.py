@@ -2,9 +2,9 @@
 """Prove that training rows do not overlap the eval and gate sets (RL-SCOPE 4.3, C15). Mac side, no model, no network.
 
     check_overlap.py --manifest eval_manifest.json --inputs grpo_prompts.overlap.jsonl grpo_text_dev.overlap.jsonl \\
-        grpo_mm_dev.overlap.jsonl ../../ask-lora-r4/data/train.jsonl ../../ask-lora-r4/data/valid.jsonl \\
+        grpo_mm_dev.overlap.jsonl ../../r4/data/train.jsonl ../../r4/data/valid.jsonl \\
         --report overlap_report.json [--stats grpo_prompts.stats.json] [--media-root mm] [--signoff signoff.json]
-    check_overlap.py --inputs new_dev/all.jsonl --against r3=../../ask-lora-r3/data/train.jsonl ...     # authoring time: no manifest
+    check_overlap.py --inputs new_dev/all.jsonl --against r3=../../r3/data/train.jsonl ...     # authoring time: no manifest
 
 INPUTS are the rows to be proven clean. Three shapes, told apart by their keys:
     sidecar    {"id","modality","users":[..],"conv":str,"thread","folds"} (export_prompts.py writes <out>.overlap.jsonl beside every
@@ -44,14 +44,14 @@ from collections import Counter
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-BUILDER_LEAK = HERE.parent.parent / "ask-lora-r2" / "builder" / "leak.py"
+BUILDER_LEAK = HERE.parent.parent / "r2" / "builder" / "leak.py"
 HIT_JACCARD, REVIEW_JACCARD = 0.7, 0.5
 DHASH_HAMMING = 10
 _LEAK = None
 
 
 def leak_mod():
-    """The builder's leak.py (fold, trigrams, LeakIndex, fact_hits), loaded by path so ask-lora-r2/builder never lands on sys.path."""
+    """The builder's leak.py (fold, trigrams, LeakIndex, fact_hits), loaded by path so r2/builder never lands on sys.path."""
     global _LEAK
     if _LEAK is None:
         spec = importlib.util.spec_from_file_location("ask_lora_builder_leak", BUILDER_LEAK)

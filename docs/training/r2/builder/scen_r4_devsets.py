@@ -8,7 +8,7 @@ Build (a separate directory, never merged into the SFT build or data-rl). This m
 build writes the SAME file set a normal build does (all.jsonl, meta.jsonl, train/valid and their .meta.jsonl,
 eval_manifest.json, stats.json) and needs no shared-file change (it adds the two names to ``writes.MULTITURN`` itself):
 
-    cd training/ask-lora-r2/builder
+    cd docs/training/r2/builder
     ASK_LORA_OUT=$OUT/devsets ~/Desktop/Harbor_Project/.venv/bin/python scen_r4_devsets.py build
     ASK_LORA_OUT=$OUT/devsets ~/Desktop/Harbor_Project/.venv/bin/python scen_r4_devsets.py validate
     ~/Desktop/Harbor_Project/.venv/bin/python export_prompts.py ... --dev-build-dir $OUT/devsets

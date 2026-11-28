@@ -17,7 +17,7 @@ import json
 import os
 import sys
 
-BUILDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "ask-lora-r2", "builder")
+BUILDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "r2", "builder")
 
 
 def main(argv=None):
@@ -40,6 +40,7 @@ def main(argv=None):
         print(f"{len(REGISTRY)} tool names -> {a.registry_out}")
     if not a.partial:
         return
+    import scen  # noqa: E402,F401  (first, as build.py does: scen's family imports reach scen_r4_session_chat)
     import scen_r4_session_chat as S  # noqa: E402  (loads the service through harness; no model, no network)
     rows = [json.loads(l) for l in open(a.partial) if l.strip()]
     rows = [r for r in rows if r["meta"]["family"] == S.FAMILY]

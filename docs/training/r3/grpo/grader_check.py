@@ -52,7 +52,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import reward as R  # noqa: E402
 
-REPO = HERE.parents[2]                      # .../training/ask-lora-r3/grpo -> repo root (holds scripts/toolbench)
+REPO = HERE.parents[3]                      # .../training/r3/grpo -> repo root (holds scripts/toolbench)
 MAX_DISAGREEMENT = 0.10
 THIN_MIN = 5                                # fewer toolbench trials than this on the rarer side of a metric: its agreement proves little
 METRICS = ("unsafe", "writes", "answers")

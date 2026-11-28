@@ -50,7 +50,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import chatlib  # noqa: E402
 
-DEFAULT_REPO = HERE.parents[2]          # training/ask-lora-r4/chateval -> repository root
+DEFAULT_REPO = HERE.parents[3]          # docs/training/r4/chateval -> repository root
 SEED_BASE = 1000
 DEFAULT_TODAY = "2026-10-30"            # the clock the r2/r3 chat eval was pinned to (a Friday, 08:30)
 HARBOR_PORTS = (8765, 8791)

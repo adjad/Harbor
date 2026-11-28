@@ -523,6 +523,9 @@ ADDITIONAL_FULL_TESTS = {
     # Owner-only (0600) SQLite stores: every store opened under tmp_path with a
     # 022 umask; no model, network or user data.
     "tests/test_private_sqlite_files.py",
+    # LoRA dataset splits keep whole conversations on one side: invented sessions in
+    # a tmp_path sessions.db, the router stubbed; no model, network or user data.
+    "tests/test_lora_dataset_split.py",
     # The send queue overwrites what it removes: an assistant.db in tmp_path, no
     # network, engine or real send.
     "tests/test_outbound_queue_secure_delete.py",

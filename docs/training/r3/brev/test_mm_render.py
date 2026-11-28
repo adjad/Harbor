@@ -1,6 +1,6 @@
 """Mac-side checks for r3's image rows: no torch, no model weights, no network.
 
-    ~/Desktop/Harbor_Project/.venv/bin/python training/ask-lora-r3/brev/test_mm_render.py
+    ~/Desktop/Harbor_Project/.venv/bin/python docs/training/r3/brev/test_mm_render.py
     (or pytest on this file)
 
 Uses only the Gemma tokenizer + chat template + processor_config.json from the local oQ4e build (or the bf16
@@ -38,7 +38,7 @@ import zipfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-R2 = HERE.parent.parent / "ask-lora-r2"
+R2 = HERE.parent.parent / "r2"
 MODEL_CANDIDATES = [
     os.environ.get("ASK_LORA_MODEL", ""),
     str(Path.home() / "Desktop/OMLX_Model_Files/Jundot/gemma-4-E4B-it-oQ4e-mtp"),

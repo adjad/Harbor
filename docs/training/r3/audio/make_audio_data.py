@@ -3,7 +3,7 @@
 
 Run (needs the macOS speech service, so NOT inside the command sandbox):
 
-    ~/Desktop/Harbor_Project/.venv/bin/python -I training/ask-lora-r3/audio/make_audio_data.py [--n-scale 1.0] [--verify-only]
+    ~/Desktop/Harbor_Project/.venv/bin/python -I docs/training/r3/audio/make_audio_data.py [--n-scale 1.0] [--verify-only]
 
 Writes clips/<id>.wav (16 kHz mono 16-bit, like the clips Harbor records) and audio_rows.jsonl. Each row is the
 production request of service/voice.py (input_audio + voice._PROMPT, temperature 0, thinking off, max_tokens 240)
@@ -43,7 +43,7 @@ from pathlib import Path
 import numpy as np
 
 HERE = Path(__file__).resolve().parent
-REPO = HERE.parents[2]
+REPO = HERE.parents[3]
 sys.path.insert(0, str(REPO))
 from service import voice as V  # noqa: E402  (_PROMPT, clean_transcript, wav_seconds, MAX_SECONDS)
 

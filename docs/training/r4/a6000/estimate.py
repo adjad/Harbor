@@ -8,7 +8,7 @@ Pure python.
     python estimate.py --zip out/ask-lora-data.zip --tokenizer <gemma dir>   # exact token counts from the packed zip
 
 EVERYTHING HERE IS AN ESTIMATE. The one measured anchor is r2's A6000 run (Hyperstack, SDPA, checkpointing on):
-85.6 s per 8-row step at ~6.7k tokens per row = 624 tok/s, peak 21.6 GiB (ask-lora-r3/PLAN.md, "Measured basis").
+85.6 s per 8-row step at ~6.7k tokens per row = 624 tok/s, peak 21.6 GiB (r3/PLAN.md, "Measured basis").
 Nothing in r3/r4 has run on an A6000 or an L40. r3 on the MI355X node cannot be scaled to either (math attention, 8 GPUs).
 The L40 numbers are the A6000's scaled by spec ratios (GPUS below), so they are one step further from a measurement.
 
@@ -144,7 +144,7 @@ def grpo_hours_plan_py(rows: int = 1500):
     """grpo/plan.py's A6000 estimate (optimistic, middle, pessimistic), read from the module, not retyped.
     None when plan.py is missing or its API has moved (another agent is adapting it for r4)."""
     import importlib.util
-    for d in (HERE.parent / "grpo", HERE.parent.parent / "ask-lora-r3" / "grpo"):
+    for d in (HERE.parent / "grpo", HERE.parent.parent / "r3" / "grpo"):
         path = d / "plan.py"
         if not path.is_file():
             continue

@@ -92,7 +92,7 @@ def counted(build: Path) -> dict:
 
 def step_provenance() -> dict:
     """The code this step is running on, never an earlier step's (code_provenance.py)."""
-    builder = Path(__file__).resolve().parents[2] / "ask-lora-r2" / "builder"
+    builder = Path(__file__).resolve().parents[2] / "r2" / "builder"
     if str(builder) not in sys.path:
         sys.path.insert(0, str(builder))
     try:

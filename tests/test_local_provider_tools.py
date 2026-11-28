@@ -1379,10 +1379,6 @@ def test_context_calibration_ignores_environment_proxy_and_redirect_policy(engin
 # transport: no socket, process, credential, model, native listener or user data.
 # Completion order is controlled with asyncio events, not sleeps.
 
-def run_bounded(coro):
-    return asyncio.run(asyncio.wait_for(coro, 30))
-
-
 _CONCURRENCY_BASE_URL = "http://127.0.0.1:18888"
 
 

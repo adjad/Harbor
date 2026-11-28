@@ -1,8 +1,8 @@
 """Mac tests for the r4 GPU kit (L40 or A6000): the text picker on fake generations, the packing guards, the estimates and the
-changes made to ask-lora-r3/brev. No torch, no GPU, no tokenizer, no network.
+changes made to r3/brev. No torch, no GPU, no tokenizer, no network.
 
-    ~/Desktop/Harbor_Project/.venv/bin/python -I -m pytest training/ask-lora-r4/a6000/test_pick_text.py -q
-    ~/Desktop/Harbor_Project/.venv/bin/python -I training/ask-lora-r4/a6000/test_pick_text.py        (also runs as a script)
+    ~/Desktop/Harbor_Project/.venv/bin/python -I -m pytest docs/training/r4/a6000/test_pick_text.py -q
+    ~/Desktop/Harbor_Project/.venv/bin/python -I docs/training/r4/a6000/test_pick_text.py        (also runs as a script)
 
 The fake generations are written in the format Gemma 4 emits and reward.py parses (tool-call syntax, thought channel,
 stop tokens), and the checkpoint table is built so each rule of PLAN.md section F decides exactly one outcome.
@@ -869,7 +869,7 @@ def test_the_packed_picker_runs_standalone_from_a_copy():
     """pickers.zip + mmeval-data.zip land in one directory on the box: simulate that with copies and no repo around."""
     with tempfile.TemporaryDirectory() as d:
         d = Path(d)
-        mm = TRAINING / "ask-lora-r3" / "mmeval"
+        mm = TRAINING / "r3" / "mmeval"
         for n in ("scoring.py", "rows.py", "serving.py", "score_mm.py", "eval_mm.py", "pick_checkpoint.py"):
             (d / n).write_bytes((mm / n).read_bytes())
         (d / "pick_text.py").write_bytes((HERE / "pick_text.py").read_bytes())
@@ -919,25 +919,26 @@ def test_grpo_calibration_is_slower_than_plan_py():
 
 
 def test_r3_brev_edits_are_backward_compatible():
-    spec = importlib.util.spec_from_file_location("r3_train_a6000", TRAINING / "ask-lora-r3" / "brev" / "train.py")
+    spec = importlib.util.spec_from_file_location("r3_train_a6000", TRAINING / "r3" / "brev" / "train.py")
     tr = importlib.util.module_from_spec(spec)
     sys.modules["r3_train_a6000"] = tr
     spec.loader.exec_module(tr)
     assert tr.spread_indices(10, 0) == list(range(10)) and tr.spread_indices(10, 20) == list(range(10))
     assert tr.spread_indices(10, 4) == [0, 2, 5, 7] and len(set(tr.spread_indices(364, 150))) == 150
-    src = (TRAINING / "ask-lora-r3" / "brev" / "train.py").read_text()
+    src = (TRAINING / "r3" / "brev" / "train.py").read_text()
     assert 'ap.add_argument("--dev-text-max", type=int, default=0' in src       # default 0 = all dev rows, r3's behaviour
     assert 'ap.add_argument("--global-batch", "--accum", dest="global_batch", type=int, default=8' in src
     assert 'ap.add_argument("--lr", type=float, default=2e-4)' in src and 'ap.add_argument("--max-len", type=int, default=10240' in src
-    render = (TRAINING / "ask-lora-r3" / "brev" / "render.py").read_text()
+    render = (TRAINING / "r3" / "brev" / "render.py").read_text()
     assert 'HERE / "upload-zip.json"' in render                                  # default output unchanged
-    setup = (TRAINING / "ask-lora-r3" / "brev" / "vm-setup.sh").read_text()
+    setup = (TRAINING / "r3" / "brev" / "vm-setup.sh").read_text()
     assert '${TRANSFORMERS_SPEC:-transformers>=5.10.1,<6}' in setup and '${PEFT_SPEC:-peft>=0.19.0}' in setup
 
 
 def test_run_sft_matches_r3_effective_batch():
     sh = (HERE / "run_sft.sh").read_text()
-    assert "GLOBAL_BATCH=8" in sh and "LR=2e-4" in sh and 'NPROC="${NPROC:-1}"' in sh and "--epochs 2" in sh
+    # r5.1 let LR come from the environment; its default is still 2e-4
+    assert "GLOBAL_BATCH=8" in sh and ("LR=2e-4" in sh or 'LR="${LR:-2e-4}"' in sh) and 'NPROC="${NPROC:-1}"' in sh and ("--epochs 2" in sh or "--epochs ${EPOCHS:-2}" in sh)
     assert "--attn-parity-strict" in sh and 'PIN_TORCH="2.11.0"' in sh and 'PIN_TRANSFORMERS="5.22.1"' in sh and 'PIN_PEFT="0.21.2"' in sh
     r = subprocess.run(["bash", "-n", str(HERE / "run_sft.sh")], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
@@ -1004,7 +1005,7 @@ def test_batch_check_allows_one_near_tie_but_not_a_padding_fault():
 
 
 def test_picker_uses_math_attention_when_training_did():
-    sys.path.insert(0, str(TRAINING / "ask-lora-r3" / "mmeval"))
+    sys.path.insert(0, str(TRAINING / "r3" / "mmeval"))
     import eval_mm as EM
 
     class Backend:
@@ -1052,7 +1053,7 @@ def test_out_of_memory_returns_before_the_group_is_split():
 
 
 def test_run_r5_batches_the_picker():
-    sh = (TRAINING / "ask-lora-r5" / "mi355x" / "run_r5.sh").read_text()
+    sh = (TRAINING / "r5" / "mi355x" / "run_r5.sh").read_text()
     assert '--batch "${PICK_BATCH:-8}"' in sh and "HARBOR_ATTN=math" in sh
 
 

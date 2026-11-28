@@ -1,5 +1,5 @@
---- ask-lora-r3/brev/train.py	2026-11-09 00:06:27
-+++ ask-lora-r51/launch/patched/train.py	2026-11-12 00:09:01
+--- r3/brev/train.py	2026-11-09 00:06:27
++++ r51/launch/patched/train.py	2026-11-12 00:09:01
 @@ -1175,8 +1175,55 @@
      model.enable_input_require_grads()
      set_train(model)  # checkpointing only runs in training mode

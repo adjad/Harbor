@@ -3,7 +3,7 @@ scripts/toolbench/sources.py) and the compose matchers. No model, no network.
 
 Run from the repository root:
 
-    .venv/bin/python -m pytest --noconftest --rootdir=. -q training/ask-lora-r5/gate/test_gate_r5.py
+    .venv/bin/python -m pytest --noconftest --rootdir=. -q docs/training/r5/gate/test_gate_r5.py
 
 The leak test builds the r5 training family's prompts in a subprocess (about a minute); the tests that read r4's
 stored gate run skip when ~/.moe/evals is absent.
@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 os.environ["HARBOR_HOME"] = str(Path(tempfile.mkdtemp(prefix="gate-r5-test-")) / ".moe")
@@ -32,12 +32,12 @@ for _var in ("HARBOR_MODEL_ONLY", "HARBOR_MODEL_ONLY_NARRATION_THINKING", "HARBO
 import service.agent.loop  # noqa: E402,F401  (HARBOR_HOME is set above; score_r5 then skips runner.isolate, whose
 #                                subprocess guard would block the leak test's builder subprocess)
 import score_r5 as S  # noqa: E402
-from scripts.toolbench import sources as SRC  # noqa: E402
+SRC = pytest.importorskip("scripts.toolbench.sources", reason="the held-out sources set (scripts/toolbench/sources.py) is not in this repository")
 from scripts.toolbench.cases import HELD_OUT_SPLITS, SEALED_SPLITS, SPLITS, load_cases, parse_case, select  # noqa: E402
 from scripts.toolbench.scorer import score  # noqa: E402
 from scripts.toolbench.world import make_facts  # noqa: E402
 
-BUILDER = ROOT / "training" / "ask-lora-r2" / "builder"
+BUILDER = ROOT / "docs" / "training" / "r2" / "builder"
 R4_RUN = Path.home() / ".moe" / "evals" / "toolbench" / "20261105-122357"
 R4_CHAT = Path.home() / ".moe" / "evals" / "r4-gate" / "gate-run" / "chateval" / "replies.jsonl"
 TODAY = date(2026, 11, 5)
@@ -366,7 +366,7 @@ def _family_prompts(seeds: int = 6) -> list[str]:
 def _build_prompts() -> list[str]:
     """User prompts of every r5 dataset build on disk (meta.jsonl `prompt`), when any are present."""
     out = []
-    for meta in sorted((ROOT / "training" / "ask-lora-r5" / "data").glob("*/meta.jsonl")):
+    for meta in sorted((ROOT / "docs" / "training" / "r5" / "data").glob("*/meta.jsonl")):
         for line in meta.read_text().splitlines():
             try:
                 p = json.loads(line).get("prompt")

@@ -14,7 +14,7 @@ Like picture_turn_r3 the reading is scripted (harness.run_scenario patches servi
 row is plain text and needs no image, no Mac and no GPU. Only prompts with an action word (vision.wants_action) take
 the agent path, so the document rows ask the assistant to "write out" / "make a list of" what the document says.
 The picture-direct path (a plain question about an image, answered by the vision model itself) is the part that
-needs real images: see training/ask-lora-r4/vision/r5_picture_spec.md.
+needs real images: see docs/training/r4/vision/r5_picture_spec.md.
 
 Gated on ASK_LORA_R5=1 by scen.py's auto-registration (FAMILIES_R5, WRITE_ALLOW_R5).
 """

@@ -2,7 +2,7 @@
 """Seven known-answer cases on six synthetic scanned documents (1 to 4 pages), appended to cases.json.
 
 Run after make_images_more.py (which writes cases.json from scratch):
-    cd training/ask-lora-r3/gate/vision && $PY make_images_more.py && $PY make_documents.py
+    cd docs/training/r3/gate/vision && $PY make_images_more.py && $PY make_documents.py
 
 Each case goes through service/vision.py's scanned-document branch (`_messages(..., scanned_document=name)`), the
 path service/documents.py takes for a PDF without a text layer: up to MAX_SCANNED_PAGES (4) page images, the file

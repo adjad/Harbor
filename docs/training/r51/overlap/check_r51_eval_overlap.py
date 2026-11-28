@@ -11,8 +11,8 @@ import argparse, hashlib, json, os, sys
 from pathlib import Path
 HERE = Path(__file__).resolve().parent
 TRAINING = HERE.parent.parent
-sys.path.insert(0, str(TRAINING / "ask-lora-r5" / "mi355x"))
-sys.path.insert(0, str(TRAINING / "ask-lora-r2" / "builder"))
+sys.path.insert(0, str(TRAINING / "r5" / "mi355x"))
+sys.path.insert(0, str(TRAINING / "r2" / "builder"))
 os.environ.setdefault("ASK_LORA_ROUND", "4")
 os.environ.setdefault("ASK_LORA_R5", "1")
 import leak, leak_check_r5 as lc  # noqa: E402

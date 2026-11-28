@@ -217,7 +217,6 @@ SKIP = {
     "music": "would start or skip real playback in Music/Spotify",
     "play_podcast": "opens Podcasts and performs a real search",
     "play_audiobook": "opens Books.app",
-    "play_radio": "starts real audio playback (tested separately, already verified)",
     "stop_radio": "no-op without play_radio having run in this process",
     "open_app": "would launch an arbitrary real application",
     "airdrop_file": "opens a real Finder share sheet",
@@ -232,7 +231,7 @@ SKIP = {
     # This run: user asked to skip anything that produces sound.
     "play_ambient": "skipped this run — produces audible output",
     "text_to_speech": "skipped this run — produces audible output",
-    "play_radio": "skipped this run — produces audible output",
+    "play_radio": "skipped this run — starts real, audible playback (tested separately)",
     # sends / drafts / schedules — tested explicitly and separately via the
     # live agent endpoint with the user's own address/number, per their
     # request, not auto-invoked here.

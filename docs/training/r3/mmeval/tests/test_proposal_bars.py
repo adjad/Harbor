@@ -2,7 +2,7 @@
 
 F1 alone passes a checkpoint that drops from 6 right to 5 right while making far fewer proposals; these tests
 pin that case (and its mirror, more proposals right but more spurious) so the hard r4 bars stay enforced.
-Run: python -m pytest training/ask-lora-r3/mmeval -q
+Run: python -m pytest docs/training/r3/mmeval -q
 """
 import copy
 import json

@@ -62,7 +62,7 @@ and the choice go to text_run_info.json. An integer still works.
 
 Where the other code comes from: reward.py (this directory, else --reward-dir, else the repo's grpo/) and the mmeval
 modules pick_checkpoint / eval_mm / scoring (this directory after `unzip mmeval-data.zip` into it, else --mmeval-dir,
-else the repo's ask-lora-r3/mmeval). Stage 1 needs no private data and none is ever uploaded to the box.
+else the repo's r3/mmeval). Stage 1 needs no private data and none is ever uploaded to the box.
 """
 from __future__ import annotations
 
@@ -163,9 +163,9 @@ def _find(name: str, dirs: list) -> Path | None:
 
 def load_reward(reward_dir: str | None = None):
     """reward.py as a module. Search: --reward-dir, this directory, the r4 grpo dir (if r4 adapts it), the r3 grpo dir."""
-    d = _find("reward.py", [reward_dir, HERE, REPO_TRAINING / "ask-lora-r4" / "grpo", REPO_TRAINING / "ask-lora-r3" / "grpo"])
+    d = _find("reward.py", [reward_dir, HERE, REPO_TRAINING / "r4" / "grpo", REPO_TRAINING / "r3" / "grpo"])
     if d is None:
-        die("reward.py not found (looked in --reward-dir, next to pick_text.py, ask-lora-r4/grpo, ask-lora-r3/grpo)")
+        die("reward.py not found (looked in --reward-dir, next to pick_text.py, r4/grpo, r3/grpo)")
     spec = importlib.util.spec_from_file_location("harbor_reward", d / "reward.py")
     mod = importlib.util.module_from_spec(spec)
     sys.modules["harbor_reward"] = mod
@@ -174,7 +174,7 @@ def load_reward(reward_dir: str | None = None):
 
 
 def mmeval_dir(arg: str | None = None) -> Path:
-    d = _find("pick_checkpoint.py", [arg, HERE, REPO_TRAINING / "ask-lora-r3" / "mmeval"])
+    d = _find("pick_checkpoint.py", [arg, HERE, REPO_TRAINING / "r3" / "mmeval"])
     if d is None:
         die("mmeval code not found (unzip mmeval-data.zip next to pick_text.py, or pass --mmeval-dir)")
     if str(d) not in sys.path:
@@ -1190,11 +1190,11 @@ def stage2_text(top: list, private_dir: str | None = None) -> str:
     L += [f"     ~/harbor/gemma/{merged_dir(n)}    (rank {t.get('rank', i + 1)}, step {t.get('step')})" for i, (n, t) in enumerate(zip(names, top))]
     L += ["",
           "2. Quantise each into the production oQ4e-mtp format with oMLX's own Python, under the heavy lock, one at a time",
-          "   (training/ask-lora-r3/brev/quantize.py; it refuses to overwrite an existing folder):",
+          "   (docs/training/r3/brev/quantize.py; it refuses to overwrite an existing folder):",
           "     R=/Applications/oMLX.app/Contents/Resources; P=$R/Python; R4=~/Desktop/r4-stage2"]
     for n in names:
         L.append(f"     PYTHONHOME=$P/cpython-3.11 PYTHONPATH=$R:$P/framework-mlx-base/lib/python3.11/site-packages \\\n"
-                 f"       $P/cpython-3.11/bin/python3 -s training/ask-lora-r3/brev/quantize.py --src $R4/{merged_dir(n)} \\\n"
+                 f"       $P/cpython-3.11/bin/python3 -s docs/training/r3/brev/quantize.py --src $R4/{merged_dir(n)} \\\n"
                  f"       --out ~/Desktop/OMLX_Model_Files/{quant_dir(n)} \\\n"
                  f"       --mtp-from ~/Desktop/OMLX_Model_Files/Jundot/gemma-4-E4B-it-oQ4e-mtp")
     L += ["",
@@ -1209,7 +1209,7 @@ def stage2_text(top: list, private_dir: str | None = None) -> str:
           "   Read each model's pass count (passed trials / total trials) from the SCORECARD.",
           "",
           "5. Decide. The one that passes more wins; a tie goes to the earlier step:",
-          "     python training/ask-lora-r4/a6000/pick_text.py stage2-decide --picked <picked.json> \\"]
+          "     python docs/training/r4/a6000/pick_text.py stage2-decide --picked <picked.json> \\"]
     L.append("       " + " ".join(f"--result {n}=<private passed>/<private total>,<toolbench passed>/<toolbench total>" for n in names))
     L += ["", "The winner is the r4 SFT candidate that goes to the Mac gate (gate.sh). Neither passing the private eval nor the "
           "toolbench subset ships anything: the full PLAN.md gate still decides."]

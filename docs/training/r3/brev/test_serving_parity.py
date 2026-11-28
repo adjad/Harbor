@@ -14,6 +14,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 import render as rd  # noqa: E402
 
+import pytest  # noqa: E402
+pytest.importorskip("omlx", reason="needs the oMLX engine package installed")
 from omlx.api.openai_models import Message  # noqa: E402
 from omlx.api.tool_calling import convert_tools_for_template, enrich_tool_params_for_gemma4  # noqa: E402
 from omlx.adapter.gemma4 import extract_gemma4_messages  # noqa: E402

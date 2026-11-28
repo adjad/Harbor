@@ -34,13 +34,13 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 TRAINING = HERE.parent.parent
-BUILDER = TRAINING / "ask-lora-r2" / "builder"
+BUILDER = TRAINING / "r2" / "builder"
 sys.path.insert(0, str(BUILDER))
 import leak  # noqa: E402  (fold only; the toolbench index is lazy)
 
 NEW_FAMILY = "safety_contrast_r51"
 RESTRAINT_FAMILIES = {"restraint_r4", "safe_restraint"}
-DEFAULT_PIN = TRAINING / "ask-lora-r5" / "data" / "pin-7e442f2d"
+DEFAULT_PIN = TRAINING / "r5" / "data" / "pin-7e442f2d"
 FILES = ["all.jsonl", "meta.jsonl", "train.jsonl", "train.meta.jsonl", "valid.jsonl", "valid.meta.jsonl"]
 SAMPLE_N, SAMPLE_SEED = 60, 51
 

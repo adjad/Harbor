@@ -15,7 +15,7 @@ import json
 import sys
 from pathlib import Path
 
-GPU = Path(__file__).resolve().parents[2] / "ask-lora-r5" / "gpu"
+GPU = Path(__file__).resolve().parents[2] / "r5" / "gpu"
 sys.path.insert(0, str(GPU))
 import choose_traces as CT  # noqa: E402
 

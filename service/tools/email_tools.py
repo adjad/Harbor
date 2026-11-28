@@ -1804,10 +1804,6 @@ def _unique_records(rows: list[dict]) -> list[dict]:
 _CROSS_SOURCE_WINDOW_SECONDS = 120.0
 
 
-def _subject_key(subject: str) -> str:
-    return " ".join((subject or "").split()).casefold()
-
-
 def _source_kind(row: dict) -> str:
     """Which reader produced the row: Mail's native IDs carry a ``mail:`` /
     ``db:`` style prefix, Gmail's are bare; rows with none (legacy) are unknown."""
