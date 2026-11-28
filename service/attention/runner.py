@@ -19,7 +19,9 @@ The order of operations is the safety argument:
      At most one reminder is written per pass, so a slow or stuck app cannot be hit with a
      burst of writes.
   5. The effect's outcome is recorded whatever it is. Unknown and failed outcomes are
-     final: nothing retries, because the reminder may exist.
+     final: nothing retries, because the reminder may exist. A `capped` row made nothing, so
+     it is taken up again on a later day while still inside the lookback (the cap defers,
+     it does not decide), through the same per-pass limit and daily cap.
   6. The ledger key is the message, but the thing reminded about is the EVENT: a second
      message about a plan this runner already acted on is matched against the ledger's own
      rows by event time and recorded as `already_on_file`. The store cannot answer that
@@ -77,7 +79,10 @@ class Outcome:
 
 async def process(*, records: list[dict], commitments: list[dict], now: float, tz: str,
                   settings: Settings, ledger: Ledger, create: Create, publish: Publish,
-                  fresh_commitments: Commitments, name_for: NameFor | None = None) -> Outcomes:
+                  fresh_commitments: Commitments, name_for: NameFor | None = None,
+                  skip_ids: set[str] | frozenset[str] = frozenset()) -> Outcomes:
+    """One pass. `skip_ids` are messages another path owns (event capture's previews): they
+    still give context to the messages around them, but are never decided here."""
     outcomes: Outcomes = Outcomes()
     if settings.mode == "off":
         # Remember that it was off. Resuming live afterwards must re-baseline, or the messages
@@ -92,8 +97,13 @@ async def process(*, records: list[dict], commitments: list[dict], now: float, t
     floor = max(now - LOOKBACK_S, float(ledger.meta("enabled_at")))
 
     items = items_from_records(records)
-    fresh = [i for i in items if i.direction == "incoming" and floor <= i.ts <= now]
-    unseen_ids = {i.id for i in fresh} - ledger.known([i.id for i in fresh])
+    fresh = [i for i in items if i.direction == "incoming" and floor <= i.ts <= now
+             and i.id not in skip_ids]
+    fresh_ids = [i.id for i in fresh]
+    # A message the daily cap held back is taken up again on a later pass (a later day),
+    # within the lookback: being over the cap defers it, it does not decide it for good.
+    capped_ids = ledger.in_state(fresh_ids, "capped") if settings.mode == "live" else set()
+    unseen_ids = (set(fresh_ids) - ledger.known(fresh_ids)) | capped_ids
     if not unseen_ids:
         return outcomes
 
@@ -117,10 +127,11 @@ async def process(*, records: list[dict], commitments: list[dict], now: float, t
             continue
         context = f"{decision.source.text} {item.text}" if decision.source else item.text
         thread = _thread_key(item.conversation, salt)
+        retry = item.id in capped_ids
         twin = _already_acted(ledger, decision.resolved, context, thread, now, tz, settings.mode)
         if twin is not None:
-            if ledger.claim(item.id, title=plan.title, due_ts=plan.due_ts, event_ts=plan.event_ts, now=now,
-                            detail={"quote": plan.quote, "thread": thread}):
+            if retry or ledger.claim(item.id, title=plan.title, due_ts=plan.due_ts, event_ts=plan.event_ts,
+                                     now=now, detail={"quote": plan.quote, "thread": thread}):
                 detail = {"quote": plan.quote, "when": plan.when_label, "why": list(decision.why),
                           "thread": thread, "duplicate_of": twin}
                 ledger.finish(item.id, "already_on_file", detail, now)
@@ -129,12 +140,19 @@ async def process(*, records: list[dict], commitments: list[dict], now: float, t
         if settings.mode == "live" and effects >= MAX_EFFECTS_PER_PASS:
             outcomes.limited = True
             break                                         # the rest wait for the next pass, unclaimed
+        detail = {"quote": plan.quote, "when": plan.when_label, "why": list(decision.why), "thread": thread}
+        if retry:
+            # Still over today's cap: the row stays `capped` (and shown) until a later day.
+            if ledger.effect_count_since(local_midnight(now, tz), exclude=item.id) >= settings.daily_cap:
+                continue
+            if not ledger.reclaim_capped(item.id, title=plan.title, due_ts=plan.due_ts, event_ts=plan.event_ts,
+                                         now=now, detail={"quote": plan.quote, "thread": thread}):
+                continue
         # The quote and thread go in with the claim: if the process dies before `finish`, the row
         # recovered as `unknown` (whose reminder may exist) must still match a follow-up.
-        if not ledger.claim(item.id, title=plan.title, due_ts=plan.due_ts, event_ts=plan.event_ts,
-                            now=now, detail={"quote": plan.quote, "thread": thread}):
+        elif not ledger.claim(item.id, title=plan.title, due_ts=plan.due_ts, event_ts=plan.event_ts,
+                              now=now, detail={"quote": plan.quote, "thread": thread}):
             continue
-        detail = {"quote": plan.quote, "when": plan.when_label, "why": list(decision.why), "thread": thread}
 
         if settings.mode == "shadow":
             ledger.finish(item.id, "shadow", detail, now)

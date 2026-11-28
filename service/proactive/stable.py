@@ -23,6 +23,8 @@ from __future__ import annotations
 MISSING_GRACE_S = 2 * 3600
 
 _REPLY_METHODS = ("email_reply", "text_reply")
+# Slots this cycle's new cards are sure of when older standing cards would fill the limit.
+NEW_CARD_SLOTS = 2
 # Owned by deadlines.py and autoadd.py, which rebuild them every cycle.
 _REBUILT_METHODS = ("block_time", "undo_add")
 
@@ -180,4 +182,23 @@ def carry(previous: list[dict], fresh: list[dict], *, items: dict[str, dict], wi
             return 0
         return 1 if (card.get("action") or {}).get("method") in _REPLY_METHODS else 2
     merged.sort(key=tier)
-    return merged[:limit]
+    if len(merged) <= limit:
+        return merged
+    # Older cards that still stand must not take every slot: then a new ask, however
+    # urgent, never shows. Alerts come first; then up to NEW_CARD_SLOTS cards for asks
+    # that arrived since the cards were last shown (this cycle's are in the judge's order,
+    # most important first); then the rest in tier order. Cards for asks that were already
+    # there keep the no-reshuffle rule. A card left out is still the user's to-do.
+    def arrived_since(card: dict) -> bool:
+        ts = (items.get(card_ref(card)) or {}).get("received_ts")
+        return isinstance(ts, (int, float)) and not isinstance(ts, bool) and ts > since
+    chosen = {id(c) for c in [c for c in merged if c.get("critical")][:limit]}
+    for card in [c for c in new_cards if arrived_since(c)][:NEW_CARD_SLOTS]:
+        if len(chosen) >= limit:
+            break
+        chosen.add(id(card))
+    for card in merged:
+        if len(chosen) >= limit:
+            break
+        chosen.add(id(card))
+    return [c for c in merged if id(c) in chosen]

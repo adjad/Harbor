@@ -299,7 +299,9 @@ async def run_tick(now: float | None = None) -> list:
         ledger.set_meta("last_mode", "off")
         return []
     capture_outcomes = await run_capture_tick(now, tz, settings)
-    if settings.capture_events:
+    if settings.capture_events and capture_outcomes:
+        # One automatic write per pass: the capture path just made one, so the reminder
+        # path waits for the next pass.
         return capture_outcomes
     from service.tools import imessage_tools
     feed = imessage_tools.structured_messages_snapshot()
@@ -311,10 +313,20 @@ async def run_tick(now: float | None = None) -> list:
                    int(now // FINGERPRINT_BUCKET_S))
     if fingerprint == _last_fingerprint:
         return []
+    if settings.capture_events:
+        # With event capture on, a message it previews (or paired) is its: the reminder path
+        # leaves it alone so one message never becomes two writes. Every other message (a
+        # deadline or errand with no event in it) still reaches the reminder path.
+        from service.attention.live import items_from_records
+        ids = [item.id for item in items_from_records(records)]
+        skip = {sid.removeprefix("preview:") for sid in ledger.known(["preview:" + i for i in ids])}
+    else:
+        skip = set()
     outcomes = await process(
         records=records, commitments=_commitments(now, tz), now=now, tz=tz,
         settings=settings, ledger=ledger, create=create_reminder, publish=_publish,
-        fresh_commitments=lambda: _commitments(time.time(), tz), name_for=_name_for)
+        fresh_commitments=lambda: _commitments(time.time(), tz), name_for=_name_for,
+        skip_ids=skip)
     if not getattr(outcomes, "limited", False):
         _last_fingerprint = fingerprint               # a limited pass has work left: look again soon
     return outcomes

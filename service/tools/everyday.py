@@ -59,11 +59,21 @@ async def _daily_calendar(args: dict, now: float, start: float, end: float) -> s
         receipt = json.loads(row["payload"]) if row else {}
     coverage = receipt.get("diagnostics") or {}
     lo, hi = coverage.get("coverage_start"), coverage.get("coverage_end")
-    covered = (type(lo) in (int, float) and type(hi) in (int, float)
-               and math.isfinite(lo) and math.isfinite(hi) and lo <= start and hi >= end)
-    if not _native_receipt_current(receipt, now) or not covered:
+    bounded = (type(lo) in (int, float) and type(hi) in (int, float)
+               and math.isfinite(lo) and math.isfinite(hi) and lo <= start)
+    covered = bounded and hi >= end
+    # The read covers the start of the range but stops before its end (the app syncs a
+    # fixed horizon): show the covered part and say where it stops, rather than nothing.
+    partly = bounded and not covered and hi > max(start, now)
+    if not _native_receipt_current(receipt, now) or not (covered or partly):
         return "Calendar unknown: missing, stale, partial, failed or insufficient date coverage; no cached absence is verified."
-    result = await tools.get_upcoming(**args)
+    if partly:
+        result = await tools.get_upcoming(**args, _covered_until=float(hi))
+        result = (f"Calendar covered only through {dt.datetime.fromtimestamp(hi):%a %b %-d, %Y %-I:%M %p}: "
+                  "Harbor's calendar read does not reach the end of this range, so nothing after that "
+                  "is shown or verified.\n" + result)
+    else:
+        result = await tools.get_upcoming(**args)
     if args.get("account"):
         result = (f"Calendar account filter: {args['account']}; account inventory coverage is unverified. "
                   "No cached matches do not establish account-wide absence.\n" + result)
@@ -92,7 +102,7 @@ async def _daily_reminders(*, now: float, start: float, end: float, account: str
     with store.transaction(write=False) as db:
         receipt_row = db.execute("SELECT payload FROM today_source_sync WHERE source='reminders'").fetchone()
         receipt = json.loads(receipt_row["payload"]) if receipt_row else {}
-        rows = tools.reminders_matching("all", query, now=now)
+        rows = tools.reminders_matching("all", query, now=now, listing_words=True)
         view, undated = store.undated_listing(query) if include_undated and not account else ({}, [])
     native_current = _native_receipt_current(receipt, now)
     account_key = account.casefold()
@@ -182,8 +192,8 @@ async def _daily_reminders(*, now: float, start: float, end: float, account: str
             "account": {"type": "string", "description": "Account scope for calendar/email and exact reminder account label. Messages account scope unsupported."},
             "query": {"type": "string", "description": "Calendar/reminder title filter; filtered email/message summaries unsupported, never silently broadened."},
             "reminder_days": {"type": "integer", "minimum": 1, "maximum": 60, "description": "Default upcoming reminder horizon; 7 days, independent of today's calendar."},
-            "include_overdue": {"type": "boolean", "description": "Include overdue reminders outside the window. Default true only when period is omitted."},
-            "include_undated": {"type": "boolean", "description": "Show undated reminders separately. Default true only when period is omitted."},
+            "include_overdue": {"type": "boolean", "description": "Include overdue reminders outside the window. Default true when period is omitted or contains now (today, this week)."},
+            "include_undated": {"type": "boolean", "description": "Show undated reminders separately. Default true when period is omitted or contains now (today, this week)."},
             **{f"include_{source}": {"type": "boolean", "description": f"Include {source}; default true. False excludes it before reading."}
                for source in ("calendar", "reminders", "email", "messages", "weather")},
         },
@@ -226,8 +236,12 @@ async def daily_brief(location: str = "", days: int = 1,
             return f"(error: daily briefing date/range unsupported: {exc}; no sources were read.)"
         if end - start > 62 * 86400:
             return "(error: daily briefing range exceeds 62 days; no sources were read.)"
-    include_overdue = not period if include_overdue is None else include_overdue
-    include_undated = not period if include_undated is None else include_undated
+    # A range that contains now (today, this week) is about what is on the user's plate,
+    # so overdue and undated reminders belong in it; a range wholly ahead (tomorrow, next
+    # week) or behind keeps to its window.
+    current_range = not period or start <= stamp < end
+    include_overdue = current_range if include_overdue is None else include_overdue
+    include_undated = current_range if include_undated is None else include_undated
     jobs: list[tuple[str, object]] = []
     notices = []
     if include_calendar:

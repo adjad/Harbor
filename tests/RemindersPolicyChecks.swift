@@ -58,12 +58,14 @@ enum HarborClient { static let baseURL = URL(string: "http://offline.fixture/")!
             completed: false, hasDueDate: false))
         // The undated payload carries at most the cap plus the TRUE eligible count.
         func rows(_ n: Int) -> [[String: Any]] { (0..<n).map { ["source_id": "id\($0)", "title": "t\($0)"] } }
-        for (n, sent) in [(0, 0), (1, 1), (199, 199), (200, 200), (201, 200), (500, 200)] {
+        precondition(RemindersWriter.maxUndatedReminders == 1000, "the app and store.UNDATED_MAX agree")
+        for (n, sent) in [(0, 0), (1, 1), (200, 200), (201, 201), (500, 500), (999, 999),
+                          (1000, 1000), (1001, 1000), (2500, 1000)] {
             let p = RemindersWriter.undatedPayload(rows(n))
             precondition(p.items.count == sent && p.total == n,
                          "undated payload for \(n) eligible must send \(sent) and report \(n)")
         }
-        precondition(RemindersWriter.undatedPayload(rows(500)).items.first?["source_id"] as? String == "id0",
+        precondition(RemindersWriter.undatedPayload(rows(2500)).items.first?["source_id"] as? String == "id0",
                      "the cut keeps the first entries in order")
         // Newest first when creation dates are known, so the cap drops the oldest
         // (stale) reminders; undated-by-creation entries sort last, in input order.
@@ -107,18 +109,21 @@ enum HarborClient { static let baseURL = URL(string: "http://offline.fixture/")!
                      "a dated reminder with no title is still synced")
         precondition(RemindersWriter.syncedTitle("  Buy milk \n") == "  Buy milk \n",
                      "a dated reminder's own title is sent as it is")
-        // An exact target: null means undated, and only a delete may use it; 0, NaN and
-        // negative times are invalid rather than stand-ins for null.
+        // An exact target: null means undated, for update, complete and delete alike; 0, NaN
+        // and negative times are invalid rather than stand-ins for null, and an all-day
+        // target with a null time is invalid, never undated.
         typealias T = RemindersWriter.ExactTarget
-        precondition(RemindersWriter.exactTarget(kind: "delete_reminder", expectedDueTs: nil) == T.undated)
-        precondition(RemindersWriter.exactTarget(kind: "delete_reminder", expectedDueTs: 2e9) == T.dated(2e9))
-        for kind in ["update_reminder", "complete_reminder"] {
-            precondition(RemindersWriter.exactTarget(kind: kind, expectedDueTs: nil) == nil,
-                         "\(kind) never targets an undated reminder")
-        }
-        for bad in [0.0, -1.0, Double.nan, Double.infinity, 1e300, 253402300800] {
-            precondition(RemindersWriter.exactTarget(kind: "delete_reminder", expectedDueTs: bad) == nil,
-                         "\(bad) is not a due time and not a stand-in for undated")
+        for kind in ["update_reminder", "complete_reminder", "delete_reminder"] {
+            precondition(RemindersWriter.exactTarget(kind: kind, expectedDueTs: nil) == T.undated,
+                         "\(kind) can target an undated reminder")
+            precondition(RemindersWriter.exactTarget(kind: kind, expectedDueTs: 2e9) == T.dated(2e9))
+            precondition(RemindersWriter.exactTarget(kind: kind, expectedDueTs: nil,
+                                                     expectedDueDate: "2026-10-20") == nil,
+                         "\(kind): an all-day target is never undated")
+            for bad in [0.0, -1.0, Double.nan, Double.infinity, 1e300, 253402300800] {
+                precondition(RemindersWriter.exactTarget(kind: kind, expectedDueTs: bad) == nil,
+                             "\(bad) is not a due time and not a stand-in for undated")
+            }
         }
         precondition(RemindersWriter.exactTarget(kind: "create_reminder", expectedDueTs: nil) == nil)
         let wire = try! JSONSerialization.data(withJSONObject: [

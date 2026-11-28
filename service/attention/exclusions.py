@@ -139,8 +139,10 @@ def contact_vector(text: str) -> bool:
     return any(len(re.sub(r"\D", "", m.group())) >= 10 for m in _DIGIT_RUN.finditer(text))
 
 
-def screen(item: Item) -> str | None:
-    """Why this must not interrupt the user ("promo" | "scam" | "automated"), or None."""
+def screen(item: Item, *, contact_ok: bool = False) -> str | None:
+    """Why this must not interrupt the user ("promo" | "scam" | "contact_vector" | "automated"),
+    or None. `contact_ok` skips only the contact-vector check, for a caller that never acts on
+    the message by itself (a preview the person adds with a tap); every other reason stands."""
     text = item.text or ""
     if _SCAM_PHRASES.search(text) and (_LINK.search(text) or _SHORTENER.search(text)):
         return "scam"
@@ -150,7 +152,7 @@ def screen(item: Item) -> str | None:
         return "scam"
     if _PROMO.search(text):
         return "promo"
-    if contact_vector(text):
+    if not contact_ok and contact_vector(text):
         return "contact_vector"
     if item.source == "messages" and _SHORTCODE.match(re.sub(r"[\s()-]", "", item.sender or "")):
         return "automated"

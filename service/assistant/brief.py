@@ -994,7 +994,8 @@ def _agenda(now: float) -> dict:
     """
     from service.assistant.sync_status import source_status
     from service.tools.assistant_tools import (
-        _collapse_schedule_rows, _local_day_bounds, _without_holiday_calendars)
+        _collapse_schedule_rows, _local_day_bounds, _split_stale_harbor_only,
+        _without_holiday_calendars)
     states = {source: source_status(source) for source in ("calendar", "reminders")}
     skip = {source for source, state in states.items() if state["state"] == "unavailable"}
     day_start, day_end = _local_day_bounds(now)
@@ -1002,18 +1003,22 @@ def _agenda(now: float) -> dict:
     # `upcoming` starts five minutes back, so a reminder that was due earlier
     # today and is still not done has to be read separately, or the summary
     # never mentions it. Reminders only: an earlier calendar event is already
-    # in `today_calendar`. The read keeps the stale-reminder hiding.
+    # in `today_calendar`. The read keeps the stale-reminder hiding. It reaches back
+    # before today too: a reminder due yesterday and still open is overdue work for
+    # today, not something to drop at midnight. Long-overdue Harbor-only records (no
+    # Apple copy to confirm them) stay out, as in every other reminder read.
     earlier_end = now - 300
-    earlier_reminders = ([row for row in assistant_store.active_between(
-                              day_start, earlier_end, now=now)
-                          if _is_reminder(row)] if earlier_end > day_start else [])
+    earlier_reminders, _older = _split_stale_harbor_only(
+        [row for row in assistant_store.active_between(None, earlier_end, now=now)
+         if _is_reminder(row)], now)
     items = _collapse_schedule_rows(
         today_calendar + earlier_reminders + assistant_store.upcoming(now=now, days=7))
     today_items = []
     for item in items:
         when_ts = float(item["when_ts"])
         is_today = (day_start <= when_ts < day_end or
-                    (when_ts < day_start and float(item.get("end_ts") or 0) > day_start))
+                    (when_ts < day_start and float(item.get("end_ts") or 0) > day_start)
+                    or (when_ts < day_start and _is_reminder(item)))
         if item.get("source") in skip or not is_today:
             continue
         if skip.intersection(item.get("duplicate_sources") or []):
@@ -1045,7 +1050,13 @@ def _agenda_row(item: dict, now: float, *, show_account: bool,
         and float(item["when_ts"]) < day_start
         and float(item.get("end_ts") or 0) > day_start
         and "calendar" in _kinds(item))
-    if item.get("all_day"):
+    overdue_from_before = (day_start is not None and float(item["when_ts"]) < day_start
+                           and _is_reminder(item))
+    if overdue_from_before:
+        clock = (when.strftime("%a %b %-d") if item.get("all_day")
+                 else f"{when.strftime('%a %b %-d')} {_hm(when)}")
+        rel = "overdue"
+    elif item.get("all_day"):
         clock, rel = "All day", ""
         if continued_from_prior_day:
             rel = "continued into today"
@@ -1108,7 +1119,9 @@ def _schedule_section(now: float) -> str:
         lines.append("- Nothing on your calendar. ✅")
     blocks = ["\n".join(lines)]
     if agenda["reminders"]:
-        blocks.append("**✅ Reminders due today**\n"
+        overdue_before = any(float(item["when_ts"]) < day_start for item in agenda["reminders"])
+        blocks.append(("**✅ Reminders due today and overdue**\n" if overdue_before
+                       else "**✅ Reminders due today**\n")
                       + "\n".join(_agenda_row(item, now, show_account=show_account,
                                                day_start=day_start)
                                   for item in agenda["reminders"]))

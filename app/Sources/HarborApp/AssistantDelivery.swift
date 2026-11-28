@@ -136,9 +136,10 @@ final class AssistantDelivery {
             }
             var result = value
             for field in ["expected_due_ts", "due_ts"] where keys.contains(field) {
-                // A delete of a reminder with no due date carries null: the native
-                // writer then requires the reminder to still have no due date.
-                if kind == "delete_reminder", field == "expected_due_ts", value[field] is NSNull {
+                // An update, completion or delete of a reminder with no due date carries
+                // null: the native writer then requires the reminder to still have no due
+                // date. Only the expected time may be null, never the new due time.
+                if field == "expected_due_ts", value[field] is NSNull, !keys.contains("expected_due_date") {
                     result[field] = NSNull()
                     continue
                 }

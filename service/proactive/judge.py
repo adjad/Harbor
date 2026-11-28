@@ -28,8 +28,10 @@ from service.proactive.stable import ask_key
 # The first number is the no-thinking budget: 8 items plus a two-sentence summary
 # run about 600-750 tokens of JSON, and a reply cut off at the limit is no reply.
 TOKENS = (1200, 2200)
+# What the model may rank (its reply budget). Never what is visible: every survivor with an
+# ask still becomes a to-do by rule (`by_rule`, uncapped), so this caps cards, not items.
 MAX_ITEMS = 8
-MAX_SURVIVOR_LINES = 24
+MAX_SURVIVOR_LINES = 40
 MAX_LINE_CHARS = 260
 KINDS = ("reply", "meet", "call", "errand", "task", "read")
 _URGENCY = {"high": 0, "medium": 1, "low": 2}
@@ -473,8 +475,10 @@ def validate(reply: str | None, ids: dict[str, dict], *, now: float, tz: str, sc
 
 
 def by_rule(survivors: list[dict], sched: dict, *, now: float, tz: str, suppressed: set[str],
-            allowed: set[str] | None = None) -> list[dict]:
-    """Every survivor with an ask, as an item, newest first: the judge's stand-in."""
+            allowed: set[str] | None = None, limit: int | None = None) -> list[dict]:
+    """Every survivor with an ask, as an item, newest first: the judge's stand-in. No cap
+    unless `limit` is given: a ninth ask is as real as the first, and the card count is
+    capped later (prepare.MAX_CARDS); everything else stays a to-do."""
     allowed = set() if allowed is None else allowed
     out = []
     for survivor in sorted(survivors, key=lambda s: -(s["item"].get("received_ts") or 0)):
@@ -485,7 +489,7 @@ def by_rule(survivors: list[dict], sched: dict, *, now: float, tz: str, suppress
                          suppressed=suppressed, allowed=allowed)
         if item is not None:
             out.append(item)
-        if len(out) >= MAX_ITEMS:
+        if limit is not None and len(out) >= limit:
             break
     return out
 

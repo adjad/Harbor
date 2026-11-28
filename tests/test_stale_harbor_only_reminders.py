@@ -1,4 +1,5 @@
-"""Long-overdue Harbor-only reminder records stop reading as current reminders."""
+"""Long-overdue Harbor-only reminder records stop reading as current reminders, but a
+direct read still lists them, apart and labelled."""
 from __future__ import annotations
 
 import asyncio
@@ -30,33 +31,44 @@ def _search(rows: list[dict], readiness: dict = READY) -> str:
         return asyncio.run(assistant_tools.search_reminders("x"))
 
 
-def test_old_harbor_only_record_is_hidden_with_a_count() -> None:
+OLDER = "Older Harbor-only records, overdue by more than 14 days"
+
+
+def _older_part(answer: str) -> tuple[str, str]:
+    head, _, tail = answer.partition(OLDER)
+    return head, tail
+
+
+def test_old_harbor_only_record_is_listed_apart_from_current_ones() -> None:
     answer = _search([_row("synthetic recent", 2), _row("synthetic ancient", 40),
                       _row("synthetic ancient two", 90)])
-    assert "synthetic recent" in answer
-    assert "synthetic ancient" not in answer
-    assert "2 older Harbor-only records overdue by more than 14 days are not listed" in answer
+    head, tail = _older_part(answer)
+    assert "synthetic recent" in head
+    assert "synthetic ancient" not in head, "never listed as a current reminder"
+    assert "- synthetic ancient —" in tail and "- synthetic ancient two —" in tail
+    assert "not listed" not in answer
 
 
-def test_apple_backed_and_future_rows_are_never_hidden() -> None:
+def test_apple_backed_and_future_rows_are_never_set_apart() -> None:
     answer = _search([_row("synthetic apple", 400, source="reminders"),
                       _row("synthetic mirrored", 400, dup=("reminders",)),
                       _row("synthetic future", -3)])
     for title in ("synthetic apple", "synthetic mirrored", "synthetic future"):
         assert title in answer
-    assert "not listed" not in answer
+    assert OLDER not in answer
 
 
-def test_only_stale_rows_still_explain_the_empty_result() -> None:
+def test_only_stale_rows_still_explain_the_empty_result_and_list_them() -> None:
     answer = _search([_row("synthetic ancient", 60)])
-    assert "synthetic ancient" not in answer
-    assert "no active match" in answer
-    assert "1 older Harbor-only record overdue by more than 14 days is not listed" in answer
+    head, tail = _older_part(answer)
+    assert "synthetic ancient" not in head
+    assert "no active match" in head
+    assert "- synthetic ancient —" in tail
 
 
-def test_unavailable_reminders_path_also_hides_and_counts() -> None:
+def test_unavailable_reminders_path_also_lists_them_apart() -> None:
     answer = _search([_row("synthetic recent", 1), _row("synthetic ancient", 50)],
                      {"sources": [{"id": "reminders", "state": "unavailable"}]})
-    assert "synthetic recent" in answer and "synthetic ancient" not in answer
-    assert "not listed" in answer
-
+    head, tail = _older_part(answer)
+    assert "synthetic recent" in head and "synthetic ancient" not in head
+    assert "- synthetic ancient —" in tail

@@ -271,12 +271,27 @@ def test_pii_never_reaches_the_model_and_output_backstop(store):
     view = snap(store)
     assert not any("benefits" in json.dumps(x).casefold() for x in view["cards"] + view["threads"] + view["todos"])
     item = items_fixture()[0]
-    for leaked in ("Card 4111 1111 1111 1111 on file", "Your code is 482913", "SSN 123-45-6789",
-                   "Her password: hunter22"):
+    for leaked, value in (("Card 4111 1111 1111 1111 on file", "4111"), ("Your code is 482913", "482913"),
+                          ("SSN 123-45-6789", "123-45-6789"), ("Her password: hunter22", "hunter22")):
         result = triage.validate(json.dumps({"title": "Coffee chat", "summary": leaked, "junk": False,
                                              "sensitive": False, "asks_of_me": ""}), item, allowed=set())
-        assert result["sensitive"] is True and result["summary"] == "" and result["title"] == ""
+        # The identifier's value is cut out; the rest of the reading stays readable on the card.
+        assert value not in json.dumps(result) and triage.REDACTED in result["summary"]
+        assert result["title"] == "Coffee chat" and result["redacted"] is True
+        assert not triage.has_identifier_value(result["summary"])
     assert guard.has_card_number("4111-1111-1111-1111") and not guard.has_card_number("4111 1111 1111 1112")
+
+
+def test_pii_backstop_keeps_the_rest_of_the_reading_and_cuts_only_the_value():
+    item = items_fixture()[0]
+    reply = json.dumps({"title": "Coffee chat", "summary": "Sam asked about coffee; card 4111 1111 1111 1111 on file.",
+                        "junk": False, "sensitive": False, "asks_of_me": "Reply with code is 482913 by Friday"})
+    result = triage.validate(reply, item, allowed=set())
+    assert result is not None and result["sensitive"] is False and result["title"] == "Coffee chat"
+    assert "4111" not in result["summary"] and "482913" not in result["asks_of_me"]
+    assert "coffee" in result["summary"] and "Friday" in result["asks_of_me"]
+    # A benign phrase is not an identifier and is never cut.
+    assert triage.redact_identifiers("Use promo code SPRING20 at checkout") == "Use promo code SPRING20 at checkout"
 
 
 def test_unparseable_triage_fails_closed():

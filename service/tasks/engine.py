@@ -420,9 +420,11 @@ def _resolve_operation_targets(plan: TaskPlan, assistant_store, *,
     scope = str(plan.parameters.get("scope", SlotValue("all")).value or "all")
     rows = _reminder_candidates(assistant_store, scope=scope, now=now)
     if plan.intent == "reminder.complete":
+        # Overdue reminders stay completable: finishing something after it was due is
+        # the usual case, and complete_reminder accepts them too.
         horizon = now.timestamp() + 365 * 86400
         rows = [row for row in rows
-                if now.timestamp() - 300 <= float(row.get("when_ts") or 0) <= horizon]
+                if row.get("when_ts") is not None and float(row["when_ts"]) <= horizon]
     target = _norm(plan.target.value)
     if target:
         exact = [row for row in rows if _norm(row.get("title")) == target]
