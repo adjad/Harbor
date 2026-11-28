@@ -1318,7 +1318,8 @@ _APPS_MEDIA_RE = re.compile(
     # Playback phrases ("play some music", "next track") were dropped with the
     # music and play_audio tools (retired 2026-10): nothing here can play.
     r"\b(?:open|launch|start|quit|close|kill)\s+(?:the\s+|my\s+)?[\w.]+", re.I)
-# window_control / switch_app / list_running_apps joined 2026-08-19: this
+# window_control / list_running_apps joined 2026-08-19 (switch_app, named in
+# the deny lists below, is not a built-in; open_app focuses an app): this
 # route claims "close this window" and "switch to Safari", so those requests
 # never reach the semantic fallback, and a hand-written subset frozen at
 # open/quit/music/spotify meant the window tools were registered and
@@ -1895,12 +1896,15 @@ _RECENT_RE = re.compile(
 # and past events are by definition done. Including it would add a tool that
 # can only contribute noise, and every extra tool on the list costs selection
 # accuracy (see _mk_scoped).
-_ALL_SOURCES = ["get_upcoming", "search_reminders", "summarize_messages",
-                "summarize_emails", "search_notes"]
-# search_notes is LAST deliberately: the user keeps very little in Notes, so it
-# is the weakest of the four sources. The order is a weak prior on which tool
-# the model reaches for first; the aggregate route still requires ALL of them
-# (see RouteDecision.narration_after).
+# _CORE_SOURCES is the set an aggregate answer must hear from before it may
+# narrate (RouteDecision.narration_after). _ALL_SOURCES adds the raw readers,
+# triage and the cross-app recency feed, so a detail the digests leave out is
+# still reachable on the same route. Every name here is a registered tool
+# (tests/test_router_source_subsets.py).
+_CORE_SOURCES = ["get_upcoming", "search_reminders", "summarize_messages",
+                 "summarize_emails", "search_notes"]
+_ALL_SOURCES = [*_CORE_SOURCES, "view_emails", "view_messages", "triage_inbox",
+                "get_recent_activity"]
 # Inbound "did I get/hear from <someone>" queries that name no channel ("email"/
 # "text") explicitly — "did I get anything from NSU", "did the professor email
 # me", "hear back from the recruiter". They're read intents, but without a
@@ -4626,6 +4630,10 @@ def _domain_subset(t: str, pre_claims: list[_Claim] | None = None) -> RouteDecis
                   and not _MESSAGE_NONSMS_RE.search(t))
                  or SEND_MESSAGE_RE.search(t))):
         subset += ["view_messages", "summarize_messages"]; domains.append("messages")
+        if not writing:
+            # Files people sent and the user's own past chats are message-side
+            # reads too; without them here they were reachable only unscoped.
+            subset += ["read_message_attachments", "search_conversations"]
         # "the Chase message" is one specific item on an unnamed channel (a
         # bank writes email, a friend texts). Reading both is harmless; reading
         # only Messages left the email unreachable.
@@ -4642,7 +4650,7 @@ def _domain_subset(t: str, pre_claims: list[_Claim] | None = None) -> RouteDecis
         # inbox by priority"), so those tools were registered, aliased, and
         # still unreachable without this.
         subset += ["view_emails", "summarize_emails", "scan_subscriptions",
-                  "triage_inbox"]
+                  "triage_inbox", "read_email_attachments"]
         domains.append("email")
     # Same subtraction idiom as the messages branch above: strip the phrases
     # where "note" is the thing being SENT (see _OUTBOUND_NOTE) before asking
@@ -4661,7 +4669,13 @@ def _domain_subset(t: str, pre_claims: list[_Claim] | None = None) -> RouteDecis
         # left the model to eyeball gaps out of a list of appointments — which
         # is arithmetic it should not be doing (see conversions.calculate).
         # One extra schema on calendar reads is a cheap price for that.
-        subset += ["get_upcoming", "find_free_time"]; domains.append("calendar")
+        # search_reminders too on a read: get_upcoming is future-only, so an
+        # overdue reminder asked about beside the calendar had no reader here.
+        # A write ("make a reminder, not a calendar event") keeps its own menu.
+        # A negated mention ("not a calendar event") reads nothing at all.
+        subset += ["get_upcoming", "find_free_time"] + (
+            [] if writing or _calendar_is_excluded(t) else ["search_reminders"])
+        domains.append("calendar")
         # Offer the past-events tool ALONGSIDE get_upcoming rather than instead
         # of it: "what did I have yesterday and what's next" is one question
         # spanning both directions, and the agent prompt already tells the
@@ -4711,11 +4725,11 @@ def _domain_subset(t: str, pre_claims: list[_Claim] | None = None) -> RouteDecis
         # to "what should I do today" in one read.
         subset += [*_ALL_SOURCES, "daily_brief", "get_my_day_plan"]
         domains.append("todo" if _TODO_RE.search(t) else "planning")
-        multi = True   # see RouteDecision.multi_round — all four sources are required
-        # …and once all four HAVE answered, the requirement is met and the
+        multi = True   # see RouteDecision.multi_round — all core sources are required
+        # …and once the core sources HAVE answered, the requirement is met and the
         # remaining work is pure synthesis. See RouteDecision.narration_after:
         # measured 2,415 chars of reasoning / 14.85s on exactly this step.
-        after |= set(_ALL_SOURCES)
+        after |= set(_CORE_SOURCES)
     # A send that names no CHANNEL: "send this to mom tonight", "forward it to
     # my boss". There's a clear write intent and a recipient but no "email"/
     # "text" noun for the domain matchers above to catch, so the subset came
@@ -4773,11 +4787,9 @@ def _domain_subset(t: str, pre_claims: list[_Claim] | None = None) -> RouteDecis
     # the message, where nothing so far added a fact-lookup tool because
     # "date" isn't a domain noun any rule above recognizes. See
     # _TOPIC_LOOKUP_RE's comment for the two live failures this closes.
-    # get_upcoming is biased calendar-first deliberately — every observed
-    # case so far was date/schedule-shaped, and this user's own prompt rules
-    # already say to weight Notes lightest — so it's the one tool worth
-    # FORCING (below) rather than just offering; search_notes only rides
-    # along as an available fallback if get_upcoming comes back empty.
+    # get_upcoming is forced first because this payload is date-shaped
+    # (_CALENDAR_PAYLOAD_RE); search_notes rides along so a date the user
+    # wrote down is still found when the calendar has none.
     needs_calendar_topic_lookup = (
         writing and _COMPOSE_RE.search(t) and _CALENDAR_PAYLOAD_RE.search(t)
         and not (_suppressed & {"calendar", "notes"}))
@@ -4855,11 +4867,15 @@ def _domain_subset(t: str, pre_claims: list[_Claim] | None = None) -> RouteDecis
     if ("calendar" in domains and set(domains) <= {"calendar", "past", "notes"}
             and not claims and not writing and not _NOTE_WRITE_RE.search(t)
             and re.search(r"\breminders?\b", t, re.I)
-            and not re.search(r"\b(?:calendar|events?|meetings?)\b", t, re.I)
             and not _AVAILABILITY_RE.search(t) and not _JOIN_CALL_RE.search(t)):
         # Includes overdue active reminders; even the generic past-calendar
-        # branch cannot substitute for this reminder-only source.
+        # branch cannot substitute for this reminder-only source. A prompt that
+        # also names the calendar ("my reminders and calendar today") reads
+        # both instead of losing the reminder read.
         sources = _notes_reminder_read_sources(t) or ["search_reminders"]
+        if (re.search(r"\b(?:calendar|events?|meetings?)\b", t, re.I)
+                and "get_upcoming" not in sources):
+            sources = [*sources, "get_upcoming"]
         d = _mk_scoped(sources, "Notes/Reminders source lookup -> " + ", ".join(sources),
                        force=sources[0], multi=len(sources) > 1)
         if len(sources) > 1:
@@ -5573,7 +5589,7 @@ def rule_route(text: str, *, web_request: _WebRequest | None = None) -> RouteDec
                            "people-in-my-life query -> read-only contacts",
                            light=False))
     if _RECENT_RE.search(t) and not _TODO_RE.search(t) and not _PLANNING_RE.search(t):
-        _pre.append(_Claim("recency", ["get_recent_activity", *_ALL_SOURCES],
+        _pre.append(_Claim("recency", list(dict.fromkeys(["get_recent_activity", *_ALL_SOURCES])),
                            "recency sweep -> get_recent_activity",
                            force="get_recent_activity"))
     # Device control contributes only when it is NOT the whole request: on its
@@ -5619,7 +5635,7 @@ def rule_route(text: str, *, web_request: _WebRequest | None = None) -> RouteDec
     # than the model reaching for a single source and calling that "what's new";
     # the other read tools ride along so it can drill down afterwards.
     if _RECENT_RE.search(t) and not _TODO_RE.search(t) and not _PLANNING_RE.search(t):
-        return _mk_scoped(["get_recent_activity", *_ALL_SOURCES],
+        return _mk_scoped(list(dict.fromkeys(["get_recent_activity", *_ALL_SOURCES])),
                           "recency sweep -> get_recent_activity",
                           force="get_recent_activity")
 
@@ -7831,13 +7847,13 @@ def _priority_read(text: str) -> RouteDecision | None:
     decision.forbidden_tools |= policy_forbidden
     decision.strict_read_limits = {"collect_task_evidence": 1}
     if attention:
-        decision.resolved_request = (text + "\n\nRead the selected current communication sources once. "
+        decision.resolved_request = (text + "\n\nRead the selected current sources once (mail, messages, notes, reminders). "
             "Identify actual requests, unresolved decisions, deadlines and account/security alerts using exact source quotes/IDs. "
             "Unread state and a human-looking sender name do not establish importance. "
             "Promotions, newsletter invitations and list footers are not personal obligations. "
             "Keep outgoing promises and other people's responsibilities distinct. "
             "Cover every selected source or explicitly state its unavailable/omitted coverage; "
-            "an empty Messages result says nothing about Mail. Use reference_time as today's captured clock, "
+            "an empty Messages result says nothing about Mail, Notes or Reminders. Use reference_time as today's captured clock, "
             "not task_window or cache publication time. State absolute source dates; qualify relative deadlines "
             "without an authenticated original timestamp. Never invent urgency or claim an action was performed.")
         return decision
@@ -8568,25 +8584,49 @@ _SKILL_ADDED_UNSAFE_RE = re.compile(
     r"send_|draft|delete|cancel_event|add_calendar_event|forward_email|reply", re.I)
 
 
+def _forced_write(name: str | None) -> bool:
+    """A route forced to open with a write ("remember that …" -> remember):
+    the request's words are the write's content, so a skill they happen to
+    trigger is not being asked for. Forced READS still get skill tools."""
+    if not name:
+        return False
+    from service.router.model_led import READ_CATEGORIES
+    from service.tools.registry import REGISTRY
+    tool = REGISTRY.get(name)
+    return tool is None or tool.category not in READ_CATEGORIES
+
+
 def _add_matched_skill_tools(decision: RouteDecision, text: str) -> None:
     """A skill whose trigger fires brings its tools into a scoped menu: skill
     triggers used to feed only the prompt, so 'turn it down' reached the model
     with 13 retrieved tools and none of mac-controls'. A trigger never adds an
-    outbound, draft, delete or calendar-write tool the route did not offer."""
-    if (not decision.tool_subset or decision.force_first_tool or not decision.needs_tools
-            or decision.direct_calls or decision.required_tool_groups):
+    outbound, draft, delete or calendar-write tool the route did not offer.
+
+    A forced first READ or required groups do not stop it: the extra tools
+    are optional and come after the forced step, so the route's own contract
+    is unchanged (a forced write does, see _forced_write). It still adds nothing to a route with no menu, to one the
+    router executes itself (direct calls), or to an owned execution contract
+    (argument bindings), whose tool set is the whole plan."""
+    if (not decision.tool_subset or decision.direct_calls
+            or decision.tool_argument_bindings or _forced_write(decision.force_first_tool)):
         return
     try:
         from service import skills
         from service.tools.registry import is_tool_routable
+        from service.utterance_shape import mask_quoted
         extra: list[str] = []
+        # Quoted words are content ('remember that the title is "turn it
+        # down"'), never a request for the skill they happen to trigger.
+        asked = mask_quoted(text or "")
         # Matched directly (not via turn_skill_names): the main turn loop owns
         # that call and withholds it from literal-envelope turns.
         for skill in skills.all_skills().values():
-            if skill.error or not skill.enabled or not skill.tools or not skill.matches(text):
+            if skill.error or not skill.enabled or not skill.tools or not skill.matches(asked):
                 continue
             for tool in skill.tools:
-                tool_name = tool.get("name")
+                # Registered lowercased (skills/tools.py), so look it up that way:
+                # a skill that wrote "Mac_Media" still brings mac_media.
+                tool_name = str(tool.get("name") or "").strip().lower()
                 if (tool_name and is_tool_routable(tool_name)
                         and not _SKILL_ADDED_UNSAFE_RE.search(tool_name)
                         and tool_name not in decision.forbidden_tools

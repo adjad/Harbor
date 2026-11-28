@@ -384,7 +384,7 @@ FAMILIES = {
     "mail": "Email search, summaries, drafts, replies and delivery",
     "messages_contacts": "Messages, conversation history, drafts and contacts",
     "notes": "Search and edit Notes",
-    "memory": "Harbor memory and previous conversations",
+    "memory": "Harbor memory, saved knowledge and previous conversations",
     "files": "Find, read, organize and convert files and documents",
     "public_web": "Public web search, weather, stocks, travel and reference",
     "apps_media": "Applications, windows, media and speech",
@@ -403,7 +403,8 @@ _MODULE_FAMILIES = {
     "email_tools": "mail", "email_extras": "mail",
     "imessage_tools": "messages_contacts", "contacts_tools": "messages_contacts",
     "notes_tools": "notes", "notes_write": "notes",
-    "memory_tools": "memory", "files_tools": "files", "doc_tools": "files",
+    "memory_tools": "memory", "knowledge_tools": "memory",
+    "files_tools": "files", "doc_tools": "files",
     "web_tools": "public_web", "web_extras": "public_web",
     "maps_travel": "public_web", "reference_tools": "public_web",
     "apps": "apps_media", "window_tools": "apps_media",
@@ -475,7 +476,7 @@ def family_for(tool: ToolSpec) -> str:
         return "harbor_activity"
     if tool.name in {"run_shell", "run_applescript"}:
         return "automation"
-    if tool.name in {"remember", "recall", "forget", "clear_memory", "search_memory"}:
+    if tool.name in {"remember", "recall", "forget"}:
         return "memory"
     if tool.module.rsplit(".", 1)[-1] == "action_tools":
         return ("mail" if "email" in tool.name or tool.name == "schedule_send"

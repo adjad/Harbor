@@ -291,3 +291,94 @@ def test_context_block_without_catalog_keeps_matched_bodies(tmp_path, monkeypatc
 
     assert skills.skills_context_block("nothing matches", "", False) == ""
     assert "Other body." in skills.skills_context_block("nothing matches", "other", False)
+
+
+# ---------------------------------------------------------------- prompt content
+
+def _built(*tools: str) -> str:
+    import service.tools  # noqa: F401  (registers every tool)
+    loop._BLOCKS_CACHE = None
+    return loop.build_system(set(tools))
+
+
+def test_notes_are_searched_and_weighted_like_every_other_source():
+    for text in (loop.SYSTEM, _built("search_notes", "get_upcoming", "summarize_emails",
+                                     "summarize_messages")):
+        assert "LAST PLACE TO LOOK" not in text
+        assert "keeps very little in Notes" not in text
+        assert "weight it lightest" not in text
+        assert "final fallback" not in text
+    assert "search notes together with the other sources" in loop.SYSTEM
+
+
+def test_sends_and_drafts_do_not_require_a_contact_lookup_first():
+    text = _built("send_message", "send_email", "draft_email", "lookup_contact")
+    assert "FIRST tool call you make" not in text
+    assert "before you draft anything" not in text
+    assert "resolve saved contact names themselves" in text
+    from service.tools.short_descriptions import SHORT
+    assert "use before sending" not in SHORT["lookup_contact"]
+
+
+def test_file_tidying_points_to_organize_files_with_a_preview():
+    for offered in (("organize_files",), ("move_path",)):
+        text = _built(*offered)
+        assert "call `organize_files`" in text, offered
+        assert "preview" in text and "confirm=true" in text
+        assert "once per file" not in text
+        assert "Do not move a batch with repeated move_path calls" in text
+
+
+def test_rules_delta_names_only_blocks_the_new_tools_add():
+    import service.tools  # noqa: F401
+    loop._BLOCKS_CACHE = None
+    base = loop.build_system({"get_upcoming"})
+    delta = loop.system_rules_delta({"get_upcoming"}, {"get_upcoming", "search_notes"})
+    assert "`search_notes`" in delta and delta not in base
+    assert loop.system_rules_delta({"search_notes"}, {"search_notes"}) == ""
+
+
+def test_rule_blocks_rebuild_when_a_tool_registers_later(monkeypatch):
+    import service.tools  # noqa: F401
+    from service.tools import registry
+    loop._BLOCKS_CACHE = None
+    name = "search_notes"
+    real = registry.REGISTRY
+    without = {k: v for k, v in real.items() if k != name}
+    # Unregistered, the notes block names no tool and rides on every prompt;
+    # once registered it rides only when search_notes is offered.
+    monkeypatch.setattr(registry, "REGISTRY", without)
+    assert "`search_notes` with a keyword" in loop.build_system(set())
+    monkeypatch.setattr(registry, "REGISTRY", real)   # registered after the first build
+    assert "`search_notes` with a keyword" not in loop.build_system(set())
+    assert "`search_notes` with a keyword" in loop.build_system({name})
+
+
+def test_explicit_skill_name_is_a_word_not_an_address(monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr(skills, "_skills", {"humanizer": SimpleNamespace(
+        name="humanizer", enabled=True, error="")})
+    assert loop.explicit_skill_named("rewrite this @humanizer please")
+    assert loop.explicit_skill_named("$Humanizer, tidy this")
+    assert not loop.explicit_skill_named("email user@humanizer.com")
+    assert not loop.explicit_skill_named("humanizer is a word")
+
+
+def test_ask_direct_turn_keeps_an_explicitly_named_skill(monkeypatch):
+    monkeypatch.setattr(loop, "explicit_skill_named", lambda text: "@idea-refine" in text)
+    monkeypatch.setattr(skills, "skills_context_block",
+                        lambda text, active, catalog: "\nSKILL BODY" if "@idea-refine" in text else "")
+    seen = []
+
+    class Client(ScriptedClient):
+        pass
+    for prompt in ("@idea-refine help me name my bakery", "help me name my bakery"):
+        client = Client()
+
+        async def emit(event):
+            pass
+        asyncio.run(loop.run_agent(
+            client, "Ling-3.0-tiny-oQ4e", [{"role": "user", "content": prompt}],
+            emit, Approver(), debug=False, max_steps=1, tools=[], ask_quality=True, ask_direct=True))
+        seen.append(_stable_system(client))
+    assert "SKILL BODY" in seen[0] and "SKILL BODY" not in seen[1]

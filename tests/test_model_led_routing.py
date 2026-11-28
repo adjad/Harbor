@@ -48,6 +48,18 @@ class DiscoveryTests(unittest.TestCase):
             "name": "view_messages", "description": fake.description, "parameters": fake.parameters}})
         self.assertEqual(subject.family_for(specs[0]), "messages_contacts")
 
+    def test_saved_knowledge_tools_have_a_real_family(self):
+        # "other" is the unknown-tool bucket; knowledge records are Harbor's
+        # own saved snippets and belong with memory.
+        for name in ("read_knowledge", "save_knowledge", "edit_knowledge", "delete_knowledge"):
+            self.assertEqual(subject.family_for(tool(name, "knowledge_tools")), "memory")
+
+    def test_family_table_names_no_retired_memory_tools(self):
+        import inspect
+        source = inspect.getsource(subject.family_for)
+        self.assertNotIn("search_memory", source)
+        self.assertNotIn("clear_memory", source)
+
     def test_all_admitted_tools_visible_once_in_semantic_families(self):
         tools = (tool(), tool("summarize_emails", "email_tools"),
                  tool("custom_future", "unknown_future"),

@@ -216,3 +216,49 @@ def test_a_tool_without_a_terse_line_is_handed_out_as_a_copy(monkeypatch, terse)
     out["required"].append("__probe__")
     assert registered.parameters == {"type": "object", "properties": {"name": {"type": "string"}},
                                      "required": ["name"]}
+
+
+# The agent prompt answers "how far back can you check my X" from the tool
+# descriptions themselves (loop.SYSTEM). Terse mode must keep that reach.
+_REACH = {"view_emails": "50", "summarize_emails": "2 years", "search_notes": "500",
+          "view_messages": "1 year", "get_past_events": "a year",
+          "search_browser_history": "30 days"}
+
+
+def test_reach_limits_survive_terse_mode(monkeypatch):
+    from service.agent.loop import SYSTEM
+    assert "they state their own coverage" in SYSTEM
+    monkeypatch.setenv(FLAG, "1")
+    for name, phrase in _REACH.items():
+        [schema] = tool_schemas([name])
+        assert phrase in schema["function"]["description"], name
+
+
+def test_search_coverage_states_the_real_notes_limit():
+    from service.tools.search_coverage import search_coverage
+    text = search_coverage("notes")
+    assert "500" in text and "~100" not in text
+
+
+@pytest.mark.parametrize("tool, params", [
+    ("update_event", {"when_iso", "current_when_iso"}),
+    ("cancel_event", {"when_iso"}),
+    ("complete_reminder", {"expected_id"}),
+    ("clear_reminders", {"scope", "expected_ids"}),
+    ("daily_brief", {"location", "period", "query"}),
+    ("view_emails", {"period", "strict_match", "mailbox"}),
+    ("view_messages", {"period", "conversation"}),
+])
+def test_guard_and_format_parameters_keep_their_prose(monkeypatch, tool, params):
+    monkeypatch.setenv(FLAG, "1")
+    [schema] = tool_schemas([tool])
+    props = schema["function"]["parameters"]["properties"]
+    for name in params:
+        assert props[name].get("description") == REGISTRY[tool].parameters["properties"][name]["description"]
+
+
+def test_toggle_setting_line_names_no_admin_only_setting():
+    # bluetooth, low_power and firewall need an admin password and are not
+    # in the advertised enum; the terse line must not offer them either.
+    line = SHORT["toggle_setting"].casefold()
+    assert not any(word in line for word in ("bluetooth", "low_power", "low power", "firewall"))

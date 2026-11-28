@@ -142,3 +142,31 @@ def test_compose_scope_follows_the_name_not_the_frontmatter(tmp_path: Path) -> N
     assert copy_skill.compose is True
     assert "OLD BODY" in skills.compose_style_block()
     assert "OLD BODY" not in skills.always_skills_block()
+
+
+def _model_led_system(prompt: str) -> str:
+    client = ScriptedClient()
+    # A window wide enough that the fit keeps every stub.
+    client.managed, client.context_window, client.target = True, 32000, client
+
+    async def emit(event):
+        pass
+    asyncio.run(loop.run_agent(
+        client, "Ling-3.0-tiny-oQ4e", [{"role": "user", "content": prompt}],
+        emit, Approver(), debug=False, max_steps=1, tools=[],
+        model_led_discovery=True, model_led_preload=["get_upcoming"]))
+    offered = {t["function"]["name"]: t["function"] for t in client.requests[0].get("tools") or []}
+    # send_email is on the table by name only (a stub), not as a full schema.
+    assert "send_email" in offered and "description" not in offered["send_email"]
+    return "\n".join(m["content"] for m in client.requests[0]["messages"]
+                     if m.get("role") == "system")
+
+
+def test_a_send_offered_as_a_stub_still_gets_the_style_on_a_send_request() -> None:
+    _switch(True)
+    assert STYLE in _model_led_system("Email Sam asking about lunch")
+
+
+def test_a_stubbed_send_does_not_bring_the_style_to_a_plain_question() -> None:
+    _switch(True)
+    assert STYLE not in _model_led_system("What is on today?")

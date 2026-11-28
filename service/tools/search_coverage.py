@@ -55,9 +55,10 @@ _COVERAGE = {
         "Calendar and reminders: up to about 1 year back, or however long "
         "Harbor has been syncing on this Mac if that's less."
     ),
-    # Cite: notes_tools, ~100-note cache, no time bound.
+    # Cite: NotesDBReader.swift noteLimit / NotesReader.swift `lim` (500),
+    # notes_tools.raw_notes_snapshot limit=500; no time bound.
     "notes": (
-        "Notes: the ~100 most recently-edited notes, not bounded by time — an "
+        "Notes: the 500 most recently-edited notes, not bounded by time — an "
         "old note you haven't touched won't show up, one from years ago you "
         "edited yesterday will."
     ),

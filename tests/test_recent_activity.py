@@ -194,10 +194,25 @@ def test_no_model_call_and_fast() -> None:
 
 
 def test_notes_is_quota_limited() -> None:
-    print("\nnotes can never flood the feed (weakest source for this user)")
-    check("notes quota is small and smaller than the message cap",
-          RT._NOTES_QUOTA <= 3 and RT._NOTES_QUOTA < RT._CAP_MESSAGES,
-          f"notes={RT._NOTES_QUOTA} msgs={RT._CAP_MESSAGES}")
+    print("\nnotes are quota'd like mail, not penalized")
+    check("notes quota is bounded and as large as the mail cap",
+          RT._CAP_EMAIL <= RT._NOTES_QUOTA <= RT._CAP_MESSAGES,
+          f"notes={RT._NOTES_QUOTA} mail={RT._CAP_EMAIL} msgs={RT._CAP_MESSAGES}")
+    # A full feed (every source at its cap) is cut by recency, not by which
+    # source _collect happened to read last: a note edited a minute ago must
+    # survive a limit that older messages and mail overflow.
+    seed(msgs=[(NOW - 3600 - 60 * i, f"Person {i}", "hello") for i in range(8)],
+         emails=[(NOW - 7200 - 60 * i, "U", f"Sender {i}", "News") for i in range(8)],
+         notes=[{"ts": NOW - 60 - i, "title": f"Fresh note {i}", "body": "x", "folder": ""}
+                for i in range(4)])
+    out = render(limit=6)
+    check("the newest note edits outrank older messages under the limit",
+          out.count("NOTES") == 4 and "Fresh note 0" in out, out[:400])
+    seed(notes=[{"ts": NOW - 60 * i, "title": f"Edit {i}", "body": "", "folder": ""}
+                for i in range(1, 11)])
+    out = render()
+    check("more than three recent note edits are listed",
+          out.count("NOTES") == RT._NOTES_QUOTA, out[:400])
 
 
 def test_recency_questions_route_to_it() -> None:
