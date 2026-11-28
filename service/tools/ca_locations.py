@@ -51,7 +51,8 @@ _ALIASES = {
 }
 _US = {"us", "usa", "united states", "united states of america"}
 _CA_SUFFIX = re.compile(
-    r"^(?P<city>.+?)(?:\s*,\s*|\s+)(?:c\.?a\.?|calif\.?|california\.?)"
+    r"^(?P<city>.+?)(?P<sep>\s*,\s*|\s+)(?:c\.?a\.?|calif\.?|california\.?)"
+    r"(?P<zip>\s+\d{5}(?:-\d{4})?)?"
     r"(?:\s*,\s*(?:us|usa|united states(?: of america)?))?$", re.I)
 _AMBIGUOUS = {"san", "santa", "santa c", "sc", "la", "sd", "sj", "california", "ca"}
 # Full names whose California city is the overwhelmingly dominant match, so a
@@ -91,6 +92,10 @@ def normalize_weather_location(place: str) -> WeatherLocation:
     """
     normalized = _key(place)
     match = _CA_SUFFIX.fullmatch(place.strip())
+    # A ZIP is accepted after "City, CA"; "City CA 90001" without the comma
+    # stays ambiguous.
+    if match and match["zip"] and "," not in match["sep"]:
+        match = None
     if match:
         city_text = re.sub(r"\s+", " ", match["city"]).strip()
         city_key = _key(city_text)
@@ -108,6 +113,14 @@ def normalize_weather_location(place: str) -> WeatherLocation:
     if "," not in place and (normalized in _CITIES or normalized in _ALIASES
                              or normalized in _AMBIGUOUS):
         raise ValueError("ambiguous city; ask the user for the city and state/country")
+    # A place that is itself named California ("California, Maryland") has the
+    # word only in its first part and a different state/country after it.
+    parts = [_key(part) for part in place.split(",") if part.strip()]
+    if (len(parts) >= 2 and re.search(r"\bcalifornia\b", parts[0])
+            and parts[1] not in _US
+            and not re.fullmatch(r"(?:ca|calif|california)(?:\s+\d{5}(?:-\d{4})?)?", parts[1])
+            and not any(re.search(r"\b(?:ca|calif|california)\b", part) for part in parts[1:])):
+        return WeatherLocation(place)
     if re.search(r"\b(?:ca|calif|california)\b", normalized):
         raise ValueError("ambiguous California location; ask for city, state and country")
     return WeatherLocation(place)

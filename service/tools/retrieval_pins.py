@@ -12,8 +12,8 @@ from __future__ import annotations
 
 PINS = {
     'get_upcoming': (
-        "Read the user's upcoming schedule — calendar events, meetings, Canvas "
-        "assignment/exam due dates, and reminders — from Harbor's local commitment store. "
+        "Read the user's upcoming schedule — calendar events, meetings, "
+        "and reminders — from Harbor's local commitment store. "
         "ALWAYS use this for questions about the calendar, schedule, deadlines, what's due, "
         "or what's coming up. Pass `account` if the user asks about a SPECIFIC linked "
         "calendar account and more than one is linked. Do NOT script Calendar.app."
@@ -104,7 +104,7 @@ PINS = {
         "price) — if the user named a specific span, check that header against what you're "
         "about to say before you describe a price as being from a particular time ago; never "
         "relabel the span the result actually covers as the one the user asked for. For "
-        "CRYPTO prices, use web_fetch's documented CoinGecko form instead — this tool is "
+        "CRYPTO prices, use web_search instead — this tool is "
         "equities/ETFs only."
     ),
     'web_search': (

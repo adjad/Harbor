@@ -1413,8 +1413,12 @@ class RoutingContractTests(unittest.IsolatedAsyncioTestCase):
         report = harbor_capabilities("email scheduling")
         self.assertIn("Yes — Schedule a new email or text for later", report)
         self.assertIn("No — schedule a reply inside an existing email thread", report)
-        self.assertIn("Yes — Move calendar events to a new time (confirmation required)", report)
         self.assertNotIn("settings under API keys", report)
+
+    def test_capability_report_answers_the_question_asked(self):
+        report = harbor_capabilities("can you move calendar events")
+        self.assertIn("Yes — Move calendar events to a new time (confirmation required)", report)
+        self.assertNotIn("Send email", report)
 
     async def test_compound_reminder_lookup_requires_both_actual_sources(self):
         prompt = "find my overdue dentist reminder and search my notes for dentist"

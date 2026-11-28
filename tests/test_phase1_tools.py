@@ -154,9 +154,11 @@ def test_world_time() -> None:
     # implementations go wrong.
     out = world_time("kolkata")
     check("half-hour zones are handled", "Kolkata" in out, out)
-    # Abbreviations resolve to the zone's real city name, not "Sf".
+    # Abbreviations expand to the city the user meant, not "Sf" or the zone's city.
     out = world_time("sf", "sydney")
-    check("'sf' labels as Los Angeles", "Los Angeles" in out, out)
+    check("'sf' labels as San Francisco", "San Francisco" in out, out)
+    check("an asked-for city is not swapped for the zone city",
+          "Boston" in world_time("Boston") and "New York" not in world_time("Boston"))
     check("comparison names both places", "Sydney" in out, out)
 
 
