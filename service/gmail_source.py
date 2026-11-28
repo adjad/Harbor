@@ -1110,6 +1110,7 @@ def parse_metadata(message: dict) -> dict:
             "name": _clean(name), "address": _clean(address),
             "sender_address": _sender_address(raw_from),
             "to": _clean(_decode(_header(payload, "To"))),
+            "cc": _clean(_decode(_header(payload, "Cc"))),
             "subject": _clean(_decode(_header(payload, "Subject"))),
             "message_id": _clean(_header(payload, "Message-ID")),
             "in_reply_to": _clean(_header(payload, "In-Reply-To")),
@@ -1207,6 +1208,15 @@ def _b64(data: str, charset: str = "") -> str:
         return raw.decode("utf-8", "replace")
 
 
+def _is_attached_file(part: dict) -> bool:
+    """A part sent as a file: Content-Disposition attachment, or a filename on it."""
+    if str(part.get("filename") or "").strip():
+        return True
+    disposition = _header(part, "Content-Disposition").strip().lower()
+    return disposition.startswith("attachment") or bool(
+        re.search(r"(?:^|;)\s*filename\*?\s*=", disposition))
+
+
 def extract_body(payload: dict) -> str:
     plain: list[str] = []
     markup: list[str] = []
@@ -1214,6 +1224,10 @@ def extract_body(payload: dict) -> str:
     def walk(part: dict) -> None:
         mime = part.get("mimeType", "")
         data = (part.get("body") or {}).get("data")
+        # A text file attached to the mail (notes.txt, a log) is a file, not the message:
+        # it is listed on the "[Attached: ...]" line and read by read_email_attachments.
+        if data and mime in ("text/plain", "text/html") and _is_attached_file(part):
+            data = None
         if data and mime == "text/plain":
             plain.append(_b64(data, _charset(part)))
         elif data and mime == "text/html":
@@ -1313,8 +1327,10 @@ def raw_record(message: dict, account: str) -> str:
                           if _worth_listing(a)])
     if line:
         body = f"{line}\n{body}".strip()
+    # Cc last (field 10), the same record MailReader.swift's raw scan writes: mail that
+    # copies the user is addressed to them too, and a search finds a copied person.
     return _FS.join([str(int(meta["ts"])), "U" if meta["unread"] else "R", account, account,
-                     sender, meta["to"], meta["subject"], meta["message_id"], body])
+                     sender, meta["to"], meta["subject"], meta["message_id"], body, meta.get("cc", "")])
 
 
 # --- attachments (read-only) ---------------------------------------------------
@@ -1370,6 +1386,67 @@ async def search_attachments(account: str, terms: list[str], start: float | None
     found = [m for m in (_attachment_message(account.lower(), message)
                          for message in messages if message is not None) if m]
     return sorted(found, key=lambda m: m["ts"], reverse=True)
+
+
+# A search reaches past the synced Inbox bodies: each connected account's whole mailbox
+# (All Mail: archived, labelled and Skip Inbox mail too), never Spam, Trash or Drafts,
+# and never the user's own sent-only mail. At most SEARCH_LIMIT messages per account,
+# newest first, each fetched once in full; read-only like every other call here.
+SEARCH_LIMIT = 10
+SEARCH_TIMEOUT_S = 8.0
+
+
+async def search_all_mail(terms: list[str], *, start: float | None = None, end: float | None = None,
+                          limit: int = SEARCH_LIMIT, accounts: set[str] | None = None) -> list[dict]:
+    """Mail matching every term in each connected account's All Mail, newest first:
+    [{account, record, in_inbox}], `record` in raw_record's format (body and Cc
+    included). An account that can't be read (offline, sign-in expired) is skipped:
+    this widens a search, it never stands in for the synced Inbox."""
+    words = [w for w in (_search_word(t) for t in terms or []) if w][:8]
+    if not words:
+        return []
+    query = list(words)
+    if start and math.isfinite(start) and start > 0:
+        query.append(f"after:{int(start)}")
+    if end and math.isfinite(end) and end > 0:
+        query.append(f"before:{int(end)}")
+    limit = max(1, min(int(limit), 25))
+    wanted = {a.casefold() for a in accounts} if accounts else None
+    found: list[dict] = []
+    for account, cfg in connected_accounts().items():
+        if cfg.get("auth_expired") or (wanted is not None and account.casefold() not in wanted):
+            continue
+        try:
+            with bound_account(account):
+                async with httpx.AsyncClient(timeout=SEARCH_TIMEOUT_S) as http:
+                    listing = await _get(http, "messages", [("q", " ".join(query)), ("maxResults", str(limit)),
+                                                            ("includeSpamTrash", "false")])
+                    ids = [str(item["id"]) for item in listing.get("messages", []) if item.get("id")][:limit]
+                    gate = asyncio.Semaphore(FETCH_CONCURRENCY)
+
+                    async def one(message_id: str) -> dict | None:
+                        async with gate:
+                            try:
+                                return await _get(http, f"messages/{message_id}", [("format", "full")])
+                            except GmailMessageGone:
+                                return None
+
+                    messages = await asyncio.gather(*(one(i) for i in ids))
+                    if not _still_connected():
+                        continue
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — one unreadable account never fails the search
+            continue
+        for message in messages:
+            if message is None:
+                continue
+            labels = set(message.get("labelIds") or [])
+            if labels & _HIDDEN_LABELS or ("SENT" in labels and "INBOX" not in labels):
+                continue
+            found.append({"account": account.lower(), "record": raw_record(message, account.lower()),
+                          "in_inbox": "INBOX" in labels})
+    return found
 
 
 async def find_by_rfc_id(account: str, rfc_id: str) -> dict | None:

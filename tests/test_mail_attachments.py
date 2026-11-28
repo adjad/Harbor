@@ -680,13 +680,13 @@ def _message(attachments=True, labels=()):
 
 def test_raw_record_lists_attachments_first():
     record = gmail_source.raw_record(_message(), "me@gmail.com")
-    body = record.split(gmail_source._FS)[-1]
+    body = record.split(gmail_source._FS)[8]     # field 9; Cc is field 10
     assert body.startswith("[Attached: report.pdf (2 KB), note.txt (5 B)]\nHello body")   # tiny inline logo left out
 
 
 def test_raw_record_unchanged_without_attachments():
     record = gmail_source.raw_record(_message(attachments=False), "me@gmail.com")
-    assert record.split(gmail_source._FS)[-1] == "Hello body"
+    assert record.split(gmail_source._FS)[8] == "Hello body"
     assert "[Attached" not in record
 
 

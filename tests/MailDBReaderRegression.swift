@@ -135,16 +135,26 @@ enum MailDBReaderRegression {
             "VALUES (\(base) - 200, 0, 2, 1, 1, 'bad')")
         let malformedLines = reader.readHeadersAndHistory()!.headers.split(separator: "\n")
             .map { String($0).components(separatedBy: "\u{01}") }
-        precondition(malformedLines.filter { $0[0] == "H2" }.count == 199,
-                     "Malformed header must be omitted from display rows")
-        precondition(malformedLines.contains { $0[0] == "C2" && $0[3] == "200" && $0[4] == "1" && $0[5] == "1" },
-                     "Native attempted/skipped/cap marker must survive one malformed header")
+        // A subject folded over two lines is still the user's mail: its line break becomes a
+        // space, the row is kept, and nothing is reported skipped.
+        precondition(malformedLines.filter { $0[0] == "H2" }.count == 200 &&
+                     malformedLines.allSatisfy { $0.count == ($0[0] == "H2" ? 10 : 6) },
+                     "A subject with a line break keeps its row and forges no record")
+        precondition(malformedLines.contains { $0[0] == "H2" && $0[8] == "Bad subject" && $0[7] == "bad" },
+                     "The line break in a subject becomes a space")
+        precondition(malformedLines.contains { $0[0] == "C2" && $0[3] == "200" && $0[4] == "0" && $0[5] == "1" },
+                     "Native attempted/skipped/cap marker counts no skipped header")
         let historyFields = reader.readHeadersAndHistory()!.history.split(separator: "\n")
             .map { String($0).components(separatedBy: "\u{01}") }
-        precondition(historyFields.filter { $0[0] == "H2" }.count == 199 &&
+        precondition(historyFields.filter { $0[0] == "H2" }.count == 200 &&
                      historyFields.contains { $0[0] == "C2" && $0[2] == "fixture-account" &&
-                         $0[3] == "200" && $0[4] == "1" && $0[5] == "0" },
-                     "History must report its skipped header without inventing a history cap")
+                         $0[3] == "200" && $0[4] == "0" && $0[5] == "0" },
+                     "History keeps the folded-subject header without inventing a history cap")
+        precondition(MailDBReader.safeText("Re: a\u{01}b\r\nc\rd") == "Re: a b c d"
+                     && MailDBReader.safeText("Plain") == "Plain",
+                     "safeText turns every record separator into one space")
+        precondition(MailDBReader.safeIdentifier("<a@x>") == "<a@x>" && MailDBReader.safeIdentifier("<a@x>\n") == "",
+                     "An identifier holding a separator is left out, never rewritten")
         sql("BEGIN EXCLUSIVE")
         precondition(reader.readHeadersAndHistory() == nil, "A locked read is failure, not empty-ready")
         sql("ROLLBACK")

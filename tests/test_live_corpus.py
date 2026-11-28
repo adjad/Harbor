@@ -562,7 +562,7 @@ def test_corpus_mail_literal_identifiers_and_bounded_absence(corpus_mail_reader,
         result = asyncio.run(email.view_emails_impl(query=target, strict_match=True))
     assert ("FIXTUREMATCH" in result) is expected
     if not expected:
-        assert "No emails matching" in result and "recent inbox Harbor searched" in result
+        assert "No emails matching" in result and "mail Harbor searched" in result
 
 
 @pytest.mark.parametrize("strict", [False, True])

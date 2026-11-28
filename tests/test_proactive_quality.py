@@ -815,3 +815,49 @@ def test_a_never_answered_text_keeps_its_own_sentence(store):
     assert "after your last reply" not in card["body"] and "after your last reply" not in card["why"]
     assert card["sources"][0]["quote"] == "u free fri? need a hand w the move"
 
+
+
+# --- app audit 2.2: what reaches the user's cards ----------------------------------------------------
+
+
+def test_a_bodied_gmail_copy_beats_a_header_only_mail_app_copy():
+    body = "Can you send the signed lease by Friday?"
+    rows = [mail("<lease@x>", "Sam Lee", "sam@example.com", "Lease", "", 5, account=LINKED),
+            mail("<lease@x>", "Sam Lee", "sam@example.com", "Lease", body, 5, account="Google")]
+    deduped = sources.dedupe_copies(rows, {LINKED})
+    assert len(deduped) == 1 and deduped[0]["body"] == body
+
+
+def _items(rows):
+    return sources.mail_items(rows, mine={ME, LINKED}, now=NOW, tz=TZ, linked={LINKED}, own=ME)
+
+
+def test_a_job_offer_letter_is_not_dropped_as_marketing():
+    row = mail("<job@x>", "Acme Recruiting", "recruiting@acme.example", "Your job offer from Acme",
+               "Congratulations! Please sign by Friday.", 3)
+    items = _items([row])
+    assert len(items) == 1 and items[0]["recall"] == "notice" and items[0]["person"] is False
+
+
+def test_a_registrar_deadline_is_recalled_but_a_government_newsletter_is_not():
+    deadline = mail("<reg@x>", "Office of the Registrar", "registrar@nsu.example",
+                    "Action required: confirm your enrollment", "Confirm by Oct 30.", 3)
+    newsletter = mail("<gov@x>", "City News", "news@city.example.gov", "City newsletter: October",
+                      "Parks and events this month.", 3)
+    items = _items([deadline, newsletter])
+    assert len(items) == 1 and items[0]["ref"]["message_id"] == "<reg@x>"
+    assert items[0]["person"] is False and items[0]["recall"] == "notice"
+
+
+def test_a_last_first_sender_is_a_person():
+    row = mail("<p@x>", "Lee, Sam", "sam.lee@example.com", "Question", "Could you look at my draft?", 3)
+    items = _items([row])
+    assert len(items) == 1 and items[0]["person"] is True
+
+
+def test_a_bank_alert_from_a_bulk_mail_host_is_still_critical():
+    from service.tools.email_tools import critical_account_mail
+    alert = {"sender": "Bank Alerts", "sender_address": "alerts@email.bank.example",
+             "subject": "New sign-in to your account", "message_id": "<a@x>"}
+    promo = {**alert, "subject": "Security tips for the holidays"}
+    assert critical_account_mail(alert) and not critical_account_mail(promo)

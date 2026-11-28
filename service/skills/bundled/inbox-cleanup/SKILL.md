@@ -22,8 +22,8 @@ metadata:
       steps:
         - {tool: scan_subscriptions, args: {limit: 15}}
         - {tool: triage_inbox, args: {count: 60}}
-        - {tool: view_emails, args: {unread: false, count: 20}}
-        - {tool: email_triage, args: {action: archive}, confirm: group}
+        - {tool: view_emails, args: {query: "<sender name>", count: 5}}
+        - {tool: email_triage, args: {message_id: "<Message-ID from view_emails>", action: archive}, confirm: group}
 ---
 
 # Inbox clean-up
@@ -37,16 +37,20 @@ never archive, flag or mark anything without the person's yes for that group.
 2. Call `triage_inbox` to rank recent senders; its low-priority senders are the
    candidates for old notifications.
 3. Call `view_emails` (with a `query` of the sender name) only when you need a
-   Message-ID for a message you plan to propose. Never open or quote a message
-   body in the proposal.
+   Message-ID for a message you plan to propose. It returns each message's text
+   along with its Message-ID: read only the Message-ID, and never quote or
+   summarize a message's text in the proposal.
 
 ## 2. Propose groups (nothing changes yet)
 
 Group the candidates into at most five groups, for example "Newsletters",
 "Shipping and order notifications", "Social notifications", "Old promotions".
 For each group show: the group name, the senders in it, how many messages, and
-what archiving does ("moves them out of the inbox into Archive; not a delete,
-they stay searchable").
+what archiving does ("moves them out of the inbox into Archive; not a delete.
+They stay in Mail, and Harbor still finds them when you search for a word from
+them: the full text for a linked Gmail account, the sender and subject for
+Apple Mail"). Don't promise more than that: without a search, Harbor's inbox
+views no longer show archived mail.
 
 - Archive is the only change this skill makes. It never deletes.
 - Unsubscribing is not something Harbor can do for the person. If they want out of
@@ -65,7 +69,8 @@ or "always" approval, and do not offer one.
 ## 4. Archive the approved group only
 
 For each message in the approved group call `email_triage` with
-`action: "archive"` and its Message-ID. Harbor's own confirmation card appears
+`message_id` set to that message's Message-ID (from `view_emails`) and
+`action: "archive"`. Never call it without a `message_id`. Harbor's own confirmation card appears
 for these calls unless the person has given Harbor full access; do not try to
 avoid it and never batch groups together. Your own question in step 3 is what
 the person approved, so ask it even when no card follows. If a

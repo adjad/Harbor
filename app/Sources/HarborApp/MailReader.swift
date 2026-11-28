@@ -100,14 +100,11 @@ final class MailReader {
 
     // Full RAW content (`content of m`) is the SLOW AppleScript call — it
     // decodes the whole message body — so its scan is deliberately much
-    // shallower than the header one. Budgeted across accounts rather than
-    // applied per-account so linking a second account doesn't silently double
-    // every 15-min sync: one account still gets the same 50 it always did, and
-    // beyond that each account gets an equal share with a floor of 20 (enough
-    // that a newly linked account is actually usable for verbatim lookups).
+    // shallower than the header one. Per account, not shared: a shared 50 left
+    // each of three accounts only 20 bodies, so a busy account pushed a quieter
+    // one's last week of text out of every search. Each account keeps its own 50.
     private func rawLimit(accountCount n: Int) -> Int {
-        guard n > 1 else { return 50 }
-        return max(20, 50 / n)
+        50
     }
 
     // MARK: - AppleScript fragments
@@ -135,6 +132,38 @@ final class MailReader {
         set month of refDate to 1
         set day of refDate to 1
         set time of refDate to 0
+    """
+
+    // Field cleaners, defined outside `tell application "Mail"` and called as `my ...`.
+    // A subject folded over two lines or a body that happens to hold a control
+    // character is still the user's mail: the record separators in it become spaces
+    // instead of costing the message (or, for the raw scan, the whole account).
+    // harborLine: one-line display text (header fields) — SOH, STX, LF and CR become spaces.
+    // harborText: raw-record text, which keeps its line breaks — only SOH and STX go.
+    // harborID: an identifier (address, Message-ID) is never rewritten: "" when unsafe.
+    static let fieldCleaners = """
+    on harborReplace(t, marks)
+        set t to t as text
+        set oldDelims to AppleScript's text item delimiters
+        set AppleScript's text item delimiters to marks
+        set parts to text items of t
+        set AppleScript's text item delimiters to " "
+        set t to parts as text
+        set AppleScript's text item delimiters to oldDelims
+        return t
+    end harborReplace
+    on harborLine(t)
+        return harborReplace(t, {(ASCII character 1), (ASCII character 2), (ASCII character 10), (ASCII character 13)})
+    end harborLine
+    on harborText(t)
+        return harborReplace(t, {(ASCII character 1), (ASCII character 2)})
+    end harborText
+    on harborID(t)
+        set t to t as text
+        if (t contains (ASCII character 1)) or (t contains (ASCII character 2)) or (t contains (ASCII character 10)) or (t contains (ASCII character 13)) then return ""
+        return t
+    end harborID
+
     """
 
     // Resolve the message list to scan. `account == nil` means the legacy
@@ -189,7 +218,7 @@ final class MailReader {
     // Recent header scan for one account (or the unified inbox when nil).
     private func headerScript(account: AccountTarget?, limit: Int) -> String {
         let capName = esc(account?.label ?? "Mail")
-        return """
+        return Self.fieldCleaners + """
         tell application "Mail"
         \(refDateSetup)
             set FS to ASCII character 1
@@ -233,8 +262,12 @@ final class MailReader {
                     try
                         set nativeID to "mail:" & ((id of m) as text)
                     end try
-                    set subj to (subject of m) as text
-                    set headerFields to {acctName, acctID, senderName, senderAddress, msgID, subj, nativeID}
+                    set subj to my harborLine((subject of m) as text)
+                    set senderName to my harborLine(senderName)
+                    set senderAddress to my harborID(senderAddress)
+                    set msgID to my harborID(msgID)
+                    set nativeID to my harborID(nativeID)
+                    set headerFields to {acctName, acctID}
                     repeat with fieldValue in headerFields
                         set fieldText to contents of fieldValue
                         if (fieldText contains FS) or (fieldText contains linefeed) or (fieldText contains return) then error "Unsafe Mail header separator"
@@ -274,7 +307,7 @@ final class MailReader {
     // tick reads a day or so of mail instead of two years (see HistoryMerge).
     private func historyBatchScript(account: AccountTarget?, start: Int, count: Int,
                                     cutoff: Double? = nil) -> String {
-        """
+        Self.fieldCleaners + """
         tell application "Mail"
         \(refDateSetup)
             set FS to ASCII character 1
@@ -330,8 +363,12 @@ final class MailReader {
                     try
                         set nativeID to "mail:" & ((id of m) as text)
                     end try
-                    set subj to (subject of m) as text
-                    set headerFields to {acctName, acctID, senderName, senderAddress, msgID, subj, nativeID}
+                    set subj to my harborLine((subject of m) as text)
+                    set senderName to my harborLine(senderName)
+                    set senderAddress to my harborID(senderAddress)
+                    set msgID to my harborID(msgID)
+                    set nativeID to my harborID(nativeID)
+                    set headerFields to {acctName, acctID}
                     repeat with fieldValue in headerFields
                         set fieldText to contents of fieldValue
                         if (fieldText contains FS) or (fieldText contains linefeed) or (fieldText contains return) then error "Unsafe Mail header separator"
@@ -365,12 +402,13 @@ final class MailReader {
     // record boundaries the header format gets away with because subjects
     // don't.
     private func rawScript(account: AccountTarget?, limit: Int) -> String {
-        """
+        Self.fieldCleaners + """
         tell application "Mail"
         \(refDateSetup)
             set FS to ASCII character 1
             set RS to ASCII character 2
             set output to ""
+            set skippedCount to 0
         \(inboxSource(account))
             set n to count of theMessages
             set lim to \(limit)
@@ -425,19 +463,22 @@ final class MailReader {
                     considering case
                         if "\(esc(account?.id ?? ""))" is not "" and acctID is not "\(esc(account?.id ?? ""))" then error "Message account identity changed."
                     end considering
-                    set rowFields to {epochSecs as text, readFlag as text, acctName as text, acctID, (sender of m) as text, toLine as text, (subject of m) as text, msgId as text, (content of m) as text, ccLine as text}
+                    -- A separator inside the text (a body that happens to hold SOH or
+                    -- STX) becomes a space; the account fields are never rewritten.
+                    set rowFields to {epochSecs as text, readFlag as text, acctName as text, acctID, my harborText((sender of m) as text), my harborText(toLine as text), my harborText((subject of m) as text), my harborID(msgId as text), my harborText((content of m) as text), my harborText(ccLine as text)}
                     repeat with fieldValue in rowFields
                         set fieldText to contents of fieldValue
                         if (fieldText contains FS) or (fieldText contains RS) then error "Mail raw field contains a reserved record separator." number -2700
                     end repeat
                     set output to output & (item 1 of rowFields) & FS & (item 2 of rowFields) & FS & (item 3 of rowFields) & FS & (item 4 of rowFields) & FS & (item 5 of rowFields) & FS & (item 6 of rowFields) & FS & (item 7 of rowFields) & FS & (item 8 of rowFields) & FS & (item 9 of rowFields) & FS & (item 10 of rowFields) & RS
-                on error problem number code
-                    -- A skipped record is not a complete reference search.
-                    -- Report this account as failed rather than silently
-                    -- claiming uniqueness among the rows we could read.
-                    error problem number code
+                on error
+                    -- One unreadable message costs only itself. It is counted, and
+                    -- syncRaw reports the scan as not decode-complete, so nothing
+                    -- claims uniqueness among the rows that were read.
+                    set skippedCount to skippedCount + 1
                 end try
             end repeat
+            if skippedCount > 0 then return "SKIP" & FS & skippedCount & RS & output
             return output
         end tell
         """
@@ -1461,6 +1502,7 @@ final class MailReader {
                 var succeeded: [String] = []
                 var failed: [String] = []
                 var failures: [[String: Any]] = []
+                var skippedMessages = 0
                 for target in targets {
                     // Re-checked per account — same relaunch race as sync()'s loop.
                     guard self.isMailRunning() else {
@@ -1479,7 +1521,20 @@ final class MailReader {
                         failures.append(["stage": "body_scan", "code": code])
                         continue
                     }
-                    chunks.append(text)
+                    // The scan's first record, "SKIP<FS><n>", says how many messages it
+                    // could not read; the rest is the account's records.
+                    var records = text
+                    var skipped = 0
+                    if text.hasPrefix("SKIP\u{01}") {
+                        let head = text.prefix { $0 != "\u{02}" }
+                        skipped = max(1, Int(head.dropFirst(5)) ?? 1)
+                        records = String(text.dropFirst(head.count).drop { $0 == "\u{02}" })
+                    }
+                    if skipped > 0 {
+                        skippedMessages += skipped
+                        failures.append(["stage": "body_record_skipped", "code": 0])
+                    }
+                    chunks.append(records)
                     succeeded.append(target.id)
                 }
                 self.post(raw: self.mergeRawChunks(chunks), coverage: [
@@ -1488,7 +1543,10 @@ final class MailReader {
                     "successful_account_ids": succeeded, "failed_account_ids": failed,
                     "accounts": succeeded.compactMap { inventory[$0] },
                     "failed_accounts": failed.compactMap { inventory[$0] },
-                    "complete": !names.isEmpty && failed.isEmpty,
+                    "complete": !names.isEmpty && failed.isEmpty && skippedMessages == 0,
+                    // Rows from an account with a skipped message stay readable, but the
+                    // scan is not decode-complete, so no reference is resolved from it.
+                    "decode_complete": skippedMessages == 0,
                     "failure_diagnostics": failures,
                 ])
             }

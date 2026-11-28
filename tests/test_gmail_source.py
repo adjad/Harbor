@@ -99,6 +99,33 @@ class GmailSource(unittest.TestCase):
         E.cache_raw_emails("",{"accounts":["Native"],"failed_accounts":[],"complete":True})
         self.assertIsNone(E.prepare_publication_witness(snapshot))
 
+    def test_mail_closing_keeps_the_last_good_bodies(self):
+        # app audit 2.1.3: MailReader posts raw "" with "Mail unavailable" when Mail is closed.
+        raw = "\x01".join([str(time.time()), "U", "Native", "native-id", "Sender <s@example.test>",
+                           "me@example.test", "Pickup time", "<pickup@x>", "Pickup is at 4:30 pm.", ""])
+        E.set_email_availability(True)
+        E.cache_raw_emails(raw, {"accounts": ["Native"], "failed_accounts": [], "complete": True})
+        E.cache_raw_emails("", {"accounts": [], "failed_accounts": ["Mail unavailable"], "complete": False,
+                                "failure_diagnostics": [{"stage": "mail_closed", "code": 0}]})
+        self.assertEqual([r["body"] for r in E._parse_raw()], ["Pickup is at 4:30 pm."])
+        self.assertIsNone(E.raw_email_snapshot())       # display bytes kept, never complete evidence
+
+    def test_a_skipped_message_keeps_the_accounts_other_bodies_but_not_completeness(self):
+        # app audit 2.1.3: one unreadable message no longer fails the whole account.
+        raw = "\x01".join([str(time.time()), "U", "Native", "native-id", "Sender <s@example.test>",
+                           "me@example.test", "Kept", "<kept@x>", "Still readable.", ""]) + "\x02"
+        E.set_email_availability(True)
+        E.cache_raw_emails(raw, {"version": 2, "account_inventory": [{"id": "native-id", "label": "Native"}],
+                                 "successful_account_ids": ["native-id"], "failed_account_ids": [],
+                                 "accounts": ["Native"], "failed_accounts": [], "complete": False,
+                                 "decode_complete": False,
+                                 "failure_diagnostics": [{"stage": "body_record_skipped", "code": 0}]})
+        self.assertEqual([r["subject"] for r in E._parse_raw()], ["Kept"])
+        diagnostics = {}
+        self.assertIsNone(E.raw_email_snapshot(diagnostics=diagnostics))
+        self.assertIn("decode_incomplete", diagnostics["reason_codes"])
+        self.assertIn(("body_record_skipped", 0), E._raw_mail_snapshot.scan_failures)
+
     def test_native_mail_memory_witness_does_not_renew_original_receipt(self):
         raw = "\x01".join([str(time.time()),"U","Native","native-id","Sender","me@example.test",
                               "Subject","<synthetic>","A complete synthetic native body."])
@@ -3757,6 +3784,112 @@ class MergedAccountState(unittest.TestCase):
         self.assertEqual(G.workspace_note(self.WORKSPACE_OK), {"message": "", "detail": ""})
         preparing = {**self.WORKSPACE_OK, "running": False, "prepare": {"state": "preparing"}}
         self.assertEqual(G.workspace_note(preparing)["message"], "")
+
+
+
+# --- app audit 2.1.1 / 2.1.4: attached text files, Cc, and the All Mail search ------------
+
+def _b64(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode()
+
+
+def test_extract_body_skips_text_files_attached_to_the_mail():
+    mixed = {"mimeType": "multipart/mixed", "parts": [
+        {"mimeType": "text/plain", "body": {"data": _b64(b"See the notes attached.")}, "headers": []},
+        {"mimeType": "text/plain", "filename": "notes.txt", "body": {"data": _b64(b"SECRET LOG LINES")},
+         "headers": [{"name": "Content-Disposition", "value": 'attachment; filename="notes.txt"'}]},
+        {"mimeType": "text/plain", "body": {"data": _b64(b"UNNAMED ATTACHMENT")},
+         "headers": [{"name": "Content-Disposition", "value": "attachment"}]}]}
+    assert G.extract_body(mixed) == "See the notes attached."
+    only_file = {"mimeType": "multipart/mixed", "parts": [
+        {"mimeType": "text/html", "body": {"data": _b64(b"<p>Body in HTML</p>")}, "headers": []},
+        {"mimeType": "text/plain", "filename": "log.txt", "body": {"data": _b64(b"FILE TEXT")}, "headers": []}]}
+    assert G.extract_body(only_file) == "Body in HTML"       # the file never stands in for the body
+
+
+def test_raw_record_keeps_cc_as_the_tenth_field():
+    message = msg("c1")
+    message["payload"]["headers"].append({"name": "Cc", "value": "Robin <robin@example.test>"})
+    record = G.raw_record(message, ME)
+    fields = record.split("\x01")
+    assert len(fields) == 10 and fields[9] == "Robin <robin@example.test>"
+    parsed = E._parse_raw_text(record)
+    assert parsed and parsed[0]["cc"] == "Robin <robin@example.test>" and parsed[0]["body"] == "Synthetic body"
+
+
+def test_search_all_mail_reads_archived_mail_but_never_spam_trash_drafts_or_sent(monkeypatch):
+    from contextlib import contextmanager
+    seen = []
+    archived = msg("a1", "Kayak receipt")
+    archived["labelIds"] = ["CATEGORY_UPDATES"]
+    messages = {"messages/a1": archived, "messages/i1": msg("i1", "Kayak trip"),
+                "messages/s1": {**msg("s1"), "labelIds": ["SPAM"]},
+                "messages/t1": {**msg("t1"), "labelIds": ["TRASH"]},
+                "messages/d1": {**msg("d1"), "labelIds": ["DRAFT"]},
+                "messages/o1": {**msg("o1"), "labelIds": ["SENT"]}}
+
+    @contextmanager
+    def bound(account):
+        yield
+
+    async def get(http, path, params=None):
+        seen.append((path, params))
+        if path == "messages":
+            return {"messages": [{"id": key.split("/")[1]} for key in messages]}
+        return messages[path]
+
+    class Http:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    monkeypatch.setattr(G, "connected_accounts", lambda cfg=None: {ME: {}, "gone@gmail.com": {"auth_expired": True}})
+    monkeypatch.setattr(G, "bound_account", bound)
+    monkeypatch.setattr(G, "_get", get)
+    monkeypatch.setattr(G, "_still_connected", lambda: True)
+    monkeypatch.setattr(G.httpx, "AsyncClient", Http)
+    found = asyncio.run(G.search_all_mail(["kayak", "two words"], start=1000.0, limit=99))
+    listing = dict(seen[0][1])
+    assert listing["q"] == 'kayak "two words" after:1000' and listing["includeSpamTrash"] == "false"
+    assert "labelIds" not in listing and listing["maxResults"] == "25"     # All Mail, not the Inbox label
+    assert [(f["record"].split("\x01")[6], f["in_inbox"]) for f in found] == [
+        ("Kayak receipt", False), ("Kayak trip", True)]
+    assert asyncio.run(G.search_all_mail(["", "  "])) == []
+
+
+
+def test_bridge_archive_search_asks_with_bounded_terms_and_keeps_only_clean_rows(monkeypatch):
+    from service.mail_memory import bridge
+    sent = {}
+
+    async def ask(kind, timeout, **fields):
+        sent.update(kind=kind, **fields)
+        return {"ok": True, "capped": True, "rows": [
+            {"ts": 10.0, "account": "A", "mailbox": "Archive", "subject": "Lease", "sender": "l@x.example",
+             "sender_name": "Leasing", "rfc_message_id": "<l@x>"},
+            {"ts": "bad"}, {"ts": 0}, "junk"]}
+
+    monkeypatch.setattr(bridge, "_ask", ask)
+    rows, capped = asyncio.run(bridge.read_archive(["lease", "", "a", "b", "c", "d", "e"], since=5, limit=999))
+    assert sent["kind"] == "archive_search" and sent["terms"] == ["lease", "a", "b", "c", "d"]
+    assert sent["limit"] == bridge.ARCHIVE_LIMIT_MAX and sent["since"] == 5.0 and sent["until"] == 0.0
+    assert capped is True and [r["subject"] for r in rows] == ["Lease"] and rows[0]["mailbox"] == "Archive"
+    assert asyncio.run(bridge.read_archive(["", " "])) == ([], False)
+
+    async def refuse(kind, timeout, **fields):
+        return {"ok": False, "error": "no_mail_index"}
+    monkeypatch.setattr(bridge, "_ask", refuse)
+    try:
+        asyncio.run(bridge.read_archive(["x"]))
+    except bridge.BridgeError as e:
+        assert str(e) == "no_mail_index"
+    else:
+        raise AssertionError("a refused archive read raises")
 
 
 if __name__ == "__main__":

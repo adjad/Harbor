@@ -91,3 +91,60 @@ async def test_my_address_among_several_recipients_is_caught(world):
 def test_the_guard_judges_only_what_it_is_given():
     # No identity: nothing is the user's own address.
     assert action_tools._own_address_guard("Mom", "send_message") is None
+
+
+# --- tools audit 3.2: forward, schedule and cc are guarded too; one de-garbled text ----------------
+
+FORWARD, SCHEDULE = registry.REGISTRY["forward_email"], registry.REGISTRY["schedule_send"]
+
+
+def test_a_forward_to_my_own_address_gets_no_card(world):
+    _, problem = action_tools.prepare_send_recipient(FORWARD, {"message_id": "<m@x>", "to": "Mom"})
+    assert problem is not None and ME in problem
+    args, problem = action_tools.prepare_send_recipient(FORWARD, {"message_id": "<m@x>", "to": "Friend",
+                                                                  "note": "See below\\nthanks"})
+    assert problem is None and args["to"] == FRIEND and args["note"] == "See below\nthanks"
+
+
+async def test_the_forward_tool_itself_refuses_my_own_address(world):
+    refused = await action_tools.forward_email("<m@x>", ME)
+    assert ME in refused and world == []
+
+
+def test_cc_to_my_own_address_is_caught_before_the_card(world):
+    _, problem = action_tools.prepare_send_recipient(EMAIL, {"to": FRIEND, "cc": ME, "subject": "s", "body": "b"})
+    assert problem is not None and ME in problem
+
+
+async def test_the_email_tool_refuses_cc_to_my_own_address(world):
+    refused = await action_tools.send_email(FRIEND, "s", "b", cc="Mom")
+    assert ME in refused and world == []
+
+
+def test_schedule_send_settles_time_and_recipient_before_the_card(world):
+    past, problem = action_tools.prepare_send_recipient(
+        SCHEDULE, {"channel": "email", "to": "Friend", "when": "2020-01-01T09:00:00-08:00", "body": "Hi"})
+    assert problem is not None and "past" in problem
+    _, problem = action_tools.prepare_send_recipient(
+        SCHEDULE, {"channel": "email", "to": "Mom", "when": "2099-01-01T09:00:00-08:00", "body": "Hi"})
+    assert problem is not None and ME in problem
+    args, problem = action_tools.prepare_send_recipient(
+        SCHEDULE, {"channel": "email", "to": "Friend", "when": "2099-01-01T09:00:00-08:00", "body": "Line one\\nLine two"})
+    assert problem is None and args["to"] == FRIEND and args["body"] == "Line one\nLine two"
+    _, problem = action_tools.prepare_send_recipient(
+        SCHEDULE, {"channel": "email", "to": "Nobody Known", "when": "2099-01-01T09:00:00-08:00", "body": "Hi"})
+    assert problem is not None                                  # unresolvable: asked before any card
+
+
+def test_the_card_shows_and_the_send_carries_the_same_degarbled_text(world):
+    args, problem = action_tools.prepare_send_recipient(
+        EMAIL, {"to": FRIEND, "subject": "It\\'s on", "body": "Hi\\nSee you at 5"})
+    assert problem is None and args["body"] == "Hi\nSee you at 5" and args["subject"] == "It's on"
+    preview = action_tools.confirm_preview("send_email", args)
+    assert "Hi\nSee you at 5" in preview and "\\n" not in preview
+    text_args, _ = action_tools.prepare_send_recipient(TEXT, {"to": "Friend", "text": "On my way\\nsoon"})
+    assert text_args["text"] == "On my way\nsoon"
+    assert "\\n" not in action_tools.confirm_preview("send_message", text_args)
+    assert "\\n" not in action_tools.confirm_preview("forward_email", {"message_id": "<m@x>", "to": FRIEND,
+                                                                       "note": "a\\nb"})
+    assert "\\n" not in action_tools.confirm_preview("reply_to_email", {"message_id": "<m@x>", "body": "a\\nb"})

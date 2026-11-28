@@ -1,7 +1,9 @@
 """Ask the app for Mail data, one request at a time (MailMemoryReader.swift answers).
 
 Mail memory asks for `index` and `body`; Ask's sent-mail read (view_emails
-mailbox='sent') asks for `sent`: the user's own sent mail, headers only.
+mailbox='sent') asks for `sent`: the user's own sent mail, headers only. A mail
+search (view_emails with a query) asks for `archive_search`: headers of mail
+outside the Inbox and Sent, matching the search words.
 
 The backend can't read Mail's files: Full Disk Access belongs to the app. So a
 request is a non-durable `mail_memory_read` hub event carrying a random,
@@ -144,6 +146,47 @@ async def read_sent(days: int, timeout: float = 8.0) -> tuple[list[dict], bool]:
     if reply.get("ok") is not True:
         raise BridgeError(str(reply.get("error") or "sent_failed")[:40])
     return _sent_rows(reply), reply.get("capped") is True
+
+
+# --- archive search (MailMemoryReader kind `archive_search`) ------------------------
+
+ARCHIVE_TERMS_MAX = 5
+ARCHIVE_LIMIT_MAX = 50
+
+
+def _archive_rows(reply: dict) -> list[dict]:
+    out = []
+    for r in reply.get("rows") or []:
+        if not isinstance(r, dict):
+            continue
+        try:
+            ts = float(r["ts"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not math.isfinite(ts) or ts <= 0:
+            continue
+        out.append({"ts": ts, "account": str(r.get("account") or "")[:80],
+                    "mailbox": str(r.get("mailbox") or "")[:80],
+                    "subject": str(r.get("subject") or "")[:300], "sender": str(r.get("sender") or "")[:200],
+                    "sender_name": str(r.get("sender_name") or "")[:200],
+                    "rfc_message_id": str(r.get("rfc_message_id") or "")[:300]})
+    return out
+
+
+async def read_archive(terms: list[str], since: float = 0.0, until: float = 0.0, limit: int = 20,
+                       timeout: float = 6.0) -> tuple[list[dict], bool]:
+    """Apple Mail's mail OUTSIDE the Inbox and Sent (Archive and other folders, Gmail's
+    All Mail without an Inbox label; never Trash, Junk or Drafts), headers only, newest
+    first, every term matching the subject, sender address or sender name; and whether
+    the app capped the list. Raises BridgeError."""
+    cleaned = [str(t).strip()[:80] for t in terms or [] if str(t).strip()][:ARCHIVE_TERMS_MAX]
+    if not cleaned:
+        return [], False
+    reply = await _ask("archive_search", timeout, terms=cleaned, since=float(since or 0),
+                       until=float(until or 0), limit=max(1, min(int(limit), ARCHIVE_LIMIT_MAX)))
+    if reply.get("ok") is not True:
+        raise BridgeError(str(reply.get("error") or "archive_failed")[:40])
+    return _archive_rows(reply), reply.get("capped") is True
 
 
 # --- attachments (MailMemoryReader kinds `attachments` and `attachment`) -----------

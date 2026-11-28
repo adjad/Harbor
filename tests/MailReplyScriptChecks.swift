@@ -282,9 +282,18 @@ enum MailReplyScriptChecks {
                 .replacingOccurrences(of: "\\(count)", with: "2")
                 .replacingOccurrences(of: "\\(limit)", with: "2")
         }
-        let raw = scanTemplate("private func rawScript")
-        let header = scanTemplate("private func headerScript")
-        let history = scanTemplate("private func historyBatchScript")
+        // Every scan script is prefixed with the field cleaners it calls (`my harborLine`...).
+        let cleaners = template(after: "static let fieldCleaners")
+        let raw = cleaners + scanTemplate("private func rawScript")
+        let header = cleaners + scanTemplate("private func headerScript")
+        let history = cleaners + scanTemplate("private func historyBatchScript")
+        require(cleaners.contains("on harborLine(t)") && cleaners.contains("on harborText(t)")
+                && cleaners.contains("on harborID(t)"), "The field cleaners must be defined")
+        require(raw.contains("my harborText((content of m) as text)") && raw.contains("set skippedCount to skippedCount + 1")
+                && raw.contains("\"SKIP\" & FS & skippedCount"),
+                "One unreadable message must cost only itself, and be counted")
+        require(header.contains("my harborLine((subject of m) as text)") && history.contains("my harborID(msgID)"),
+                "Header separators are escaped, not dropped")
         require(inbox.contains("every account whose id is") && inbox.contains("count of matches"),
                 "Native scans must select exactly one stable account ID")
         require(inbox.contains("enabled of scanAccount") && inbox.contains("name of scanAccount"),
