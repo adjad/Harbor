@@ -619,3 +619,28 @@ def test_v2_line_with_escaped_pipe_in_the_chat_name_keeps_the_body_whole(monkeyp
     assert (conversation, unread) == ("chat:4", True)
     assert context == "Team ¦ Ops"
     assert text.endswith("Standup moved | see thread")
+
+
+def test_judge_never_hides_an_ask_past_its_ranking_budget():
+    """More asks than the judge may rank: every one is still an item (a to-do), with the
+    model's reply and without it."""
+    import asyncio
+    from service.proactive import judge
+
+    def survivor(n):
+        item = dict(id=f"messages:q{n}", hash=f"h{n}", source="messages", account="", who=f"Pal {n}",
+                    title=f"Pal {n}", text=f"can you send the notes {n}?", lines=[f"can you send the notes {n}?"],
+                    received_ts=NOW - n * 60, replied=False, person=True, ref={"conversation": f"Pal {n}"})
+        return {"item": item, "result": {"summary": f"Pal {n} asked for notes.", "title": "Notes",
+                                         "asks_of_me": f"Send the notes {n}"}}
+    many = [survivor(n) for n in range(judge.MAX_ITEMS + 4)]
+
+    async def empty(*_):
+        return '{"summary": "", "items": []}'
+
+    async def broken(*_):
+        return "not json"
+    for reply in (empty, broken):
+        _, got, _ = asyncio.run(judge.judge(many, {"calendar": [], "reminders": []}, reply, lambda: False,
+                                            now=NOW, tz=TZ))
+        assert {i["primary"] for i in got} == {s["item"]["id"] for s in many}

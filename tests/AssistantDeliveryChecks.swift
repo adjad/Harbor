@@ -489,16 +489,23 @@ struct AssistantDeliveryChecks {
             precondition((try? Data(contentsOf: aside)) == data, "the damaged bytes are kept aside")
             scenarios += 1
         }
-        // A delete of an undated reminder carries expected_due_ts: null. Only delete may;
-        // complete/update still require a real due time, and 0 is never a stand-in for null.
+        // An update, completion or delete of an undated reminder carries expected_due_ts:
+        // null. 0 is never a stand-in for null, and the NEW due time of an update is never null.
         do {
             let undated: [String: Any] = ["type": "delete_reminder", "action_id": "reminder:u1",
                 "source_id": "ek-u", "expected_title": "Old idea", "expected_due_ts": NSNull()]
             precondition(AssistantDelivery.calendarPayload(undated, kind: "delete_reminder")?["expected_due_ts"] is NSNull)
             var complete = undated; complete["type"] = "complete_reminder"
-            precondition(AssistantDelivery.calendarPayload(complete, kind: "complete_reminder") == nil)
-            var zero = undated; zero["expected_due_ts"] = 0.0
-            precondition(AssistantDelivery.calendarPayload(zero, kind: "delete_reminder") == nil)
+            precondition(AssistantDelivery.calendarPayload(complete, kind: "complete_reminder")?["expected_due_ts"] is NSNull)
+            var update = undated; update["type"] = "update_reminder"
+            update["title"] = "Old idea"; update["due_ts"] = 2e9
+            precondition(AssistantDelivery.calendarPayload(update, kind: "update_reminder")?["expected_due_ts"] is NSNull)
+            var nullNew = update; nullNew["due_ts"] = NSNull()
+            precondition(AssistantDelivery.calendarPayload(nullNew, kind: "update_reminder") == nil)
+            for kind in ["delete_reminder", "complete_reminder"] {
+                var zero = undated; zero["type"] = kind; zero["expected_due_ts"] = 0.0
+                precondition(AssistantDelivery.calendarPayload(zero, kind: kind) == nil)
+            }
             scenarios += 1
         }
         // A Calendar move names the exact occurrence and the new start; a null length keeps

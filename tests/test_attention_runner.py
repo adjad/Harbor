@@ -243,6 +243,53 @@ async def test_the_daily_cap_stops_the_third_reminder(ledger):
     assert await run(recs, MON_9AM + 400, ledger, f, daily_cap=2) == []     # capped stays capped
 
 
+async def test_a_message_held_back_by_the_daily_cap_is_taken_up_the_next_day(ledger):
+    """Over the cap defers a plan, it does not drop it: still inside the lookback and still
+    ahead, it is created on a later day, through the same per-pass limit and that day's cap."""
+    f = Fakes()
+    recs = [rec("h", "Mom", "hi", MON_9AM - 3600, "outgoing"),
+            rec("a", "Mom", "Lunch today at 12pm", MON_9AM),
+            rec("b", "Mom", "Dinner tomorrow at 7pm", MON_9AM + 60),
+            rec("c", "Mom", "Movie tomorrow at 9pm", MON_9AM + 120)]
+    out = await drain(recs, MON_9AM + 300, ledger, f, daily_cap=1)
+    assert [o.state for o in out] == ["created", "capped", "capped"] and len(f.created) == 1
+    assert ledger.get("msg:b")["state"] == "capped"                       # still shown as held back
+    tue = MON_9AM + 86400
+    first = await run(recs, tue, ledger, f, daily_cap=1)
+    assert [(o.source_id, o.state) for o in first] == [("msg:b", "created")] and len(f.created) == 2
+    assert ledger.get("msg:b")["decided_at"] == tue                       # counts against Tuesday
+    assert await run(recs, tue + 600, ledger, f, daily_cap=1) == []        # Tuesday's cap is used up
+    assert ledger.get("msg:c")["state"] == "capped"
+    wed = tue + 86400
+    assert await run(recs, wed, ledger, f, daily_cap=1) == []              # its evening has passed
+    assert ledger.get("msg:c")["state"] == "capped" and len(f.created) == 2
+
+
+async def test_held_back_messages_still_go_one_per_pass(ledger):
+    f = Fakes()
+    recs = [rec("h", "Mom", "hi", MON_9AM - 3600, "outgoing"),
+            rec("a", "Mom", "Lunch today at 12pm", MON_9AM),
+            rec("b", "Mom", "Dinner tomorrow at 7pm", MON_9AM + 60),
+            rec("c", "Mom", "Movie tomorrow at 9pm", MON_9AM + 120)]
+    await drain(recs, MON_9AM + 300, ledger, f, daily_cap=1)
+    tue = MON_9AM + 86400
+    first = await run(recs, tue, ledger, f, daily_cap=5)
+    assert [o.state for o in first] == ["created"] and first.limited is True
+    second = await run(recs, tue, ledger, f, daily_cap=5)
+    assert [o.state for o in second] == ["created"] and len(f.created) == 3
+
+
+async def test_a_held_back_message_is_not_taken_up_in_shadow(ledger):
+    f = Fakes()
+    recs = [rec("h", "Mom", "hi", MON_9AM - 3600, "outgoing"),
+            rec("a", "Mom", "Lunch today at 12pm", MON_9AM),
+            rec("b", "Mom", "Dinner tomorrow at 7pm", MON_9AM + 60)]
+    await drain(recs, MON_9AM + 300, ledger, f, daily_cap=1)
+    assert ledger.get("msg:b")["state"] == "capped"
+    assert await run(recs, MON_9AM + 86400, ledger, f, daily_cap=1, mode="shadow") == []
+    assert ledger.get("msg:b")["state"] == "capped" and len(f.created) == 1
+
+
 async def test_a_reminder_the_user_just_added_is_noticed_before_writing(ledger):
     onfile = commit("Meet Mom", datetime(2026, 9, 21, 18, 0, tzinfo=ZONE).timestamp())
     f = Fakes(fresh=[onfile])                   # appears after the tick began: not in `commitments`

@@ -289,7 +289,7 @@ def projection(monkeypatch):
     time.tzset()
 
 
-def test_end_projection_uses_end_timestamp_and_retains_ongoing_without_changing_agenda(projection):
+def test_end_projection_uses_end_timestamp_and_retains_ongoing(projection):
     p = projection
     p.event(start=-3600, end=3600)
     p.event('class end celebration', start=7200, end=10800)
@@ -297,8 +297,21 @@ def test_end_projection_uses_end_timestamp_and_retains_ongoing_without_changing_
     assert 'Physics class' in result and 'class end celebration' not in result
     assert '- Physics class (Today · Wed, Jan 2, 1:00 AM) ends at **3:00 AM**' in result
     assert 'not a record of when anything actually ended' in result
-    assert 'Physics class' not in asyncio.run(p.A.get_upcoming(calendar_only=True, query='Physics class'))
+    # The default agenda keeps the class the user is in now, marked as under way.
+    agenda = asyncio.run(p.A.get_upcoming(calendar_only=True, query='Physics class'))
+    assert '1:00 AM (in progress)** — Physics class' in agenda
     p.readiness.assert_awaited_with(('calendar',))
+
+
+def test_default_agenda_keeps_an_event_in_progress_but_not_one_already_over(projection):
+    p = projection
+    p.event('Long workshop', start=-5400, end=1800)
+    p.event('Finished standup', start=-7200, end=-3600)
+    p.event('Lunch with team', start=7200, end=9000)
+    agenda = asyncio.run(p.A.get_upcoming(calendar_only=True))
+    assert 'Long workshop' in agenda and '(in progress)' in agenda
+    assert 'Lunch with team' in agenda
+    assert 'Finished standup' not in agenda
 
 
 def test_end_projection_missing_all_day_and_multiple_events_are_distinct(projection):
@@ -747,3 +760,12 @@ def test_literal_next_is_a_title_under_explicit_calendar_authority(
     assert record['executed']
     assert all(c['name'] == 'get_upcoming' and c['args']['query'] == 'next meeting'
                and c['args']['calendar_only'] is True for c in record['executed'])
+
+
+def test_covered_until_cuts_the_agenda_at_the_end_of_the_verified_read(projection):
+    p = projection
+    p.event('Covered meeting', start=3600, end=5400)
+    p.event('Beyond the read', start=3 * 86400, end=3 * 86400 + 1800)
+    agenda = asyncio.run(p.A.get_upcoming(calendar_only=True, days=7, _covered_until=p.now + 86400))
+    assert 'Covered meeting' in agenda and 'Beyond the read' not in agenda
+    assert 'Beyond the read' in asyncio.run(p.A.get_upcoming(calendar_only=True, days=7))

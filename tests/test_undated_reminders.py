@@ -124,8 +124,9 @@ def test_a_valid_snapshot_is_normalised():
 def test_total_above_the_list_marks_it_truncated_and_over_the_cap_is_cut():
     snap = parse_undated_snapshot([_item("a", "x")], 5)
     assert snap.truncated is True and snap.total == 5 and len(snap.rows) == 1
-    big = parse_undated_snapshot([_item(f"id{i}", f"r{i}") for i in range(300)], 300)
-    assert len(big.rows) == UNDATED_MAX and big.truncated is True and big.total == 300
+    over = UNDATED_MAX + 100
+    big = parse_undated_snapshot([_item(f"id{i}", f"r{i}") for i in range(over)], over)
+    assert len(big.rows) == UNDATED_MAX and big.truncated is True and big.total == over
 
 
 # --- store ----------------------------------------------------------------------
@@ -314,26 +315,33 @@ def test_r4_a_healthy_complete_list_has_no_caveat(store):
 
 
 def test_r4_a_truncated_list_is_reported_as_k_of_n_and_never_as_exhaustive(store):
-    items = [_item(f"id{i:03d}", f"Reminder {i:03d}") for i in range(UNDATED_MAX)]
-    assert _post(_body(items, total=250)).status_code == 200
+    total, rest = UNDATED_MAX + 50, 50
+    items = [_item(f"id{i:04d}", f"Reminder {i:04d}") for i in range(UNDATED_MAX)]
+    assert _post(_body(items, total=total)).status_code == 200
     view = store.undated_view()
-    assert (view["freshness"], view["status"], view["total"], view["stored"]) == ("current", "truncated", 250, 200)
+    assert (view["freshness"], view["status"], view["total"], view["stored"]) == (
+        "current", "truncated", total, UNDATED_MAX)
     listed = _search()
-    assert f"showing {UNDATED_MAX} of 250; the rest were not synced" in listed
+    assert f"showing {UNDATED_MAX} of {total}; the rest were not synced" in listed
     miss = _search("zzz-not-there")
-    assert "No match among the 200 of 250" in miss and "the other 50 were not checked" in miss
+    assert f"No match among the {UNDATED_MAX} of {total}" in miss and f"the other {rest} were not checked" in miss
     assert "among reminders with a due date" in miss, "never an unqualified 'no active match'"
     narrow = _search(scope="today")
-    assert "250 incomplete Apple reminders with no due date are not in this time window" in narrow
+    assert f"{total} incomplete Apple reminders with no due date are not in this time window" in narrow
     filtered = _search("Reminder 00", scope="today")
-    assert "of the 200 synced" in filtered and "of 250 in all" in filtered
+    assert f"of the {UNDATED_MAX} synced" in filtered and f"of {total} in all" in filtered
+
+
+def test_the_undated_cap_is_well_above_two_hundred():
+    assert UNDATED_MAX >= 1000, "a list of a few hundred undated reminders must arrive whole"
 
 
 def test_r4_the_backend_caps_an_oversized_list_and_calls_it_truncated(store):
-    items = [_item(f"id{i}", f"Reminder {i}") for i in range(300)]
-    assert _post(_body(items, total=300)).status_code == 200
+    over = UNDATED_MAX + 100
+    items = [_item(f"id{i}", f"Reminder {i}") for i in range(over)]
+    assert _post(_body(items, total=over)).status_code == 200
     view = store.undated_view()
-    assert (view["status"], view["total"], view["stored"]) == ("truncated", 300, UNDATED_MAX)
+    assert (view["status"], view["total"], view["stored"]) == ("truncated", over, UNDATED_MAX)
     assert len(store.undated_reminders()) == UNDATED_MAX
 
 
@@ -438,3 +446,63 @@ def test_long_ids_sharing_a_prefix_merge_instead_of_colliding(store):
                      raise_server_exceptions=False)
     assert response.status_code == 200 and _titles(store) == ["B"]
 
+
+
+# --- an undated reminder can be given a due time -----------------------------------------
+
+def _update(monkeypatch, sent, reply, **args):
+    from service.assistant import outbox
+    from service.assistant.hub import hub
+
+    async def request(kind, payload):
+        sent.append((kind, dict(payload)))
+        return reply(payload)
+
+    async def publish(_event):
+        return None
+    monkeypatch.setattr(outbox, "request", request)
+    monkeypatch.setattr(hub, "publish", publish)
+    return asyncio.run(assistant_tools.update_reminder(**args))
+
+
+def _verified(payload):
+    return {"ok": True, "status": "succeeded", "error": "", "source_id": payload["source_id"],
+            "title": payload["title"], "due_ts": float(int(payload["due_ts"] // 60) * 60)}
+
+
+def test_update_reminder_finds_an_undated_reminder_and_targets_it_as_undated(store, monkeypatch):
+    assert _post(_body([_item("u1", "Book the vet"), _item("u2", "Return the drill")])).status_code == 200
+    sent = []
+    when = time.strftime("%Y-%m-%dT%H:%M", time.localtime(time.time() + 2 * 86400))
+    result = _update(monkeypatch, sent, _verified, title="book the vet", when_iso=when)
+    assert result.startswith("Reminder updated: “Book the vet”"), result
+    kind, payload = sent[0]
+    assert kind == "update_reminder" and payload["source_id"] == "u1"
+    assert payload["expected_due_ts"] is None and payload["expected_title"] == "Book the vet"
+    assert "Nothing active matches" not in result
+
+
+def test_an_undated_update_needs_a_new_due_time(store, monkeypatch):
+    assert _post(_body([_item("u1", "Book the vet")])).status_code == 200
+    sent = []
+    result = _update(monkeypatch, sent, _verified, title="vet", day="tomorrow")
+    assert "no due time to keep" in result and sent == []
+
+
+def test_no_undated_target_from_a_list_that_is_not_current(store, monkeypatch):
+    assert _post(_body([_item("u1", "Book the vet")])).status_code == 200
+    assert _post(_body()).status_code == 200          # a later read without an undated list
+    assert store.undated_view()["freshness"] == "stale"
+    sent = []
+    when = time.strftime("%Y-%m-%dT%H:%M", time.localtime(time.time() + 86400))
+    result = _update(monkeypatch, sent, _verified, title="vet", when_iso=when)
+    assert "Nothing active matches" in result and sent == []
+
+
+def test_a_dated_and_an_undated_match_ask_which(store, monkeypatch):
+    assert _post(_body([_item("u1", "Call the plumber")],
+                       events=[_dated("d1", "Call the plumber again")])).status_code == 200
+    sent = []
+    when = time.strftime("%Y-%m-%dT%H:%M", time.localtime(time.time() + 86400))
+    result = _update(monkeypatch, sent, _verified, title="plumber", when_iso=when)
+    assert "Several reminders match" in result and "(no due date)" in result and sent == []

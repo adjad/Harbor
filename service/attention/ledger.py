@@ -94,6 +94,31 @@ class Ledger:
                  json.dumps(detail or {}, sort_keys=True)))
             return cur.rowcount == 1
 
+    def reclaim_capped(self, source_id: str, *, title: str | None = None, due_ts: float | None = None,
+                       event_ts: float | None = None, now: float | None = None,
+                       detail: dict | None = None) -> bool:
+        """True exactly once for a row the daily cap held back (state `capped`), turning it
+        into a fresh claim dated now, so it counts against today's cap. A capped row made no
+        effect, so taking it up again cannot create a twin; any other state is left alone."""
+        with self._lock:
+            cur = self._db.execute(
+                "UPDATE actions SET state='claimed', decided_at=?, finished_at=NULL, title=?, due_ts=?, "
+                "event_ts=?, detail=? WHERE source_id=? AND state='capped'",
+                (now if now is not None else time.time(), title, due_ts, event_ts,
+                 json.dumps(detail or {}, sort_keys=True), source_id))
+            return cur.rowcount == 1
+
+    def in_state(self, source_ids: list[str], state: str) -> set[str]:
+        found: set[str] = set()
+        for i in range(0, len(source_ids), 500):          # stay under SQLite's variable limit
+            chunk = source_ids[i:i + 500]
+            marks = ",".join("?" * len(chunk))
+            with self._lock:
+                found.update(r[0] for r in self._db.execute(
+                    f"SELECT source_id FROM actions WHERE state=? AND source_id IN ({marks})",
+                    (state, *chunk)))
+        return found
+
     def finish(self, source_id: str, state: str, detail: dict | None = None,
                now: float | None = None) -> None:
         if state not in STATES:

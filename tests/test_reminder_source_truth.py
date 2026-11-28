@@ -519,6 +519,31 @@ def test_daily_summary_and_card_qualify_native_deletion_status() -> None:
         assert "unverified" in output.lower()
 
 
+def test_daily_summary_keeps_a_reminder_overdue_from_before_today() -> None:
+    from service.assistant import brief
+
+    store = AssistantStore(Path(_SCRATCH.name) / "daily-overdue-yesterday.db")
+    now = datetime.now().replace(hour=12, minute=0, second=0, microsecond=0).timestamp()
+    store.sync_source("reminders", [
+        {"source_id": "late", "title": "Synthetic overdue since yesterday",
+         "kind": "reminder", "when_ts": now - 30 * 3600},
+        {"source_id": "soon", "title": "Synthetic due this afternoon",
+         "kind": "reminder", "when_ts": now + 3600}],
+        diagnostics={"snapshot_started_at": time.time()})
+    store.add_manual("Synthetic ancient Harbor record", now - 40 * 86400)
+    states = {"calendar": {"state": "ready"}, "reminders": {"state": "ready"}}
+    with patch.object(brief, "assistant_store", store), \
+         patch.object(sync_status, "source_status", side_effect=states.get), \
+         patch.object(brief, "_mail_split", return_value={"state": "unavailable"}):
+        section = brief._schedule_section(now)
+        card = brief._today_card(now)
+    assert "Synthetic overdue since yesterday" in section and "— overdue" in section
+    assert "Reminders due today and overdue" in section
+    assert "Synthetic due this afternoon" in section
+    assert "Synthetic ancient Harbor record" not in section
+    assert "2 reminders due" in card
+
+
 def test_daily_notification_never_claims_empty_calendar_when_unavailable() -> None:
     from service.assistant import brief
     from service.tools import email_tools

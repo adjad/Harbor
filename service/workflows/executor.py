@@ -30,6 +30,29 @@ def usable_source(name: str, raw: str) -> bool:
                 "could not be checked", "couldn't include", "not ready yet")))
 
 
+# get_upcoming's notice when one source could not be read while others were:
+# "Harbor could not check Reminders. <where to allow it> This schedule may be incomplete."
+_PARTIAL_NOTICE = re.compile(
+    r"Harbor could not check (?P<what>[A-Za-z ,]+?)\.[^\n]*?This schedule may be incomplete\.[ \t]*\n?")
+
+
+def partial_source(name: str, raw: str) -> tuple[str, str] | None:
+    """(content, warning) when the only problem with a read is that some of its sources
+    could not be checked and real rows from the others remain; else None.
+
+    The notice is model- and user-facing (it names settings to change), so it is taken out
+    of what a recipient would read and replaced by one plain warning that the approval
+    preview shows and the delivered text keeps."""
+    found = list(_PARTIAL_NOTICE.finditer(raw or ""))
+    if not found:
+        return None
+    rest = _PARTIAL_NOTICE.sub("", raw).strip()
+    if not any(line.startswith("- ") for line in rest.splitlines()) or not usable_source(name, rest):
+        return None
+    what = " and ".join(dict.fromkeys(m.group("what").strip() for m in found))
+    return rest, f"Note: {what} could not be checked, so this may be incomplete."
+
+
 def resolve_destination(recipient: str, channel: str) -> tuple[str, str]:
     from service.tools.action_tools import _resolve_recipient
     value = recipient.strip()
@@ -207,7 +230,7 @@ async def execute_workflow(plan, emit, approver, *, test_mode=False, store=None,
                 "workflow_id": plan.id, "requested_recipient": plan.recipient,
                 "resolved_recipient": destination, "channel": plan.channel})
 
-    sections = []
+    sections, warnings = [], []
     if "weather" in plan.sources and re.search(r"\b(?:week|month|year)\b", plan.date_range):
         return finish("failed", "Nothing sent: the weather tool covers only three days, "
                       "not the requested range. Would a three-day forecast be useful?")
@@ -217,7 +240,15 @@ async def execute_workflow(plan, emit, approver, *, test_mode=False, store=None,
                           "or cancelled before its private source could be read.")
         name,args = source_call(plan,source)
         status, raw = await invoke(name,args)
-        if status != "succeeded" or not usable_source(name, raw):
+        # The notice alone makes the read classify as failed, so the remainder is judged
+        # on its own (partial_source re-checks it with usable_source).
+        partial = partial_source(name, raw) if status in {"succeeded", "failed"} else None
+        if partial is not None:
+            # One source of this read could not be checked, the rest could: go on with
+            # what was read and carry the warning into the previewed text.
+            raw, warning = partial
+            warnings.append(warning)
+        elif status != "succeeded" or not usable_source(name, raw):
             return finish("failed", f"Nothing sent: the required {source} lookup "
                           f"did not produce a complete verified result.\n{raw}")
         # No model rewrite: `present` is deterministic code, so quotations keep
@@ -226,6 +257,8 @@ async def execute_workflow(plan, emit, approver, *, test_mode=False, store=None,
         # strings carry for the model — see service/workflows/present.py.
         sections.append((source, raw))
     body = plan.artifact_text or compose(sections)
+    if warnings and not plan.artifact_text:
+        body += "\n\n" + "\n".join(dict.fromkeys(warnings))
     # Action tools normalize literal escapes. Reach the same fixed point
     # before approval so repeated production normalization cannot alter what
     # was approved (including nested literal escape sequences).

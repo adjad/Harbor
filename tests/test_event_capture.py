@@ -73,6 +73,27 @@ def test_generic_confirmed_events_and_common_weekday_typos(text, day):
         assert got[0].duration_min == 120 and got[0].start_ts is not None
 
 
+@pytest.mark.parametrize('text', [
+    'Our appointment next Tuesday. Bring the clinic card, 650-555-0100',
+    'Our appointment next Tuesday. Bring the referral for Dr Lee (650) 555-0100',
+])
+def test_a_plan_with_a_number_link_or_address_stays_a_tap_only_preview(text):
+    """The contact screen stops a stranger's lure from being written by itself; it must not
+    drop a real referral or portal instruction. Kept as a preview, never automatic."""
+    from service.attention.event_capture import captures_itself
+    got = plans([], [message('Hi', ts=MON-HOUR, direction='outgoing', guid='history'), message(text)])
+    assert len(got) == 1 and got[0].day == '2026-10-20'
+    assert got[0].automatic_eligible is False and captures_itself(got[0]) is False
+    assert 'review before adding' in got[0].when
+
+
+def test_a_lure_with_a_link_is_still_dropped_when_it_is_a_scam_or_promo():
+    history = message('Hi', ts=MON-HOUR, direction='outgoing', guid='history')
+    for text in ('Our appointment next Tuesday, verify your account at bit.ly/x1',
+                 'Our appointment next Tuesday, 50% off at shop.example'):
+        assert plans([], [history, message(text)]) == [], text
+
+
 @pytest.mark.parametrize('subject', [
     'STAT 7 Exam next Wednesday?', 'Maybe STAT 7 exam next Wednesday',
     'STAT 7 exam next Wednesday cancelled', 'No STAT 7 exam next Wednesday',

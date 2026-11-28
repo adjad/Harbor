@@ -154,3 +154,38 @@ def test_days_across_a_dst_change_end_at_local_midnight():
         start, end = datetime.fromtimestamp(s), datetime.fromtimestamp(e)
         assert (start.hour, start.minute, end.hour, end.minute) == (0, 0, 0, 0)
         assert (end.date() - start.date()).days == 1
+
+
+# --- an aware `now` keeps its zone on every branch ------------------------------------------
+
+def _aware_now():
+    from datetime import timedelta, timezone
+    # A zone far from the test host's, so a dropped tzinfo shifts the window visibly.
+    return datetime(2026, 11, 10, 12, 0, tzinfo=timezone(timedelta(hours=9)))
+
+
+@pytest.mark.parametrize("period,start,end", [
+    ("2026-12", "2026-12-01T00:00", "2027-01-01T00:00"),
+    ("this month", "2026-11-01T00:00", "2026-12-01T00:00"),
+    ("next month", "2026-12-01T00:00", "2027-01-01T00:00"),
+    ("the 3rd", "2026-12-03T00:00", "2026-12-04T00:00"),
+    ("nov 20", "2026-11-20T00:00", "2026-11-21T00:00"),
+    ("2026-11-15", "2026-11-15T00:00", "2026-11-16T00:00"),
+    ("this year", "2026-01-01T00:00", "2027-01-01T00:00"),
+])
+def test_an_aware_now_keeps_its_zone(period, start, end):
+    now = _aware_now()
+    s, e, _ = resolve_span(period, now=now, forward=True)
+    zone = now.tzinfo
+    got = (datetime.fromtimestamp(s, zone).strftime("%Y-%m-%dT%H:%M"),
+           datetime.fromtimestamp(e, zone).strftime("%Y-%m-%dT%H:%M"))
+    assert got == (start, end)
+
+
+def test_an_iso_timestamp_keeps_its_clock_time():
+    now = _aware_now()
+    s, e, label = resolve_span("2026-11-15T14:30", now=now, forward=True)
+    zone = now.tzinfo
+    assert datetime.fromtimestamp(s, zone).strftime("%Y-%m-%dT%H:%M") == "2026-11-15T14:30"
+    assert datetime.fromtimestamp(e, zone).strftime("%Y-%m-%dT%H:%M") == "2026-11-16T00:00"
+    assert "2:30 PM" in label

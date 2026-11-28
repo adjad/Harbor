@@ -143,13 +143,13 @@ class BadPeriod(ValueError):
 
 
 def _month_start(d: datetime) -> datetime:
-    return datetime(d.year, d.month, 1)
+    return datetime(d.year, d.month, 1, tzinfo=d.tzinfo)
 
 
 def _add_month(d: datetime, delta: int) -> datetime:
     """First-of-month `delta` months away, without a calendar dependency."""
     month = d.month - 1 + delta
-    return datetime(d.year + month // 12, month % 12 + 1, 1)
+    return datetime(d.year + month // 12, month % 12 + 1, 1, tzinfo=d.tzinfo)
 
 
 _DAY_NAMES = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
@@ -268,14 +268,14 @@ def resolve_period(period: str, *, now: datetime | None = None, forward: bool = 
             nxt = _add_month(today, 1)
             while n > calendar.monthrange(nxt.year, nxt.month)[1]:
                 nxt = _add_month(nxt, 1)
-            return day_win(datetime(nxt.year, nxt.month, n))
+            return day_win(datetime(nxt.year, nxt.month, n, tzinfo=today.tzinfo))
         # Looking back, "the 31st" in February is January's: the last month
         # that has that day (dev8 delta review; it used to name a missing date).
         if not forward and n > calendar.monthrange(today.year, today.month)[1]:
             prev = _add_month(today.replace(day=1), -1)
             while n > calendar.monthrange(prev.year, prev.month)[1]:
                 prev = _add_month(prev, -1)
-            return day_win(datetime(prev.year, prev.month, n))
+            return day_win(datetime(prev.year, prev.month, n, tzinfo=today.tzinfo))
     if md is not None:
         month, dom = md
         year = today.year
@@ -285,16 +285,16 @@ def resolve_period(period: str, *, now: datetime | None = None, forward: bool = 
             # used to be an error that named the wrong year).
             for _ in range(8):
                 if dom <= calendar.monthrange(y, month)[1]:
-                    return datetime(y, month, dom)
+                    return datetime(y, month, dom, tzinfo=today.tzinfo)
                 y += step
             raise BadPeriod(f"(there is no {calendar.month_name[month]} {dom})")
         if not 1 <= dom <= max(calendar.monthrange(2028, month)[1], 1):
             raise BadPeriod(f"(there is no {calendar.month_name[month]} {dom})")
         if forward:
-            d = (datetime(year, month, dom) if dom <= calendar.monthrange(year, month)[1]
-                 and datetime(year, month, dom) >= today else dated(year + 1, 1))
+            d = (datetime(year, month, dom, tzinfo=today.tzinfo) if dom <= calendar.monthrange(year, month)[1]
+                 and datetime(year, month, dom, tzinfo=today.tzinfo) >= today else dated(year + 1, 1))
         else:
-            d = (datetime(year, month, dom) if dom <= calendar.monthrange(year, month)[1]
+            d = (datetime(year, month, dom, tzinfo=today.tzinfo) if dom <= calendar.monthrange(year, month)[1]
                  else dated(year - 1, -1))
             if d > today + timedelta(days=31):
                 # History about a date well ahead means last year's; a few days
@@ -335,11 +335,11 @@ def _resolve_core(p, period, today, win):
         return win(start, _month_start(today), f"{start:%B %Y}")
 
     if p in ("this year", "the year", "year"):
-        start = datetime(today.year, 1, 1)
-        return win(start, datetime(today.year + 1, 1, 1), str(today.year))
+        start = datetime(today.year, 1, 1, tzinfo=today.tzinfo)
+        return win(start, datetime(today.year + 1, 1, 1, tzinfo=today.tzinfo), str(today.year))
     if p == "last year":
-        start = datetime(today.year - 1, 1, 1)
-        return win(start, datetime(today.year, 1, 1), str(today.year - 1))
+        start = datetime(today.year - 1, 1, 1, tzinfo=today.tzinfo)
+        return win(start, datetime(today.year, 1, 1, tzinfo=today.tzinfo), str(today.year - 1))
 
     if (m := _LAST_N_UNIT_RE.match(p)):
         raw, unit_word = m.group(1), m.group(2)
@@ -370,7 +370,7 @@ def _resolve_core(p, period, today, win):
         year, month = int(m.group(1)), int(m.group(2))
         if not 1 <= month <= 12:
             raise BadPeriod(f"(there is no month {month} — use YYYY-MM, e.g. 2026-07)")
-        start = datetime(year, month, 1)
+        start = datetime(year, month, 1, tzinfo=today.tzinfo)
         return win(start, _add_month(start, 1), f"{start:%B %Y}")
 
     try:                                    # a bare YYYY-MM-DD
@@ -385,8 +385,18 @@ def _resolve_core(p, period, today, win):
             "years' (N as a digit or spelled out, e.g. '3 weeks' or 'six "
             "months'), 'YYYY-MM' for a specific month, or 'YYYY-MM-DD' for a "
             "specific day.)") from None
-    start = datetime(d.year, d.month, d.day)
+    zone = d.tzinfo if d.tzinfo is not None else today.tzinfo
+    start = datetime(d.year, d.month, d.day, tzinfo=zone)
+    if _HAS_CLOCK_RE.search(p):
+        # A full ISO timestamp names a moment: the window runs from it to the end of
+        # that day, instead of quietly widening to the whole day.
+        moment = d if d.tzinfo is not None else d.replace(tzinfo=zone)
+        return win(moment, start + timedelta(days=1),
+                   moment.strftime("%A, %B %-d from %-I:%M %p"))
     return win(start, start + timedelta(days=1), start.strftime("%A, %B %-d"))
+
+
+_HAS_CLOCK_RE = re.compile(r"\d[t ]\d{1,2}:\d{2}")
 
 
 def resolve_span(period: str, *, now: datetime | None = None, forward: bool = False,

@@ -444,3 +444,19 @@ def test_unchecking_a_to_do_that_was_done_brings_it_back(store):
     store.set_todo_done(sam, False)
     run(store, model, items_for(), force=True)
     assert "Sam Lee" in who(store)
+
+
+def test_standing_reply_cards_do_not_starve_a_new_ask(store):
+    """Five reply cards already fill the Brief; someone new writes. The new ask gets a card
+    (the standing ones are not reshuffled among themselves), and the card left out stays a to-do."""
+    model = Reshuffling()
+    five = [(NOW - 7200 - 600 * n, name, f"{name}: can you call me tonight?") for n, name in enumerate(PEOPLE[:5])]
+    run(store, model, items_for(rows=[], texts=five), force=True, resolve=anyone, now=NOW - 3600)
+    first = [c["id"] for c in cards(store)]
+    assert len(first) == 5
+    newcomer = (NOW - 300, "Quinn", "Quinn: can you call me tonight?")
+    run(store, model, items_for(rows=[], texts=five + [newcomer]), force=True, resolve=anyone)
+    shown = cards(store)
+    assert len(shown) == 5 and "Quinn" in {c["sources"][0]["who"] for c in shown}
+    assert [c["id"] for c in shown if c["id"] in first] == [i for i in first if i in {c["id"] for c in shown}]
+    assert len(set(first) & {c["id"] for c in shown}) == 4

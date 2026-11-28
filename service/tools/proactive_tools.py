@@ -24,7 +24,13 @@ from zoneinfo import ZoneInfo
 
 from service.tools.registry import register
 
-MAX_CHARS = 1500
+# Long enough for a full day: a plan cut at a few items read to the model as the whole
+# list ("which emails do I need to reply to?" answered with three). Every section that
+# is still cut says "…and N more", and a plan cut at this length says how much is left.
+MAX_CHARS = 4000
+# Rows each Day-plan section prints before "…and N more".
+DAY_PLAN_CAPS = {"timed": 12, "overdue": 8, "waiting": 8, "cards": 5, "later": 8}
+RANGE_PLAN_CAPS = {"day": 6, "overdue": 8, "waiting": 8, "cards": 5, "undated": 6}
 _SOURCE = {"mail": "email", "messages": "text", "calendar": "calendar",
            "reminders": "reminder", "notes": "note", "day": "Harbor's plan"}
 
@@ -299,7 +305,10 @@ def _overdue(todos: list[dict], now: float, zone, today: date) -> list[dict]:
 def _finish(lines: list[str]) -> str:
     text = "\n".join(lines)
     if len(text) > MAX_CHARS:
-        text = text[:MAX_CHARS].rsplit("\n", 1)[0] + "\n- …"
+        kept = text[:MAX_CHARS].rsplit("\n", 1)[0]
+        left = sum(1 for line in text[len(kept):].split("\n") if line.startswith("- "))
+        text = kept + (f"\n- …plan cut at its length limit; {left} more item{'s' if left != 1 else ''} "
+                       "not shown (the list above is not complete)")
     return text
 
 
@@ -353,11 +362,12 @@ def render_day_plan(snap: dict, *, now: float, tz: str, day: str | date = "today
             if len(items) > cap:
                 lines.append(f"- …and {len(items) - cap} more")
 
-    section(f"Time-bound {word}:", timed, lambda t: _due_line(t, zone), 8)
-    section("Overdue:", overdue, _overdue_line, 3)
-    section("Waiting on a reply from you:", waiting, _waiting_line, 3)
-    section("Suggested next steps:", cards, _card_line, 3)
-    section("Other to-dos:", later, _todo_line, 5)
+    caps = DAY_PLAN_CAPS
+    section(f"Time-bound {word}:", timed, lambda t: _due_line(t, zone), caps["timed"])
+    section("Overdue:", overdue, _overdue_line, caps["overdue"])
+    section("Waiting on a reply from you:", waiting, _waiting_line, caps["waiting"])
+    section("Suggested next steps:", cards, _card_line, caps["cards"])
+    section("Other to-dos:", later, _todo_line, caps["later"])
     if len(lines) <= 2 + (snap.get("state") == "unavailable"):
         lines.append(f"Nothing time-bound, waiting or open {word}.")
     return _finish(lines)
@@ -405,11 +415,11 @@ def render_range_plan(snap: dict, *, now: float, tz: str, start: float, end: flo
 
     for day, rows in zip(order, dated):
         section(f"{'Today' if day == today else 'Tomorrow' if day == today + timedelta(days=1) else f'{day:%a %b %-d}'}:",
-                rows, lambda t: _due_line(t, zone), 4)
-    section("Overdue:", overdue, _overdue_line, 3)
-    section("Waiting on a reply from you:", waiting, _waiting_line, 3)
-    section("Suggested next steps:", cards, _card_line, 3)
-    section("Other to-dos:", undated, _todo_line, 3)
+                rows, lambda t: _due_line(t, zone), RANGE_PLAN_CAPS["day"])
+    section("Overdue:", overdue, _overdue_line, RANGE_PLAN_CAPS["overdue"])
+    section("Waiting on a reply from you:", waiting, _waiting_line, RANGE_PLAN_CAPS["waiting"])
+    section("Suggested next steps:", cards, _card_line, RANGE_PLAN_CAPS["cards"])
+    section("Other to-dos:", undated, _todo_line, RANGE_PLAN_CAPS["undated"])
     if len(lines) == body:
         lines.append(f"Nothing scheduled, due, waiting or open {label}.")
     return _finish(lines)
@@ -481,11 +491,21 @@ async def with_day_rows(snap: dict, start: float, end: float, now: float, tz: st
     todos = [t for t in snap.get("todos") or []
              if not (t.get("source") == "calendar" and key(t.get("title"), t.get("due_ts")) in blocks)]
     have = {key(t.get("title"), t.get("due_ts")) for t in todos}
-    titles = {k[0] for k in have}
+    try:
+        zone = ZoneInfo(tz)
+    except Exception:  # noqa: BLE001
+        zone = None
+
+    def local_day(ts):
+        return datetime.fromtimestamp(float(ts), zone).date() if _dated(ts) else None
+    # A Day "due" entry gives way to a to-do with its title on the SAME day (the Reminders
+    # row it came from, at a slightly different minute). The same title on another date is
+    # another occurrence (a weekly assignment), so it stays.
+    titled_days = {(key(t.get("title"), 0)[0], local_day(t.get("due_ts"))) for t in todos}
     fresh = []
     for row in rows:
         k = key(row["title"], row["when_ts"])
-        if k in have or (row["kind"] == "due" and k[0] in titles):
+        if k in have or (row["kind"] == "due" and (k[0], local_day(row["when_ts"])) in titled_days):
             continue
         have.add(k)
         fresh.append(row)

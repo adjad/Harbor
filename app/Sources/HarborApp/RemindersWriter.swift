@@ -258,8 +258,9 @@ final class RemindersWriter {
                                          completed: completed, hasDueDate: true)
     }
 
-    /// Bound on how many undated titles one snapshot carries.
-    static let maxUndatedReminders = 200
+    /// Bound on how many undated titles one snapshot carries. Matches the backend's
+    /// store.UNDATED_MAX; a person can keep several hundred undated to-dos.
+    static let maxUndatedReminders = 1000
 
     /// The undated list as it travels: at most `maxUndatedReminders` entries plus the TRUE
     /// number of eligible reminders, so the backend can tell a complete list from one that
@@ -318,14 +319,14 @@ final class RemindersWriter {
     }
 
     /// What an exact update/complete/delete targets. A missing expected due time (JSON null)
-    /// means "a reminder with no due date", which only a delete may target; any other value
-    /// must be a real time. Nothing stands in for null, so a bad or missing number can never
-    /// turn a dated target into an undated one.
+    /// means "a reminder with no due date"; any other value must be a real time. Nothing
+    /// stands in for null, so a bad or missing number can never turn a dated target into an
+    /// undated one, and an all-day target (with an expected date) is never undated.
     enum ExactTarget: Equatable { case dated(Double), allDay(String), undated }
 
     static func exactTarget(kind: String, expectedDueTs: Double?, expectedDueDate: String = "") -> ExactTarget? {
         guard ["update_reminder", "complete_reminder", "delete_reminder"].contains(kind) else { return nil }
-        guard let due = expectedDueTs else { return kind == "delete_reminder" && expectedDueDate.isEmpty ? .undated : nil }
+        guard let due = expectedDueTs else { return expectedDueDate.isEmpty ? .undated : nil }
         // Same bound as the backend's verified_reminders._timestamp (before year 10000), so
         // `Int(due / 60)` can never trap on a huge finite value.
         guard due.isFinite && due > 0 && due < 253402300800 else { return nil }
@@ -486,9 +487,9 @@ final class RemindersWriter {
             }
         }
 
-        // An undated target (expected due time null) is allowed only for delete_reminder and
-        // only while the reminder still has no due date and is still incomplete. Its title is
-        // compared in the normalised form the undated sync sent (undatedTitle).
+        // An undated target (expected due time null) is allowed for update, complete and
+        // delete, only while the reminder still has no due date and is still incomplete. Its
+        // title is compared in the normalised form the undated sync sent (undatedTitle).
         guard let target = Self.exactTarget(kind: kind, expectedDueTs: expectedDueTs, expectedDueDate: expectedDueDate),
               !sourceID.isEmpty, !expectedTitle.isEmpty
         else { return failure("Invalid exact reminder target") }

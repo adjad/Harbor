@@ -144,10 +144,29 @@ def test_calendar_source_failure_never_becomes_empty_schedule(sources, problem):
     elif problem == "stale": sources.receipts["calendar"]["snapshot_started_at"] = STAMP - 1201
     elif problem == "failed": sources.receipts["calendar"]["available"] = False
     elif problem == "partial": sources.receipts["calendar"]["complete"] = False
-    else: sources.receipts["calendar"]["diagnostics"]["coverage_end"] = STAMP + 1
+    else: sources.receipts["calendar"]["diagnostics"]["coverage_end"] = STAMP - 1
     result = dispatch(include_reminders=False, include_activity=False, include_weather=False)
     assert "Calendar unknown" in result and "Nothing scheduled" not in result
     assistant_tools.get_upcoming.assert_not_awaited()
+
+
+def test_a_read_that_stops_inside_the_range_shows_the_covered_part_with_a_note(sources):
+    stop = STAMP + 3 * 3600
+    sources.receipts["calendar"]["diagnostics"]["coverage_end"] = stop
+    result = dispatch(include_reminders=False, include_activity=False, include_weather=False)
+    assert "Calendar unknown" not in result and "Verified calendar item" in result
+    assert "Calendar covered only through" in result and "nothing after that is shown or verified" in result
+    assistant_tools.get_upcoming.assert_awaited_once_with(period="today", calendar_only=True,
+                                                          _covered_until=stop)
+
+
+def test_today_includes_overdue_and_undated_reminders_by_default(sources):
+    sources.rows = [reminder("Overdue errand", -2 * 86400), reminder("Due tonight", 3600)]
+    sources.undated = [{"title": "Someday errand"}]
+    sources.view.update(stored=1, total=1)
+    result = only_reminders(period="today")
+    assert "overdue: Overdue errand" in result and "upcoming: Due tonight" in result
+    assert "Someday errand" in result and "overdue outside window included" in result
 
 
 def test_source_exclusions_do_not_touch_excluded_sources(sources):
