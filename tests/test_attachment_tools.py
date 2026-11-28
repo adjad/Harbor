@@ -310,6 +310,42 @@ def test_a_token_works_once_and_only_for_its_own_arguments(fake_save):
     assert len(fake_save.save_calls) == 1
 
 
+def test_the_card_is_shown_only_for_its_own_arguments_and_in_time(fake_save, monkeypatch):
+    # Tools audit 3.4: card_for showed the line for any args carrying a live token,
+    # and after the token had expired, though the save would refuse both.
+    args, _ = prepared({"query": "maria", "name": "invoice"})
+    assert attachment_actions.card_for(args) == CARD
+    for changed in ({"folder": "~/Desktop"}, {"name": "other"}, {"source": "messages"}):
+        assert attachment_actions.card_for({**args, **changed}) is None, changed
+        assert action_tools.confirm_preview(SAVE, {**args, **changed}).startswith("(this file was not set up")
+    made = attachment_actions._PREPARED[args["prepared"]][0]
+    monkeypatch.setattr(attachment_actions.time, "monotonic",
+                        lambda: made + attachment_actions._PREPARED_TTL + 1)
+    assert attachment_actions.card_for(args) is None
+    assert type(run(REGISTRY[SAVE].func(**args))) is registry._NotDoneResult
+    assert fake_save.save_calls == []
+
+
+@pytest.mark.parametrize("source", ["imessage", "gmail", "notes", "files", 5])
+def test_an_unknown_source_is_refused_not_read_as_mail(fake_save, source):
+    args, stopped = prepared({"query": "maria", "source": source})
+    assert type(stopped) is registry._NotDoneResult and "'mail' or 'messages'" in stopped
+    assert fake_save.prepare_calls == [] and "prepared" not in args
+    good, _ = prepared({"query": "maria"})
+    assert good["source"] == "mail"
+    forged = {**good, "source": source}
+    assert attachment_actions.card_for(forged) is None
+    assert type(run(REGISTRY[SAVE].func(**forged))) is registry._NotDoneResult
+    assert fake_save.save_calls == []
+
+
+@pytest.mark.parametrize("source, kept", [("Messages", "messages"), (" MAIL ", "mail"), ("", "mail"), (None, "mail")])
+def test_known_sources_in_any_case_still_work(fake_save, source, kept):
+    args, stopped = prepared({"query": "maria", "source": source})
+    assert stopped is None and args["source"] == kept
+    assert attachment_actions.card_for(args) == CARD
+
+
 # ------------------------------------------------------------------ save: on yes
 
 def test_on_yes_save_gets_exactly_the_prepared_file(fake_save):

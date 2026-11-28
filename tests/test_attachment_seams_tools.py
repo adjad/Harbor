@@ -1140,7 +1140,10 @@ async def test_a_listing_with_inside_or_across_confirms_the_rest_of_the_turn_thr
     assert ctx.run(policy.decide, "fs_write", write, tool="write_file").tier is Tier.ALLOW
 
 
-async def test_across_with_list_only_reaches_the_engine_as_an_across_read(world, monkeypatch):
+async def test_across_with_list_only_reaches_the_engine_as_a_listing(world, monkeypatch):
+    # list_only wins over across, as mail_attachments.run documents (tools audit 3.3):
+    # a request to only list files never opens up to 40 of them. The loop still
+    # marks such a turn as a picture turn, which only ever asks more.
     from service.tools.email_attachments import read_email_attachments
     seen = {}
 
@@ -1149,7 +1152,7 @@ async def test_across_with_list_only_reaches_the_engine_as_an_across_read(world,
         return "ok"
     monkeypatch.setattr(ma, "run", fake_run)
     await read_email_attachments(list_only=True, across=True)
-    assert seen["across"] is True and seen["list_only"] is False
+    assert seen["across"] is True and seen["list_only"] is True
     seen.clear()
     await read_email_attachments(list_only=True)
     assert seen["across"] is False and seen["list_only"] is True
@@ -1385,7 +1388,7 @@ def test_tokens_expire_on_the_monotonic_clock_not_the_wall_clock(monkeypatch):
     monkeypatch.setattr(actions.time, "time", lambda: (_ for _ in ()).throw(AssertionError("wall clock read")))
     token = actions._remember({"query": "a", "source": "mail"}, {"f": 1}, "c")
     clock[0] += actions._PREPARED_TTL - 1
-    assert actions.card_for({"prepared": token}) == "c"
+    assert actions.card_for({"query": "a", "source": "mail", "prepared": token}) == "c"
     clock[0] += 2
     assert actions._take(token, {"query": "a", "source": "mail"}) is None
     assert actions._PREPARED == {}

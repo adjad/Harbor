@@ -102,7 +102,9 @@ async def test_one_candidate_card_and_frozen(world, home):
     json.dumps(frozen)
     assert world.fetches == 0 and list_dir(home / "Downloads") == []
     call = world.found_calls[0]
-    assert call["count"] == 5 and call["most"] == 5 and call["source"] == "mail"
+    # Tools audit 3.4: every message a search may hold, not only the newest five.
+    assert call["count"] == ma.MAX_EMAILS and call["most"] == ma.MAX_EMAILS and call["source"] == "mail"
+    assert ma.MAX_EMAILS > 5
 
 
 async def test_several_files_ask_which(world):
@@ -196,6 +198,26 @@ def test_bad_folders(home, tmp_path):
         assert real == "" and why, case
     assert not (home / "Documents" / "nope").exists()
     assert sv.check_folder("Library")[1] == "Harbor only saves into a folder in your home folder, like Downloads or Documents."
+
+
+@pytest.mark.parametrize("folder, wanted, existing", [
+    ("Documents/Taxes/2026", "Documents/Taxes/2026", "Documents/Taxes"),
+    ("Downloads/Receipts/March", "Downloads/Receipts/March", "Downloads"),
+    ("~/Documents/New", "Documents/New", "Documents"),
+])
+def test_a_missing_subfolder_is_named_and_never_created(home, folder, wanted, existing):
+    real, why = sv.check_folder(folder)
+    assert real == ""
+    assert f"There's no folder {wanted} yet" in why and "doesn't create folders" in why
+    assert f"save into {existing}." in why
+    assert not (home / wanted).exists()
+
+
+async def test_prepare_with_a_missing_subfolder_explains_without_searching(world, home):
+    world.add("x.pdf")
+    got = await sv.prepare(folder="Documents/Taxes/2026")
+    assert got["ok"] is False and "no folder Documents/Taxes/2026" in got["reason"]
+    assert not world.found_calls and not (home / "Documents/Taxes/2026").exists()
 
 
 async def test_prepare_refuses_bad_folder_without_searching(world, home):

@@ -514,6 +514,22 @@ async def test_small_logos_skipped_unless_named(world):
     assert "tiny.png" in named and "scan.png" not in named
 
 
+@pytest.mark.parametrize("ask", [
+    {"question": "show me my receipts"},
+    {"question": "find the QR code for the concert"},
+    {"query": "receipt"},
+    {"question": "my boarding pass"},
+])
+async def test_small_receipts_and_qr_codes_are_kept_when_asked_for(world, ask):
+    # Tools audit 3.4: a receipt or QR code is often a picture under 20 KB.
+    world.apple_rows = [row(1, "receipt.png", rfc="a@x.com", size=3_000, subject="Your receipt"),
+                        row(2, "qr.png", rfc="b@x.com", attachment_id="1.3", size=4_000,
+                            subject="Your receipt and ticket")]
+    out = await ma.run(list_only=True, **ask)
+    assert "receipt.png" in out and "qr.png" in out, out
+    assert "small picture" not in out
+
+
 async def test_name_filter_and_explicit_range_reach_both_searches(world):
     world.apple_rows = [row(1, "a.pdf", rfc="a@x.com"), row(2, "b.pdf", rfc="b@x.com", attachment_id="1.3")]
     world.gmail = {"me@gmail.com": []}
