@@ -25,7 +25,9 @@ import Compression
 //     the note's text (title line included). ProtobufTextExtractor follows
 //     exactly that path. It once took the longest string anywhere in the
 //     tree instead, which dropped 1-3 character notes and let a UUID or a
-//     style string win over a short note's text.
+//     style string win over a short note's text. That method is kept only as
+//     a fallback when the path finds no text, so a store laid out otherwise
+//     still yields its notes.
 //   - Recently Deleted is a folder row whose ZFOLDERTYPE is 1 (its title is
 //     localized, so the type decides, not the name). A trashed note keeps
 //     ZMARKEDFORDELETION at 0 and only moves to that folder, so the folder
@@ -126,7 +128,7 @@ final class NotesDBReader {
             guard len > 0 else { continue }
             let raw = Data(bytes: blob, count: len)
             let payload = gunzipIfNeeded(raw) ?? raw
-            var body = (ProtobufTextExtractor.noteText(in: payload) ?? "")
+            var body = ProtobufTextExtractor.bodyText(in: payload)
                 .replacingOccurrences(of: "\u{FFFC}", with: "")   // attachment markers
             for cells in tables[sqlite3_column_int64(stmt, 4)] ?? [] {
                 body += (body.hasSuffix("\n") || body.isEmpty ? "" : "\n") + cells.joined(separator: "\n")
@@ -299,6 +301,64 @@ enum ProtobufTextExtractor {
     static func noteText(in data: Data) -> String? {
         guard let document = message(data, field: 2), let note = message(document, field: 3) else { return nil }
         return string(note, field: 2)
+    }
+
+    /// What the reader keeps as the body: the note's text by its field path,
+    /// or, when that path finds no text, the longest plausible string in the
+    /// tree (the reader's old method). The field path isn't checked against a
+    /// real store here, so a wrong path must not make notes disappear.
+    static func bodyText(in data: Data) -> String {
+        if let text = noteText(in: data), !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return text
+        }
+        return longestString(in: data) ?? ""
+    }
+
+    /// The old heuristic: the longest decodable UTF-8 string of 4+ characters
+    /// with no control bytes, anywhere in the message tree. Only a fallback.
+    static func longestString(in data: Data) -> String? {
+        var best: String?
+        walk(data, into: &best)
+        return best
+    }
+
+    private static func walk(_ data: Data, into best: inout String?) {
+        var i = data.startIndex
+        while i < data.endIndex {
+            guard let (tag, next) = readVarint(data, i) else { return }
+            i = next
+            switch tag & 0x7 {
+            case 0:
+                guard let (_, n) = readVarint(data, i) else { return }
+                i = n
+            case 1:
+                guard data.endIndex - i >= 8 else { return }
+                i += 8
+            case 5:
+                guard data.endIndex - i >= 4 else { return }
+                i += 4
+            case 2:
+                guard let (len, n) = readVarint(data, i) else { return }
+                // UInt64 compare first: Int(len) would trap past Int.max.
+                guard len <= UInt64(data.endIndex - n) else { return }
+                let end = n + Int(len)
+                let chunk = data.subdata(in: n..<end)
+                if let s = plausibleText(chunk), s.count > (best?.count ?? 0) { best = s }
+                // A string can also parse as a (nonsensical) message: try both.
+                walk(chunk, into: &best)
+                i = end
+            default:
+                return
+            }
+        }
+    }
+
+    private static func plausibleText(_ chunk: Data) -> String? {
+        guard chunk.count >= 4, let s = String(data: chunk, encoding: .utf8) else { return nil }
+        for scalar in s.unicodeScalars where scalar.value < 0x20 && scalar != "\n" && scalar != "\t" {
+            return nil
+        }
+        return s
     }
 
     /// A table attachment's cell texts, in stored order: MergableDataProto

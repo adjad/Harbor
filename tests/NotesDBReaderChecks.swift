@@ -112,6 +112,16 @@ import SQLite3
         check(P.noteText(in: store("Call the plumber on Monday")) == "Call the plumber on Monday",
               "plain text is read as before")
 
+        // The structured text wins whenever it has text; when the path finds
+        // none (a store laid out some other way), the longest string is kept
+        // instead of losing the note.
+        check(P.bodyText(in: crowded) == "Gym", "the field path's text is kept over longer strings")
+        let otherLayout = ld(4, num(1, 3) + ld(7, "Pick up the dry cleaning") + ld(8, "abc"))
+        check(P.noteText(in: otherLayout) == nil, "the other layout has no note path")
+        check(P.bodyText(in: otherLayout) == "Pick up the dry cleaning", "a note off the path falls back to its longest string")
+        check(P.bodyText(in: store("  \n")) == "", "an empty note on the path stays empty when nothing else is there")
+        check(P.bodyText(in: Data(hugeLength)) == "", "a damaged blob gives no text and no crash")
+
         // A table: MergableDataProto 2 -> object 3 -> entries 3 -> note 10 -> text 2.
         func cell(_ text: String) -> Data { ld(3, ld(10, ld(2, text))) }
         let rowsEntry = ld(3, ld(6, ld(1, num(1, 0))))   // a dictionary entry, no text
@@ -162,6 +172,7 @@ import SQLite3
             INSERT INTO ZICCLOUDSYNCINGOBJECT \(cols) VALUES (7, 5, 'In a deleted folder', NULL, 696000000, 12, 0, NULL, NULL);
             INSERT INTO ZICCLOUDSYNCINGOBJECT \(cols) VALUES (8, 5, 'Short', NULL, 680000000, 10, 0, NULL, NULL);
             INSERT INTO ZICCLOUDSYNCINGOBJECT \(cols) VALUES (9, 5, 'Week', NULL, 670000000, 10, 0, NULL, NULL);
+            INSERT INTO ZICCLOUDSYNCINGOBJECT \(cols) VALUES (13, 5, 'Moved', NULL, 660000000, 10, 0, NULL, NULL);
             INSERT INTO ZICCLOUDSYNCINGOBJECT (Z_PK, Z_ENT, ZNOTE, ZTYPEUTI, ZMERGEABLEDATA1, ZMARKEDFORDELETION)
                 VALUES (20, 7, 9, 'com.apple.notes.table', X'\(hex(table))', 0);
             INSERT INTO ZICNOTEDATA VALUES (1, X'\(hex(store(greeting)))');
@@ -172,6 +183,7 @@ import SQLite3
             INSERT INTO ZICNOTEDATA VALUES (6, X'\(hex(store("Trashed and left out")))');
             INSERT INTO ZICNOTEDATA VALUES (7, X'\(hex(store("Deleted with its folder")))');
             INSERT INTO ZICNOTEDATA VALUES (8, X'\(hex(store("Ok", noteExtras: style, docExtras: ld(1, uuid))))');
+            INSERT INTO ZICNOTEDATA VALUES (13, X'\(hex(ld(4, ld(7, "Written somewhere else"))))');
             INSERT INTO ZICNOTEDATA VALUES (9, X'\(hex(store("Week\n\u{FFFC}", noteExtras: attachment)))');
             """
         let rowsPath = root.appendingPathComponent("Rows.sqlite").path
@@ -183,6 +195,7 @@ import SQLite3
             "1678307200\u{01}Greeting\u{01}Home\u{01}\(greeting)\u{02}",
             "1658307200\u{01}Short\u{01}Home\u{01}Ok\u{02}",
             "1648307200\u{01}Week\u{01}Home\u{01}Week\nMonday\nSwim\nTuesday\nRun\u{02}",
+            "1638307200\u{01}Moved\u{01}Home\u{01}Written somewhere else\u{02}",
             "1578307200\u{01}Plumber\u{01}\u{01}\(plumber)\u{02}",
             "0\u{01}No date\u{01}Home\u{01}No date\nStill kept\u{02}",
         ].joined()
