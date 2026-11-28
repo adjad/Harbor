@@ -33,6 +33,30 @@ def _key(text: str) -> str:
     return hashlib.sha256(_norm(text).encode()).hexdigest()
 
 
+_PREF_FILLER = frozenset('prefer now actually rather than over instead really much usually always'.split())
+_PREF_NEGATION = frozenset("not no never dont don doesnt longer anymore hate dislike stopped".split())
+
+
+def preference_conflicts(new_text: str, old_text: str) -> bool:
+    """Whether two preference statements are the same preference, or opposite
+    ones, so that only the newer should stand. "I prefer tea in the morning" and
+    "I prefer dark mode" are separate preferences and both stay."""
+    def content(t):
+        return {w for w in _norm(t).split() if w not in _STOP and w not in _PREF_FILLER
+                and w not in _PREF_NEGATION}
+    a, b = content(new_text), content(old_text)
+    if not a or not b:
+        return False
+    overlap = a & b
+    if a == b:
+        return True
+    neg_a = bool(set(_norm(new_text).split()) & _PREF_NEGATION)
+    neg_b = bool(set(_norm(old_text).split()) & _PREF_NEGATION)
+    if overlap and neg_a != neg_b:
+        return True
+    return len(overlap) / len(a | b) >= 0.6
+
+
 class SuppressionView:
     """FactStore's suppression rules over one read of memory_suppression."""
 
@@ -307,9 +331,8 @@ class FactStore:
                 self._db.execute("DELETE FROM memory_suppression WHERE kind='fact' AND value=?", (key,))
             if origin in ('connection', 'historical'):
                 status = 'proposed'
-            if origin == 'automatic' and subject and predicate and self._db.execute(
-                    "SELECT 1 FROM facts WHERE status='active' AND subject=? AND predicate=? AND fact_key!=?",
-                    (subject, predicate, key)).fetchone():
+            if origin == 'automatic' and subject and predicate and self._slot_conflict(
+                    subject, predicate, key, text):
                 status = 'proposed'
                 explanation = explanation or 'May update an existing memory. Review which statement is current.'
             prior = self._db.execute("SELECT * FROM facts WHERE fact_key=? AND status IN ('active','proposed','deferred') ORDER BY id LIMIT 1", (key,)).fetchone()
@@ -459,6 +482,17 @@ class FactStore:
                 self._db.execute("UPDATE facts SET status='active',reviewed=1,pinned=?,updated_at=? WHERE id=?", (pinned, time.time(), fid))
                 return self.get(fid)
             raise ValueError('Invalid review decision')
+
+    def _slot_conflict(self, subject, predicate, key, text):
+        """An active fact in the same slot that this one would update. Most slots
+        hold one value (home, employer). 'preference' holds many: a new
+        preference only conflicts with one it repeats or contradicts."""
+        rows = self._db.execute(
+            "SELECT text FROM facts WHERE status='active' AND subject=? AND predicate=? AND fact_key!=?",
+            (subject, predicate, key)).fetchall()
+        if predicate == 'preference':
+            return any(preference_conflicts(text, r['text']) for r in rows)
+        return bool(rows)
 
     def slot_facts(self, subject, predicate):
         """Live facts (active, proposed or deferred) that fill one slot, e.g. the user's

@@ -24,7 +24,10 @@ from pathlib import Path
 import re
 import stat
 import sys
+import time
 
+# Names that mean a download is still being written. file-tidy passes these.
+PARTIAL_DOWNLOAD_EXTENSIONS = (".download", ".crdownload", ".part", ".partial", ".opdownload", ".tmp")
 MAX_FILES = 1000
 MAX_BYTES = 512 * 1024 * 1024
 
@@ -59,6 +62,9 @@ class OrganizationPlan:
     # A newly appearing target is safely skipped by the kernel. Its presence
     # changes the preview note, not the already-approved source/target set.
     existing_targets: tuple[str, ...] = field(default=(), compare=False)
+    # Files left out by exclude_extensions / min_age_seconds, with the reason.
+    # Not part of what moves, so not part of the plan's identity.
+    excluded: tuple[tuple[str, str], ...] = field(default=(), compare=False)
 
 
 def absolute_path(value: str) -> Path:
@@ -167,7 +173,31 @@ def group_for_filename(name: str, group_by: str) -> str | None:
     return ""
 
 
-def build_plan(pattern: str, folder: str, destination: str, group_by: str = "") -> OrganizationPlan:
+def normalize_extensions(value) -> tuple[str, ...]:
+    """".Part, crdownload" or a list -> (".part", ".crdownload"). Matching is on
+    the end of the name, case-insensitive, so ".tar.gz" works too."""
+    if not value:
+        return ()
+    items = re.split(r"[,\s]+", value) if isinstance(value, str) else list(value)
+    out = []
+    for item in items:
+        item = str(item).strip().lower()
+        if item and item != ".":
+            out.append(item if item.startswith(".") else "." + item)
+    return tuple(dict.fromkeys(out))
+
+
+def build_plan(pattern: str, folder: str, destination: str, group_by: str = "", *,
+               exclude_extensions=(), min_age_seconds: float = 0, now: float | None = None) -> OrganizationPlan:
+    """`exclude_extensions` leaves files with those endings where they are;
+    `min_age_seconds` leaves files modified more recently than that (a file with
+    a modification time in the future counts as recent)."""
+    excluded_ext = normalize_extensions(exclude_extensions)
+    try:
+        min_age = max(0.0, float(min_age_seconds or 0))
+    except (TypeError, ValueError):
+        raise ValueError("minimum age must be a number of seconds") from None
+    clock = time.time() if now is None else now
     if not isinstance(group_by, str) or group_by not in {"", "extension", "debug_date"}:
         raise ValueError("semantic/content categorization is unsupported; group_by must be empty, extension, or debug_date")
     if not all(isinstance(value, str) and value.strip() for value in (pattern, folder, destination)):
@@ -182,7 +212,7 @@ def build_plan(pattern: str, folder: str, destination: str, group_by: str = "") 
         if qualified.parent != source:
             raise ValueError("pattern must be a filename glob inside the source folder")
         pattern = qualified.name
-    moves, skipped, states, conflicts = [], [], {}, []
+    moves, skipped, states, conflicts, excluded = [], [], {}, [], []
     with open_directory(source) as (src_fd, source_state):
         names = sorted(name for name in os.listdir(src_fd) if fnmatch.fnmatch(name, pattern))
         files, total_bytes = [], 0
@@ -192,6 +222,13 @@ def build_plan(pattern: str, folder: str, destination: str, group_by: str = "") 
                 continue  # Immediate regular files only; never recurse.
             if not stat.S_ISREG(info.st_mode):
                 skipped.append((str(source / name), "not a regular file; symlink/special file left untouched"))
+                continue
+            lowered = name.lower()
+            if any(lowered.endswith(ext) for ext in excluded_ext):
+                excluded.append((str(source / name), "may still be downloading or is a temporary file; left untouched"))
+                continue
+            if min_age and clock - info.st_mtime < min_age:
+                excluded.append((str(source / name), "modified too recently; left untouched"))
                 continue
             files.append((name, info))
             total_bytes += info.st_size
@@ -217,7 +254,8 @@ def build_plan(pattern: str, folder: str, destination: str, group_by: str = "") 
                         pass
             moves.append(FileMove(str(source / name), str(parent / name), file_identity(src_fd, name)))
     return OrganizationPlan(str(source), str(target), pattern, group_by, tuple(moves),
-                            tuple(skipped), source_state, tuple(sorted(states.items())), tuple(conflicts))
+                            tuple(skipped), source_state, tuple(sorted(states.items())), tuple(conflicts),
+                            tuple(excluded))
 
 
 def atomic_move_no_replace(source_fd: int, source: str, destination_fd: int, destination: str) -> None:

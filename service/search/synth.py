@@ -96,6 +96,31 @@ _PUNCT_FOLD = str.maketrans({
 def _normalize_punct(s: str) -> str:
     return s.translate(_PUNCT_FOLD)
 
+
+# A full stop after one of these does not end a sentence.
+_ABBREV_RE = re.compile(
+    r"(?:\b(?:mr|mrs|ms|dr|prof|st|vs|no|fig|inc|ltd|co|jr|sr)|\b(?:e\.g|i\.e|etc|a\.m|p\.m|u\.s))\.$",
+    re.I)
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Sentence split that keeps a quotation, or "Dr. Smith", in one piece.
+
+    A plain split on end punctuation cut `"He left. She stayed." [1]` in two,
+    so the quotation could never match the source and the cited half lost its
+    first sentence. Pieces are re-joined while a quote is still open or the
+    previous piece ends in an abbreviation."""
+    out: list[str] = []
+    for piece in _SENT_RE.split(text):
+        if out:
+            prev = out[-1]
+            norm = _normalize_punct(prev)
+            if norm.count('"') % 2 == 1 or _ABBREV_RE.search(prev.rstrip()):
+                out[-1] = f"{prev} {piece}"
+                continue
+        out.append(piece)
+    return out
+
 # Name-shaped tokens, for the global-scope proper-noun check below.
 _PROPER_RE = re.compile(r"\b([A-Z][a-z]{2,})\b")
 # Capitalized words that routinely appear mid-sentence in a summary without
@@ -130,7 +155,19 @@ def _invents_proper_noun(sentence: str, sources: str) -> bool:
     for tok in _PROPER_RE.findall(" ".join(words[1:])):
         if tok in _GENERIC_CAPS:
             continue
-        if fold(tok) not in sources:
+        if not _in_sources(tok, sources):
+            return True
+    return False
+
+
+def _in_sources(tok: str, sources: str) -> bool:
+    """A name or its ordinary inflection is in the source: "Romans" is grounded
+    by "Roman", "Dickens" by "Dickens's". Invented names still fail."""
+    low = fold(tok)
+    if low in sources:
+        return True
+    for suf in ("es", "s", "ian", "ians"):
+        if len(low) - len(suf) >= 3 and low.endswith(suf) and low[:-len(suf)] in sources:
             return True
     return False
 
@@ -258,13 +295,31 @@ him she you your our out off per via any all one two can may might must
 _GROUND_RATIO = 0.8
 
 
+_CONTRACTION_RE = re.compile(r"\b(can't|won't|shan't|ain't)\b|n't\b")
+
+
+def _expand_contractions(text: str) -> str:
+    """"hasn't" -> "has not" so negation is seen. The token pattern otherwise
+    reads "hasn't confirmed" as the word "hasn" and a positive clause, which
+    both dropped a faithful paraphrase of "has not confirmed" and let a
+    positive claim be cited to a passage that denies it. Expects folded,
+    punctuation-normalized text (straight apostrophes)."""
+    def _sub(m: re.Match) -> str:
+        w = m.group(1)
+        if w is None:
+            return " not"
+        return {"can't": "cannot", "won't": "will not",
+                "shan't": "shall not", "ain't": "is not"}[w]
+    return _CONTRACTION_RE.sub(_sub, text)
+
+
 def _content_tokens(text: str) -> set[str]:
     return set(_content_sequence(text))
 
 
 def _content_sequence(text: str) -> list[str]:
     out: list[str] = []
-    for t in _TOKEN_RE.findall(text):
+    for t in _TOKEN_RE.findall(_expand_contractions(text)):
         t = t.rstrip(".,")          # "September 30." carries the period
         if t and t not in _STOP:
             out.append(t)
@@ -278,7 +333,7 @@ def _negation_scope(text: str, reach: int = 6) -> set[str]:
     renewal, terms}; the lease clause stays out of it. Measured over the raw
     stream, stop words included, so the reach cannot bridge a clause boundary
     the way a count over content tokens alone did."""
-    raw = [t.rstrip(".,") for t in _TOKEN_RE.findall(text)]
+    raw = [t.rstrip(".,") for t in _TOKEN_RE.findall(_expand_contractions(text))]
     scope: set[str] = set()
     for i, t in enumerate(raw):
         if t in _NEGATIONS:
@@ -359,7 +414,7 @@ def verify(answer: str, chunks: list[Chunk], picks: list[int], *,
     all_sources = _src(" ".join(chunks[i].text for i in picks))
     kept: list[str] = []
     used: list[int] = []
-    for sent in _SENT_RE.split(answer.strip()):
+    for sent in _split_sentences(answer.strip()):
         s = sent.strip()
         if not s:
             continue

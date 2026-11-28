@@ -39,9 +39,11 @@ metadata:
       - name: mac_get_volume
         description: Read the Mac's output volume and whether it is muted.
         command: bash controls.sh get-volume
+        apple_events: ["System Events"]
       - name: mac_set_volume
         description: Set the Mac's output volume to a level from 0 to 100.
         command: bash controls.sh set-volume {level}
+        apple_events: ["System Events"]
         parameters:
           level:
             type: integer
@@ -52,6 +54,7 @@ metadata:
       - name: mac_mute
         description: Mute (state on) or unmute (state off) the Mac's sound output.
         command: bash controls.sh mute {state}
+        apple_events: ["System Events"]
         parameters:
           state:
             type: string
@@ -60,9 +63,11 @@ metadata:
       - name: mac_lock_screen
         description: Lock the Mac's screen now and report whether macOS confirmed the lock.
         command: bash controls.sh lock
+        apple_events: ["System Events"]
       - name: mac_media
         description: Play, pause, skip or go back in Apple Music (default) or Spotify.
         command: bash controls.sh media {action} {app}
+        apple_events: ["Music", "Spotify"]
         parameters:
           action:
             type: string
@@ -81,4 +86,9 @@ metadata:
 - "Mute" is `mac_mute` with state `on`; "unmute" is state `off`. Setting volume 0 is not the same as muting.
 - `mac_media` cannot pick a song, album or playlist. If the user asks for specific music, say so and offer to play or open the app instead.
 - `mac_lock_screen` reports "screen locked" only when macOS confirms it. If it returns an error, tell the user the screen is NOT locked and why.
+- These tools run inside Harbor's skill sandbox, which refuses Apple Events. Each tool
+  above declares `apple_events` (only a bundled skill may): the sandbox then lets that
+  one tool send Apple Events to those apps and to no others. If macOS has not been
+  given Automation permission, or Music/Spotify is not already open, the tool reports
+  an error; say so and do not retry another way.
 - Depending on the user's permission settings these may ask for confirmation first. If the user declines, say so plainly and do not retry another way.

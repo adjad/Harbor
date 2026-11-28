@@ -250,7 +250,7 @@ async def embed_queries(queries: list[str], *, timeout: float = 30.0, target: Ta
 
 
 def rank(query_vecs: list[list[float]], doc_vecs: list[list[float]], *,
-         limit: int = 20) -> list[tuple[int, float]]:
+         limit: int = 20, allow: "set[int] | None" = None) -> list[tuple[int, float]]:
     """Best score per chunk across all sub-queries, descending.
 
     Max (not mean) across sub-queries on purpose: a two-part question like
@@ -267,6 +267,8 @@ def rank(query_vecs: list[list[float]], doc_vecs: list[list[float]], *,
     best: dict[int, float] = {}
     for qv in query_vecs:
         for i, dv in enumerate(doc_vecs):
+            if allow is not None and i not in allow:
+                continue
             s = _dot(qv, dv)
             if s > best.get(i, -2.0):
                 best[i] = s
