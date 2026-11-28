@@ -342,11 +342,102 @@ def test_archive_skips_its_card_under_full_access_and_the_skill_text_says_so(loa
     skill = loaded["inbox-cleanup"]
     assert "full access" in " ".join(skill.body.lower().split())
     assert contracts.validate(skill) == []
-    # validate restores the mode it borrowed, and flags text that promises a card regardless.
+    # validate never borrows the person's mode.
     assert policy._FULL_ACCESS is False
     tampered = copy.deepcopy(skill)
     tampered.body = tampered.body.replace("full access", "other access")
+    # As shipped, the archive comes after the skill has read mail, so it asks even
+    # under Full access (policy.after_untrusted_read_decision) and needs no caveat.
+    assert not any("full access" in p for p in contracts.validate(tampered))
+    # An archive with no read before it would skip its card, and the text must say so.
+    steps = tampered.contract["steps"]
+    tampered.contract["steps"] = ([st for st in steps if st["tool"] == "email_triage"]
+                                  + [st for st in steps if st["tool"] != "email_triage"])
     assert any("full access" in p for p in contracts.validate(tampered))
+
+
+def test_validate_never_changes_the_access_mode_a_concurrent_turn_sees(loaded, monkeypatch) -> None:
+    """The full-access check used to set policy._FULL_ACCESS for the whole process while
+    it ran; a turn deciding at that moment saw Full access on. The simulated mode is
+    this task's own: another thread deciding meanwhile sees the person's mode."""
+    import threading
+    args = {"message_id": "<m@example.test>", "action": "archive"}
+    seen: dict = {}
+    real_decide = policy.decide
+
+    def other_turn() -> None:
+        seen["full"] = policy.full_access()
+        seen["tier"] = real_decide("email_triage", args, tool="email_triage").tier
+
+    def decide_and_look(*a, **k):
+        if "tier" not in seen:                    # while validate is inside its simulation
+            worker = threading.Thread(target=other_turn)
+            worker.start()
+            worker.join()
+        return real_decide(*a, **k)
+
+    monkeypatch.setattr(policy, "decide", decide_and_look)
+    with policy.simulated_mode(full_access=True):
+        assert policy.full_access() is True
+        decide_and_look("email_triage", args, tool="email_triage")
+    assert seen == {"full": False, "tier": policy.Tier.CONFIRM}
+    seen.clear()
+    contracts.validate(loaded["file-tidy"])
+    assert seen == {"full": False, "tier": policy.Tier.CONFIRM}
+    assert policy._FULL_ACCESS is False and policy.full_access() is False
+
+
+def test_validate_ignores_the_person_s_own_mode_and_grants(loaded, monkeypatch) -> None:
+    """A contract is checked against the default mode with no standing grant, whatever
+    this Mac is set to: view-only used to make every step look refused."""
+    monkeypatch.setattr(policy, "_READ_ONLY", True, raising=False)
+    assert contracts.validate(loaded["file-tidy"]) == []
+    monkeypatch.setattr(policy, "_READ_ONLY", False, raising=False)
+    monkeypatch.setattr(policy, "_FULL_ACCESS", True, raising=False)
+    assert contracts.validate(loaded["week-review"]) == []
+    assert policy._FULL_ACCESS is True and policy._READ_ONLY is False
+
+
+@pytest.mark.parametrize("tamper,expect", [
+    (lambda st: st[0].update(args={"limt": 15}), "takes no argument 'limt'"),
+    (lambda st: st[0].update(args={"limit": "fifteen"}), "is not of type integer"),
+    (lambda st: st[2].update(args={"mailbox": "drafts"}), "is not one of"),
+    (lambda st: st[3]["args"].pop("action"), "needs action"),
+    (lambda st: st.__setitem__(0, {"tool": "scan_subscriptions", "args": ["limit"]}), "args must be a mapping"),
+])
+def test_validate_checks_step_arguments_against_the_tool_schema(loaded, tamper, expect) -> None:
+    skill = copy.deepcopy(loaded["inbox-cleanup"])
+    tamper(skill.contract["steps"])
+    assert any(expect in p for p in contracts.validate(skill)), contracts.validate(skill)
+
+
+def test_a_confirmed_step_must_carry_every_required_argument(loaded) -> None:
+    skill = copy.deepcopy(loaded["file-tidy"])
+    skill.contract["steps"][2]["args"].pop("folder")
+    assert any("organize_files needs folder" in p for p in contracts.validate(skill))
+    # A read step's required arguments are the model's to fill (find_files' query).
+    assert not any("find_files" in p for p in contracts.validate(loaded["meeting-prep"]))
+
+
+def test_a_bundled_skill_whose_contract_fails_loads_as_broken(tmp_path, monkeypatch) -> None:
+    import shutil
+    bundled = tmp_path / "bundled"
+    shutil.copytree(skills.BUNDLED_SKILLS_DIR / "week-review", bundled / "week-review")
+    md = bundled / "week-review" / "SKILL.md"
+    md.write_text(md.read_text().replace("{tool: get_past_events, args: {days: 7}}",
+                                         "{tool: get_past_events, args: {days: seven}}"))
+    original = skills.all_skills()
+    monkeypatch.setattr(skills, "BUNDLED_SKILLS_DIR", bundled)
+    monkeypatch.setattr(skills, "SKILLS_DIR", tmp_path / "user-skills")
+    try:
+        skill = skills.load()["week-review"]
+        assert skill.error.startswith("its contract does not hold") and "days='seven'" in skill.error
+        assert not skill.enabled and skills.turn_skill_names("review my week") == []
+        assert skills.set_enabled("week-review", True) is True
+        assert skills.get("week-review").enabled is False
+    finally:
+        monkeypatch.undo()
+        skills._skills = original
 
 
 def test_file_tidy_move_still_asks_under_full_access_so_its_text_needs_no_caveat(loaded) -> None:
