@@ -19,37 +19,11 @@ final class NotesReader {
     private let dbReader = NotesDBReader()
     private let backendRetry = NativeBackendRetry()
 
-    // Same FS/RS control-character delimiters as MailReader's raw script — a
-    // note body routinely contains "|" and newlines, which would corrupt a
-    // "|"-delimited, linefeed-separated format.
-    private let script = """
-    tell application "Notes"
-        set refDate to current date
-        set year of refDate to 2001
-        set month of refDate to 1
-        set day of refDate to 1
-        set time of refDate to 0
-        set FS to ASCII character 1
-        set RS to ASCII character 2
-        set output to ""
-        set theNotes to notes
-        set n to count of theNotes
-        set lim to 500
-        if n < lim then set lim to n
-        repeat with i from 1 to lim
-            set nt to item i of theNotes
-            try
-                set epochSecs to ((modification date of nt) - refDate) + 978307200
-                set folderName to ""
-                try
-                    set folderName to name of container of nt
-                end try
-                set output to output & epochSecs & FS & (name of nt) & FS & folderName & FS & (plaintext of nt) & RS
-            end try
-        end repeat
-        return output
-    end tell
-    """
+    // The read itself is NotesScriptRead (NotesDBReader.swift): one script
+    // lists ids and dates, a second reads the newest 500 outside Recently
+    // Deleted. Same FS/RS control-character delimiters as MailReader's raw
+    // script — a note body routinely contains "|" and newlines, which would
+    // corrupt a "|"-delimited, linefeed-separated format.
 
     // Same once/day cadence + warm-up-retry shape as Mail's raw sync: content
     // fetch (`plaintext of nt`) over potentially hundreds of notes is the slow
@@ -151,12 +125,39 @@ final class NotesReader {
             }
             return
         }
-        guard let s = NSAppleScript(source: self.script) else {
+        // First the ids and dates of every note, so the read takes the
+        // newest ones: Notes' own order is not by date.
+        guard let list = NSAppleScript(source: NotesScriptRead.listScript) else {
             self.post(snapshotStartedAt: snapshotStartedAt, raw: "", available: false,
                       reason: "Harbor couldn't start reading Notes. Try again in a moment.")
             return
         }
         var err: NSDictionary?
+        let listed = list.executeAndReturnError(&err)
+        if let err {
+            let code = (err[NSAppleScript.errorNumber] as? Int) ?? 0
+            self.post(snapshotStartedAt: snapshotStartedAt, raw: "", available: false,
+                      reason: Self.scriptFailureReason(code: code))
+            return
+        }
+        let ids = Self.items(listed.atIndex(1)).map { $0?.stringValue ?? "" }
+        let dates = Self.items(listed.atIndex(2)).map { $0?.dateValue }
+        guard ids.count == dates.count, !ids.contains("") else {
+            self.post(snapshotStartedAt: snapshotStartedAt, raw: "", available: false,
+                      reason: "Notes didn't answer. Harbor will try again later.")
+            return
+        }
+        if ids.isEmpty {
+            self.post(snapshotStartedAt: snapshotStartedAt, raw: "")
+            return
+        }
+        let ordered = NotesScriptRead.newestFirst(ids: ids, dates: dates)
+        guard let s = NSAppleScript(source: NotesScriptRead.readScript(ids: ordered)) else {
+            self.post(snapshotStartedAt: snapshotStartedAt, raw: "", available: false,
+                      reason: "Harbor couldn't start reading Notes. Try again in a moment.")
+            return
+        }
+        err = nil
         let result = s.executeAndReturnError(&err)
         if let err {
             let code = (err[NSAppleScript.errorNumber] as? Int) ?? 0
@@ -165,6 +166,12 @@ final class NotesReader {
             return
         }
         self.post(snapshotStartedAt: snapshotStartedAt, raw: result.stringValue ?? "")
+    }
+
+    /// A list descriptor's items (1-based in Apple events), or none.
+    private static func items(_ list: NSAppleEventDescriptor?) -> [NSAppleEventDescriptor?] {
+        guard let list, list.numberOfItems > 0 else { return [] }
+        return (1...list.numberOfItems).map { list.atIndex($0) }
     }
 
     /// Why the AppleScript read failed, from its error number: -1743 is macOS

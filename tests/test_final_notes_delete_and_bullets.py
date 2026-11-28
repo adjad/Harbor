@@ -78,6 +78,9 @@ NOTES = [
 
 @pytest.fixture
 def fake(monkeypatch):
+    from service.tools import notes_tools
+    monkeypatch.setattr(notes_tools, "_changed_at", 0.0)
+
     def install(notes=NOTES, **kw):
         f = FakeNotes(notes, **kw)
         monkeypatch.setattr(notes_write, "_osa", f)
@@ -263,7 +266,8 @@ def test_append_note_sends_list_items(fake):
         return subprocess.CompletedProcess(["osascript"], 0, "OK:Packing list\n", "")
     notes_write._osa = answer
     assert notes_write.append_note("Packing", "- socks\n- hat") == "Added it to \"Packing list\"."
-    assert "<div><ul><li>socks</li><li>hat</li></ul></div>" in f.scripts[-1]
+    assert 'b & "<ul><li>socks</li><li>hat</li></ul>"' in f.scripts[-1]
+    assert "<div><ul>" not in f.scripts[-1]
     assert "- socks" not in f.scripts[-1]
 
 
@@ -293,7 +297,7 @@ def test_a_note_that_ends_in_a_list_gets_a_new_item_inside_it(fake):
 
 def test_a_bullet_asked_for_starts_a_list(fake):
     script = _appended(fake, "Demo ideas", "Demo point 4", bullet=True)
-    assert 'set body of target to b & "<div><ul><li>Demo point 4</li></ul></div>"' in script
+    assert 'set body of target to b & "<ul><li>Demo point 4</li></ul>"' in script
     assert 'of e) & "<li>Demo point 4</li>" & closer' in script
 
 
@@ -304,7 +308,7 @@ def test_the_persons_own_word_bullet_starts_a_list_too(fake):
         script = _appended(fake, "Demo ideas", "Demo point 4\nDemo point 5")
     finally:
         self_send.mark_turn("")
-    assert '"<div><ul><li>Demo point 4</li><li>Demo point 5</li></ul></div>"' in script
+    assert 'b & "<ul><li>Demo point 4</li><li>Demo point 5</li></ul>"' in script
     assert '"<li>Demo point 4</li><li>Demo point 5</li>" & closer' in script
 
 
@@ -389,3 +393,70 @@ def test_the_two_unconfirmed_results_say_which_it_was(fake):
     fake(verify_fails=True)
     out = notes_write.delete_note("Packing list")
     assert "did not answer the check" in out and "Recently Deleted" in out
+
+
+
+# ------------------------------------------------ app audit, section 3.4
+
+def _pending():
+    from service.tools import notes_tools
+    return notes_tools.notes_change_pending()
+
+
+def test_create_note_marks_the_notes_cache_stale(fake):
+    fake()
+    assert not _pending()
+    out = notes_write.create_note("Groceries", "milk")
+    assert out == "Created the note \"Groceries\" in Notes." and "daily sync" not in out
+    assert _pending()
+
+
+def test_a_create_that_made_nothing_leaves_the_cache_alone(fake):
+    f = fake()
+    notes_write._osa = lambda script: subprocess.CompletedProcess(["osascript"], 0, "NOFOLDER\n", "")
+    notes_write.create_note("Groceries", "milk", folder="Nope")
+    assert not _pending()
+
+
+def test_append_note_marks_the_notes_cache_stale(fake):
+    fake()
+    notes_write._osa = lambda script: subprocess.CompletedProcess(["osascript"], 0, "NONE\n", "")
+    notes_write.append_note("Packing", "socks")
+    assert not _pending()
+    notes_write._osa = lambda script: subprocess.CompletedProcess(["osascript"], 0, "OK:Packing list\n", "")
+    notes_write.append_note("Packing", "socks")
+    assert _pending()
+
+
+def test_delete_note_marks_the_notes_cache_stale(fake):
+    fake()
+    notes_write.delete_note("Groceries")   # no such note: nothing deleted
+    assert not _pending()
+    assert notes_write.delete_note("Packing list").startswith("Deleted the note")
+    assert _pending()
+
+
+def test_append_note_never_targets_a_note_in_recently_deleted(fake):
+    f = fake()
+
+    def answer(script):
+        f.scripts.append(script)
+        return subprocess.CompletedProcess(["osascript"], 0, "OK:Packing list\n", "")
+    notes_write._osa = answer
+    notes_write.append_note("Packing", "socks")
+    script = f.scripts[-1]
+    # Matches are filtered by folder before they are counted or written to.
+    keep = script.index('if (name of container of n) is not "Recently Deleted" then set end of hits')
+    assert keep < script.index("(count of hits) is 0") < script.index("set target to item 1 of hits")
+    assert "set hits to (every note" not in script
+
+
+# ------------------------------------- tools/skills audit 2.7: no double wrap
+
+def test_appended_lines_outside_a_list_are_not_wrapped_twice(fake):
+    script = _appended(fake, "Demo ideas", "Packed:\n- socks\n- hat\nDone & dusted")
+    assert ('set body of target to b & "<div>Packed:</div><ul><li>socks</li><li>hat</li></ul>'
+            '<div>Done &amp; dusted</div>"') in script
+    assert "<div><div>" not in script and "<div><ul>" not in script
+    # create_note's body is unchanged: plain lines are not put in a <div>.
+    assert notes_write._body_html("a\n- b") == "a<ul><li>b</li></ul>"

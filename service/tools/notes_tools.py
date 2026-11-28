@@ -62,6 +62,23 @@ _received_at: float = 0.0
 _receipt_started: float = 0.0
 _receipt_available: bool | None = None
 _receipt_reason = ""
+# When Harbor last wrote to Notes (create_note, append_note, delete_note). Until
+# a read that STARTED after it has been published, the held snapshot is known to
+# be missing that change, so the next search asks for a fresh read first.
+_changed_at: float = 0.0
+
+
+def mark_notes_changed(now: float | None = None) -> None:
+    """Harbor just changed Notes: the held snapshot no longer shows it."""
+    global _changed_at
+    with _publication_lock:
+        _changed_at = max(_changed_at, time.time() if now is None else now)
+
+
+def notes_change_pending() -> bool:
+    """A write since the held snapshot's read began (or an unstamped snapshot)."""
+    with _publication_lock:
+        return bool(_changed_at) and _snapshot_started_at < _changed_at
 
 
 # A start stamp may be at most this far ahead of our clock (host clock skew)...
@@ -197,14 +214,26 @@ class RawNotesSnapshot:
     raw_digest: str
 
 
-def raw_notes_snapshot(*, limit: int = 500, byte_limit: int = 100_000) -> RawNotesSnapshot:
+# The snapshot's byte budget. It was 100_000, about 200 bytes for each of the
+# 500 notes the app sends: a few long notes used it up and every later (older)
+# note was silently "omitted", so the Brief, proactive to-dos and task evidence
+# never saw them. The snapshot stays on this Mac and in memory; each consumer
+# applies its own, much smaller budget to what it passes on (task_evidence keeps
+# ~1.7 KB, the Brief 100 rows). 8 KB per note across the full 500 is 4 MB, the
+# same budget the Messages snapshot uses; 16 MB is the hard ceiling.
+_SNAPSHOT_BYTES = 4_000_000
+_SNAPSHOT_MAX_BYTES = 16_000_000
+
+
+def raw_notes_snapshot(*, limit: int = 500, byte_limit: int = _SNAPSHOT_BYTES) -> RawNotesSnapshot:
     """One immutable bounded plaintext view, with held-body and latest receipts.
 
     Content references identify these local bytes, not native Notes objects.
     The native 500-note carrier cap and unknown checkbox/history coverage mean
     even a clean parse cannot establish an exhaustive Notes inventory.
     """
-    if type(limit) is not int or not 1 <= limit <= 500 or type(byte_limit) is not int or not 1 <= byte_limit <= 100_000:
+    if (type(limit) is not int or not 1 <= limit <= 500 or type(byte_limit) is not int
+            or not 1 <= byte_limit <= _SNAPSHOT_MAX_BYTES):
         raise ValueError("invalid Notes snapshot bounds")
     global _issued_snapshot
     _purge_if_expired()  # Outer revocation precedes the source lock.
@@ -314,9 +343,16 @@ _STOP = frozenset(
     "a an the i me my we our you your is are am was were be been do does did have "
     "has had to of for in on at with and or but it this that what which who how "
     "when where can could would should please remember recall know about tell "
-    "said say whats what's".split())
+    "said say whats what's any anything".split())
 # Words that describe the request ("show my recent notes") rather than the topic.
 _META = frozenset("note notes recent recently latest newest list show find search".split())
+# Words that ask for what MATTERS rather than naming a topic: "any important
+# notes?", "urgent notes". Notes has no importance flag and a note rarely says
+# "important", so these are never literal search terms (a lookup for "important"
+# used to find nothing). On their own they are an importance browse.
+_IMPORTANCE = frozenset("important importance urgent urgently priority priorities".split())
+# What a note that marks itself as important tends to say.
+_IMPORTANCE_MARK = re.compile(r"\b(?:important|urgent|urgently|priority|asap|deadline)\b|!!", re.I)
 # Only these mark a request as a vague browse; "list"/"show"/"find" alone name a
 # topic ("to do list", "find my list").
 _BROWSE_HINTS = frozenset("note notes recent recently latest newest".split())
@@ -327,22 +363,67 @@ def _words(text: str) -> list[str]:
     return re.findall(r"\w+", (text or "").casefold())
 
 
+def _tokens(text: str) -> list[tuple[str, bool]]:
+    """Words with whether each stands on its own: not split off by an
+    apostrophe ("what's" -> "what" + a fragment "s", "I'd" -> "d")."""
+    text = (text or "").casefold()
+    out = []
+    for m in re.finditer(r"\w+", text):
+        before = text[m.start() - 1] if m.start() else " "
+        after = text[m.end()] if m.end() < len(text) else " "
+        out.append((m.group(), before not in "'’" and after not in "'’"))
+    return out
+
+
+def _terms(query: str, drop: frozenset[str]) -> list[str]:
+    """Topic words. A single letter counts when it stands on its own next to
+    a topic word ("Vitamin D", "Project X", "plan B"); elsewhere a one-letter
+    token is a fragment ("what's") and is dropped. Digits always count."""
+    tokens = _tokens(query)
+
+    def word(w: str) -> bool:
+        return len(w) > 1 and w not in _STOP and w not in drop and w not in _IMPORTANCE
+    out = []
+    for i, (w, alone) in enumerate(tokens):
+        if w.isdigit() or word(w):
+            out.append(w)
+        elif (len(w) == 1 and w.isalpha() and alone and w not in _STOP
+              and any(0 <= j < len(tokens) and tokens[j][1] and word(tokens[j][0]) for j in (i - 1, i + 1))):
+            out.append(w)
+    return list(dict.fromkeys(out))
+
+
 def significant_terms(query: str) -> list[str]:
-    return list(dict.fromkeys(
-        w for w in _words(query)
-        if (len(w) > 1 or w.isdigit()) and w not in _STOP and w not in _META))
+    return _terms(query, _META)
 
 
 def _fallback_terms(query: str) -> list[str]:
     """Topic words for a query made only of request words ("to do list")."""
-    return list(dict.fromkeys(
-        w for w in _words(query)
-        if (len(w) > 1 or w.isdigit()) and w not in _STOP and w not in _VERBS))
+    return _terms(query, _VERBS)
+
+
+def is_importance_query(query: str | None) -> bool:
+    """The query asks for what is important / urgent / a priority."""
+    return any(w in _IMPORTANCE for w in _words(query or ""))
+
+
+def _importance_only(query: str | None) -> bool:
+    """'important notes' / 'anything urgent?': importance and no topic."""
+    if not is_importance_query(query) or significant_terms(query or ""):
+        return False
+    content = [w for w in _words(query or "") if w not in _STOP and (len(w) > 1 or w.isdigit())]
+    return all(w in _META or w in _IMPORTANCE for w in content)
+
+
+def _marked_important(row: dict) -> bool:
+    return bool(_IMPORTANCE_MARK.search(row["title"]) or _IMPORTANCE_MARK.search(row["body"]))
 
 
 def is_browse_query(query: str | None) -> bool:
     """'recent notes' / 'my notes' name no topic: an explicitly vague browse."""
     if not query or not query.strip():
+        return True
+    if _importance_only(query):
         return True
     # one-character tokens are fragments ("what's" -> "what", "s"), not words
     content = [w for w in _words(query) if w not in _STOP and (len(w) > 1 or w.isdigit())]
@@ -416,8 +497,12 @@ def stem_keys(word: str) -> frozenset[str]:
             out.discard(base)
             out.add(core)
             out.add(core + "e")                              # used/use, making/make
-            if len(core) >= 3 and core[-1] == core[-2] and core[-1] not in _VOWELS:
-                out.add(core[:-1])                           # running/run, travelling/travel
+            # running/run, travelling/travel. Not -ss or -ff: those letters
+            # belong to the word (passed/pass, missed/miss, stuffed/stuff),
+            # and "pas" or "mis" would be a different word.
+            if (len(core) >= 3 and core[-1] == core[-2] and core[-1] not in _VOWELS
+                    and core[-1] not in "sf"):
+                out.add(core[:-1])
             break
         if base.endswith("ery") and len(base) >= 8:          # delivery/deliver
             out.add(base[:-1])
@@ -475,8 +560,13 @@ _SCOPE = (" Only Notes was searched; Mail, Messages and Calendar were not.")
 # ("Harbor resolves it, not the model"). A good default costs one extra prompt
 # block of tokens on a browse (~0.1s by the project's own prompt-token rule)
 # and removes a coin flip from the answer.
+#
+# The search default was 5. Every strict hit carries every term, so they are all
+# relevant, and a topic that recurs ("standup", "Lisbon", "tax") routinely has
+# more than 5 notes: the 6th and later were cut with nothing saying so. 10 still
+# leaves the search clearly narrower than a browse.
 _BROWSE_COUNT = 15
-_SEARCH_COUNT = 5
+_SEARCH_COUNT = 10
 
 
 def _freshness_prefix(receipt: dict | None) -> str:
@@ -530,6 +620,10 @@ async def search_notes_impl(query: str | None = None, count: int | None = None,
              data searched is current, stale (with its age), timed out or unavailable.
     """
     receipt: dict | None = None
+    # Harbor wrote to Notes since this snapshot was read: re-read before
+    # answering, so a note it just created, added to or deleted is reflected.
+    if not refresh and notes_change_pending():
+        refresh = True
     if refresh:
         from service.assistant.sync_status import refresh_notes
         receipt = await refresh_notes()
@@ -579,20 +673,29 @@ async def search_notes_impl(query: str | None = None, count: int | None = None,
                 f"No notes modified in {label} — but there are {total} more notes "
                 f"outside that range. Call this again with no `period`/`day` to "
                 f"browse them.")
-    topic = bool(query and query.strip()) and not (strict and is_browse_query(query))
+    importance = is_importance_query(query)
+    topic = (bool(query and query.strip()) and not (strict and is_browse_query(query))
+             and not _importance_only(query))
     # An explicit count from the model always wins; otherwise browse wide and
     # search narrow (see _BROWSE_COUNT). A period/day range is itself the
     # scope, so return everything in it unless the caller capped it.
     if count is None:
         count = _SEARCH_COUNT if topic else (None if label is not None else _BROWSE_COUNT)
     note = _freshness_prefix(receipt)
+    if importance:
+        # Notes has no importance flag: notes that say they matter come first,
+        # each group most recent first. Topic matches are sorted again below.
+        rows.sort(key=lambda r: not _marked_important(r))
+        note += ("(Notes has no importance flag. Notes that say important, urgent, priority, ASAP "
+                 "or deadline are listed first, then the most recent.)\n\n")
     if topic and strict:
         terms = significant_terms(query) or _fallback_terms(query)
         if terms:
             matched = [r for r in rows if all_terms_match(terms, r["title"], r["folder"], r["body"])]
             shown = " and ".join(repr(t) for t in terms)
             # a note whose title carries every term is the better answer
-            matched.sort(key=lambda r: not all_terms_match(terms, r["title"]))
+            matched.sort(key=lambda r: (not all_terms_match(terms, r["title"]),
+                                        importance and not _marked_important(r)))
         else:
             matched = [r for r in rows if _matches(query, r["title"], r["folder"], r["body"])]
             shown = repr(query.strip())
@@ -612,7 +715,9 @@ async def search_notes_impl(query: str | None = None, count: int | None = None,
     rows = rows[:count]
     blocks = []
     for r in rows:
-        when = time.strftime("%a %b %-d, %Y %-I:%M %p", time.localtime(r["ts"]))
+        # A note the reader could not date arrives as 0: say so, not "1970".
+        when = (time.strftime("%a %b %-d, %Y %-I:%M %p", time.localtime(r["ts"]))
+                if r["ts"] > 0 else "unknown")
         folder = f" [{r['folder']}]" if r["folder"] else ""
         blocks.append(f"Title: {r['title']}{folder}\nModified: {when}\n\n{r['body']}")
     return note + "\n\n---\n\n".join(blocks)
