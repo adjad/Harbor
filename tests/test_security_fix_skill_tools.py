@@ -25,6 +25,7 @@ from service.tools.registry import REGISTRY  # noqa: E402
 @pytest.fixture(autouse=True)
 def no_kernel_sandbox(monkeypatch):
     monkeypatch.setattr(sandbox, "available", lambda: False)
+    monkeypatch.setattr(sandbox, "refusal", lambda: "")
     monkeypatch.setattr(T, "_TIMEOUT_S", 3)
 
 
