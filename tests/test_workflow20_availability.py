@@ -60,7 +60,7 @@ def source(monkeypatch):
 
 def invoke(legacy=False, **args):
     if legacy:
-        return S.find_free_time(days=2, **args)
+        return asyncio.run(S.find_free_time(days=2, **args))
     return asyncio.run(S.find_free_time(period='tomorrow', **args))
 
 
@@ -73,17 +73,13 @@ def test_real_long_event_end_replaces_one_hour_assumption(source, legacy):
     assert 'Reminders without durations are deadlines' in result
     assert 'other people' in result and 'not been created' in result
     assert source.reads == (['2026-10-10','2026-10-11'] if legacy else ['2026-10-11'])
-    if legacy:
-        source.ensure.assert_not_awaited()
-    else:
-        source.ensure.assert_awaited_once_with(('calendar','reminders'))
+    source.ensure.assert_awaited_once_with(('calendar',))
 
 
 @pytest.mark.parametrize('legacy', [False, True])
 @pytest.mark.parametrize('change', [
-    {'end_ts':None}, {'end_ts':float('nan')}, {'end_ts':float('inf')},
-    {'end_ts':stamp('2026-10-11T10:00')}, {'when_ts':None},
-    {'when_ts':float('nan')}, {'all_day':True,'end_ts':None},
+    {'end_ts':float('nan')}, {'end_ts':float('inf')},
+    {'when_ts':None}, {'when_ts':float('nan')},
 ])
 def test_unknown_invalid_intervals_never_claim_free(source, legacy, change):
     row = event(); row.update(change); source.rows=[row]
@@ -91,6 +87,33 @@ def test_unknown_invalid_intervals_never_claim_free(source, legacy, change):
     assert result.startswith('(error:')
     assert 'candidate slots' not in result and 'Free for' not in result
     assert classify_tool_outcome('find_free_time', result).status != 'succeeded'
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+@pytest.mark.parametrize('change,why', [
+    ({'end_ts':None}, 'no end time'), ({'end_ts':stamp('2026-10-11T10:00')}, 'end before start'),
+    ({'all_day':True,'end_ts':None}, 'no end time'),
+    ({'all_day':True,'end_ts':stamp('2026-10-11T09:30')}, 'zero-length all-day item'),
+])
+def test_malformed_end_blocks_conservatively_with_a_note(source, legacy, change, why):
+    row = event(); row.update(change)
+    if why == 'zero-length all-day item':
+        row['when_ts'] = row['end_ts']
+    other = {**event(), 'id': 'other-ok', 'title': 'Standup', 'when_ts': stamp('2026-10-11T13:00'),
+             'end_ts': stamp('2026-10-11T14:00')}
+    source.rows = [row, other]
+    result = invoke(legacy, minutes=60)
+    assert not result.startswith('(error:')
+    assert 'had invalid times' in result and why in result and 'blocked conservatively' in result
+    day_line = next((l for l in result.splitlines() if '2026-10-11' in l and l.lstrip().startswith(('Sunday','tomorrow'))), '')
+    if change.get('all_day'):
+        assert not day_line                       # the whole day is blocked: no slot that day
+    else:
+        # one hour from the 10:30 start is blocked; the valid 1-2 PM event still blocks
+        assert ('9:00 AM–10:30 AM' in result or 'free until 2026-10-11T10:30' in result)
+        assert '11:30 AM–' in result and '2:00 PM–' in result
+        for overlapping in ('10:30 AM–', '11:00 AM–', '10:00 AM–', '1:00 PM–'):
+            assert overlapping not in day_line
 
 
 @pytest.mark.parametrize('legacy', [False, True])
@@ -118,7 +141,7 @@ def test_multiday_sync_generation_mismatch_even_with_unique_events(source, field
             result['commitments']=[{**event(),'id':'unique.new.event'}]
         return result
     source.transform=transform
-    result=S.find_free_time(days=2)
+    result=asyncio.run(S.find_free_time(days=2))
     assert result.startswith('(error:')
     assert 'Free for' not in result
 
@@ -130,7 +153,7 @@ def test_same_receipt_cannot_hide_mutated_duplicate_occurrence(source):
             result['commitments'][0]['end_ts'] += 3600
         return result
     source.transform=transform
-    assert 'changed between snapshots' in S.find_free_time(days=2)
+    assert 'changed between snapshots' in asyncio.run(S.find_free_time(days=2))
 
 
 def test_overnight_event_clips_to_real_end(source):
@@ -143,7 +166,7 @@ def test_overnight_event_clips_to_real_end(source):
 def test_all_day_multiday_event_blocks_every_covered_day(source):
     row=event(start='2026-10-10T00:00',end='2026-10-12T00:00'); row['all_day']=True
     source.rows=[row]
-    assert 'No gaps' in S.find_free_time(days=2)
+    assert 'No gaps' in asyncio.run(S.find_free_time(days=2))
 
 
 @pytest.mark.parametrize('legacy', [False, True])
@@ -186,7 +209,8 @@ def test_due_only_reminders_do_not_invent_busy_hour(source):
 
 def test_manual_event_requires_real_end(source):
     source.rows=[{**event(end=None),'source':'manual','kind':'event'}]
-    assert 'missing or invalid ends' in invoke()
+    result = invoke()
+    assert 'had invalid times' in result and 'no end time' in result
 
 
 def test_pinned_tasks_block_and_unpinned_do_not(source):
@@ -316,7 +340,7 @@ def test_full_calendar_date_ranges_share_one_coverage_receipt(source,period,firs
 
 def test_second_day_uncovered_does_not_leak_first_day_slots(source):
     source.sync['diagnostics']['coverage_end']=stamp('2026-10-11T00:00')
-    result=S.find_free_time(days=2)
+    result=asyncio.run(S.find_free_time(days=2))
     assert result.startswith('(error:') and 'Free for' not in result
 
 
@@ -379,3 +403,45 @@ def test_period_availability_reads_its_day_snapshots_off_the_event_loop(source, 
     loop_thread, answer = asyncio.run(ask())
     assert seen and loop_thread not in seen
     assert '(error' not in answer
+
+
+# --- audit 2.3 ------------------------------------------------------------------------------
+
+def test_legacy_form_refreshes_calendar_but_not_reminders(source):
+    asyncio.run(S.find_free_time(days=2))
+    source.ensure.assert_awaited_once_with(('calendar',))
+
+
+def test_reminder_freshness_never_blocks_free_time(source):
+    source.ensure.return_value = {'sources': [{'id': 'calendar', 'state': 'ready'},
+                                              {'id': 'reminders', 'state': 'syncing'}], 'reminders_fresh': False}
+    assert not invoke(False).startswith('(error:')
+    assert not invoke(True).startswith('(error:')
+    source.ensure.return_value = {'sources': [{'id': 'calendar', 'state': 'syncing'}]}
+    assert 'could not check current Calendar' in invoke(False)
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_inverted_hours_are_rejected_not_clamped(source, legacy):
+    result = invoke(legacy, day_start=18, day_end=9)
+    assert result.startswith('(error:') and 'day_start (18) is after day_end (9)' in result
+    assert 'Free for' not in result and 'candidate slots' not in result
+
+
+@pytest.mark.parametrize('period', ['last 7 days', 'yesterday', 'last week', 'past 3 days', '2026-10-01'])
+def test_past_periods_are_rejected_not_clamped_to_today(source, period):
+    result = asyncio.run(S.find_free_time(period=period))
+    assert result.startswith('(error:') and 'in the past' in result
+
+
+def test_one_malformed_row_blocks_an_hour_and_does_not_hide_other_days(source):
+    bad = {**event(), 'id': 'bad-1', 'title': 'Invented broken item', 'end_ts': stamp('2026-10-11T08:00')}
+    good = {**event(), 'id': 'good-1', 'title': 'Invented review', 'when_ts': stamp('2026-10-11T10:00'),
+            'end_ts': stamp('2026-10-11T12:00')}
+    source.rows = [bad, good]
+    result = invoke(True, minutes=60)
+    assert not result.startswith('(error:')
+    assert 'Invented broken item (end before start)' in result
+    # bad row starts 10:30 (end before start): 10:30-11:30 blocked; the valid 10-12 event blocks too
+    assert '12:00 PM–' in result and '10:00 AM–11:00 AM' not in result and '11:30 AM–' not in result
+    assert 'today (2026-10-10)' in result                                 # the other day is listed

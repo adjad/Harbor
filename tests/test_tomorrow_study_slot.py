@@ -1,4 +1,5 @@
 """Study availability and assent regressions; synthetic sources and fixed clocks only."""
+import asyncio
 import datetime as dt
 import os
 import time
@@ -263,9 +264,10 @@ S._store._db.close()
 @pytest.mark.asyncio
 async def test_unknown_end_duration_is_disclosed(clock):
     result = await availability([{"when_ts": stamp(4, 9), "source": "manual", "kind": "event"}])
-    assert result.startswith("(error:") and "missing or invalid ends" in result
-    assert "candidate" not in result and "assumed" not in result
-    assert "10:00 AM" not in result
+    assert not result.startswith("(error:") and "had invalid times" in result
+    assert "no end time" in result and "blocked conservatively" in result and "assumed" not in result
+    # one hour from the 9:00 start is blocked, so no slot overlaps it
+    assert "9:00 AM–" not in result and "10:00 AM–11:30 AM" in result
 
 
 @pytest.mark.asyncio
@@ -467,28 +469,28 @@ async def test_bare_assent_cannot_display_unreceipted_write_claim(call_forbidden
 
 
 @pytest.mark.parametrize("minutes", [0, -5, 30])
-def test_legacy_availability_keeps_sync_api_clamping_and_real_end_semantics(minutes, clock):
+def test_legacy_availability_clamping_and_real_end_semantics(minutes, clock):
     rows = [{"when_ts": stamp(4, 9), "end_ts": stamp(4, 12), "source": "calendar"}]
     store = SimpleNamespace(today_snapshot=lambda day, zone: synthetic_snapshot(rows))
-    with patch.object(S, "_store", store), patch("service.assistant.sync_status.ensure_sources", new=AsyncMock()) as ensure:
-        result = S.find_free_time(days=2, minutes=minutes)
+    with patch.object(S, "_store", store), patch("service.assistant.sync_status.ensure_sources", new=AsyncMock(return_value={"sources": [{"id": "calendar", "state": "ready"}]})) as ensure:
+        result = asyncio.run(S.find_free_time(days=2, minutes=minutes))
     assert isinstance(result, str)
     assert "tomorrow (2026-10-04): 12:00 PM–6:00 PM" in result
     assert f"Free for {max(5,minutes)}+ minutes" in result
     assert "assumed" not in result
     assert "candidate" in result
-    ensure.assert_not_awaited()
+    ensure.assert_awaited_once_with(("calendar",))
 
 
 @pytest.mark.asyncio
-async def test_legacy_availability_registered_execution_does_not_wait_for_sources(clock):
+async def test_legacy_availability_registered_execution_refreshes_calendar_only(clock):
     from service.tools.registry import run_tool, REGISTRY
     with patch.object(S, "_store", SimpleNamespace(today_snapshot=lambda day, zone: synthetic_snapshot())), \
-         patch("service.assistant.sync_status.ensure_sources", new=AsyncMock()) as ensure:
+         patch("service.assistant.sync_status.ensure_sources", new=AsyncMock(return_value={"sources": [{"id": "calendar", "state": "ready"}]})) as ensure:
         result = await run_tool(REGISTRY["find_free_time"], {"days": 1})
     assert result.startswith("No matches: No gaps of 30+ minutes")
     assert "9:00 and 18:00" in result
-    ensure.assert_not_awaited()
+    ensure.assert_awaited_once_with(("calendar",))
 
 
 @pytest.mark.asyncio
@@ -502,12 +504,16 @@ async def test_mid_gap_duration_boundary(clock, gap_minutes, qualifies):
 
 
 @pytest.mark.asyncio
-async def test_exact_day_rejects_zero_minutes_and_stale_reminders(clock):
+async def test_exact_day_rejects_zero_minutes_and_ignores_reminder_freshness(clock):
     assert "minutes must be" in await S.find_free_time(period="tomorrow", minutes=0)
-    with patch("service.assistant.sync_status.ensure_sources", new=AsyncMock(return_value={
+    store = SimpleNamespace(today_snapshot=lambda day, zone: synthetic_snapshot([]))
+    with patch.object(S, "_store", store), patch("service.assistant.sync_status.ensure_sources", new=AsyncMock(return_value={
             "sources": [{"id": "calendar", "state": "ready"}], "reminders_fresh": False})):
         result = await S.find_free_time(period="tomorrow")
-    assert "could not check" in result
+    assert "could not check" not in result and "candidate slots" in result
+    with patch("service.assistant.sync_status.ensure_sources", new=AsyncMock(return_value={
+            "sources": [{"id": "calendar", "state": "syncing"}]})):
+        assert "could not check current Calendar" in await S.find_free_time(period="tomorrow")
 
 
 @pytest.mark.asyncio
@@ -653,8 +659,9 @@ async def test_capability_then_date_question_keeps_generic_route(offer, clock):
 @pytest.mark.parametrize("gap,expected", [(4, False), (5, True)])
 def test_legacy_zero_minutes_still_requires_five_minute_gap(gap, expected, clock):
     rows = [{"when_ts":stamp(4,9,gap), "end_ts":stamp(4,18), "source":"calendar"}]
-    with patch.object(S, "_store", SimpleNamespace(today_snapshot=lambda day, zone:synthetic_snapshot(rows))):
-        result = S.find_free_time(days=2, minutes=0)
+    with patch.object(S, "_store", SimpleNamespace(today_snapshot=lambda day, zone:synthetic_snapshot(rows))), \
+         patch("service.assistant.sync_status.ensure_sources", new=AsyncMock(return_value={"sources": [{"id": "calendar", "state": "ready"}]})):
+        result = asyncio.run(S.find_free_time(days=2, minutes=0))
     assert ("9:00 AM–9:05 AM" in result) is expected
     assert ("No gaps" in result) is not expected
 
@@ -669,5 +676,6 @@ async def test_explicit_assistant_denial_cannot_grant_confirmed_write(clock):
 @pytest.mark.asyncio
 async def test_all_day_unknown_end_cannot_claim_a_verified_gap(clock):
     result = await availability([{"when_ts":stamp(3,0), "all_day":True, "source":"calendar"}])
-    assert result.startswith("(error:") and "missing or invalid ends" in result
-    assert "candidate" not in result and "9:00 AM" not in result
+    assert not result.startswith("(error:") and "had invalid times" in result
+    assert "no end time" in result and "blocked conservatively" in result
+    assert result.startswith("No matches") and "9:00 AM" not in result   # an all-day row blocks the day

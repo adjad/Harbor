@@ -93,7 +93,8 @@ def _private_block_request(quote):
         return False
     command = (rf"(?:^\s*(?:(?:can|could|would|will)\s+you\s+|i\s+want\s+you\s+to\s+)?(?:please\s+)?"
                rf"|\b(?:and|then)\s+(?:please\s+)?)({write})\b[^.!?\n]{{0,160}}"
-               r"\bprivate\s+(?:(?:personal|calendar)\s+){0,2}block\b")
+               r"\b(?:private\s+(?:(?:personal|calendar)\s+){0,2}(?:block|meeting|event)"
+               r"|personal\s+(?:calendar\s+)?(?:block|meeting|event))\b")
     return bool(re.search(command, text, re.I))
 
 
@@ -439,6 +440,12 @@ async def complete_reminder(title: str, expected_id: str = "") -> str:
             if row.get("when_ts") is not None
             and (row.get("source") in reminder_sources
                  or bool(reminder_sources & set(row.get("duplicate_sources") or [])))]
+    # Apple reminders with no due date are completable too, from a current undated list.
+    view, undated = getattr(_store, "undated_listing", lambda: ({}, []))()
+    if view.get("freshness") == "current":
+        rows += [{"id": item["source_id"], "source": "reminders", "source_id": item["source_id"],
+                  "title": item["title"], "when_ts": None, "all_day": 0, "undated": True}
+                 for item in undated]
     hits = [r for r in rows if needle in (r.get("title") or "").lower()]
     exact = [r for r in hits if " ".join((r.get("title") or "").split()).casefold()
              == " ".join(title.split()).casefold()]
@@ -460,18 +467,34 @@ async def complete_reminder(title: str, expected_id: str = "") -> str:
         # A reminder every other view has stopped showing should not turn a clear
         # request into a question: prefer the ones still shown.
         shown_ids = {row["id"] for row in _store.active_between(None, None)}
-        shown = [row for row in hits if row["id"] in shown_ids]
+        shown = [row for row in hits if row["id"] in shown_ids or row.get("undated")]
         if shown:
             hits = shown
     if len(hits) > 1:
         today = dt.date.today()
         listed = "\n".join(
+            f"  - {r['title']} (no due date)" if r.get("when_ts") is None else
             f"  - {r['title']} ({_fmt_day(dt.datetime.fromtimestamp(r['when_ts']).date(), today)}, "
             f"{_fmt_time(r['when_ts'])})" for r in hits[:8])
         return not_done(f"Several match {title!r} — which one?\n{listed}")
 
     _, message = await complete_commitment(hits[0])
     return message
+
+
+async def _complete_undated(row: dict, store) -> tuple[bool, str]:
+    """Complete an Apple reminder that has no due date. The native writer is told the
+    target is undated (null due) and refuses if Reminders.app now shows a due date."""
+    from service.assistant.outbox import request as app_request
+    from service.assistant.verified_reminders import is_undated_target
+    source_id, title = row.get("source_id"), row.get("title")
+    if not source_id or not is_undated_target(store, source_id, title):
+        return False, "(error: that reminder is not a current undated reminder; nothing was marked done.)"
+    result = await app_request("complete_reminder", {
+        "source_id": source_id, "expected_title": title, "expected_due_ts": None})
+    if result.get("ok") is not True:
+        return False, f"(error: {result.get('error') or 'Native completion was not verified'}.)"
+    return True, f"Marked “{title}” done."
 
 
 async def complete_commitment(row: dict, store=None) -> tuple[bool, str]:
@@ -483,6 +506,8 @@ async def complete_commitment(row: dict, store=None) -> tuple[bool, str]:
     marks it done here. ``row`` carries ``duplicate_ids`` (a collapsed read).
     Returns ``(done, message)``."""
     store = store if store is not None else _store
+    if row.get("when_ts") is None and row.get("source") == "reminders":
+        return await _complete_undated(row, store)
     group = [row] + [member for member in
                      (store.get(cid) for cid in row.get("duplicate_ids") or []) if member]
     native = [member for member in group if member.get("source") == "reminders"]
@@ -541,10 +566,8 @@ async def complete_commitment(row: dict, store=None) -> tuple[bool, str]:
 )
 def find_free_time(days: int = 3, minutes: int = 30,
                    day_start: int = 9, day_end: int = 18, period: str = ""):
-    # Keep the synchronous default API. It can use a current receipt but never
-    # invent freshness; callers wanting a refresh use the awaitable period API.
-    if not period:
-        return _legacy_find_free_time(days, minutes, day_start, day_end)
+    # Both forms refresh Calendar first (period="" is the days-ahead form), so the
+    # result is always an awaitable.
     return _find_free_time_for_day(days, minutes, day_start, day_end, period)
 
 
@@ -556,6 +579,9 @@ def _availability_options(days, minutes, day_start, day_end, *, legacy=False):
         minutes = max(5, int(minutes)) if legacy else int(minutes)
         if not 1 <= minutes <= 1440:
             raise ValueError("minutes must be between 1 and 1440.")
+        if int(day_start) > int(day_end):
+            raise ValueError(f"day_start ({int(day_start)}) is after day_end ({int(day_end)}); "
+                             "give the earliest hour first, for example day_start=9, day_end=18.")
         start = max(0, min(23, int(day_start)))
         end = max(start + 1, min(24, int(day_end)))
         return days, minutes, start, end
@@ -586,6 +612,9 @@ def _availability_days(now, days, period):
     else:
         # A weekday, a weekend or a date ("friday", "this weekend", "nov 3"),
         # read forward like any schedule question.
+        if re.search(r"\b(?:last|past|previous|prior|yesterday|ago)\b", value):
+            raise ValueError("the requested availability range is in the past; ask about today "
+                             "or a later day.")
         from service.tools.timeranges import BadPeriod, resolve_span
         try:
             lo, hi, _ = resolve_span(period, now=now.replace(tzinfo=None), forward=True)
@@ -650,6 +679,11 @@ def _availability_result(options, period, timezone, now):
 
     from service.tools.assistant_tools import _is_holiday_calendar_item
 
+    skipped = []
+
+    def malformed(row, why):
+        skipped.append(f"{str(row.get('title') or 'an untitled item').strip()[:60]} ({why})")
+
     def interval(row, lo, hi):
         if row.get("status") in {"done", "dismissed", "cancelled", "declined"}:
             return None
@@ -680,7 +714,14 @@ def _availability_result(options, period, timezone, now):
         if begin >= hi:
             return None
         if not number(finish) or finish < begin or (row.get("all_day") and finish == begin):
-            raise ValueError("Calendar has items with missing or invalid ends; no availability was verified.")
+            # An unusable end must not free time that a real event may hold: block it
+            # conservatively (an all-day row blocks the whole day, anything else one hour
+            # from its start) and name it in the note.
+            malformed(row, "no end time" if not number(finish) else
+                      "end before start" if finish < begin else "zero-length all-day item")
+            if row.get("all_day"):
+                return (lo, hi) if lo < hi else None
+            finish = begin + 3600
         a, b = max(begin, lo), min(finish, hi)
         return (a, b) if a < b else None
 
@@ -718,12 +759,19 @@ def _availability_result(options, period, timezone, now):
         if spans:
             label = day.strftime("%A, %Y-%m-%d") if period else _fmt_day(day, now.date()) + f" ({key})"
             out.append(f"  {label}: " + ", ".join(spans))
+    if skipped:
+        shown = "; ".join(sorted(set(skipped))[:5])
+        skip_note = (f"\nNote: {len(skipped)} Calendar item{'s' if len(skipped) != 1 else ''} had invalid times and "
+                     f"{'were' if len(skipped) != 1 else 'was'} blocked conservatively ({shown}): one hour "
+                     "from the start, or the whole day for an all-day item.")
+    else:
+        skip_note = ""
     scope = (target_days[0].isoformat() if len(target_days) == 1 else
              f"{target_days[0].isoformat()} through {target_days[-1].isoformat()}")
     qualification = ("\nScope: user Calendar, explicit manual events and pinned Harbor tasks only. Reminders without durations are deadlines, not busy intervals. "
         "All active Calendar entries count as busy, including tentative or response-unknown entries; "
         "attendee responses/free-busy flags and other people's availability are unverified. "
-        "These are candidate times; a Calendar event or reminder has not been created.")
+        "These are candidate times; a Calendar event or reminder has not been created.") + skip_note
     # Dated Brief items (a family lunch from a text, a due time from mail)
     # are shown, never counted as busy: they have no duration, most carry a
     # date only, a due time is a deadline, and model-read message text must
@@ -741,34 +789,21 @@ def _availability_result(options, period, timezone, now):
     return f"{heading}, {start_h}:00–{end_h}:00 ({timezone}):\n" + "\n".join(out) + qualification + brief
 
 
-def _legacy_find_free_time(days: int = 3, minutes: int = 30,
-                   day_start: int = 9, day_end: int = 18) -> str:
-    try:
-        options = _availability_options(days, minutes, day_start, day_end, legacy=True)
-        timezone = _availability_timezone()
-        if timezone is None:
-            raise ValueError("the local timezone could not be resolved; no availability was verified.")
-        return _availability_result(options, "", timezone, dt.datetime.now(ZoneInfo(timezone)))
-    except (ValueError, TypeError, OverflowError, OSError, KeyError, AttributeError) as exc:
-        return f"(error: {exc})"
-
-
 async def _find_free_time_for_day(days: int = 3, minutes: int = 30,
                          day_start: int = 9, day_end: int = 18,
                          period: str = "") -> str:
     try:
-        options = _availability_options(days, minutes, day_start, day_end)
+        options = _availability_options(days, minutes, day_start, day_end, legacy=not period)
         timezone = _availability_timezone()
         if timezone is None:
             raise ValueError("the local timezone could not be resolved; no availability was verified.")
         # Validate syntax before refresh, then derive dates only after it.
         _availability_days(dt.datetime.now(ZoneInfo(timezone)), options[0], period)
         from service.assistant.sync_status import ensure_sources
-        readiness = await ensure_sources(("calendar", "reminders"))
-        if (not any(s.get("id") == "calendar" and s.get("state") == "ready" for s in readiness.get("sources", []))
-                or any(s.get("state") != "ready" for s in readiness.get("sources", []))
-                or not readiness.get("reminders_fresh", True)):
-            raise ValueError("Harbor could not check current Calendar and Reminders availability. No study slot has been verified; try again after the sources finish syncing.")
+        # Reminders never block time (no duration), so only Calendar freshness gates this.
+        readiness = await ensure_sources(("calendar",))
+        if not any(s.get("id") == "calendar" and s.get("state") == "ready" for s in readiness.get("sources", [])):
+            raise ValueError("Harbor could not check current Calendar availability. No slot has been verified; try again after Calendar finishes syncing.")
         # One store snapshot per day (up to a month or more for a period): off the loop,
         # so a long range never stalls other turns' streaming and approvals.
         return await asyncio.to_thread(_availability_result, options, period, timezone,

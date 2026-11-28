@@ -203,14 +203,21 @@ def test_unsupported_availability_never_delivers(tmp_path,delivery_sources,promp
     assert all(name not in {'send_message','send_email','draft_email'} for name,args in state.calls)
 
 
-@pytest.mark.parametrize('problem',['stale','missing_end','denied'])
+def test_a_malformed_calendar_row_blocks_conservatively_and_the_send_still_waits_for_approval(tmp_path,delivery_sources):
+    state=delivery_sources
+    state.rows=[{'id':'synthetic.cal','source':'calendar','title':'Unknown end',
+        'when_ts':dt.datetime(2026,10,11,10,tzinfo=ZoneInfo('America/Los_Angeles')).timestamp(),
+        'end_ts':None,'all_day':False,'status':'active'}]
+    _,result=execute_synthetic_delivery(tmp_path,'Text Mom my free time tomorrow',state)
+    assert result.status=='completed'
+    assert [name for name,args in state.calls]==['find_free_time','send_message']
+    assert len(state.approvals)==1                     # nothing is sent without the user's approval
+
+
+@pytest.mark.parametrize('problem',['stale','denied'])
 def test_unverified_availability_or_denied_preview_has_no_effect(tmp_path,delivery_sources,problem):
     state=delivery_sources
     state.stale=problem=='stale'; state.allow=problem!='denied'
-    if problem=='missing_end':
-        state.rows=[{'id':'synthetic.cal','source':'calendar','title':'Unknown end',
-            'when_ts':dt.datetime(2026,10,11,10,tzinfo=ZoneInfo('America/Los_Angeles')).timestamp(),
-            'end_ts':None,'all_day':False,'status':'active'}]
     _,result=execute_synthetic_delivery(tmp_path,'Text Mom my free time tomorrow',state)
     assert result.status==('denied' if problem=='denied' else 'failed')
     assert [name for name,args in state.calls]==['find_free_time']
