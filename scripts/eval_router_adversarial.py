@@ -19,7 +19,7 @@ import json
 import re
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import httpx
@@ -59,6 +59,7 @@ class LiveResult:
     called_forbidden: list[str]
     contract_tools: list[str]
     arg_mismatches: list[str]
+    route_missing_required: list[str] = field(default_factory=list)
 
     @property
     def passed_tool_contract(self) -> bool:
@@ -80,10 +81,13 @@ async def run_case(client: httpx.AsyncClient, case: PromptCase, repetition: int)
     called = {tool["name"] for tool in turn.tools}
     contract_tools = {name for group in turn.route.get("required_tool_groups", [])
                       for name in group}
-    planned = called | contract_tools
-    missing_required = sorted(set(case.required) - planned)
-    missing_one_of = (sorted(case.one_of) if case.one_of and not (set(case.one_of) & planned)
+    # Execution is scored on what the model called. A tool the route only listed as
+    # required was never run, so it must not satisfy the case; what the route offered
+    # is reported separately as a routing metric.
+    missing_required = sorted(set(case.required) - called)
+    missing_one_of = (sorted(case.one_of) if case.one_of and not (set(case.one_of) & called)
                       else [])
+    route_missing = sorted(set(case.required) - contract_tools - called)
     called_forbidden = sorted(set(case.forbidden) & called)
     arg_mismatches: list[str] = []
     for tool_name, key, expected in case.required_args:
@@ -96,6 +100,7 @@ async def run_case(client: httpx.AsyncClient, case: PromptCase, repetition: int)
         elapsed_s=turn.elapsed_s, missing_required=missing_required,
         missing_one_of=missing_one_of, called_forbidden=called_forbidden,
         contract_tools=sorted(contract_tools), arg_mismatches=arg_mismatches,
+        route_missing_required=route_missing,
     )
 
 
@@ -136,7 +141,8 @@ async def main_async(args) -> int:
                     print(f"       contract: {', '.join(result.contract_tools)}", flush=True)
                 for label, values in (("missing", result.missing_required),
                                       ("one-of missing", result.missing_one_of),
-                                      ("forbidden", result.called_forbidden)):
+                                      ("forbidden", result.called_forbidden),
+                                      ("route did not offer", result.route_missing_required)):
                     if values:
                         print(f"       {label}: {', '.join(values)}", flush=True)
                 if result.arg_mismatches:

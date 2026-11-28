@@ -41,11 +41,11 @@ async def lifespan(_app: FastAPI):
     the latter is deprecated and the Air pip-installs whatever FastAPI is
     current, so relying on it would be a time bomb."""
     store.init()
-    key = config.api_key()
+    config.api_key()                      # creates the key on first start
     cfg = config.load()
     task = asyncio.create_task(scheduler.loop())
     log.info("Harbor Air periodic node up on %s:%s", cfg["bind_host"], cfg["bind_port"])
-    log.info("API key (configure this on the Pro): %s", key)
+    log.info("API key is in %s (configure it on the Pro); it is not logged", config.API_KEY_PATH)
     try:
         yield
     finally:

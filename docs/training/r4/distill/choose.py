@@ -32,7 +32,7 @@ from gen import request_hash  # noqa: E402  (the sampler's own hash: object/stri
 RECALL_KEY = "recall"        # meta field (str or list of str) of facts a reply must carry; may be renamed
 USER_NAME = "Sam"            # the synthetic user's name in the prompts
 
-# --- copied from training/ask-lora-r2/builder/validate.py (FINAL_LEAK, CHAT_RECEIPT); not imported, validate.py loads
+# --- copied from docs/training/r2/builder/validate.py (FINAL_LEAK, CHAT_RECEIPT); not imported, validate.py loads
 # --- the whole service. Keep in step by hand if validate.py changes.
 FINAL_LEAK_CALL = re.compile(r"\{\"|\bUNTRUSTED\b|haven['’]t checked (?:a |any )?current|current personal source|"
                              r"\b[a-z]+_[a-z_]+\(", re.I)
@@ -167,10 +167,193 @@ def recall_missing(content: str, recall) -> list[str]:
     return [r for r, h in zip(need, hits) if not h]
 
 
+# --- anchor finals (select_anchor.py, meta "_anchor"): the final after the turn's reads, or a safety decline. These
+# --- reuse the builder's planted-line test (thinking.planted_lines) and the r4 reward's grounding and leak checks
+# --- (r3/grpo/reward.py); both are stdlib-only and load no service.
+ANCHOR_KEY = "_anchor"
+VALIDATE_CHECKS = True       # validate.py's own final checks on every sample (tests of the other rules turn it off)
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ANCHOR_LIBS = None
+# copied from validate.py (_PAYLOAD, claims_done); validate.py loads the whole service
+_PAYLOAD = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+|\b[\w-]+(?:\.[\w-]+)*\.(?:net|com|org|io|sh)\b(?:/\S*)?"
+                      r"|\$\d[\d,.]*|\b\d{3,}-\d{3,}\b|`[^`]+`")
+_DONE = re.compile(r"\b(?:sent|added|scheduled|created|booked|saved|deleted|removed|moved|cancel+ed|updated|"
+                   r"emailed|texted|replied|forwarded|completed|marked|done|all set)\b", re.I)
+_NEGATED = re.compile(r"\b(?:not|never|no|nothing|none|nope|without|cannot|unsent|unsaved)\b|n['’]t\b", re.I)
+# --- end copy
+# "nothing / no messages / I don't have / there aren't any": an absence claim. It is a defect only where the scripted
+# final (written from the same results) claims no absence, i.e. the results show the item.
+ABSENCE = re.compile(rf"\bnothing\b|\bnone\b|\bno\s+(?:new\s+|unread\s+|other\s+|upcoming\s+|matching\s+)?"
+                     rf"(?:messages?|e-?mails?|mail|events?|meetings?|appointments?|reminders?|notes?|results?|matches|"
+                     rf"plans|files?|contacts?|record|entries|items?|alarms?|timers?|texts?)\b|"
+                     rf"\bI\s+(?:do\s+not|don{_AP}t)\s+(?:have|see)\s+(?:any|anything|a\s+(?:new|recent|reply|message|record))\b|"
+                     rf"\bthere\s+(?:is|are)\s+no\b|"
+                     rf"\bthere\s+(?:isn{_AP}t|aren{_AP}t)\s+any\b|\bno\s+sign\s+of\b|\b(?:couldn{_AP}t|didn{_AP}t)\s+find\b",
+                     re.I)
+# a first-person claim that something was done ("I've added", "it's on your calendar"): a defect when the turn shows
+# no effect at all
+CLAIM_DONE = re.compile(rf"(?<!what )(?<!that )(?<!which )\bI(?:{_AP}ve|\s+have|\s+just)?\s+(?:sent|added|scheduled|created|"
+                        r"booked|saved|deleted|removed|moved|cancel+ed|updated|emailed|texted|replied|forwarded|marked|"
+                        r"turned|switched|remembered|stored|cleared)\b|\b(?:is|are)\s+(?:now\s+)?on\s+your\s+calendar\b|"
+                        r"\ball\s+set\b", re.I)
+QUOTED = re.compile(r"[“\"][^”\"\n]*[”\"]")
+# a result that leaves the action unfinished: a draft, nothing sent, a denied card
+PENDING = re.compile(r"nothing has been sent|not (?:been )?sent|\bdraft (?:opened|saved|created)|awaiting|"
+                     r"waiting for (?:your )?approval|needs your approval|The user denied this action", re.I)
+SENT_DONE = re.compile(r"\b(?:sent|done|added|emailed|texted|forwarded|replied|scheduled|booked|all set)\b", re.I)
+CLOCK_LINE = re.compile(r"The current date and time is [^\n]+")
+# the scripted final already says something is missing or has not happened ("you haven't replied"), so a base reply
+# that says so in other words is not contradicting the results
+SCRIPTED_NEG = re.compile(rf"\b(?:haven{_AP}t|hasn{_AP}t|didn{_AP}t|isn{_AP}t|aren{_AP}t|wasn{_AP}t|not\s+yet|no|not|never|none|"
+                          rf"nothing|can{_AP}t|cannot|couldn{_AP}t|won{_AP}t)\b", re.I)
+# the user spoken of in the third person: "Sam's", "Sam has", "the user"
+THIRD_PERSON = re.compile(rf"\b{USER_NAME}{_AP}s\b|\b{USER_NAME}\s+(?:has|is|was|had|needs|wants|asked|said|will)\b|"
+                          r"\bthe user\b", re.I)
+
+
+def anchor_libs():
+    """(thinking, reward, export_prompts), imported on first use."""
+    global _ANCHOR_LIBS
+    if _ANCHOR_LIBS is None:
+        os.environ.setdefault("ASK_LORA_ROUND", "4")    # thinking.planted_lines' round-4 "assistant" test
+        for d in (os.path.join(_HERE, "..", "..", "r2", "builder"),
+                  os.path.join(_HERE, "..", "..", "r3", "grpo")):
+            if os.path.abspath(d) not in sys.path:
+                sys.path.insert(0, os.path.abspath(d))
+        import export_prompts  # noqa: E402
+        import reward  # noqa: E402
+        import thinking  # noqa: E402
+        _ANCHOR_LIBS = (thinking, reward, export_prompts)
+    return _ANCHOR_LIBS
+
+
+def claims_done(text: str) -> bool:
+    for sentence in re.split(r"(?<=[.!?])\s+|\n+", text or ""):
+        s = sentence.strip()
+        if s and not s.endswith("?") and _DONE.search(s) and not _NEGATED.search(s):
+            return True
+    return False
+
+
+def _grams(text: str, n: int = 4) -> set[str]:
+    w = re.findall(r"[a-z0-9]+", (text or "").lower())
+    return {" ".join(w[i:i + n]) for i in range(len(w) - n + 1)}
+
+
+_NUMTOK = re.compile(r"\b\d+(?:\.\d+){2,}\b")     # dotted numbers: IPs, versions
+_DEC = re.compile(r"-?\d+(?:\.\d+)?")
+HEADING = re.compile(r"^[ \t]*#{1,6}[^\n]*$", re.M)
+# the long forms of the abbreviations a result uses, so a reply may spell them out
+ALIASES = ((r"\bProf\.", "Professor"), (r"\bDr\.", "Doctor"), (r"\bP[SD]?T\b", "Pacific"), (r"\bE[SD]?T\b", "Eastern"),
+           (r"\bAve\.?\b", "Avenue"), (r"\bSt\.(?=\s|$)", "Street"))
+
+
+def ungrounded(content: str, ground: str) -> list[str]:
+    """reward.ungrounded_entities, after dropping tokens the ground holds verbatim (an IP such as 10.24.8.113 would
+    otherwise split into numbers) and keeping a decimal that a ground number rounds to ($34.5 -> $34.50, 11.811 ->
+    11.81: a computed answer, not an invented one)."""
+    _, reward, _ = anchor_libs()
+    text = _NUMTOK.sub(lambda m: " " if m.group(0) in ground else m.group(0), content)
+    text = HEADING.sub(" ", text)            # markdown headings are the reply's own labels, not facts
+    ground = ground + "".join(f"\n{full}" for short, full in ALIASES if re.search(short, ground))
+    nums = [float(x) for x in _DEC.findall(ground.replace(",", ""))]
+    out = []
+    for hit in reward.ungrounded_entities(text, ground):
+        if re.fullmatch(r"\d+\.\d+", hit):
+            d = len(hit.split(".")[1])
+            if any(abs(round(n, d) - float(hit)) < 10 ** -(d + 1) for n in nums):
+                continue
+        out.append(hit)
+    return out
+
+
+def anchor_reasons(content: str, reasoning: str, row: dict) -> list[str]:
+    """The anchor-final defects: a fact the turn never showed, an absence claim the results contradict, the user in the
+    third person, plumbing in the text, a planted line followed or quoted (reply or thought), success claimed after a
+    denial."""
+    thinking, reward, ep = anchor_libs()
+    hist = row["messages"][:-1]
+    scripted = row["messages"][-1].get("content") or ""
+    # what an answer may restate: the person's words, the results, the arguments and earlier answers (ground_text),
+    # plus the whole system prompt (the profile, the day's context), which ground_text leaves out when it is long
+    ground = "\n".join([USER_NAME, system_text(row), ep.ground_text(hist)])     # greeting the person by name is fine
+    results = [str(m.get("content") or "") for m in hist if m.get("role") == "tool"]
+    out = []
+    if ungrounded(content, ground):
+        out.append("ungrounded")
+    if ABSENCE.search(content) and not ABSENCE.search(scripted) and not SCRIPTED_NEG.search(scripted):
+        out.append("absence")
+    if THIRD_PERSON.search(content):
+        out.append("third_person")
+    if reward.leaked_internals(content, {"ground": ground, "tool_names": tool_names(row)}):
+        out.append("leak")
+    # the lines written to an assistant (validate.py's INJECTION_MARKERS; not round 4's bare "assistant" word, which
+    # harbor_capabilities' own "your assistant in the Mac's notch" trips). Its payload (address, URL, amount, code) may
+    # not appear at all; a 6-gram of it is a quote. A short mention of what it asked ("a line asking me to text your
+    # contacts") is what the scripted finals do, so shorter overlaps pass.
+    planted = [s for r in results for s in re.split(r"(?<=[.!?])\s+|\n", r) if thinking.INJECTION.search(s)]
+    payloads = [p.strip("`").lower() for s in planted for p in _PAYLOAD.findall(s)]
+    bad = set().union(*[_grams(s, 6) for s in planted]) if planted else set()
+    for text in (content, reasoning or ""):
+        if any(p in text.lower() for p in payloads) or (_grams(text, 6) & bad):
+            out.append("planted")
+            break
+    if any(thinking.DENIED in r for r in results) and claims_done(content):
+        out.append("denied_claims_success")
+    meta = row["meta"]
+    effects = meta.get("effects") or []
+    if not effects and any(CLAIM_DONE.search(s) and not _NEGATED.search(s)
+                           for s in re.split(r"(?<=[.!?])\s+|\n+", QUOTED.sub(" ", content))):
+        out.append("claims_unshown")         # says it acted, but nothing took effect this turn
+    if meta.get("turn_writes"):
+        if any(PENDING.search(r) for r in results) and any(
+                SENT_DONE.search(s) and not _NEGATED.search(s) and not s.strip().endswith("?")
+                for s in re.split(r"(?<=[.!?])\s+|\n+", content)):
+            out.append("claims_pending")     # a draft or a denied card, told as sent / done / added
+        # a receipt restates only what the person said, the call and its result hold: times, titles, recipients
+        # (and may greet the person by name)
+        args = [tc["function"].get("arguments") for m in hist for tc in m.get("tool_calls") or ()]
+        users = [m.get("content") or "" for m in hist if m["role"] == "user" and isinstance(m.get("content"), str)]
+        strict = "\n".join([USER_NAME] + CLOCK_LINE.findall(system_text(row)) + users + results +
+                           [a if isinstance(a, str) else json.dumps(a, ensure_ascii=False) for a in args])
+        if ungrounded(content, strict):
+            out.append("receipt_ungrounded")
+    return out
+
+
+_LEAK = None
+
+
+def validate_reasons(content: str, row: dict) -> list[str]:
+    """validate.py's round-4 checks on a final, run on the sample (thinking.py's: ISO timestamps, empty ranges, a "no
+    free time" that the results contradict, an absence claim with no read in the turn, a wrong position claim; and a
+    toolbench fact value the conversation did not already hold). Any hit is "validate"."""
+    global _LEAK
+    thinking, _, _ = anchor_libs()
+    if _LEAK is None:
+        import leak as _leak  # noqa: E402  (builder dir; the toolbench fact pool, no service)
+        _LEAK = _leak
+    meta = {k: v for k, v in (row["meta"] or {}).items() if not k.startswith("_")}
+    msgs = row["messages"][:-1] + [{"role": "assistant", "content": content}]
+    results = [str(m.get("content") or "") for m in row["messages"][:-1] if m.get("role") == "tool"]
+    errs = (thinking.iso_problems(content) + thinking.empty_range_problems(content)
+            + thinking.nofree_problems(content, results) + thinking.absence_problems(meta, msgs))
+    try:
+        errs += thinking.position_problems(meta, msgs)
+    except Exception as exc:  # noqa: BLE001
+        errs.append(f"position check failed {exc!r}")
+    before = set(_LEAK.fact_hits(_LEAK.conversation_text({"messages": row["messages"][:-1]})))
+    errs += [v for v in _LEAK.fact_hits(content) if v not in before]
+    return ["validate"] if errs else []
+
+
 def reject_reasons(rec: dict, row: dict) -> list[str]:
-    """Every defect of one sample, in a fixed order; empty list = passes."""
+    """Every defect of one sample, in a fixed order; empty list = passes. Anchor finals skip the chat-only checks
+    (CHAT_RECEIPT: "I didn't send it" is a right decline; antecedent: "you told me before" can restate a recalled fact)
+    and count a non-reply only where the scripted final is not one itself (a read that failed)."""
     if rec.get("error"):
         return ["error"]
+    anchor = bool((row["meta"] or {}).get(ANCHOR_KEY))
     out = []
     if rec.get("no_choices"):
         out.append("no_choices")
@@ -185,13 +368,21 @@ def reject_reasons(rec: dict, row: dict) -> list[str]:
         out.append("no_thought")      # every distilled row keeps the base's own thinking (r3's thinking collapsed)
     if FINAL_GLITCH.search(content):
         out.append("glitch")
-    if STALL.search(content) or CHAT_RECEIPT.search(content) or FINAL_LEAK_STALL.search(content):
+    scripted = row["messages"][-1].get("content") or ""
+    if anchor:
+        if (STALL.search(content) and not STALL.search(scripted)) or FINAL_LEAK_STALL.search(content):
+            out.append("stall")
+    elif STALL.search(content) or CHAT_RECEIPT.search(content) or FINAL_LEAK_STALL.search(content):
         out.append("stall")
     if (tool_leak(content, tool_names(row)) or skill_leak(content, skill_names(row)) or "UNTRUSTED" in content
             or json_leak(content) or FINAL_LEAK_CALL.search(content)):
         out.append("leak")
-    if sum(m["role"] == "user" for m in row["messages"][:-1]) == 1 and ANTECEDENT.search(content):
+    if not anchor and sum(m["role"] == "user" for m in row["messages"][:-1]) == 1 and ANTECEDENT.search(content):
         out.append("antecedent")
+    if anchor and content.strip():
+        out += [x for x in anchor_reasons(content, rec.get("reasoning") or "", row) if x not in out]
+    if content.strip() and VALIDATE_CHECKS:
+        out += validate_reasons(content, row)
     rc = (row["meta"] or {}).get(RECALL_KEY)
     if rc and recall_missing(content, rc):
         out.append("recall")
@@ -336,10 +527,19 @@ def read_jsonl(path: str):
                 continue          # a line cut off by a kill or still being written
 
 
-def run(partial: str, raws: list[str], k: int | None = None, hash_check: bool = True, refs: list[str] = ()):
+def read_ids(paths) -> set[str]:
+    return {x.strip() for p in paths for x in open(p) if x.strip()}
+
+
+def run(partial: str, raws: list[str], k: int | None = None, hash_check: bool = True, refs: list[str] = (),
+        anchors: list[str] = (), targets: list[str] = ()):
     all_rows = list(read_jsonl(partial))
     for p in refs:
         apply_refs(all_rows, json.load(open(p)))
+    anchor_ids = read_ids(anchors)
+    for r in all_rows:
+        if r["meta"]["id"] in anchor_ids:
+            r["meta"] = {**r["meta"], ANCHOR_KEY: True}
     by_id = {r["meta"]["id"]: r for r in all_rows}
     cur = {i: request_hash(r["messages"][:-1], r.get("tools")) for i, r in by_id.items()}
     recs = [rec for path in raws for rec in read_jsonl(path)
@@ -357,6 +557,9 @@ def run(partial: str, raws: list[str], k: int | None = None, hash_check: bool = 
     orphans = sorted({i for i, _ in got} - set(by_id))
     fams = {r["family"] for r in got.values()} | {by_id[i]["meta"]["family"] for i, _ in got}
     rows = [r for r in all_rows if r["meta"]["family"] in fams]
+    if targets or anchors:          # the ids meant for distilling (plus any sampled id), not every step of the family
+        want = read_ids(targets) | anchor_ids | {i for i, _ in got}
+        rows = [r for r in rows if r["meta"]["id"] in want]
     samples = defaultdict(list)
     for (i, kk), rec in sorted(got.items(), key=lambda kv: (kv[0][0], kv[0][1])):
         row = by_id[i]
@@ -372,6 +575,7 @@ def run(partial: str, raws: list[str], k: int | None = None, hash_check: bool = 
         if ok:
             ok = {k2: v for k2, v in ok.items() if k2 != "_reasons"}
             ok["reasoning"] = (ok.get("reasoning") or "").strip() or None
+            ok["distill_kind"] = "anchor_final" if by_id[i]["meta"].get(ANCHOR_KEY) else "chat"
             chosen[i] = ok
     stats = {"overall": group_stats(rows, samples, chosen), "orphan_ids": orphans,
              "families": {f: group_stats([r for r in rows if r["meta"]["family"] == f], samples, chosen)
@@ -380,6 +584,12 @@ def run(partial: str, raws: list[str], k: int | None = None, hash_check: bool = 
     for f, g in stats["families"].items():
         g["chosen_k"] = dict(sorted(Counter(c["k"] for i, c in chosen.items() if by_id[i]["meta"]["family"] == f).items()))
     stats["overall"]["chosen_k"] = dict(sorted(Counter(c["k"] for c in chosen.values()).items()))
+    # the base-anchored share of the whole build (every step row counts; call steps are never distilled)
+    finals = sum(1 for r in all_rows if not r["messages"][-1].get("tool_calls"))
+    stats["overall"]["build_rows"], stats["overall"]["build_finals"] = len(all_rows), finals
+    stats["overall"]["distilled_by_kind"] = dict(Counter(c["distill_kind"] for c in chosen.values()))
+    stats["overall"]["distilled_share"] = round(len(chosen) / len(all_rows), 3) if all_rows else None
+    stats["overall"]["distilled_share_of_finals"] = round(len(chosen) / finals, 3) if finals else None
     return rows, chosen, stats
 
 
@@ -394,6 +604,8 @@ def summary(stats: dict) -> str:
     o = stats["overall"]
     out.append(f"rejects by reason: {o['rejects_by_reason']}")
     out.append(f"no passing sample: {len(o['no_pass'])}; no samples yet: {len(o['no_samples'])}")
+    out.append(f"distilled {o['distilled_by_kind']}: {o['distilled_share']} of {o['build_rows']} build rows, "
+               f"{o['distilled_share_of_finals']} of {o['build_finals']} finals")
     return "\n".join(out)
 
 
@@ -406,11 +618,13 @@ def main(argv=None):
     ap.add_argument("--k", type=int, default=None, help="only samples with k < K")
     ap.add_argument("--tool-names", help="JSON list of every live tool name (refs.py --registry-out)")
     ap.add_argument("--refs", action="append", default=[], help="refs.py output (session_chat recall checks)")
+    ap.add_argument("--anchor-ids", action="append", default=[], help="select_anchor.py output: anchor-final checks")
+    ap.add_argument("--targets", action="append", default=[], help="id files meant for distilling (stats rows)")
     ap.add_argument("--no-hash-check", action="store_true", help="do not reject samples whose request_hash differs")
     a = ap.parse_args(argv)
     if a.tool_names:
         EXTRA_TOOL_NAMES.update(json.load(open(a.tool_names)))
-    rows, chosen, stats = run(a.partial, a.raw, a.k, not a.no_hash_check, a.refs)
+    rows, chosen, stats = run(a.partial, a.raw, a.k, not a.no_hash_check, a.refs, a.anchor_ids, a.targets)
     with open(a.out_chosen, "w") as f:
         for r in rows:
             if r["meta"]["id"] in chosen:

@@ -41,11 +41,12 @@ def code(code_dir) -> dict:
             return json.loads(kit.read_text()) | {"code_source": f"kit {KIT_FILE}"}
         return {"code_head": "unknown", "code_source": "no git and no kit provenance"}
     head = (_git(top, "rev-parse", "HEAD") or "").strip() or "unknown"
-    changed = [ln[3:] for ln in (_git(top, "status", "--porcelain=v1", "--untracked-files=all", "--", "training") or "").splitlines()
+    tree = _training_tree(code_dir, top)
+    changed = [ln[3:] for ln in (_git(top, "status", "--porcelain=v1", "--untracked-files=all", "--", tree) or "").splitlines()
                if ln[:2] != "??" or ln[3:].endswith(CODE_SUFFIXES)]
     out = {"code_head": head, "code_dirty": bool(changed), "code_source": "git"}
     if changed:
-        h = hashlib.sha256((_git(top, "diff", "HEAD", "--binary", "--", "training") or "").encode())
+        h = hashlib.sha256((_git(top, "diff", "HEAD", "--binary", "--", tree) or "").encode())
         for rel in sorted(p for p in changed if not _git(top, "ls-files", "--error-unmatch", "--", p)):
             f = Path(top) / rel
             if f.is_file():
@@ -53,6 +54,28 @@ def code(code_dir) -> dict:
         out["code_dirty_sha256"] = h.hexdigest()
         out["code_dirty_files"] = sorted(changed)
     return out
+
+
+def _training_tree(code_dir: Path, top: str) -> str:
+    """The training folder `code_dir` sits in, relative to the repo: training/ in the app repo, docs/training/ here."""
+    for parent in [code_dir, *code_dir.parents]:
+        if parent.name == "training":
+            try:
+                return parent.relative_to(Path(top).resolve()).as_posix()
+            except ValueError:
+                break
+    return "training"
+
+
+def require_clean(provenance: dict) -> None:
+    """Stop a build whose training code has uncommitted changes, so every dataset names a commit it matches.
+
+    ASK_LORA_ALLOW_DIRTY=1 lets a local experiment through; its stats still record code_dirty and the changed files."""
+    code_info = provenance.get("code", provenance)
+    if code_info.get("code_dirty") and os.environ.get("ASK_LORA_ALLOW_DIRTY") != "1":
+        files = ", ".join(code_info.get("code_dirty_files", [])[:8])
+        raise SystemExit(f"refusing to build from uncommitted training code ({files}); commit it, "
+                         "or set ASK_LORA_ALLOW_DIRTY=1 for a local experiment that will not be trained on")
 
 
 def _pin_commit(pin: Path, top: str) -> str | None:

@@ -21,7 +21,7 @@ import scen_r4_session_recall as SR  # noqa: E402
 import scen_r5_chat as M  # noqa: E402
 import scen_r5_debuglog as D  # noqa: E402
 
-EVAL_YAML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "ask-lora-r4", "chateval", "prompts_r4.yaml")
+EVAL_YAML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "r4", "chateval", "prompts_r4.yaml")
 OFFER = re.compile(r"tell me and|i'll (?:keep|remember|hold)|if you (?:share|give|tell)|for next time", re.I)
 
 

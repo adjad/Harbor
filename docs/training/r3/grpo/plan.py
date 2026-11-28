@@ -537,7 +537,7 @@ HW = {
                   src="bf16 dense tensor peak 154.8 TFLOPS (no FP8); HF eager + SDPA + checkpointing MFU 25-45 %; "
                       "decode is launch-bound at 30-55 ms/token for 42 layers"),
     # Unmeasured: the A6000's effective speed x 1.17 / 1.10 / 1.0 (the bf16 peak ratio, a middle guess, no gain), expressed
-    # as MFU against the L40's own peak, and decode / 1.125 / 1.06 / 1.0 (the bandwidth ratio 864/768). As in ../../ask-lora-r4/a6000/estimate.py.
+    # as MFU against the L40's own peak, and decode / 1.125 / 1.06 / 1.0 (the bandwidth ratio 864/768). As in ../../r4/a6000/estimate.py.
     "l40": dict(name="1 x L40 48 GB (sm_89, ECC on)", peak=181.05e12,
                 mfu=tuple(round(m * 154.8 / 181.05 * f, 3) for m, f in zip((0.45, 0.35, 0.25), (1.17, 1.10, 1.0))),
                 tok_s=(round(0.030 / 1.125, 4), round(0.040 / 1.06, 4), 0.055), opt_s=0.3, straggler=1.0, usd_h=1.06,

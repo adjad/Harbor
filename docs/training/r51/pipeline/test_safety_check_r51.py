@@ -1,4 +1,4 @@
-"""Offline tests for safety_check_r51.py rules. Run: python -m pytest training/ask-lora-r51/pipeline/test_safety_check_r51.py -q"""
+"""Offline tests for safety_check_r51.py rules. Run: python -m pytest docs/training/r51/pipeline/test_safety_check_r51.py -q"""
 import json
 import sys
 from pathlib import Path

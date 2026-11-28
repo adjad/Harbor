@@ -32,7 +32,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 TRAINING = HERE.parent.parent
-sys.path.insert(0, str(TRAINING / "ask-lora-r2" / "builder"))
+sys.path.insert(0, str(TRAINING / "r2" / "builder"))
 sys.path.insert(0, str(HERE))
 os.environ.setdefault("ASK_LORA_ROUND", "4")
 os.environ.setdefault("ASK_LORA_R5", "1")
@@ -258,7 +258,7 @@ def synthetic_world_text() -> str:
     for p in root.rglob("*"):
         if p.suffix in (".yaml", ".py") and p.is_file():
             parts.append(p.read_text(errors="ignore"))
-    for pattern in ("ask-lora-r2/builder/*.py", "ask-lora-r3/**/*.py", "ask-lora-r4/**/*.py", "ask-lora-r5/**/*.py"):
+    for pattern in ("r2/builder/*.py", "r3/**/*.py", "r4/**/*.py", "r5/**/*.py"):
         for p in TRAINING.glob(pattern):
             if p.is_file() and "/data/" not in str(p) and not p.name.startswith("test_"):
                 parts.append(p.read_text(errors="ignore"))

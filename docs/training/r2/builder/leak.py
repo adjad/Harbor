@@ -28,8 +28,8 @@ from datetime import date
 from functools import lru_cache
 
 DATASET_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# builder/ -> ask-lora-r2/ -> training/ -> repo root (same rule as boot.py)
-REPO = os.environ.get("HARBOR_REPO") or os.path.abspath(os.path.join(DATASET_DIR, "..", ".."))
+# builder/ -> r2/ -> training/ -> repo root (same rule as boot.py)
+REPO = os.environ.get("HARBOR_REPO") or os.path.abspath(os.path.join(DATASET_DIR, "..", "..", ".."))
 THRESHOLD = 0.7
 SEEDS = range(50)
 

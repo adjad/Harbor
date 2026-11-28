@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """Audit of the Ask LoRA r5 training targets and their effective loss. Analysis only: it changes nothing about training.
 
-    python audit_targets.py --build training/ask-lora-r5/data/r5-final --out OUT --tokenizer ~/Desktop/OMLX_Model_Files/Jundot/gemma-4-E4B-it-oQ4e-mtp
+    python audit_targets.py --build docs/training/r5/data/r5-final --out OUT --tokenizer ~/Desktop/OMLX_Model_Files/Jundot/gemma-4-E4B-it-oQ4e-mtp
 
 Reads the build's train split (train.jsonl + train.meta.jsonl; the other files only for the stats.json cross-check) and writes
 OUT/audit.json, OUT/AUDIT.md, OUT/examples/*.txt (exact rendered text, supervised span in ⟦ ⟧) and OUT/date_candidates.jsonl.
 Loads the TOKENIZER only (transformers' tokenizers; no torch, no weights, no GPU).
 
 What is IMPORTED from the trainer (torch-free, checked by test_audit_targets.py):
-  ask-lora-r3/brev/render.py : render() (row -> prompt/completion text), FORCED, EMPTY_THOUGHT, row_shape(), STOPS
-  ask-lora-r3/brev/train.py  : tokenize() (prompt/completion -> ids, max_len skip) and sequence() (ids + labels, -100 over the prompt)
-  ask-lora-r5/mi355x/r5_stats.py : origin_of(), trace_origin(), is_forced()
+  r3/brev/render.py : render() (row -> prompt/completion text), FORCED, EMPTY_THOUGHT, row_shape(), STOPS
+  r3/brev/train.py  : tokenize() (prompt/completion -> ids, max_len skip) and sequence() (ids + labels, -100 over the prompt)
+  r5/mi355x/r5_stats.py : origin_of(), trace_origin(), is_forced()
 What is MIRRORED (cites in MIRRORED below): the per-row loss reduction, which lives inside torch code (row_losses / the train loop).
 """
 from __future__ import annotations
@@ -25,8 +25,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 R5 = HERE.parent
-BREV = R5.parent / "ask-lora-r3" / "brev"
-SFT_SH = R5.parent / "ask-lora-r4" / "a6000" / "run_sft.sh"
+BREV = R5.parent / "r3" / "brev"
+SFT_SH = R5.parent / "r4" / "a6000" / "run_sft.sh"
 RUN_R5 = HERE / "run_r5.sh"
 MARK_L, MARK_R = "⟦", "⟧"
 

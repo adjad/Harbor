@@ -29,7 +29,7 @@ say "adapter sha256 $got"
 
 if [ ! -d $W/merged-$STEP ]; then
   say "merge"
-  $PY $T/ask-lora-r3/brev/merge_mac.py --base $BF16 --adapter $W/ckpt/$STEP --out $W/merged-$STEP || exit 3
+  $PY $T/r3/brev/merge_mac.py --base $BF16 --adapter $W/ckpt/$STEP --out $W/merged-$STEP || exit 3
 fi
 
 if [ ! -d $QOUT ]; then
@@ -37,7 +37,7 @@ if [ ! -d $QOUT ]; then
   until mkdir "$LOCK" 2>/dev/null; do sleep 30; done
   echo "r5.1 step-50 quantize pid $$ $(date)" > "$LOCK/owner" || { rmdir "$LOCK"; exit 2; }
   R=/Applications/oMLX.app/Contents/Resources; P=$R/Python
-  (cd $T/ask-lora-r3/brev && PYTHONHOME=$P/cpython-3.11 PYTHONPATH=$R:$P/framework-mlx-base/lib/python3.11/site-packages \
+  (cd $T/r3/brev && PYTHONHOME=$P/cpython-3.11 PYTHONPATH=$R:$P/framework-mlx-base/lib/python3.11/site-packages \
     $P/cpython-3.11/bin/python3 -s quantize.py --src $W/merged-$STEP --out $QOUT --mtp-from $MTP); rc=$?
   rm -f "$LOCK/owner"; rmdir "$LOCK" 2>/dev/null
   [ $rc -eq 0 ] || { say "quantize exit $rc"; exit 4; }
@@ -45,7 +45,7 @@ fi
 
 say "gate (takes the heavy lock itself)"
 RUN=$HOME/Desktop/r5-pilot/step50-gate-r51-$(date +%Y%m%d-%H%M%S)
-RUN=$RUN CAND=$ID zsh $T/ask-lora-r51/eval/run_step50_eval.sh; rc=$?
+RUN=$RUN CAND=$ID zsh $T/r51/eval/run_step50_eval.sh; rc=$?
 say "gate exit $rc; run $RUN"
 echo "$RUN" > $W/LAST_GATE_RUN
 exit $rc

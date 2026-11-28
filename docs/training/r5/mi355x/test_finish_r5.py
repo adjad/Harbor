@@ -59,7 +59,7 @@ def test_placeholder_found(tmp_path):
 
 
 def test_placeholder_matches_builder():
-    builder = F.TRAINING / "ask-lora-r2" / "builder" / "scen_r5_debuglog.py"
+    builder = F.TRAINING / "r2" / "builder" / "scen_r5_debuglog.py"
     assert f'BASE_WRITES = "{F.PLACEHOLDER}"' in builder.read_text()
 
 
@@ -242,7 +242,7 @@ def test_a_pipeline_check_without_traces_keeps_tool_steps_and_counts_them(tmp_pa
 
 
 def test_pack_refuses_an_unfinished_or_stale_build(tmp_path):
-    sys.path.insert(0, str(F.TRAINING / "ask-lora-r4" / "a6000"))
+    sys.path.insert(0, str(F.TRAINING / "r4" / "a6000"))
     import pack_r4
     _build(tmp_path, [_row("a-s0")], stats={"status": "incomplete_no_base_answers", "examples": 1})
     assert "not complete" in pack_r4.stats_problem(tmp_path)

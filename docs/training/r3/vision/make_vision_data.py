@@ -31,7 +31,7 @@ from functools import lru_cache
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-REPO = HERE.parents[2]
+REPO = HERE.parents[3]
 
 
 def _round() -> int:
@@ -52,8 +52,8 @@ def _round() -> int:
 
 ROUND = _round()
 # Every output (images, rows, stats) goes under OUT. Round 3 writes next to this file; round 4 writes to
-# training/ask-lora-r4/vision/ and never touches round 3's files.
-OUT = HERE if ROUND == 3 else HERE.parents[1] / "ask-lora-r4" / "vision"
+# docs/training/r4/vision/ and never touches round 3's files.
+OUT = HERE if ROUND == 3 else HERE.parents[1] / "r4" / "vision"
 _TMP = tempfile.mkdtemp(prefix="vision_data_")
 os.environ["MOE_DIR"] = _TMP
 os.environ["HARBOR_HOME"] = _TMP

@@ -1,13 +1,13 @@
 """Is the tuned model worse than base at Harbor's PROACTIVE background jobs?
 
-The existing background_probe (training/ask-lora-r4) checks digests, message topics, Brief
+The existing background_probe (training/r4) checks digests, message topics, Brief
 messages, memory capture and search synthesis. This one covers the jobs that act on their own:
 per-item triage, the judge that ranks the Brief, auto-add, held time for deadlines, follow-up
 detection, and reply drafts written ahead. Every job sends the PRODUCTION system prompt, user
 message format, budget and thinking setting to the engine at temperature 0, then scores the
 reply against a GOLD label with the production parser, so "valid" means what the app accepts.
 
-    HARBOR_HOME=<empty dir> .venv/bin/python training/ask-lora-r5/demo/proactive_probe.py \\
+    HARBOR_HOME=<empty dir> .venv/bin/python docs/training/r5/demo/proactive_probe.py \\
         --models BASE,CAND --out proactive.json [--reps 3] [--repo <checkout>]
 
 HARBOR_HOME MUST be set first, to an empty directory that is not ~/.moe: identity and the
@@ -56,7 +56,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-REPO = Path(__file__).resolve().parents[3]
+REPO = Path(__file__).resolve().parents[4]
 ALIASES = {"BASE": "gemma-4-E4B-it-oQ4e-mtp", "CAND": "gemma-4-E4B-it-r5-step-01800-oQ4e-mtp"}
 TZ = "America/Los_Angeles"
 NOW = datetime(2026, 11, 12, 10, 0, tzinfo=ZoneInfo(TZ))        # a Thursday

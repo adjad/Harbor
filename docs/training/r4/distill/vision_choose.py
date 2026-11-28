@@ -2,7 +2,7 @@
 """Pick one base answer per vision row from vision_gen.py's samples, rejecting only defects, and write the spliced
 rows file.
 
-The checks are the r4 GRPO reward's own (ask-lora-r3/grpo/reward.py ``score_mm``, ``score_picture_read``), with
+The checks are the r4 GRPO reward's own (r3/grpo/reward.py ``score_mm``, ``score_picture_read``), with
 labels built the way export_prompts.py builds them. ``facts`` come from the row's meta when it has them, else
 ``mm_facts`` of the scripted answer.
 
@@ -46,7 +46,7 @@ from collections import Counter, defaultdict
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..", "..", "ask-lora-r3", "grpo")))
+sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..", "..", "r3", "grpo")))
 import export_prompts as EP  # noqa: E402
 import reward as W  # noqa: E402
 from vision_gen import image_bytes, vision_hash  # noqa: E402

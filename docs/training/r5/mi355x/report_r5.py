@@ -30,8 +30,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 TRAINING = HERE.parent.parent
 sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(TRAINING / "ask-lora-r3" / "brev"))
-sys.path.insert(0, str(TRAINING / "ask-lora-r5" / "gpu"))
+sys.path.insert(0, str(TRAINING / "r3" / "brev"))
+sys.path.insert(0, str(TRAINING / "r5" / "gpu"))
 import r5_stats  # noqa: E402
 import source_contract as S  # noqa: E402
 

@@ -9,18 +9,18 @@
 # run; the resume reuses it. Reading ~/.moe/evals needs the sandbox off. Manifests hold ids only: no eval wording is copied.
 #
 # Env: PY, PIN (service pin, default r5's pin-7e442f2d), PRIVATE (r5's private debug-log set), STEP50 (sealed r5.1 eval set),
-#      AUDIT (the audit outputs r5 sealed against), GEN_SH (default ask-lora-r4/distill/run.sh), K (default 2),
+#      AUDIT (the audit outputs r5 sealed against), GEN_SH (default r4/distill/run.sh), K (default 2),
 #      ALLOW_INCOMPLETE=1 (pipeline check only: finish tolerates finals base never answered; the output can't be packed).
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)" || exit 1
 T="$(cd "$HERE/../.." && pwd)" || exit 1
 FAMILY="${1:?FAMILY (comma-separated ok)}"; D="${2:?OUT}"
 PY="${PY:-$HOME/Desktop/Harbor_Project/.venv/bin/python}"
-PIN="${PIN:-$T/ask-lora-r5/data/pin-7e442f2d}"
+PIN="${PIN:-$T/r5/data/pin-7e442f2d}"
 PRIVATE="${PRIVATE:-$HOME/.moe/evals/private-real-use/debug-logs}"
 STEP50="${STEP50:-$HOME/.moe/evals/r51-step50}"
 AUDIT="${AUDIT:-$HOME/r51-audit/outputs}"
-GEN_SH="${GEN_SH:-$T/ask-lora-r4/distill/run.sh}"
+GEN_SH="${GEN_SH:-$T/r4/distill/run.sh}"
 K="${K:-2}"
 die() { echo "FAIL: $1"; exit 1; }
 rows_in() { wc -l < "$1/meta.jsonl" | tr -d ' '; }
@@ -40,7 +40,7 @@ if [ "${GEN:-}" != "done" ]; then
   # (b) seal 1 = what r5 sealed against: public toolbench with history + chat eval, the private debug-log set, the audit prompts.
   #     seal 2 = the sealed r5.1 eval set. Each keeps its own manifest (ids and scores only).
   mkdir -p "$D/seal" || exit 1
-  cd "$T/ask-lora-r5/mi355x" || exit 1
+  cd "$T/r5/mi355x" || exit 1
   env -u HARBOR_REPO "$PY" seal_r5.py --build "$D/sealed" --private-dir "$PRIVATE" --audit-dir "$AUDIT" > "$D/seal/seal1.log" 2>&1 || die "seal 1: see $D/seal/seal1.log"
   cp "$D/sealed/overlap_manifest.json" "$D/seal/overlap_manifest.r5-sets.json" || exit 1
   echo "seal 1 (public+chat eval, $PRIVATE, audit): $(tail -1 "$D/seal/seal1.log" | cut -c1-400)"
@@ -61,7 +61,7 @@ before = sum(1 for _ in open(f"{d}/build/meta.jsonl")); after = sum(1 for _ in o
 print(f"sealed: {before} -> {after} rows ({len(ids)} turns removed in all); turn ids in {d}/seal/removed_turns.json")
 PYEOF
   [ "$(rows_in "$D/sealed")" -gt 0 ] || die "the seals removed every row"
-  "$PY" "$T/ask-lora-r5/mi355x/verify_contract.py" --build "$D/sealed" --out "$D/sealed/contract_verification.json" > "$D/seal/verify_contract.log" 2>&1
+  "$PY" "$T/r5/mi355x/verify_contract.py" --build "$D/sealed" --out "$D/sealed/contract_verification.json" > "$D/seal/verify_contract.log" 2>&1
   if [ $? -eq 0 ]; then echo "contract verification ok ($D/sealed/contract_verification.json)"
   else echo "WARN: verify_contract.py failed (it self-tests r5's gold kinds and may not know this family's gold); not fatal here, see $D/seal/verify_contract.log"; fi
 fi
@@ -88,7 +88,7 @@ for f in "$D"/raw/*.jsonl; do
   "$PY" "$HERE/safety_check_r51.py" --meta "$D/sealed/meta.jsonl" --filter-raw "$f" --out "$D/raw_safe/$(basename "$f")" \
       | tee -a "$D/choose/raw_filter.log" || die "raw filter"
 done
-cd "$T/ask-lora-r5/gpu" || exit 1
+cd "$T/r5/gpu" || exit 1
 "$PY" choose_r5.py --partial "$D/sealed/partial.jsonl" --raw "$D/raw_safe/*.jsonl" --out-chosen "$D/choose/chosen.jsonl" --out-stats "$D/choose/stats.json" \
     --out-nopass-ids "$D/choose/nopass.ids" --out-drop-ids "$D/choose/drop.ids" --out-rejections "$D/choose/rejections.jsonl" > "$D/choose/choose_r5.log" 2>&1 || die "choose_r5: see $D/choose/choose_r5.log"
 cat "$D/choose/choose_r5.log" | cut -c1-240
@@ -100,7 +100,7 @@ cat "$D/choose/choose_traces.log" | cut -c1-400
     --out "$D/choose/safety_rejections.jsonl" | tee "$D/choose/safety_check.log" || die "safety check"
 
 # (e) finish: splice, drop with a reason per row (drop_manifest.jsonl), validator-flagged base rows dropped too
-cd "$T/ask-lora-r5/mi355x" || exit 1
+cd "$T/r5/mi355x" || exit 1
 INC=""; [ "${ALLOW_INCOMPLETE:-}" = "1" ] && INC="--allow-incomplete"
 # ASK_LORA_R51=1: finish_r5 runs validate.py, which only knows this family's write tools with it set (else every
 # authorized write is a write_call problem and the row is dropped)
@@ -116,7 +116,7 @@ cp "$D/seal/"overlap_manifest.*.json "$D/seal/removed_turns.json" "$D/choose/tra
 [ -f "$D/sealed/contract_verification.json" ] && cp "$D/sealed/contract_verification.json" "$D/finished/"   # absent when verify_contract.py failed (WARN above)
 
 # (f) validate: exit code recorded in validate.log
-cd "$T/ask-lora-r2/builder" || exit 1
+cd "$T/r2/builder" || exit 1
 ASK_LORA_ROUND=4 ASK_LORA_R5=1 ASK_LORA_R51=1 HARBOR_REPO="$PIN" "$PY" validate.py "$D/finished/all.jsonl" "$D/finished/train.jsonl" "$D/finished/valid.jsonl" > "$D/finished/validate.log" 2>&1
 RC=$?
 echo "validate exit code: $RC" >> "$D/finished/validate.log"

@@ -1,7 +1,7 @@
 #!/bin/bash
 # r4 SFT on ONE 48 GB NVIDIA card on Brev, an RTX A6000 (sm_86; the user's choice, 2026-11-03) or an L40 (sm_89): the whole
 # flow from a fresh instance to a picked checkpoint.
-# A thin layer over ~/harbor/run.sh (written by ../../ask-lora-r3/brev/vm-setup.sh). README.md next to this file explains every step.
+# A thin layer over ~/harbor/run.sh (written by ../../r3/brev/vm-setup.sh). README.md next to this file explains every step.
 #
 #   bash run_sft.sh setup                  pinned stack (torch 2.11.0+cu128, transformers 5.22.1, peft 0.21.2) + the 16 GB base
 #   bash run_sft.sh check                  GPU, versions against the pins, zip sha
@@ -46,7 +46,7 @@ DEV_TEXT_MAX="${DEV_TEXT_MAX:-150}"
 DEV_STEPS="${DEV_STEPS:-360}"
 SEED=20261029                            # train.py's default; eval_mm.py's serving-shape hash must use the same one
 
-# The pins. r2 trained on an A6000 with exactly this stack (ask-lora-r3/PLAN.md: "r2 stack ... is the starting pin").
+# The pins. r2 trained on an A6000 with exactly this stack (r3/PLAN.md: "r2 stack ... is the starting pin").
 PIN_TORCH="2.11.0"; PIN_TV="0.26.0"; PIN_TRANSFORMERS="5.22.1"; PIN_PEFT="0.21.2"
 TORCH_IDX="https://download.pytorch.org/whl/cu128"     # needs driver 570+ (CUDA 12.8); its sm_86 kernels also run on the L40's sm_89
 

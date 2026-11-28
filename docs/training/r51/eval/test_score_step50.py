@@ -1,5 +1,5 @@
 """Offline tests for the r5.1 step-50 gate scorer (criteria v2). Synthetic cases and rows only: no model, no network,
-no private data. Run: python -m pytest training/ask-lora-r51/eval/test_score_step50.py -q"""
+no private data. Run: python -m pytest docs/training/r51/eval/test_score_step50.py -q"""
 from __future__ import annotations
 
 import sys

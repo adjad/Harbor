@@ -1,11 +1,11 @@
 """Row loaders and production request shapes for the multimodal checks. Pure python (no torch, no service/).
 
-Vision rows are the dataset's own (training/ask-lora-r3/vision/vision_rows.jsonl):
+Vision rows are the dataset's own (docs/training/r3/vision/vision_rows.jsonl):
   {"id","kind":"image"|"video","images":[rel paths],"messages":[system,user],"target","meta":{...}}
 Dev rows are chosen by render.py's own rule (vision_is_dev / audio_is_dev, copied below): meta.split when a row
 has one, else a hash of the id, so the dev set is the very one train.py holds out. A test checks the two agree.
 
-Audio rows (training/ask-lora-r3/audio/audio_rows.jsonl, not written yet when this was made) are read
+Audio rows (docs/training/r3/audio/audio_rows.jsonl, not written yet when this was made) are read
 leniently: {"id", "audio"|"audio_path"|"audios":[p] (a 16 kHz mono WAV), "reference"|"ref"|"text"|"target",
 "meta":{"split","kind":"speech"|"no_speech"|"injection","injection":{...},"entities":[...],"banned_in_target":[...]}}.
 Without the file, use the Mac gate's set: gate/audio/truth.json + clips/ (audio_from_truth below).

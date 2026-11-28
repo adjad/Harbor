@@ -1,5 +1,5 @@
 """Reading (picture_read) scoring and picking on fixture generations. Mac, no GPU:
-    python -I -m pytest training/ask-lora-r3/mmeval/tests/test_reading.py -q
+    python -I -m pytest docs/training/r3/mmeval/tests/test_reading.py -q
 """
 from __future__ import annotations
 

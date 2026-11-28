@@ -6,7 +6,7 @@ size and scan look match images/doc4_*), the messages are built by service.visio
 real_messages() that built the doc4 rows (so the system message and the user turn are byte for byte production's), and
 the rows are appended to vision_rows.jsonl. Rerunning replaces every doc5 row and image; nothing else is touched.
 
-    ~/Desktop/Harbor_Project/.venv/bin/python training/ask-lora-r4/vision/make_doc5.py
+    ~/Desktop/Harbor_Project/.venv/bin/python docs/training/r4/vision/make_doc5.py
 
 Everything on the pages is invented: no real people, companies, phone numbers or addresses.
 """
@@ -23,9 +23,9 @@ from collections import Counter
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-R3 = HERE.parents[1] / "ask-lora-r3" / "vision"
+R3 = HERE.parents[1] / "r3" / "vision"
 
-os.environ["ASK_LORA_ROUND"] = "4"          # r3's module reads this at import: OUT/IMG_DIR -> ask-lora-r4/vision
+os.environ["ASK_LORA_ROUND"] = "4"          # r3's module reads this at import: OUT/IMG_DIR -> r4/vision
 sys.argv = sys.argv[:1]
 spec = importlib.util.spec_from_file_location("make_vision_data", R3 / "make_vision_data.py")
 M = importlib.util.module_from_spec(spec)

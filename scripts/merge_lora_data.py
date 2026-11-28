@@ -2,6 +2,9 @@
 """Merge the harvested-simulation SFT set with the real-usage SFT set into
 one train/valid/test split, dropping known-contaminated examples.
 
+Each source is split on its own (so real usage is always in valid), and by
+whole conversation (so no valid example shares its history with a train one).
+
 Contamination: a harvest flow's own approver (SelfTargetApprover) can deny a
 call the MODEL got right (e.g. `mail_draft_then_send`'s expect only listed
 `summarize_emails`, so a correctly self-targeted `send_email` in the same
@@ -16,6 +19,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -82,6 +86,42 @@ def is_contaminated(example: dict) -> bool:
     return any("denied this action" in (m.get("content") or "") for m in example["messages"])
 
 
+def _conversation(example: dict) -> str:
+    """The conversation an example belongs to: its first user message.
+
+    Every turn of one session shares that prefix, so grouping on it keeps a
+    session's examples together.
+    """
+    first = next((m.get("content") or "" for m in example.get("messages", [])
+                  if m.get("role") == "user"), "")
+    return hashlib.sha256(json.dumps(first).encode()).hexdigest()
+
+
+def split(examples: list[dict], val_frac: float) -> tuple[list[dict], list[dict]]:
+    """(train, valid) by whole conversation, in a stable hashed order."""
+    groups: dict[str, list[dict]] = {}
+    for example in examples:
+        groups.setdefault(_conversation(example), []).append(example)
+    want = max(1, int(len(examples) * val_frac)) if examples else 0
+    train: list[dict] = []
+    valid: list[dict] = []
+    for key in sorted(groups):
+        (valid if len(valid) < want and len(groups) > 1 else train).extend(groups[key])
+    return train, valid
+
+
+def stratified_split(sources: list[list[dict]], val_frac: float) -> tuple[list[dict], list[dict]]:
+    """Split each source on its own, so every non-empty source appears in valid."""
+    train: list[dict] = []
+    valid: list[dict] = []
+    for source in sources:
+        if source:
+            t, v = split(source, val_frac)
+            train += t
+            valid += v
+    return train, valid
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--harvest", default="~/lora_data")
@@ -105,13 +145,12 @@ def main() -> int:
     dropped = n_harvest_raw - len(harvest)
 
     examples = harvest + real
-    n_val = max(1, int(len(examples) * args.val_frac))
-    val, train = examples[:n_val], examples[n_val:]
+    train, val = stratified_split([harvest, real], args.val_frac)
 
     _write_private(out_dir / "train.jsonl", "\n".join(json.dumps(e) for e in train) + "\n")
     _write_private(out_dir / "valid.jsonl", "\n".join(json.dumps(e) for e in val) + "\n")
     _write_private(out_dir / "test.jsonl",
-                   "\n".join(json.dumps(e) for e in val[: max(1, n_val // 2)]) + "\n")
+                   "\n".join(json.dumps(e) for e in val[: max(1, len(val) // 2)]) + "\n")
 
     print(f"harvest: {len(harvest)} ({dropped} dropped as contaminated)")
     print(f"real usage: {len(real)}")

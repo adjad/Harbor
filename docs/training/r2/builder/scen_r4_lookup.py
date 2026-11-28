@@ -2,7 +2,7 @@
 
 Evidence: toolbench 20261102 Mac gate, r3 vs untuned. r3 lost 13 points on notes and 5 on memory, and its
 answers dropped the fact ("I found a note" with no list, "you have some mail" with no sender). The r4 plan
-(training/ask-lora-r4/PLAN.md, Stage 1 B) asks for finals that carry every fact the question asks for, because
+(docs/training/r4/PLAN.md, Stage 1 B) asks for finals that carry every fact the question asks for, because
 the thought that precedes a final now lists those facts from the tool result.
 
 What this family teaches (every turn is one lookup):

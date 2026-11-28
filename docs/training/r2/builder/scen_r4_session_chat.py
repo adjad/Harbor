@@ -1533,7 +1533,7 @@ def _none_ack():
     sys.path), so the scripted rec_none finals, the SFT picker and the GRPO reward judge a "did not come up" the same way."""
     import ast
     import os
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "ask-lora-r4", "distill", "choose.py")
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "r4", "distill", "choose.py")
     for node in ast.parse(open(path).read()).body:
         if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == "NONE_ACK" for t in node.targets):
             return eval(compile(ast.Expression(node.value), path, "eval"), {"re": re})

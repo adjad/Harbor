@@ -4,7 +4,7 @@ import sys
 import tempfile
 
 # builder/ -> ask-lora-20261029/ -> training/ -> repo root
-REPO = os.environ.get("HARBOR_REPO") or os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+REPO = os.environ.get("HARBOR_REPO") or os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
 _home = tempfile.mkdtemp(prefix="harbor-home-")
 os.environ["HARBOR_HOME"] = _home
 os.environ["MOE_DIR"] = _home

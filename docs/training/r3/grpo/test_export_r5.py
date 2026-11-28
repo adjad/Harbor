@@ -244,7 +244,10 @@ def labels(path):
 
 
 # =========================================================================== C1: round 5 is additive
-BASELINE = json.loads('''{"classify3": "3d6f436f2335d9e51af18083c1cbe649a0b70ffbd6104e7d9c92f5acb749f1c7", "classify4": "8abd9aee876970f2da207199c38dfb72da49c6b2180add00c6cf6fdcf4fa8215", "text3": {"grpo_mm_dev.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "grpo_prompts.jsonl": "f01d058526a96bf4660b4830f3adec4239f6456f92831bc1086e772f5bcb299f", "stats": "bbafd2ca503d9dc8c44ac0877f83af88de791848c89bae8f878676957ff71d6b"}, "mixed3": {"grpo_mm_dev.jsonl": "892fc4cfaeb8bc2c038b00f766ce8396112996b40e2ce455749d1a051329fab1", "grpo_prompts.jsonl": "117efa96dc2470b32cbac0cbb5683656b27b65787f7da53023aee60e0cb6b160", "stats": "c0d27fcec37fd6104f465c897328a34488f03e259d9f0e95feefd5b5f6c210e2"}, "text4": {"grpo_mm_dev.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "grpo_prompts.jsonl": "d2d0d230aaf4fb7db80c9d75b61667d82afdf462cb3c30d99010a2e064c80236", "stats": "50980fb21bcee75288b7553cddffa22309a695200ceb5ca2f06c78d77715660b"}, "mixed4": {"grpo_mm_dev.jsonl": "892fc4cfaeb8bc2c038b00f766ce8396112996b40e2ce455749d1a051329fab1", "grpo_prompts.jsonl": "004155742c391439600eb388207d86297f4eb5a288b7f0c99e33665ed7e46227", "stats": "09cf9d26ebe1f45ee04c0e7ed1f87220473ec4a396615bfa6825a003ef92b294"}}''')   # recorded from the code before round 5 was added (rounds 3 and 4)
+BASELINE = json.loads('''{"classify3": "3d6f436f2335d9e51af18083c1cbe649a0b70ffbd6104e7d9c92f5acb749f1c7", "classify4": "02cd5ebcf928aba309d6a15bc8d0d3de6d9c17c31071d29f09ede9524cdd7ebf", "text3": {"grpo_mm_dev.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "grpo_prompts.jsonl": "f01d058526a96bf4660b4830f3adec4239f6456f92831bc1086e772f5bcb299f", "stats": "bbafd2ca503d9dc8c44ac0877f83af88de791848c89bae8f878676957ff71d6b"}, "mixed3": {"grpo_mm_dev.jsonl": "892fc4cfaeb8bc2c038b00f766ce8396112996b40e2ce455749d1a051329fab1", "grpo_prompts.jsonl": "d45b39f174d7a8f220580a3bf4f2dcefcf1c540e50a3dbd92c49ac907a76b9d3", "stats": "a7a5475d0ee759ad1906dcca84c9b972bc7fcbc32492f2455257debcead72eda"}, "text4": {"grpo_mm_dev.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "grpo_prompts.jsonl": "d2d0d230aaf4fb7db80c9d75b61667d82afdf462cb3c30d99010a2e064c80236", "stats": "50980fb21bcee75288b7553cddffa22309a695200ceb5ca2f06c78d77715660b"}, "mixed4": {"grpo_mm_dev.jsonl": "892fc4cfaeb8bc2c038b00f766ce8396112996b40e2ce455749d1a051329fab1", "grpo_prompts.jsonl": "a40cefb33799a332a4f3cb4291ac4b9231a3004f5fa83bc532de043118570604", "stats": "2059b3012f63812aa42d0c25fb4fa9ec6215dc081893f59c1e99d0872dcc67bf"}}''')   # recorded from the code before round 5 was added (rounds 3 and 4)
+# classify4 and the mixed3/mixed4 prompts + stats are re-pinned for the public copy: the app's rename changes one quoted
+# line in those rows ("<app>'s reading of the picture"). The pre-rename pins were classify4 8abd9aee8769...,
+# mixed3 117efa96dc24... / c0d27fcec37f..., mixed4 004155742c39... / 09cf9d26ebe1... (prompts / stats).
 
 
 def test_rounds_3_and_4_unchanged(tmp_path):
@@ -479,7 +482,7 @@ def test_label_keys_unsafe_reads_skill_names_tool_names_ground_and_style():
 
 def test_skill_names_match_dist_choose():
     import importlib.util
-    dist = Path(X.__file__).resolve().parent.parent.parent / "ask-lora-r4" / "distill"
+    dist = Path(X.__file__).resolve().parent.parent.parent / "r4" / "distill"
     if not (dist / "choose.py").is_file():
         pytest.skip("distill is not merged here")
     sys.path.insert(0, str(dist))
@@ -765,7 +768,7 @@ def test_r5_export_refs_crosscheck_and_dist_record(tmp_path):
     with pytest.raises(SystemExit, match="recall_refs"):
         F.run_main(r5_argv(w, w["tmp"] / "o2" / "g.jsonl", extra=("--refs-crosscheck", str(good))))
     # the real distill dir: its commit is a 40-hex sha (or None when git is unavailable) and its choose.py hash is recorded
-    real = X.dist_record(Path(X.__file__).resolve().parent.parent.parent / "ask-lora-r4" / "distill")
+    real = X.dist_record(Path(X.__file__).resolve().parent.parent.parent / "r4" / "distill")
     assert real["choose_sha256"] and (real["commit"] is None or len(real["commit"]) == 40)
     if real["refs_file"]:
         assert real["refs_sha256"] == hashlib.sha256(Path(real["refs_file"]).read_bytes()).hexdigest()

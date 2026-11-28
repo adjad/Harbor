@@ -608,7 +608,7 @@ def test_a_snapshot_outlasts_its_own_fetch_interval():
 # --- about four builds a day --------------------------------------------------------
 
 
-def _at(hour: int, minute: int = 0, day: int = 15) -> float:
+def _jan_at(hour: int, minute: int = 0, day: int = 15) -> float:
     return datetime(2027, 1, day, hour, minute).timestamp()
 
 
@@ -634,18 +634,18 @@ def test_the_days_times_come_from_the_working_hours(monkeypatch):
 
 def test_the_latest_slot_reaches_back_to_yesterday():
     times = P.brief_times()
-    assert P.latest_slot(_at(12, 0), times) == _at(11, 40)
-    assert P.latest_slot(_at(9, 0), times) == _at(9, 0)
-    assert P.latest_slot(_at(7, 0), times) == _at(17, 0, day=14)
+    assert P.latest_slot(_jan_at(12, 0), times) == _jan_at(11, 40)
+    assert P.latest_slot(_jan_at(9, 0), times) == _jan_at(9, 0)
+    assert P.latest_slot(_jan_at(7, 0), times) == _jan_at(17, 0, day=14)
 
 
 def test_a_slot_is_due_until_something_covers_it():
     times = P.brief_times()
-    assert P.slot_due(None, _at(12), times)
-    assert P.slot_due(_at(9, 5), _at(12), times)
-    assert not P.slot_due(_at(11, 45), _at(12), times)
-    assert not P.slot_due(_at(11, 20), _at(12), times)  # just before it (Analyze now): covered
-    assert P.slot_due(_at(13), _at(12), times)          # a stamp from the future doesn't count
+    assert P.slot_due(None, _jan_at(12), times)
+    assert P.slot_due(_jan_at(9, 5), _jan_at(12), times)
+    assert not P.slot_due(_jan_at(11, 45), _jan_at(12), times)
+    assert not P.slot_due(_jan_at(11, 20), _jan_at(12), times)  # just before it (Analyze now): covered
+    assert P.slot_due(_jan_at(13), _jan_at(12), times)          # a stamp from the future doesn't count
 
 
 @pytest.fixture
@@ -657,25 +657,25 @@ def daytime(monkeypatch):
 
 
 def test_the_plan_by_day(daytime):
-    state = {"model_as_of": _at(11, 45), "build_at": _at(11, 45)}
-    assert P.automatic_plan(_at(12), state) == "light"
-    assert P.automatic_plan(_at(14, 25), state) == "build"
-    assert P.automatic_plan(_at(14, 25), {**state, "built_for": _at(14, 21)}) == "light"
+    state = {"model_as_of": _jan_at(11, 45), "build_at": _jan_at(11, 45)}
+    assert P.automatic_plan(_jan_at(12), state) == "light"
+    assert P.automatic_plan(_jan_at(14, 25), state) == "build"
+    assert P.automatic_plan(_jan_at(14, 25), {**state, "built_for": _jan_at(14, 21)}) == "light"
 
 
 def test_a_slot_missed_asleep_is_caught_up_once(daytime):
-    state = {"model_as_of": _at(11, 45), "build_at": _at(11, 45)}
-    assert P.automatic_plan(_at(17, 30), state) == "build"     # slept through 14:20 and 17:00
-    state["built_for"] = _at(17, 30)
-    assert P.automatic_plan(_at(17, 35), state) == "light"
-    assert P.automatic_plan(_at(21, 0), state) == "light"      # the evening isn't quiet: still no build
+    state = {"model_as_of": _jan_at(11, 45), "build_at": _jan_at(11, 45)}
+    assert P.automatic_plan(_jan_at(17, 30), state) == "build"     # slept through 14:20 and 17:00
+    state["built_for"] = _jan_at(17, 30)
+    assert P.automatic_plan(_jan_at(17, 35), state) == "light"
+    assert P.automatic_plan(_jan_at(21, 0), state) == "light"      # the evening isn't quiet: still no build
 
 
 def test_a_day_has_at_most_four_builds_however_much_mail_comes(daytime):
-    state = {"model_as_of": _at(8, 0, day=15), "build_at": _at(8, 0, day=15)}
+    state = {"model_as_of": _jan_at(8, 0, day=15), "build_at": _jan_at(8, 0, day=15)}
     builds = []
-    at = _at(8, 5, day=15)
-    while at < _at(21, 55, day=15):         # a tick every five minutes, all day, with mail always changing
+    at = _jan_at(8, 5, day=15)
+    while at < _jan_at(21, 55, day=15):         # a tick every five minutes, all day, with mail always changing
         if P.automatic_plan(at, state) == "build":
             builds.append(at)
             state.update(model_as_of=at, build_at=at, built_for=at)
@@ -684,25 +684,25 @@ def test_a_day_has_at_most_four_builds_however_much_mail_comes(daytime):
 
 
 def test_a_new_install_or_a_long_absence_goes_on_as_before(monkeypatch, daytime):
-    assert P.automatic_plan(_at(12), {}) == "as_is"                                     # never built
-    assert P.automatic_plan(_at(12), {"model_as_of": _at(12) - 2 * 86400}) == "as_is"   # days away
+    assert P.automatic_plan(_jan_at(12), {}) == "as_is"                                     # never built
+    assert P.automatic_plan(_jan_at(12), {"model_as_of": _jan_at(12) - 2 * 86400}) == "as_is"   # days away
     monkeypatch.setattr(P, "_in_setup", lambda now: True)
-    assert P.automatic_plan(_at(12), {"model_as_of": _at(11)}) == "as_is"
+    assert P.automatic_plan(_jan_at(12), {"model_as_of": _jan_at(11)}) == "as_is"
 
 
 def test_quiet_hours_are_left_as_they_are(monkeypatch, daytime):
     monkeypatch.setattr(P, "_in_quiet_hours", lambda now: True)
-    assert P.automatic_plan(_at(3), {"model_as_of": _at(2), "built_for": _at(2)}) == "as_is"
-    assert not P.between_builds(_at(3))
+    assert P.automatic_plan(_jan_at(3), {"model_as_of": _jan_at(2), "built_for": _jan_at(2)}) == "as_is"
+    assert not P.between_builds(_jan_at(3))
 
 
 def test_real_quiet_hours_are_read_from_the_setting(monkeypatch):
     from service import user_hours
     monkeypatch.setattr(user_hours, "in_quiet_hours", lambda when: when.hour < 8)
-    assert P._in_quiet_hours(_at(3))
-    assert not P._in_quiet_hours(_at(12))
+    assert P._in_quiet_hours(_jan_at(3))
+    assert not P._in_quiet_hours(_jan_at(12))
     monkeypatch.setattr(user_hours, "in_quiet_hours", lambda when: 1 / 0)
-    assert not P._in_quiet_hours(_at(3))
+    assert not P._in_quiet_hours(_jan_at(3))
 
 
 @pytest.fixture

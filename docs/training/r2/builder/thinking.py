@@ -3367,13 +3367,6 @@ def _pick_scored(reads: list[tuple[str, str]], final: str, prompt: str, loose: b
     return out
 
 
-def _pick_segments(reads: list[tuple[str, str]], final: str, prompt: str, limit: int, loose: bool = False,
-                   cap: int = 20) -> list[str]:
-    """The best `limit` pieces (_pick_scored), in result order."""
-    out = [c for c in _pick_scored(reads, final, prompt, loose, cap) if not _bare_date(c[2])][:limit]
-    return [seg for _sc, _o, seg in sorted(out, key=lambda x: x[1])]
-
-
 _MAIL_TOOLS = frozenset({"view_emails", "summarize_emails"})
 
 
@@ -3410,7 +3403,8 @@ def _turn_reads(s: dict) -> list[tuple[str, str]]:
 
 
 def _pick_segments(reads: list[tuple[str, str]], final: str, prompt: str, limit: int, loose: bool = False) -> list[str]:
-    """Result segments the final relies on, in result order: a segment is kept when it shares a time, an amount,
+    """(The only definition. An unused _pick_scored-based one above it was removed: Python kept this later one,
+    so every r2-r5 build used this.) Result segments the final relies on, in result order: a segment is kept when it shares a time, an amount,
     a quoted title or a capitalised name with the final (or two content words; one when `loose`), and every
     time and amount it holds is in the final (a fact the answer leaves out is not listed as if it were given)."""
     f_times, f_amts = time_tokens(final), amount_tokens(final)

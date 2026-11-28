@@ -20,11 +20,11 @@ import sys
 import tempfile
 
 # Which dataset the corruptions are cut from: ASK_LORA_OUT when set, else the data dir of the round being built
-# (round 4: training/ask-lora-r4/data once it has a train.jsonl, else round 3's; round 3: training/ask-lora-r3/data;
+# (round 4: docs/training/r4/data once it has a train.jsonl, else round 3's; round 3: docs/training/r3/data;
 # unset: round 2's, the builder's parent). Must be fixed before validate is imported.
 _TRAINING = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if not os.environ.get("ASK_LORA_OUT") and os.environ.get("ASK_LORA_ROUND") in ("3", "4"):
-    for _d in (("ask-lora-r4", "ask-lora-r3") if os.environ["ASK_LORA_ROUND"] == "4" else ("ask-lora-r3",)):
+    for _d in (("r4", "r3") if os.environ["ASK_LORA_ROUND"] == "4" else ("r3",)):
         _p = os.path.join(_TRAINING, _d, "data")
         if os.path.exists(os.path.join(_p, "train.jsonl")) and os.path.exists(os.path.join(_p, "train.meta.jsonl")):
             os.environ["ASK_LORA_OUT"] = _p
@@ -44,8 +44,8 @@ SYNTH = "_selftest_writes"      # a family that may call the tools below
 
 def _find_render():
     """brev/render.py next to the data when it has one, else the newest round's that exists."""
-    for d in (OUT, os.path.join(_TRAINING, "ask-lora-r4"), os.path.join(_TRAINING, "ask-lora-r3"),
-              os.path.join(_TRAINING, "ask-lora-r2")):
+    for d in (OUT, os.path.join(_TRAINING, "r4"), os.path.join(_TRAINING, "r3"),
+              os.path.join(_TRAINING, "r2")):
         if os.path.exists(os.path.join(d, "brev", "render.py")):
             return os.path.join(d, "brev", "render.py")
     return None

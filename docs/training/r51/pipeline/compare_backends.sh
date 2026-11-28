@@ -34,11 +34,11 @@ print(f"{sys.argv[3]}: {n} samples for {len(ids)} ids")
 PYEOF
   "$PY" "$HERE/safety_check_r51.py" --meta "$D/sealed/meta.jsonl" --filter-raw "$W/raw/base.jsonl" --out "$W/raw_safe/base.jsonl" \
       > "$W/choose/raw_filter.log" || die "raw filter ($arm)"
-  (cd "$T/ask-lora-r5/gpu" && "$PY" choose_r5.py --partial "$D/sealed/partial.jsonl" --raw "$W/raw_safe/*.jsonl" \
+  (cd "$T/r5/gpu" && "$PY" choose_r5.py --partial "$D/sealed/partial.jsonl" --raw "$W/raw_safe/*.jsonl" \
       --out-chosen "$W/choose/chosen.jsonl" --out-stats "$W/choose/stats.json" --out-nopass-ids "$W/choose/nopass.ids" \
       --out-drop-ids "$W/choose/drop.ids" --out-rejections "$W/choose/rejections.jsonl" > "$W/choose/choose_r5.log" 2>&1) \
       || die "choose_r5 ($arm): see $W/choose/choose_r5.log"
-  (cd "$T/ask-lora-r5/gpu" && "$PY" choose_traces.py --partial "$D/sealed/partial.jsonl" --raw "$W/raw/*.jsonl" \
+  (cd "$T/r5/gpu" && "$PY" choose_traces.py --partial "$D/sealed/partial.jsonl" --raw "$W/raw/*.jsonl" \
       --out-chosen "$W/choose/traces.chosen.jsonl" --out-stats "$W/choose/traces.stats.json" > "$W/choose/choose_traces.log" 2>&1) \
       || die "choose_traces ($arm): see $W/choose/choose_traces.log"
   "$PY" "$HERE/trace_report.py" --partial "$D/sealed/partial.jsonl" --raw "$W/raw/*.jsonl" --out "$W/choose/trace_rejections.jsonl" \

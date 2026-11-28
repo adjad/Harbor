@@ -79,3 +79,27 @@ def test_no_git_uses_the_kit_file_or_says_unknown(tmp_path):
     assert P.code(d)["code_head"] == "unknown"
     (d / P.KIT_FILE).write_text('{"code_head": "abc", "code_dirty": false}')
     assert P.code(d)["code_head"] == "abc" and P.code(d)["code_source"].startswith("kit")
+
+
+def test_a_docs_training_layout_is_checked_too(tmp_path):
+    r = tmp_path / "repo"
+    (r / "docs" / "training" / "r2" / "builder").mkdir(parents=True)
+    (r / "docs" / "training" / "r2" / "builder" / "x.py").write_text("x = 1\n")
+    _git(r, "init", "-q")
+    _git(r, "add", "-A")
+    _git(r, "commit", "-qm", "c")
+    code_dir = r / "docs" / "training" / "r2" / "builder"
+    assert P.code(code_dir)["code_dirty"] is False
+    (code_dir / "x.py").write_text("x = 2\n")
+    assert P.code(code_dir)["code_dirty_files"] == ["docs/training/r2/builder/x.py"]
+
+
+def test_require_clean_stops_a_dirty_build_unless_allowed(tmp_path, monkeypatch):
+    import pytest
+    monkeypatch.delenv("ASK_LORA_ALLOW_DIRTY", raising=False)
+    P.require_clean({"code_head": "abc", "code_dirty": False})
+    dirty = {"code_head": "abc", "code_dirty": True, "code_dirty_files": ["training/b/x.py"]}
+    with pytest.raises(SystemExit, match="uncommitted training code"):
+        P.require_clean(dirty)
+    monkeypatch.setenv("ASK_LORA_ALLOW_DIRTY", "1")
+    P.require_clean(dirty)

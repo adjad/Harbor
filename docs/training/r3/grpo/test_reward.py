@@ -299,7 +299,7 @@ def test_ideals_if_available():
 
 
 # ================================================================== multimodal (vision / audio)
-REPO = Path(__file__).resolve().parents[3]          # .../ask-lora-r3/grpo -> repo root (holds service/)
+REPO = Path(__file__).resolve().parents[4]          # .../r3/grpo -> repo root (holds service/)
 
 
 def vlabel(**kw):
@@ -2650,7 +2650,7 @@ def test_r5_ceiling_table():
 
 # ---- the SFT/RL cross-check (RL-SCOPE C11): choose.py's rules and this reward must not drift apart
 
-DIST_RAW = Path(__file__).resolve().parents[2] / "ask-lora-r4" / "distill" / "raw"
+DIST_RAW = Path(__file__).resolve().parents[2] / "r4" / "distill" / "raw"
 
 
 def _distill_runs():
@@ -2675,7 +2675,8 @@ def test_r5_sft_selected_replies_and_the_reward_agree():
     """The recall and anchor parts over every committed distill run, with no history (the runs hold none); the totals over real
     histories are asserted by test_r5_sft_selected_replies_score_their_ceiling_on_real_histories and the hermetic cases below."""
     runs = _distill_runs()
-    assert runs, f"no distill run under {DIST_RAW}"
+    if not runs:
+        pytest.skip(f"needs private training data: a distill run (chosen.jsonl) under {DIST_RAW.name}/ (see docs/training/README.md)")
     d = W.dist()
     seen = {"recall": 0, "recall_none": 0, "anchor": 0, "samples": 0}
     anchor_trips = []

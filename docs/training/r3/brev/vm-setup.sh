@@ -25,7 +25,7 @@
 # Every candidate is VERIFIED by running a bf16 matmul and an SDPA call on the GPU, not just by import; the first that
 # passes is kept. Override with TORCH_INDEX=<url> (one candidate, still verified) and TORCH_SPEC='torch>=2.9'
 # (TORCHVISION_SPEC for the matching torchvision; GPU_ARCH=gfx950 skips the rocminfo detection; TRANSFORMERS_SPEC='transformers==5.22.1'
-# and PEFT_SPEC='peft==0.21.2' pin the rest of the stack, see ../../ask-lora-r4/a6000/README.md).
+# and PEFT_SPEC='peft==0.21.2' pin the rest of the stack, see ../../r4/a6000/README.md).
 # Several GPUs: `run.sh <tag> train` launches torchrun with NPROC processes (default: every GPU nvidia-smi / amd-smi lists;
 # NPROC=1 forces one). smoke, preflight and merge always use one GPU. The effective batch is --global-batch rows
 # per optimizer step whatever NPROC is (default 8): GLOBAL_BATCH=<n> LR=<lr> in the environment pass through.

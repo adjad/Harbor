@@ -10,7 +10,7 @@ Inputs are synthetic. Bars for a tuned model, as rostered (no flag):
   - message topics and memory capture return valid JSON
   - digest recall is within 5 points of base, and no digest fails
 
-    .venv/bin/python training/ask-lora-r4/background_probe.py --model M --api-key K --out f.json
+    .venv/bin/python docs/training/r4/background_probe.py --model M --api-key K --out f.json
     --unlisted reproduces a model missing from the list, which is how a Settings pick runs.
 
 Set HARBOR_HOME to an empty directory first. Quit Harbor first at a gate.
