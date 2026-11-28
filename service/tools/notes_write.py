@@ -7,10 +7,9 @@ file on disk, which is NOT where the user keeps notes and does not sync) or be
 declined outright.
 
 Unlike `search_notes`, which reads a cache the Swift app syncs once a day, these
-drive Notes.app live over AppleScript. That difference matters in one visible
-way: a note created here will not appear in `search_notes` results until the
-next sync. The tools say so in their output rather than letting the user
-discover it by asking a follow-up question and getting nothing.
+drive Notes.app live over AppleScript. After each write the cache is marked as
+missing that change (notes_tools.mark_notes_changed), so the next search asks
+the app for a fresh read first instead of answering from the older snapshot.
 
 TCC: Notes automation access is already granted (NotesReader.swift uses it), so
 these need no new permission prompt.
@@ -56,10 +55,15 @@ def _item_text(line: str) -> str:
     return (m.group(1) if m else line).strip()
 
 
-def _body_html(text: str) -> str:
+def _body_html(text: str, plain_div: bool = False) -> str:
     """A note body: "- " / "* " / "• " lines become <ul> items and "1. " lines
     <ol> items, with the marker dropped. Left as text, Notes showed it beside
-    its own bullet ("• - Demo point 1"). Other lines keep the <br> rule above."""
+    its own bullet ("• - Demo point 1"). Other lines keep the <br> rule above.
+    `plain_div` puts each run of plain lines in its own <div> (for appending to
+    a note's end, where the lists already are blocks and need no wrapper)."""
+    def wrap(html: str) -> str:
+        return f"<div>{html}</div>" if plain_div else html
+
     parts: list[str] = []
     plain: list[str] = []
     items: list[str] = []
@@ -80,7 +84,7 @@ def _body_html(text: str) -> str:
             plain.append(line)
             continue
         if plain:
-            parts.append(_html("\n".join(plain)))
+            parts.append(wrap(_html("\n".join(plain))))
             plain.clear()
         if kind != this:
             close_list()
@@ -88,7 +92,7 @@ def _body_html(text: str) -> str:
         items.append(_html((m_b or m_n).group(1).strip()))
     close_list()
     if plain:
-        parts.append(_html("\n".join(plain)))
+        parts.append(wrap(_html("\n".join(plain))))
     return "".join(parts)
 
 
@@ -119,6 +123,15 @@ def _split_one_list_line(body: str) -> str:
     if len(items) < 2 or any(len(i.split()) > 5 for i in items):
         return body
     return "\n".join(f"- {i}" for i in items)
+
+
+def _changed() -> None:
+    """A write reached Notes (or may have): the next search re-reads Notes."""
+    try:
+        from service.tools import notes_tools
+        notes_tools.mark_notes_changed()
+    except Exception:  # noqa: BLE001 — the write itself already happened
+        pass
 
 
 def _err(p: subprocess.CompletedProcess) -> str | None:
@@ -184,6 +197,8 @@ def create_note(title: str, body: str = "", folder: str = "",
                   f'end tell')
 
     p = _osa(script)
+    if p.stdout.strip() != "NOFOLDER":
+        _changed()
     if (e := _err(p)) is not None:
         return e
     if p.stdout.strip() == "NOFOLDER":
@@ -193,8 +208,7 @@ def create_note(title: str, body: str = "", folder: str = "",
                         question=f"There's no Notes folder called “{folder}”, so I didn't create the note. "
                                  "Should I use the default folder?")
     kind = "checklist" if checklist else "note"
-    return (f"Created the {kind} \"{title}\" in Notes."
-            f" (It won't show up in search_notes until the next daily sync.)")
+    return f"Created the {kind} \"{title}\" in Notes."
 
 
 @register(
@@ -238,9 +252,14 @@ def append_note(title: str, text: str, bullet: bool = False) -> str:
     # Matching happens INSIDE AppleScript rather than by listing every note and
     # filtering here: the note bodies are the user's personal content and there
     # is no reason to pull all of them into this process to find one title.
+    # A note in Recently Deleted is never a target (as in _find_notes).
     script = (
         f'tell application "Notes"\n'
-        f'  set hits to (every note whose name contains "{_esc(title)}")\n'
+        f'  set found to (every note whose name contains "{_esc(title)}")\n'
+        f'  set hits to {{}}\n'
+        f'  repeat with n in found\n'
+        f'    if (name of container of n) is not "Recently Deleted" then set end of hits to contents of n\n'
+        f'  end repeat\n'
         f'  if (count of hits) is 0 then return "NONE"\n'
         f'  if (count of hits) > 1 then\n'
         f'    set out to ""\n'
@@ -262,15 +281,17 @@ def append_note(title: str, text: str, bullet: bool = False) -> str:
         f'  if closer is not "" and (length of e) > (length of closer) then\n'
         f'    set body of target to (text 1 thru -((length of closer) + 1) of e) & "{_esc(items)}" & closer\n'
         f'  else\n'
-        f'    set body of target to b & "<div>{_esc(_body_html(text))}</div>"\n'
+        f'    set body of target to b & "{_esc(_body_html(text, plain_div=True))}"\n'
         f'  end if\n'
         f'  return "OK:" & (name of target)\n'
         f'end tell')
 
     p = _osa(script)
+    out = p.stdout.strip()
+    if out != "NONE" and not out.startswith("MANY:"):
+        _changed()
     if (e := _err(p)) is not None:
         return e
-    out = p.stdout.strip()
     # NONE and MANY: the script returned before its `set body`.
     if out == "NONE":
         return not_done(f"No note has {title!r} in its title. Use create_note to start one.",
@@ -425,6 +446,7 @@ def delete_note(title: str, folder: str = "") -> str:
              f'  delete note id "{_esc(note_id)}"\n'
              f'  return "OK"\n'
              f'end tell')
+    _changed()
     if (e := _err(p)) is not None:
         # The script may have stopped after the delete: say so, never not_done.
         return (f"{e} I can't tell whether “{name}” was deleted. "

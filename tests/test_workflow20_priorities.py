@@ -243,7 +243,7 @@ def test_native_scan_cap_and_query_counts_are_separate(isolated):
 
 def test_notes_matching_omissions_are_separate_from_uninspected_carrier():
     N.cache_notes(N._RS.join((N._FS.join((str(STAMP), "Target", "Tasks", "Exact task")),
-                              N._FS.join((str(STAMP), "Other", "Tasks", "z" * 100_001)))))
+                              N._FS.join((str(STAMP), "Other", "Tasks", "z" * (N._SNAPSHOT_BYTES + 1))))))
     result = dispatch(query="Exact")["sources"]["notes"]
     assert result["matching"] == result["shown"] == 1 and result["omitted"] == 0
     assert result["upstream_uninspected"] == 1
