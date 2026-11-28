@@ -329,15 +329,12 @@ SYSTEM = (
     "- For anything the user wrote down or saved in Notes — an idea, a list, a "
     "code, project notes — call `search_notes` with a keyword `query`. This is "
     "always RAW verbatim content (there is no separate summary tool for notes).\n"
-    # The user keeps very little in Notes, so it is the weakest source here and
-    # a hit there is usually incidental. Ordering the search matters when the
-    # model has to guess where something lives.
-    "  NOTES IS THE LAST PLACE TO LOOK. This user keeps very little in Notes, so "
-    "when it is unclear where a piece of information lives, search the other "
-    "sources FIRST — messages, then mail, then calendar/reminders — and treat "
-    "notes as the final fallback. Do still call it when the user explicitly says "
-    "'my notes', or as part of a full sweep; just never lead with it, and never "
-    "answer 'I couldn't find it' on the strength of an empty notes search alone.\n"
+    # Notes is a source like any other. An earlier rule ranked it last for one
+    # user's habits; that hid real notes from everyone else.
+    "  When it is unclear where a piece of information lives, search notes "
+    "together with the other sources (messages, mail, calendar/reminders) in "
+    "the same step, and weigh what each returns the same way. Never answer "
+    "'I couldn't find it' on the strength of one empty source alone.\n"
     # FILES WAS THE ONE DOMAIN WITH NO BLOCK HERE. Every other area of the
     # user's data had a rule; files had none, while run_shell's own description
     # listed the domains it should defer to and omitted files entirely — so on
@@ -357,12 +354,14 @@ SYSTEM = (
     # REORGANIZING had no rule and no tool, and that combination destroyed
     # user data on 2026-08-16: the model correctly observed it had no move
     # tool, fell back to run_shell, and `rm -rf`'d the source folders without
-    # ever running a move. move_path now exists (see builtin.move_path); this
-    # tells the model to use it and states the invariant that makes the
-    # dangerous shape unnecessary.
-    "- To REORGANIZE, TIDY, SORT or FILE AWAY files, call `move_path` — once "
-    "per file, several calls in the SAME step. It creates the destination "
-    "folder for you, so you never need mkdir.\n"
+    # ever running a move. organize_files moves a whole glob in one previewed
+    # batch; move_path is for one named item. Both create folders as needed.
+    "- To REORGANIZE, TIDY, SORT or FILE AWAY files, call `organize_files` "
+    "(or `move_path` for one specific item). Call organize_files first WITHOUT "
+    "confirm to preview the plan, show the user what would move, then call it "
+    "again with confirm=true and the preview_token it returned. Do not move a "
+    "batch with repeated move_path calls. Both create the destination folder "
+    "for you, so you never need mkdir.\n"
     "  NEVER use run_shell with `rm` to reorganize anything. Moving files is "
     "the entire job: a folder you have emptied by moving its contents out is "
     "already reorganized, and an empty folder left behind is harmless. "
@@ -379,9 +378,9 @@ SYSTEM = (
     "    * `get_upcoming` — calendar events AND Reminders.app items\n"
     "    * `summarize_messages` — commitments people made to them, or they made\n"
     "    * `summarize_emails` — deadlines, asks, and things awaiting a reply\n"
-    "    * `search_notes` — anything they wrote down themselves (listed LAST on "
-    "purpose: this user keeps very little in Notes, so weight it lightest when "
-    "merging, and never let an empty notes result read as 'nothing found')\n"
+    "    * `search_notes` — anything they wrote down themselves\n"
+    "  Weigh every source the same when merging, and never let one empty "
+    "result read as 'nothing found'.\n"
     "  Emit them as several tool calls in the SAME turn, not one at a time over "
     "several turns. Then merge what comes back into ONE list, grouped by what "
     "matters (due today / this week / waiting on a reply), and say where each "
@@ -426,15 +425,15 @@ SYSTEM = (
     "scheduled no matter how plausible the phrase looked — say so plainly "
     "and ask what time they meant, never report it as queued. "
     "`list_scheduled_sends` and `cancel_scheduled_send` manage the queue.\n"
-    "  Never guess a recipient address or phone number: look it up with "
-    "`lookup_contact`, or ask. If the user names someone by relationship or "
-    "nickname ('mom', 'Dan', 'my landlord') rather than giving you a literal "
-    "address, `lookup_contact` for that name is the FIRST tool call you make "
-    "— before you draft anything, and always before send_message/send_email "
-    "— never send yet, even as a first attempt, with a guessed handle. Your "
+    "  Never guess a recipient address or phone number. When the user names "
+    "someone ('mom', 'Dan', 'my landlord'), pass that NAME as the recipient: "
+    "the send and draft tools resolve saved contact names themselves, so no "
+    "`lookup_contact` call is needed first. Never invent a handle in its place. "
+    "Use `lookup_contact` only when the user asks for the number or address "
+    "itself, or a send reports that a name did not resolve. Your "
     "own email address(es), given below for ATTRIBUTION, are never a "
-    "recipient for anyone else; if you don't have a real handle for the "
-    "person in hand, you don't have enough to send yet. Sends always require "
+    "recipient for anyone else; if you have neither a saved name nor a real "
+    "handle for the person, you don't have enough to send yet. Sends always require "
     "the user's confirmation, every time, and that's expected — call the "
     "tool rather than asking for "
     "permission in text.\n"
@@ -1188,6 +1187,19 @@ def _system_blocks() -> list[tuple[frozenset, str]]:
 
 
 _BLOCKS_CACHE: list[tuple[frozenset, str]] | None = None
+# The registered names the cache was built against. A block's tools are the
+# REGISTERED names in its first line, so a skill or MCP tool registered later
+# (or one removed) must rebuild it, or its block stays unassociated.
+_BLOCKS_KEY: frozenset | None = None
+
+
+def _blocks() -> list[tuple[frozenset, str]]:
+    global _BLOCKS_CACHE, _BLOCKS_KEY
+    from service.tools.registry import REGISTRY
+    key = frozenset(REGISTRY)
+    if _BLOCKS_CACHE is None or key != _BLOCKS_KEY:
+        _BLOCKS_CACHE, _BLOCKS_KEY = _system_blocks(), key
+    return _BLOCKS_CACHE
 _AGGREGATE_BLOCK_PREFIX = "- AGGREGATE QUESTIONS"
 
 
@@ -1212,17 +1224,43 @@ def build_system(offered: set[str], *, planner: bool = False) -> str:
     changed between steps would invalidate the prompt-cache prefix every time
     and re-prefill the whole thing.
     """
-    global _BLOCKS_CACHE
-    if _BLOCKS_CACHE is None:
-        _BLOCKS_CACHE = _system_blocks()
     # Planner turns drop the AGGREGATE block: it orders get_upcoming AND
     # summarize_messages AND summarize_emails AND search_notes for any to-do
     # question, which contradicts the plan step's "fewest calls" rule and is
     # the measured over-collection shape (LFM2.5-24B, "whats on my todo list":
     # 7 calls, 5 outside what the question needed).
-    return "\n".join(text for named, text in _BLOCKS_CACHE
+    return "\n".join(text for named, text in _blocks()
                      if (not named or (named & offered))
                      and not (planner and text.startswith(_AGGREGATE_BLOCK_PREFIX)))
+
+
+def system_rules_delta(sent: set[str], offered: set[str], *, planner: bool = False) -> str:
+    """The tool-specific SYSTEM blocks `offered` would add to a prompt already
+    built for `sent`: blocks whose tools are offered now but were not then.
+
+    Mid-turn schema discovery uses this instead of rebuilding the system
+    message. Rewriting msgs[0] on a later step changes the prompt prefix the
+    engine has cached for this turn and re-prefills everything, so the rules
+    for newly loaded tools travel with the discovery receipt instead and the
+    system message stays exactly as step 0 sent it."""
+    return "\n".join(text for named, text in _blocks()
+                     if named and (named & offered) and not (named & sent)
+                     and not (planner and text.startswith(_AGGREGATE_BLOCK_PREFIX)))
+
+def explicit_skill_named(text: str) -> bool:
+    """Whether `text` names an enabled skill as @name or $name, as a word of its
+    own: "user@humanizer.com" is an address, not a request for the skill."""
+    try:
+        from service.skills import _skills
+    except Exception:  # noqa: BLE001
+        return False
+    for skill in list(_skills.values()):
+        if not skill.enabled or skill.error:
+            continue
+        if re.search(r"(?<![\w@$])[@$]" + re.escape(skill.name) + r"(?![\w-])", text or "", re.I):
+            return True
+    return False
+
 
 # Smallest answer worth generating. Below this the model can't finish a
 # sentence, so a window too tight for it needs tools/history dropped instead.
@@ -2138,20 +2176,47 @@ async def run_agent(
     planner = bool(planner and not model_led_discovery and not public_web_synthesis
                    and getattr(client, "managed", False))
 
-    def _sys(offered: set[str]) -> str:
+    style_sent = [False]   # whether the system message carries the compose style
+
+    def _sys(offered: set[str], style_tools: set[str] | None = None) -> str:
         # Settings › Human-sounding replies shapes only the message the model
-        # writes for the user to send, so it rides only while a send/draft
-        # schema is really offered (stubs are excluded by every caller), and
-        # never Harbor's own answer on any other turn (owner decision 2026-11-10).
+        # writes for the user to send, so it rides only while a send/draft tool
+        # is on this turn's table, and never Harbor's own answer on any other
+        # turn (owner decision 2026-11-10). `style_tools` includes name-only
+        # stubs: a stub send whose arguments already fit runs as written
+        # (registry.runnable_stub_call), so the style must be there first.
         try:
             from service.skills import COMPOSE_TOOLS, compose_style_block
             # skills_allowed: the same boundary as every other skill text
             # (test mode, literal envelopes, cloud synthesis, remote profiles).
-            style = (compose_style_block()
-                     if skills_allowed and offered & COMPOSE_TOOLS else "")
+            wants = skills_allowed and bool((style_tools or offered) & COMPOSE_TOOLS)
+            style = compose_style_block() if wants else ""
         except Exception:  # noqa: BLE001 — a style must never fail the turn
             style = ""
         return build_system(offered, planner=planner) + style
+
+    def _sys_extra(sent: set[str], offered: set[str]) -> str:
+        """Rules (and compose style) `offered` needs beyond what `sent` already
+        put in the system message; see system_rules_delta."""
+        extra = system_rules_delta(sent, offered, planner=planner)
+        try:
+            from service.skills import COMPOSE_TOOLS, compose_style_block
+            if skills_allowed and offered & COMPOSE_TOOLS and not style_sent[0]:
+                extra += compose_style_block()
+                style_sent[0] = True
+        except Exception:  # noqa: BLE001 — a style must never fail the turn
+            pass
+        return extra.strip()
+
+    def _receipt_with_rules(result: str, extra: str) -> str:
+        if not extra:
+            return result
+        try:
+            receipt = json.loads(result)
+        except ValueError:
+            return result + "\nRules for the tools now loaded:\n" + extra
+        receipt["rules_for_loaded_tools"] = extra
+        return json.dumps(receipt)
 
     # Monotonic negative authority. main supplies actual pre-trimming session
     # provenance; other callers conservatively retain assistant/tool/system
@@ -3017,7 +3082,18 @@ async def run_agent(
     # Scope the prompt to this turn's toolset (see build_system). `tools` is
     # None on the unscoped route, which yields the full prompt — same as before.
     # Stubs are names only and get no tool-specific system rules.
-    sys_text = _sys({s["function"]["name"] for s in schemas} - stub_names)
+    sys_ruled = {s["function"]["name"] for s in schemas} - stub_names
+    last_user_text = str(next((m["content"] for m in reversed(messages)
+                               if m.get("role") == "user"), ""))
+    # A name-only send/draft stub counts for the compose style only on a turn
+    # that asks to send or draft something: model-led turns stub the sends on
+    # nearly every request, and the style must not ride on all of them.
+    try:
+        from service.router.semantic import outbound_intent
+        style_stubs = set(stub_names) if outbound_intent(last_user_text) else set()
+    except Exception:  # noqa: BLE001
+        style_stubs = set()
+    sys_text = _sys(sys_ruled, sys_ruled | style_stubs)
     # Instructions from installed skills whose triggers match this turn (see
     # service/skills). Empty until the user installs one. The installed-skills
     # CATALOG exists to make `use_skill` discoverable; on a route that does not
@@ -3028,13 +3104,14 @@ async def run_agent(
     # EVERY step while any skill was installed.
     # ask_direct: a one-step written answer; a skill's interview script
     # ("I'll use the idea-refine skill…") would replace the text asked for.
-    if skills_allowed and not (ask_quality and ask_direct):
+    # Unless the user named the skill themselves (@name / $name): then the
+    # skill IS what was asked for, and dropping it ignored the request.
+    if skills_allowed and (not (ask_quality and ask_direct)
+                           or explicit_skill_named(last_user_text)):
         try:
             from service.skills import skills_context_block
-            last_user = next((m["content"] for m in reversed(messages)
-                              if m.get("role") == "user"), "")
             skills_hint = skills_context_block(
-                str(last_user), active_skill,
+                last_user_text, active_skill,
                 model_led_discovery or "use_skill" in turn_tool_names)
         except Exception:  # noqa: BLE001
             skills_hint = ""
@@ -3078,11 +3155,18 @@ async def run_agent(
                 ruled.add(force_first_tool)
             for group in required_tool_groups:
                 ruled |= set(group)
-            sys_text = _sys(ruled & turn_tool_names)
+            sys_ruled = ruled & turn_tool_names
+            sys_text = _sys(sys_ruled, sys_ruled | style_stubs)
     # Keep the instruction order: base, identity, memory, skills, clock, style,
     # test-mode and reminder safeguards. The second system message follows
     # Ling's serialized schemas; style still overrides the base concision rule.
     sys_content = sys_text + identity_hint + memory_hint + skills_hint
+    try:
+        from service.skills import compose_style_block
+        _style = compose_style_block() if skills_allowed else ""
+        style_sent[0] = bool(_style) and sys_text.endswith(_style)
+    except Exception:  # noqa: BLE001
+        style_sent[0] = False
     runtime_content = (now_line
                        + (("\n" + capability_catalog.prompt(compact=ask_quality))
                           if capability_catalog else "")
@@ -3269,6 +3353,8 @@ async def run_agent(
                     registered.category.endswith("read")
                     and registered.category != "web_read"
                     or registered.category == "screen" or shell_read
+                    # search_memory is not a built-in; the name stays so a
+                    # connected or user-made tool called that still latches.
                     or name in {"recall", "search_memory", "search_conversations", "study_make"}):
                 private_shell_read_only = True
                 private_read_in_turn = True
@@ -5228,8 +5314,9 @@ async def run_agent(
                 tools = list(expansion.names)
                 schemas, stub_names = model_led_offer(capability_catalog, tools)
                 turn_tool_names = {s["function"]["name"] for s in schemas}
-                msgs[0] = {"role": "system", "content": (
-                    _sys(set(tools)) + identity_hint + memory_hint + skills_hint)}
+                # msgs[0] stays as step 0 sent it (see system_rules_delta).
+                rules_extra = _sys_extra(sys_ruled, set(tools))
+                sys_ruled |= set(tools)
                 stub_result = expansion.receipt()
                 # A small model read the bare receipt as "I have called
                 # get_upcoming" and replied "give me a moment" (2026-10-29).
@@ -5250,11 +5337,16 @@ async def run_agent(
             except SelectionError as error:
                 stub_result = (f"Schema selection rejected: {error}. No source was read or "
                                "action performed.")
+                rules_extra = ""
                 if discovery.attempts >= MAX_DISCOVERIES:
                     schemas, stub_names = model_led_offer(capability_catalog, tools)
                     turn_tool_names = {s["function"]["name"] for s in schemas}
                 await emit({"type": "routing_discovery", "status": "rejected", "implicit": True})
-            stub_results = {index: stub_result for index, _ in stub_calls}
+            # Every stub call shares one receipt; the new rules ride on the
+            # first only, so several stubs in one step do not repeat them.
+            stub_results = {index: (_receipt_with_rules(stub_result, rules_extra) if n == 0
+                                    else stub_result)
+                            for n, (index, _) in enumerate(stub_calls)}
 
         for call_index, tc in enumerate(tool_calls):
             cid = tc.get("id", "")
@@ -5274,9 +5366,10 @@ async def run_agent(
                     tools = list(expansion.names)
                     schemas, stub_names = model_led_offer(capability_catalog, tools)
                     turn_tool_names = {s["function"]["name"] for s in schemas}
-                    msgs[0] = {"role": "system", "content": (
-                        _sys(set(tools)) + identity_hint + memory_hint + skills_hint)}
-                    result = expansion.receipt()
+                    # msgs[0] stays as step 0 sent it (see system_rules_delta).
+                    rules_extra = _sys_extra(sys_ruled, set(tools))
+                    sys_ruled |= set(tools)
+                    result = _receipt_with_rules(expansion.receipt(), rules_extra)
                     await emit({"type": "routing_discovery", "families": list(expansion.families),
                                 "tools": tools, "status": "ready_next_step"})
                 except SelectionError as error:
@@ -6020,6 +6113,16 @@ async def run_agent(
                 await emit({"type": "text", "text": response})
                 await emit({"type": "done"})
                 return response
+            elif outcome.status == "unknown" and outcome.effect != "read":
+                # A change that may or may not have happened (update_event's
+                # "(not confirmed: …)"): stop with that text rather than let a
+                # retry apply it twice.
+                failed_tools.add(name)
+                response = (_reminder_update_receipts()
+                            or _earlier_effect_receipts(_stopped_text(tool, result)))
+                await emit({"type": "text", "text": response})
+                await emit({"type": "done"})
+                return response
             elif outcome.status in {"failed", "needs_input", "unsupported"}:
                 failed_tools.add(name)
                 if outcome.effect != "read":
@@ -6098,6 +6201,9 @@ async def run_agent(
                 else:
                     schemas = [s for s in _admit(tool_schemas(tools))
                                if s["function"]["name"] not in forbidden_tools]
+                # The turn's own tool set too, or a call to the new tool next
+                # step is rejected as not part of this turn.
+                turn_tool_names = {s["function"]["name"] for s in schemas}
 
         # See short_circuit_tools' docstring above. Only for a SINGLE
         # successful (ALLOW-tier) call to one of these tools — a compound

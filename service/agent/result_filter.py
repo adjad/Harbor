@@ -58,7 +58,12 @@ they their there here him her his she its our ours mine tell show give find get 
 please latest recent last new old email emails mail mails message messages text texts file files
 folder folders page pages web site search query com www http https org net ago today yesterday
 me my i it is be to of in on at as by an or if so up do no yes
+note notes reminder reminders calendar event events task tasks todo todos
+important importance urgent urgently priority priorities prioritize
 """.split())
+# The last line is intent, not content: "any important notes?" asks Harbor to
+# judge importance. Scored literally, those words ranked a newsletter that says
+# "important update" above the item the user meant.
 
 
 # --------------------------------------------------------------------------- intent
@@ -81,26 +86,38 @@ def intent_for(messages: list | None, args: dict | None = None) -> str:
 
 
 def _terms(intent: str) -> tuple[str, ...]:
-    text = unicodedata.normalize("NFKC", intent or "").casefold()
+    text = unicodedata.normalize("NFKC", intent or "")
     seen: list[str] = []
-    for word in re.findall(r"\w+", text):
+    for raw in re.findall(r"\w+", text):
+        word = raw.casefold()
         if word in _STOP or word in seen:
             continue
-        if len(word) >= 3 or (len(word) == 2 and any(c.isdigit() for c in word)):
+        # Two characters only when written as an acronym or with a digit
+        # ("AI", "HR", "TA", "ID", "Q3"); a lowercase "an"/"ok" is filler.
+        if len(word) >= 3 or (len(word) == 2 and (any(c.isdigit() for c in word)
+                                                  or raw.isupper())):
             seen.append(word)
     return tuple(seen)
+
+
+def _hits(term: str, text: str) -> int:
+    """Occurrences of `term` in casefolded `text`. A term of two characters
+    must stand alone as a word, or "ai" would match "email" and "said"."""
+    if len(term) > 2:
+        return text.count(term)
+    return len(re.findall(r"(?<!\w)" + re.escape(term) + r"(?!\w)", text))
 
 
 def _score(terms: tuple[str, ...], who: str = "", what: str = "", body: str = "") -> int:
     who, what, body = who.casefold(), what.casefold(), body.casefold()
     total = 0
     for term in terms:
-        if term in who:
+        if _hits(term, who):
             total += 3
-        if term in what:
+        if _hits(term, what):
             total += 2
         if body:
-            total += min(body.count(term), 3)
+            total += min(_hits(term, body), 3)
     return total
 
 
@@ -612,6 +629,130 @@ def _shape_web_search(result: str, limit: int, terms: tuple[str, ...]) -> str | 
     return out + "\n\n".join(r.text for r in kept)
 
 
+# --------------------------------------------------------------------------- notes
+
+_NOTE_HEAD = re.compile(r"^Title: ", re.M)
+_NOTE_DATE = "%a %b %d, %Y %I:%M %p"
+
+
+def _shape_notes(result: str, limit: int, terms: tuple[str, ...]) -> str | None:
+    """search_notes: `Title: …\nModified: …\n\n<body>` blocks joined by _SEP."""
+    parts = result.split(_SEP)
+    first = _NOTE_HEAD.search(parts[0])
+    if first is None or len(parts) < 2:
+        return None
+    preamble = parts[0][:first.start()]
+    parts[0] = parts[0][first.start():]
+    rows: list[_Row] = []
+    split: dict[int, tuple[str, str]] = {}
+    for i, block in enumerate(parts):
+        head, _, body = block.partition("\n\n")
+        if not head.startswith("Title: "):
+            return None
+        title_line = head.split("\n", 1)[0][7:]
+        title, _, folder = title_line.partition(" [")
+        when = next((ln[10:] for ln in head.split("\n") if ln.startswith("Modified: ")), "")
+        try:
+            stamp = datetime.strptime(when.strip(), _NOTE_DATE).timestamp()
+        except ValueError:
+            stamp = 0.0
+        split[i] = (head, body)
+        rows.append(_Row(block, i, _score(terms, title, folder, body), stamp, folder.rstrip("]")))
+
+    def trim(row: _Row, room: int) -> _Row:
+        head, body = split[row.index]
+        text, _shown, _total = _select_text(body, terms, max(200, room - len(head) - 2))
+        return _Row(f"{head}\n\n{_shorten(text, max(200, room - len(head) - 2))}",
+                    row.index, row.score, row.recency, row.group)
+
+    kept = _choose(rows, limit - len(preamble) - _RESERVE, len(_SEP), trim=trim)
+    remainder = _remainder(rows, kept, "notes",
+                           "search again with a more specific `query`, or a `day`/`period`",
+                           lambda g: f"in the {g} folder")
+    return preamble + (remainder + "\n\n" if remainder else "") + _SEP.join(r.text for r in kept)
+
+
+# --------------------------------------------------------------------------- digests
+
+# Row starts in the plain-text digests (reminders, agenda, mail and message
+# digests, triage, the day plan, memories): a bullet, a numbered item or a
+# bracketed tag. Indented lines continue the row above.
+_LIST_ROW = re.compile(r"^(?:[-•*] |\d{1,3}[.)] |\[)")
+_SECTION = re.compile(r"^(?:#{1,4} \S.*|[^\s\-•*\[].{0,78}:)$")
+
+
+def _shape_digest(result: str, limit: int, terms: tuple[str, ...], noun: str, how: str) -> str | None:
+    """Rank whole rows against the question and keep the best that fit, in
+    their original order under every section heading. Ties go round-robin across sections, so
+    with no matching words every section (overdue, today, waiting on a reply…)
+    still shows its first items instead of the first section taking it all."""
+    if _MARKERS.search(result):
+        return None
+    lines = result.split("\n")
+    if not any(_LIST_ROW.match(ln) for ln in lines):
+        return None
+    # (kind, text, section) items; kind is "row", "head" or "fixed".
+    items: list[list] = []
+    section = -1
+    for ln in lines:
+        if _LIST_ROW.match(ln):
+            items.append(["row", ln, section])
+        elif ln[:1].isspace() and ln.strip() and items and items[-1][0] == "row":
+            items[-1][1] += "\n" + ln
+        elif _SECTION.match(ln):
+            section += 1
+            items.append(["head", ln, section])
+        else:
+            items.append(["fixed", ln, section])
+    rows_at = [i for i, it in enumerate(items) if it[0] == "row"]
+    if len(rows_at) < 2:
+        return None
+    fixed_len = sum(len(it[1]) + 1 for it in items if it[0] != "row")
+    budget = limit - fixed_len - _RESERVE
+    if budget < 200:
+        return None
+    rank_in_section: dict[int, int] = {}
+    section_of: dict[int, int] = {}
+    rows: list[_Row] = []
+    for at in rows_at:
+        _kind, text, sec = items[at]
+        rank_in_section[sec] = rank_in_section.get(sec, -1) + 1
+        section_of[at] = sec
+        first, _, rest = text.partition("\n")
+        # Earlier in its own section wins a tie, so ties go round-robin.
+        rows.append(_Row(text, at, _score(terms, "", first, rest), -float(rank_in_section[sec])))
+    kept = _choose(rows, budget, 1, trim=lambda r, room: _Row(_shorten(r.text, room), r.index,
+                                                              r.score, r.recency))
+    kept_at = {r.index: r for r in kept}
+    left: dict[int, int] = {}
+    for r in rows:
+        if r.index not in kept_at:
+            left[section_of[r.index]] = left.get(section_of[r.index], 0) + 1
+    out: list[str] = []
+
+    def close(sec: int) -> None:
+        if left.get(sec):
+            out.append(f"- [{left.pop(sec):,} more here not shown]")
+
+    current = -1
+    for i, (kind, text, sec) in enumerate(items):
+        if kind == "head":
+            close(current)
+            current = sec
+        if kind == "row":
+            if i in kept_at:
+                out.append(kept_at[i].text)
+        else:
+            out.append(text)
+    close(current)
+    remainder = _remainder(rows, kept, noun, how, lambda g: "")
+    return (remainder + "\n" if remainder else "") + "\n".join(out)
+
+
+def _digest(noun: str, how: str):
+    return lambda r, n, t: _shape_digest(r, n, t, noun, how)
+
+
 # --------------------------------------------------------------------------- entry point
 
 _SHAPERS = {
@@ -622,6 +763,14 @@ _SHAPERS = {
     "read_file": lambda r, n, t: _shape_text_body(r, n, t, fenced=False),
     "web_fetch": lambda r, n, t: _shape_text_body(r, n, t, fenced=True),
     "web_search": _shape_web_search,
+    "search_notes": _shape_notes,
+    "search_reminders": _digest("reminders", "search again with a more specific `query`"),
+    "get_upcoming": _digest("items", "ask for a shorter `period` or fewer `days`"),
+    "summarize_emails": _digest("lines", "ask by `day`, `period` or `account`, or use view_emails with a `query`"),
+    "summarize_messages": _digest("lines", "ask by `conversation`, `day` or `period`"),
+    "triage_inbox": _digest("senders", "use view_emails with a `query` for one sender"),
+    "get_my_day_plan": _digest("items", "read the source tool (get_upcoming, search_reminders, view_emails) for the rest"),
+    "recall": _digest("memories", "recall again with a more specific `query`"),
 }
 SHAPED_TOOLS = frozenset(_SHAPERS)
 

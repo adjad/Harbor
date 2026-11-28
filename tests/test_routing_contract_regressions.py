@@ -1515,7 +1515,8 @@ class RoutingContractTests(unittest.IsolatedAsyncioTestCase):
                 ('Moved “team meeting” to Thu Sep 10, 3:00 PM–4:00 PM.', "succeeded"),
                 ('Moved “standup” to Fri Sep 11, 10:00 AM–10:15 AM. Only this occurrence moved.', "succeeded"),
                 ('Moved “team meeting”.', "failed"),
-                ('(not confirmed: Calendar may have moved “team meeting”; check it in Calendar before trying again.)', "failed"),
+                # Calendar took the move but did not confirm it: it may have moved.
+                ('(not confirmed: Calendar may have moved “team meeting”; check it in Calendar before trying again.)', "unknown"),
                 ('Several items match “team meeting”. Which one?', "needs_input"),
                 ('Cancelled “team meeting”.', "failed"),
                 (UPDATE_RECEIPT.split("\n")[1], "failed"),

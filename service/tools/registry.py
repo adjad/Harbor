@@ -413,6 +413,21 @@ _TOOL_EFFECTS = {
 
 
 _PAREN_FAILURE_TOOLS = frozenset({"toggle_setting", "clipboard_write", "screen_capture"})
+# Categories whose tools change something. Each words its refusals in
+# parentheses ("(no such path: …)", "(refusing to overwrite …)"); a success is
+# always a plain receipt, so a leading "(" from one of them is never a change.
+_MUTATING_CATEGORIES = frozenset({
+    "assistant_write", "calendar_write", "email_draft", "email_send", "email_triage",
+    "fs_delete", "fs_write", "messages_draft", "messages_send", "messages_write",
+    "notes_write", "scheduled_send", "system_write", "timer_write"})
+# Zero-match receipts of the bulk clears: nothing was deleted.
+_CLEAR_NOTHING = {"clear_past_reminders": "nothing past-due to clear",
+                  "clear_reminders": "no active reminders found"}
+
+
+def _mutating(tool_name: str) -> bool:
+    tool = REGISTRY.get(tool_name)
+    return tool_name in _TOOL_EFFECTS or (tool is not None and tool.category in _MUTATING_CATEGORIES)
 
 
 def classify_tool_outcome(tool_name: str, result: str, *, planned: bool = False,
@@ -459,6 +474,12 @@ def classify_tool_outcome(tool_name: str, result: str, *, planned: bool = False,
         # These tools word every refusal as "(could not …)" / "(I couldn't …)" /
         # "(… needs an admin password …)"; none of those is a completed change.
         return ToolOutcome("failed", text, effect)
+    if tool_name in _CLEAR_NOTHING and low.startswith(_CLEAR_NOTHING[tool_name]):
+        return ToolOutcome("no_match", text, effect)
+    if tool_name == "update_event" and low.startswith("(not confirmed:"):
+        # Calendar took the move but the read-back did not match: it may or
+        # may not have moved, so neither success nor failure is true.
+        return ToolOutcome("unknown", text, effect)
     if tool_name == "update_event":
         if (text == EVENT_UPDATE_UNAVAILABLE or low.startswith("no upcoming calendar event matches")
                 or "which one?" in low or low == "which event should move?"):
@@ -487,6 +508,9 @@ def classify_tool_outcome(tool_name: str, result: str, *, planned: bool = False,
         return ToolOutcome("no_match", text, effect)
     if any(mark in low for mark in ("which one?", "ask the user", "needs part of")):
         return ToolOutcome("needs_input", text, effect)
+    if _mutating(tool_name) and text.lstrip().startswith("("):
+        # A refusal that asks nothing of the user is a plain failure.
+        return ToolOutcome("failed", text, effect)
     if tool_name == "add_reminder" and not low.startswith("reminder set:"):
         # Bad ISO dates, past times, and arbitrary nonempty strings are not
         # evidence of a write. The creation tool emits this receipt after save.

@@ -1245,3 +1245,32 @@ def test_a_model_led_card_a_grant_can_lift_keeps_always_allow(synthetic):
     assert [a["tool"] for a in approval.calls] == ["write_file"]
     assert approval.calls[0].get("grantable", True) is not False
     assert not effects
+
+
+def test_a_tool_created_mid_turn_joins_the_turns_tool_set(synthetic, monkeypatch):
+    _, register = synthetic
+    from service.tools import tool_authoring
+    async def no_draft_problem(*args, **kwargs):
+        return ""
+    monkeypatch.setattr(tool_authoring, "prepare_draft", no_draft_problem)
+    monkeypatch.setattr(tool_authoring, "draft_code", lambda name: "synthetic code")
+    monkeypatch.setattr(tool_authoring, "draft_scope_line", lambda name: "")
+    monkeypatch.setattr(tool_authoring, "draft_warning", lambda name: "")
+
+    def create(name):
+        register(name, "tool_authoring", "fs_read")
+        return f"Created '{name}'."
+
+    tool = register("create_tool", "tool_authoring", "tool_authoring", parameters={
+        "type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]})
+    async def fake_create(name):
+        return create(name)
+    tool.func = fake_create
+    client, _, _ = run([[call("create_tool", name="synthetic_new"), call("synthetic_new")],
+                        "Synthetic answer."],
+                       model_led_discovery=False, tools=["create_tool"], force_first_tool="create_tool",
+                       approval=Approval(allowed=True))
+    results = [m["content"] for m in client.requests[1]["messages"] if m.get("role") == "tool"]
+
+    # Withheld by the forced step, but part of this turn: the honest "not yet".
+    assert any("synthetic_new is not callable on this step — it IS available" in r for r in results)

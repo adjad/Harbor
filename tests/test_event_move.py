@@ -170,13 +170,14 @@ async def test_the_app_being_down_is_the_unavailable_answer(store, bridge, monke
     assert classify_tool_outcome("update_event", result).status == "needs_input"
 
 
-@pytest.mark.parametrize("native, says", [
+@pytest.mark.parametrize("native, says, status", [
     ({"ok": False, "status": "failed", "error": "Only the organizer can move an event with invitees"},
-     "couldn't move"),
+     "couldn't move", "failed"),
+    # Calendar took the move but did not read back the same: it may have moved.
     ({"ok": False, "status": "unknown", "error": "read-back differs (notes); the outcome is unknown"},
-     "not confirmed"),
+     "not confirmed", "unknown"),
 ])
-async def test_refused_and_unverified_moves_are_never_success(store, monkeypatch, native, says):
+async def test_refused_and_unverified_moves_are_never_success(store, monkeypatch, native, says, status):
     start = _top_of_hour(26)
     _calendar(store, _event("ek-1", "Dentist", start))
     monkeypatch.setattr(outbox, "request", AsyncMock(return_value=native))
@@ -184,7 +185,7 @@ async def test_refused_and_unverified_moves_are_never_success(store, monkeypatch
     monkeypatch.setattr(hub, "publish", AsyncMock())
     result = await _move("dentist", _iso(start + HOUR))
     assert says in result
-    assert classify_tool_outcome("update_event", result).status == "failed"
+    assert classify_tool_outcome("update_event", result).status == status
     hub.publish.assert_not_awaited()
 
 
