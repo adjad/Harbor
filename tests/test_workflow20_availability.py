@@ -95,7 +95,7 @@ def test_unknown_invalid_intervals_never_claim_free(source, legacy, change):
     ({'all_day':True,'end_ts':None}, 'no end time'),
     ({'all_day':True,'end_ts':stamp('2026-10-11T09:30')}, 'zero-length all-day item'),
 ])
-def test_malformed_end_is_skipped_with_a_note_not_an_abort(source, legacy, change, why):
+def test_malformed_end_blocks_conservatively_with_a_note(source, legacy, change, why):
     row = event(); row.update(change)
     if why == 'zero-length all-day item':
         row['when_ts'] = row['end_ts']
@@ -104,8 +104,16 @@ def test_malformed_end_is_skipped_with_a_note_not_an_abort(source, legacy, chang
     source.rows = [row, other]
     result = invoke(legacy, minutes=60)
     assert not result.startswith('(error:')
-    assert 'had invalid times' in result and why in result and 'may overlap' in result
-    assert '2:00 PM–' in result            # the valid event still blocks 1-2 PM
+    assert 'had invalid times' in result and why in result and 'blocked conservatively' in result
+    day_line = next((l for l in result.splitlines() if '2026-10-11' in l and l.lstrip().startswith(('Sunday','tomorrow'))), '')
+    if change.get('all_day'):
+        assert not day_line                       # the whole day is blocked: no slot that day
+    else:
+        # one hour from the 10:30 start is blocked; the valid 1-2 PM event still blocks
+        assert ('9:00 AM–10:30 AM' in result or 'free until 2026-10-11T10:30' in result)
+        assert '11:30 AM–' in result and '2:00 PM–' in result
+        for overlapping in ('10:30 AM–', '11:00 AM–', '10:00 AM–', '1:00 PM–'):
+            assert overlapping not in day_line
 
 
 @pytest.mark.parametrize('legacy', [False, True])
@@ -426,7 +434,7 @@ def test_past_periods_are_rejected_not_clamped_to_today(source, period):
     assert result.startswith('(error:') and 'in the past' in result
 
 
-def test_one_malformed_row_does_not_hide_the_valid_rows_or_other_days(source):
+def test_one_malformed_row_blocks_an_hour_and_does_not_hide_other_days(source):
     bad = {**event(), 'id': 'bad-1', 'title': 'Invented broken item', 'end_ts': stamp('2026-10-11T08:00')}
     good = {**event(), 'id': 'good-1', 'title': 'Invented review', 'when_ts': stamp('2026-10-11T10:00'),
             'end_ts': stamp('2026-10-11T12:00')}
@@ -434,5 +442,6 @@ def test_one_malformed_row_does_not_hide_the_valid_rows_or_other_days(source):
     result = invoke(True, minutes=60)
     assert not result.startswith('(error:')
     assert 'Invented broken item (end before start)' in result
-    assert '12:00 PM–' in result and '10:00 AM–11:00 AM' not in result   # the valid event still blocks
+    # bad row starts 10:30 (end before start): 10:30-11:30 blocked; the valid 10-12 event blocks too
+    assert '12:00 PM–' in result and '10:00 AM–11:00 AM' not in result and '11:30 AM–' not in result
     assert 'today (2026-10-10)' in result                                 # the other day is listed

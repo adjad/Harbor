@@ -203,7 +203,7 @@ def test_unsupported_availability_never_delivers(tmp_path,delivery_sources,promp
     assert all(name not in {'send_message','send_email','draft_email'} for name,args in state.calls)
 
 
-def test_a_malformed_calendar_row_is_skipped_and_the_send_still_waits_for_approval(tmp_path,delivery_sources):
+def test_a_malformed_calendar_row_blocks_conservatively_and_the_send_still_waits_for_approval(tmp_path,delivery_sources):
     state=delivery_sources
     state.rows=[{'id':'synthetic.cal','source':'calendar','title':'Unknown end',
         'when_ts':dt.datetime(2026,10,11,10,tzinfo=ZoneInfo('America/Los_Angeles')).timestamp(),

@@ -265,7 +265,9 @@ S._store._db.close()
 async def test_unknown_end_duration_is_disclosed(clock):
     result = await availability([{"when_ts": stamp(4, 9), "source": "manual", "kind": "event"}])
     assert not result.startswith("(error:") and "had invalid times" in result
-    assert "no end time" in result and "may overlap" in result and "assumed" not in result
+    assert "no end time" in result and "blocked conservatively" in result and "assumed" not in result
+    # one hour from the 9:00 start is blocked, so no slot overlaps it
+    assert "9:00 AM–" not in result and "10:00 AM–11:30 AM" in result
 
 
 @pytest.mark.asyncio
@@ -675,4 +677,5 @@ async def test_explicit_assistant_denial_cannot_grant_confirmed_write(clock):
 async def test_all_day_unknown_end_cannot_claim_a_verified_gap(clock):
     result = await availability([{"when_ts":stamp(3,0), "all_day":True, "source":"calendar"}])
     assert not result.startswith("(error:") and "had invalid times" in result
-    assert "no end time" in result and "may overlap" in result
+    assert "no end time" in result and "blocked conservatively" in result
+    assert result.startswith("No matches") and "9:00 AM" not in result   # an all-day row blocks the day

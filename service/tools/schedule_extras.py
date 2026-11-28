@@ -713,12 +713,15 @@ def _availability_result(options, period, timezone, now):
             raise ValueError("Calendar has an invalid start; no availability was verified.")
         if begin >= hi:
             return None
-        if not number(finish):
-            malformed(row, "no end time")
-            return None
-        if finish < begin or (row.get("all_day") and finish == begin):
-            malformed(row, "end before start" if finish < begin else "zero-length all-day item")
-            return None
+        if not number(finish) or finish < begin or (row.get("all_day") and finish == begin):
+            # An unusable end must not free time that a real event may hold: block it
+            # conservatively (an all-day row blocks the whole day, anything else one hour
+            # from its start) and name it in the note.
+            malformed(row, "no end time" if not number(finish) else
+                      "end before start" if finish < begin else "zero-length all-day item")
+            if row.get("all_day"):
+                return (lo, hi) if lo < hi else None
+            finish = begin + 3600
         a, b = max(begin, lo), min(finish, hi)
         return (a, b) if a < b else None
 
@@ -759,8 +762,8 @@ def _availability_result(options, period, timezone, now):
     if skipped:
         shown = "; ".join(sorted(set(skipped))[:5])
         skip_note = (f"\nNote: {len(skipped)} Calendar item{'s' if len(skipped) != 1 else ''} had invalid times and "
-                     f"{'were' if len(skipped) != 1 else 'was'} skipped ({shown}); a slot may overlap "
-                     f"{'them' if len(skipped) != 1 else 'it'}.")
+                     f"{'were' if len(skipped) != 1 else 'was'} blocked conservatively ({shown}): one hour "
+                     "from the start, or the whole day for an all-day item.")
     else:
         skip_note = ""
     scope = (target_days[0].isoformat() if len(target_days) == 1 else
