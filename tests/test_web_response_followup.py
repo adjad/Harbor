@@ -1315,10 +1315,15 @@ def test_fetched_page_title_is_one_capped_line_for_every_document_kind(monkeypat
 
 
 def test_web_fetch_truncation_note_stays_outside_the_fence(monkeypatch):
-    from service.tools.untrusted import WEB_PAGE, end_marker
+    from service.tools.untrusted import WEB_PAGE, begin_marker, end_marker
 
+    # The note goes before the fence: an Ask turn keeps only the first 6,000
+    # characters of a result, so a note after a long page would be cut off.
     out = _fetched(monkeypatch, "x" * 10600)
-    assert out.endswith(f"{end_marker(WEB_PAGE)}\n…[truncated 100 characters]")
+    note = "…[truncated 100 characters]"
+    assert out.count(note) == 1
+    assert out.index(note) < out.index(begin_marker(WEB_PAGE))
+    assert out.endswith(end_marker(WEB_PAGE))
 
 
 def test_marker_lookalikes_are_neutralized_and_ordinary_brackets_are_not():

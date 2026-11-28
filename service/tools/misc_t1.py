@@ -455,7 +455,8 @@ def _capability_report(query: str) -> str:
         ("Read Mail", {"view_emails", "summarize_emails"}, False),
         ("Read Messages", {"view_messages", "summarize_messages"}, False),
         ("Search Notes", {"search_notes"}, False),
-        ("Read and organize local files", {"read_file", "find_files"}, False),
+        ("Read local files", {"read_file", "find_files"}, False),
+        ("Organize local files into folders", {"organize_files"}, True),
         ("Change system settings", {"toggle_setting"}, True),
     ]
     rows = []
@@ -471,7 +472,34 @@ def _capability_report(query: str) -> str:
         "No — watch your screen on its own, or see it without you choosing what to show",
         "No — access a bank balance unless a dedicated connected banking tool is installed",
     ]
+    focused = _capability_rows_for_query(rows, query)
+    if focused:
+        return "Here's what Harbor can and can't do about that:\n" + "\n".join(focused)
     return "Here's what Harbor can and can't do:\n" + "\n".join(rows)
+
+
+_CAPABILITY_SYNONYMS = {
+    "text": "message", "texts": "message", "texting": "message", "sms": "message",
+    "imessage": "message", "mail": "email", "emails": "email",
+    "remind": "reminder", "reminders": "reminder",
+    "event": "calendar", "events": "calendar", "meeting": "calendar",
+    "history": "browser", "safari": "browser", "chrome": "browser",
+    "folder": "file", "folders": "file", "files": "file", "organize": "organize",
+    "organise": "organize", "settings": "system", "setting": "system",
+    "screen": "screen", "picture": "picture", "bank": "bank",
+}
+
+
+def _capability_rows_for_query(rows: list[str], query: str) -> list[str]:
+    """The rows a specific question is about, or [] to show the whole report."""
+    words = {_CAPABILITY_SYNONYMS.get(w, w)
+             for w in re.findall(r"[a-z]+", (query or "").lower()) if len(w) > 2}
+    words -= {"can", "you", "the", "and", "what", "does", "harbor", "your", "are",
+              "able", "ability", "tell", "about", "have", "for", "with", "can't", "cant"}
+    if not words:
+        return []
+    return [row for row in rows
+            if any(re.search(rf"\b{re.escape(w)}", row.lower()) for w in words)]
 
 
 @register(
@@ -491,6 +519,7 @@ def harbor_skills() -> str:
         return "No skills installed."
     lines = [f"  {s.name} — {'enabled' if s.enabled else 'DISABLED'}"
             + (f" (error: {s.error})" if s.error else "")
+            + (f" (switched off: {s.trust_note})" if getattr(s, "trust_note", "") else "")
             for s in skills.values()]
     return f"{len(skills)} skill(s):\n" + "\n".join(lines)
 
