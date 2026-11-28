@@ -31,6 +31,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -74,13 +75,16 @@ _SHIPPED_BODIES: dict[str, frozenset[str]] = {
 }
 
 # Frontmatter is fenced by --- on its own line, same convention as every other
-# tool that reads SKILL.md-style files.
-_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", re.S)
+# tool that reads SKILL.md-style files. trust.split_frontmatter is the parser
+# (a BOM, an empty frontmatter and `---` rule lines in the body all handled);
+# this pattern gives the same split for code that wants match groups.
+_FRONTMATTER_RE = trust._FRONTMATTER_RE
 
 # Ceiling on one skill body injected into a turn. A skill that wants to teach a
-# 20-page procedure has to be split; silently truncating is better than blowing
-# the context budget, and the cap is generous enough that no reasonable skill
-# hits it.
+# 20-page procedure has to be split. A longer body loads as broken, with the
+# reason in Settings, rather than cut off: a cut can drop the very lines (a
+# "never" or "ask first") that the rest depends on. The cap is generous enough
+# that no reasonable skill hits it.
 MAX_SKILL_MD_BYTES = 1 << 20
 MAX_BODY_CHARS = 6000
 
@@ -122,6 +126,9 @@ class Skill:
     # Why a user skill loaded switched off whatever its SKILL.md says: it was
     # added outside Harbor, or changed since the person approved it (skills.trust).
     trust_note: str = ""
+    # Loaded by load() from the user's skills folder: such a skill's approval is
+    # re-checked before each use (verify_before_run).
+    from_user_folder: bool = False
 
     @property
     def compose(self) -> bool:
@@ -143,9 +150,12 @@ class Skill:
         if not self.enabled:
             return False
         low = text.lower()
-        explicit = (f"@{self.name.lower()}" in low
-                    or f"${self.name.lower()}" in low)
-        return explicit or any(trigger_matches(t, low) for t in self.triggers if t.strip())
+        return self.invoked(low) or any(trigger_matches(t, low) for t in self.triggers if t.strip())
+
+    def invoked(self, text: str) -> bool:
+        """`text` names this skill outright as @name or $name, as a word of its own:
+        not inside an address (user@humanizer.com) or a longer name (@humanizer-v2)."""
+        return explicit_mention(self.name, text)
 
     def as_dict(self) -> dict:
         return {"name": self.name, "description": self.description,
@@ -155,6 +165,18 @@ class Skill:
                 "bundled": self.bundled,
                 "conversation_workflow": self.conversation_workflow,
                 "trust_note": self.trust_note}
+
+
+def explicit_mention(name: str, text: str) -> bool:
+    """`@name` or `$name` in `text` as its own token: the sigil starts a word (nothing
+    word-like or another sigil before it) and the name ends one (no letter, digit,
+    `_`, `-`, `@` or `.`+word after it)."""
+    wanted = str(name or "").lower().strip()
+    if not wanted:
+        return False
+    pattern = (rf"(?<![\w@$.\-])[@$]{re.escape(wanted)}"
+               rf"(?![\w\-@]|\.\w)")
+    return re.search(pattern, str(text or "").lower()) is not None
 
 
 def trigger_matches(trigger: str, text: str) -> bool:
@@ -168,36 +190,89 @@ def trigger_matches(trigger: str, text: str) -> bool:
 _skills: dict[str, Skill] = {}
 
 
+_TRUE_WORDS = frozenset({"true", "yes", "on", "1"})
+_FALSE_WORDS = frozenset({"false", "no", "off", "0", ""})
+
+
+def parse_flag(value: object, default: bool, *, unknown: bool | None = None) -> bool:
+    """A frontmatter yes/no. YAML reads `enabled: false` as False, but a quoted
+    "false" stays a string, and bool("false") is True. `unknown` is the answer for
+    anything that is not a recognisable yes or no (the default when not given)."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        word = value.strip().lower()
+        if word in _TRUE_WORDS:
+            return True
+        if word in _FALSE_WORDS:
+            return False
+    return default if unknown is None else unknown
+
+
+def _field(meta: dict, harbor_meta: dict, key: str, default: object = None) -> object:
+    """A Harbor field: top level wins (older skills), then metadata.harbor. Present
+    with any value, an explicit [] or false included, counts as set."""
+    if key in meta:
+        return meta[key]
+    if key in harbor_meta:
+        return harbor_meta[key]
+    return default
+
+
+def _read_skill_md(path: Path) -> str:
+    """SKILL.md's text, read without following a link, only from a regular file and
+    only up to MAX_SKILL_MD_BYTES (a FIFO or /dev/zero planted as SKILL.md must not
+    hang or fill the service). Raises OSError (trust.UnsafeFile) otherwise."""
+    return trust.read_regular(path, MAX_SKILL_MD_BYTES).decode("utf-8", errors="replace")
+
+
+def _scope_problem(tools: list[dict]) -> str:
+    """Why a declared tool's read_scopes/write_scopes can't be granted, or ""."""
+    from service.skills import scopes
+    for spec in tools:
+        for key in ("read_scopes", "write_scopes"):
+            _, why = scopes.parse_scopes(spec.get(key))
+            if why:
+                return f"tool {spec.get('name') or '?'!s}: {key}: {why}"
+    return ""
+
+
 def _parse(path: Path, *, bundled: bool = False) -> Skill | None:
     """Parse one SKILL.md. A broken skill is reported, never raised — one bad
     file in the folder must not take down skill loading for the rest."""
     try:
-        size = path.stat().st_size
-        if size > MAX_SKILL_MD_BYTES:
-            # Refused whole rather than read in part: a part that is never read
-            # could change unseen (candidate review #4 of the 2026-11-25 pentest).
-            return Skill(path.parent.name, "", "", path.parent, enabled=False, bundled=bundled,
-                         error=f"SKILL.md is too large ({size // 1024} KB; the limit is "
-                               f"{MAX_SKILL_MD_BYTES // 1024} KB)")
-        raw = path.read_text(errors="replace")
+        raw = _read_skill_md(path)
+    except trust.UnsafeFile as e:
+        # Refused whole rather than read in part: a part that is never read
+        # could change unseen (candidate review #4 of the 2026-11-25 pentest).
+        return Skill(path.parent.name, "", "", path.parent, enabled=False, bundled=bundled,
+                     error=f"SKILL.md can't be loaded: {e}")
     except Exception as e:  # noqa: BLE001
-        return Skill(path.parent.name, "", "", path.parent,
+        return Skill(path.parent.name, "", "", path.parent, enabled=False,
                      error=f"unreadable: {e}", bundled=bundled)
 
-    m = _FRONTMATTER_RE.match(raw)
-    if not m:
+    split = trust.split_frontmatter(raw)
+    if split is None:
         # No frontmatter: still usable as a pure-instructions skill, named after
         # its folder. Lowering the barrier to "drop a markdown file in" is worth
         # more than strictness here.
-        return Skill(path.parent.name, "", raw.strip()[:MAX_BODY_CHARS], path.parent,
-                     bundled=bundled)
+        body = raw.lstrip("\ufeff").strip()
+        skill = Skill(path.parent.name, "", body, path.parent, bundled=bundled)
+        if len(body) > MAX_BODY_CHARS:
+            skill.error = _too_long(body)
+            skill.enabled = False
+        return skill
 
     try:
-        meta = yaml.safe_load(m.group(1)) or {}
+        meta = yaml.safe_load(split[0]) or {}
         if not isinstance(meta, dict):
             raise ValueError("frontmatter must be a mapping")
     except Exception as e:  # noqa: BLE001
-        return Skill(path.parent.name, "", "", path.parent,
+        return Skill(path.parent.name, "", "", path.parent, enabled=False,
                      error=f"bad frontmatter: {e}", bundled=bundled)
 
     # Harbor's runtime fields live under standard ``metadata`` in new skills so
@@ -207,39 +282,73 @@ def _parse(path: Path, *, bundled: bool = False) -> Skill | None:
     harbor_meta = (metadata.get("harbor")
                  if isinstance(metadata.get("harbor"), dict) else {})
 
-    triggers = meta.get("triggers") or harbor_meta.get("triggers") or []
+    triggers = _field(meta, harbor_meta, "triggers", [])
     if isinstance(triggers, str):
         triggers = [t.strip() for t in triggers.split(",")]
     elif not isinstance(triggers, list):
         triggers = []         # `triggers: 5` or `true` would crash the scan below
     triggers = [t.strip() for t in triggers if isinstance(t, str) and t.strip()]
 
-    tools = meta.get("tools") or harbor_meta.get("tools") or []
+    tools = _field(meta, harbor_meta, "tools", [])
     if not isinstance(tools, list):
         tools = []
+    contract = _field(meta, harbor_meta, "contract", {})
 
-    return Skill(
+    body = split[1].strip()
+    skill = Skill(
         name=str(meta.get("name") or path.parent.name),
         description=str(meta.get("description") or ""),
-        body=m.group(2).strip()[:MAX_BODY_CHARS],
+        body=body,
         path=path.parent,
         triggers=triggers,
-        enabled=bool(meta.get("enabled", harbor_meta.get("enabled", True))),
+        # Anything but a clear yes or no loads switched off.
+        enabled=parse_flag(_field(meta, harbor_meta, "enabled"), True, unknown=False),
         tools=[t for t in tools if isinstance(t, dict)],
-        always=bool(meta.get("always", harbor_meta.get("always", False))),
+        always=parse_flag(_field(meta, harbor_meta, "always"), False),
         bundled=bundled,
-        conversation_workflow=bool(harbor_meta.get("conversation_workflow", False)),
-        contract=(harbor_meta["contract"] if isinstance(harbor_meta.get("contract"), dict) else {}),
+        conversation_workflow=parse_flag(_field(meta, harbor_meta, "conversation_workflow"), False),
+        contract=contract if isinstance(contract, dict) else {},
     )
+    if len(body) > MAX_BODY_CHARS:
+        skill.error = _too_long(body)
+    elif (why := _scope_problem(skill.tools)):
+        # skills/tools.py would otherwise drop the bad scope and run the tool
+        # with less access than its card promised, or none of what it needs.
+        skill.error = why
+    if skill.error:
+        skill.enabled = False
+    return skill
+
+
+def _too_long(body: str) -> str:
+    return (f"its instructions are {len(body):,} characters; the limit is "
+            f"{MAX_BODY_CHARS:,}. Split it into smaller skills")
+
+
+def _contract_problem(skill: Skill) -> str:
+    """Why a skill's declared contract doesn't hold (skills.contracts), or ""."""
+    if not skill.contract or skill.error:
+        return ""
+    try:
+        import service.tools  # noqa: F401 — every built-in tool, so the contract can be checked
+        from service.skills import contracts
+        problems = contracts.validate(skill)
+    except Exception as exc:  # noqa: BLE001 — an unverifiable contract is not a valid one
+        problems = [f"could not be checked ({exc})"]
+    return ("its contract does not hold: " + "; ".join(problems)) if problems else ""
 
 
 def load() -> dict[str, Skill]:
     """(Re)scan bundled skills, then user-installed overrides.
 
     Bundled workflows ship inside Harbor.app, while ``~/.moe/skills`` remains
-    the user's editable layer. A user skill with the same frontmatter name
-    intentionally wins, which lets someone customize a bundled workflow
-    without modifying the signed app bundle.
+    the user's editable layer. A user's copy of a bundled skill (the folder of
+    the same name, carrying the same frontmatter name) wins, which lets someone
+    customize a bundled workflow without modifying the signed app bundle; it is
+    still a user skill, approved like any other (skills.trust). Any OTHER user
+    folder that claims a bundled skill's name loads as broken instead: it would
+    take that skill's place, and its Settings switch, under a name the person
+    knows as Harbor's own.
     """
     global _skills
     found: dict[str, Skill] = {}
@@ -249,6 +358,7 @@ def load() -> dict[str, Skill]:
             _retire_toggle_copies()
         except Exception:  # noqa: BLE001 — a failed migration must not hide every skill
             pass
+        bundled_names: dict[str, str] = {}          # skill name -> its bundled folder name
         for root, bundled in ((BUNDLED_SKILLS_DIR, True), (SKILLS_DIR, False)):
             if not root.exists():
                 continue
@@ -256,14 +366,27 @@ def load() -> dict[str, Skill]:
                 if not child.is_dir() or child.name.startswith("."):
                     continue
                 md = child / "SKILL.md"
-                if not md.exists():
+                if not (md.exists() or md.is_symlink()):
                     continue
                 try:
                     skill = _parse(md, bundled=bundled)
                 except Exception as exc:  # noqa: BLE001 — one bad skill must not hide the rest
                     skill = Skill(child.name, "", "", child, error=f"unreadable skill: {exc}",
-                                  bundled=bundled)
-                if skill and not bundled:
+                                  enabled=False, bundled=bundled)
+                if not skill:
+                    continue
+                if bundled:
+                    bundled_names[skill.name] = child.name
+                else:
+                    skill.from_user_folder = True
+                    owner = bundled_names.get(skill.name)
+                    if owner is not None and owner != child.name:
+                        skill.error = (f"it is named {skill.name!r}, the name of a skill that "
+                                       "ships with Harbor; give it a name of its own")
+                        skill.enabled = False
+                        # Listed under its folder's name, so the bundled one keeps its place.
+                        skill.name = (child.name if child.name not in found
+                                      else f"{child.name} (named {skill.name})")
                     # Only a skill the person approved as it is now may be on
                     # (skills.trust); one added or changed behind Harbor's back
                     # loads switched off, with the reason Settings shows. A copy
@@ -273,19 +396,81 @@ def load() -> dict[str, Skill]:
                     if note:
                         skill.enabled = False
                         skill.trust_note = note
-                if skill:
-                    found[skill.name] = skill
+                if (why := _contract_problem(skill)):
+                    skill.error = why
+                    skill.enabled = False
+                found[skill.name] = skill
     except Exception:  # noqa: BLE001 — skills are optional; never break startup
         pass
     for name, enabled in _bundled_state().items():
         skill = found.get(name)
-        if skill is not None and skill.bundled:
+        if skill is not None and skill.bundled and not skill.error:
             skill.enabled = enabled
     _skills = found
 
     from service.skills.tools import register_skill_tools
     register_skill_tools(found)
     return found
+
+
+def verify_before_run(skill: "Skill | str | Path") -> str:
+    """Why this skill must not run or reach the prompt right now, or "" when it may.
+
+    load() checks a user skill's approval once, but its folder can change while
+    Harbor runs (a script swapped, SKILL.md rewritten to widen its scopes). So
+    every use re-checks: the skill is loaded, enabled and not broken, and a user
+    skill's folder still matches what the person approved (trust.problem). A
+    skill that fails is switched off in memory, with the reason Settings shows,
+    and its tools are withdrawn; the person switches it back on in Settings.
+
+    Takes a Skill, a skill name or a skill folder. Callers: skills/tools.py's
+    runner (before it starts the process) and use_skill (before it returns the
+    body); this module's prompt blocks call it for every skill they emit.
+    """
+    current: Skill | None
+    if isinstance(skill, Skill):
+        current = _skills.get(skill.name)
+        if current is None or current.path != skill.path:
+            current = next((s for s in _skills.values() if s.path == skill.path), None)
+    elif isinstance(skill, Path):
+        try:
+            wanted = skill.resolve()
+        except (OSError, RuntimeError):
+            return "this skill's folder can't be read"
+        current = next((s for s in _skills.values() if _same_path(s.path, wanted)), None)
+    else:
+        current = _skills.get(str(skill))
+    if current is None:
+        return "this skill is not loaded; reload skills in Settings"
+    if current.error:
+        return f"the '{current.name}' skill is broken: {current.error}"
+    if not current.enabled:
+        return current.trust_note or f"the '{current.name}' skill is turned off"
+    if not current.from_user_folder:
+        return ""                                   # bundled: inside the signed app bundle
+    note = trust.problem(current.path)
+    if note:
+        current.enabled = False
+        current.trust_note = note
+        try:
+            from service.skills.tools import register_skill_tools
+            register_skill_tools(_skills)
+        except Exception:  # noqa: BLE001 — the skill is off either way
+            pass
+        return f"the '{current.name}' skill {note}"
+    return ""
+
+
+def _same_path(a: Path, b: Path) -> bool:
+    try:
+        return Path(a).resolve() == b
+    except (OSError, RuntimeError):
+        return False
+
+
+def _usable(skill: Skill) -> bool:
+    """Enabled, not broken, and (for a user skill) still as approved."""
+    return skill.enabled and not skill.error and verify_before_run(skill) == ""
 
 
 def _bundled_state() -> dict[str, bool]:
@@ -329,10 +514,16 @@ def _body_hash(body: str) -> str:
 
 
 def _same_files(copy: Path, bundled: Path) -> bool:
-    """Every file but SKILL.md is the same in both folders."""
+    """Every file but SKILL.md is the same in both folders. A link or any other
+    special entry in the copy never counts as the same (and is never read)."""
     def files(root: Path) -> dict[str, bytes]:
-        return {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*")
-                if p.is_file() and p.name != "SKILL.md"}
+        out: dict[str, bytes] = {}
+        for p in root.rglob("*"):
+            if p.is_symlink() or not (p.is_file() or p.is_dir()):
+                raise OSError(f"special entry {p.name}")
+            if p.is_file() and p.name != "SKILL.md":
+                out[str(p.relative_to(root))] = trust.read_regular(p, MAX_SKILL_MD_BYTES)
+        return out
     try:
         return files(copy) == files(bundled)
     except OSError:
@@ -343,8 +534,8 @@ def _toggle_free_meta(md: Path) -> dict | None:
     """A SKILL.md's frontmatter without the `enabled` an older set_enabled
     wrote (top level or under metadata.harbor, adding those maps when absent)."""
     try:
-        m = _FRONTMATTER_RE.match(md.read_text(errors="replace"))
-        meta = yaml.safe_load(m.group(1)) if m else {}
+        split = trust.split_frontmatter(_read_skill_md(md))
+        meta = yaml.safe_load(split[0]) if split else {}
     except Exception:  # noqa: BLE001
         return None
     if not isinstance(meta, dict):
@@ -414,11 +605,17 @@ def set_enabled(name: str, enabled: bool) -> bool:
         return True
     md = skill.path / "SKILL.md"
     try:
-        raw = md.read_text()
-        m = _FRONTMATTER_RE.match(raw)
-        if not m:
-            return False
-        meta = yaml.safe_load(m.group(1)) or {}
+        raw = _read_skill_md(md)
+        split = trust.split_frontmatter(raw)
+        if split is None:
+            # A plain markdown skill: give it a frontmatter that holds the flag.
+            meta: dict = {}
+            body = raw.lstrip("\ufeff")
+        else:
+            meta = yaml.safe_load(split[0]) or {}
+            body = split[1]
+            if not isinstance(meta, dict):
+                return False
         metadata = meta.get("metadata")
         if not isinstance(metadata, dict):
             metadata = {}
@@ -433,8 +630,8 @@ def set_enabled(name: str, enabled: bool) -> bool:
             meta["enabled"] = enabled
         else:
             harbor_meta["enabled"] = enabled
-        md.write_text("---\n" + yaml.safe_dump(meta, sort_keys=False) + "---\n\n"
-                      + m.group(2).lstrip())
+        _write_atomic(md, "---\n" + yaml.safe_dump(meta, sort_keys=False) + "---\n\n"
+                      + body.lstrip())
         # The person switching a skill on in Settings approves it as it is now.
         if enabled:
             trust.approve(skill.path)
@@ -444,27 +641,90 @@ def set_enabled(name: str, enabled: bool) -> bool:
     return True
 
 
+def _write_atomic(path: Path, text: str) -> None:
+    """Write `text` to a fresh file beside `path` and rename it over `path`, so a
+    crash or a full disk never leaves half a SKILL.md. Keeps the file's mode."""
+    try:
+        mode = stat.S_IMODE(os.lstat(path).st_mode)
+    except OSError:
+        mode = 0o644
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            out.write(text)
+            out.flush()
+            os.fsync(out.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def _refuse_links(src: Path) -> str:
+    """Why `src` can't be copied in as a skill (a link or a special file inside it), or ""."""
+    if src.is_symlink():
+        return f"{src} is a link; install the folder it points to instead"
+    for dirpath, dirnames, filenames in os.walk(src, followlinks=False):
+        for name in [*dirnames, *filenames]:
+            entry = Path(dirpath) / name
+            try:
+                info = os.lstat(entry)
+            except OSError as exc:
+                return f"can't read {entry}: {exc}"
+            if stat.S_ISLNK(info.st_mode):
+                return (f"{entry.relative_to(src)} is a link; a skill must hold its own files "
+                        "(links are not copied, and could point anywhere)")
+            if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+                return f"{entry.relative_to(src)} is not a regular file"
+    return ""
+
+
+def _swap_in(staged: Path, dest: Path) -> None:
+    """Put the staged folder at `dest`, replacing whatever was there."""
+    if dest.is_symlink() or dest.is_file():
+        dest.unlink()
+    elif dest.exists():
+        shutil.rmtree(dest)
+    os.replace(staged, dest)
+
+
 def install(source: str) -> dict:
     """Install a skill by copying a folder (or a single .md file) into
     ~/.moe/skills/. Local paths only — deliberately no download-and-run: a
     local-first assistant shouldn't grow a way to execute code fetched from a
-    URL, and a skill can register shell-backed tools."""
+    URL, and a skill can register shell-backed tools.
+
+    The installed folder holds exactly what was copied: a skill installed over
+    an older one never keeps the older one's scripts (they would be approved
+    along with it), and a source holding a link is refused rather than copied."""
     src = Path(source).expanduser()
     if not src.exists():
         return {"ok": False, "error": f"no such path: {src}"}
     SKILLS_DIR.mkdir(parents=True, exist_ok=True)
     try:
+        root = SKILLS_DIR.resolve()
         if src.is_file():
             if src.suffix.lower() != ".md":
                 return {"ok": False, "error": "a single-file skill must be a .md file"}
-            dest = SKILLS_DIR / src.stem
-            dest.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dest / "SKILL.md")
+            name = src.stem
+            if not name or name.startswith("."):
+                return {"ok": False, "error": f"{src.name} needs a name that doesn't start with a dot"}
+            text = trust.read_regular(src.resolve(), MAX_SKILL_MD_BYTES)
+            dest = root / name
+            staging = Path(tempfile.mkdtemp(prefix=f".{name}-", dir=root))
+            try:
+                (staging / "skill").mkdir()
+                (staging / "skill" / "SKILL.md").write_bytes(text)
+                _swap_in(staging / "skill", dest)
+            finally:
+                shutil.rmtree(staging, ignore_errors=True)
         else:
             if not (src / "SKILL.md").exists():
                 return {"ok": False, "error": f"{src} has no SKILL.md"}
+            if (why := _refuse_links(src)):
+                return {"ok": False, "error": why}
             src = src.resolve()
-            root = SKILLS_DIR.resolve()
             dest = root / src.name
             if src == dest:
                 # Already the installed copy: re-installing it must not delete it first.
@@ -478,10 +738,12 @@ def install(source: str) -> dict:
             # Copy beside the old copy, then swap, so a failed copy leaves the old skill.
             staging = Path(tempfile.mkdtemp(prefix=f".{src.name}-", dir=root))
             try:
-                shutil.copytree(src, staging / "skill")
-                if dest.exists():
-                    shutil.rmtree(dest)
-                os.replace(staging / "skill", dest)
+                shutil.copytree(src, staging / "skill", symlinks=True)
+                # Checked again on the copy: a link swapped in during the copy is
+                # copied as a link (symlinks=True), never followed, and caught here.
+                if (why := _refuse_links(staging / "skill")):
+                    return {"ok": False, "error": why}
+                _swap_in(staging / "skill", dest)
             finally:
                 shutil.rmtree(staging, ignore_errors=True)
         # Installed by the person from Settings: approved as copied.
@@ -522,7 +784,8 @@ def skills_context_block(user_text: str = "", active_name: str = "",
     on the list, so only matched (or active) skill bodies are returned.
     """
     # An always-on style skill belongs to plain chat (always_skills_block).
-    enabled = [s for s in _skills.values() if s.enabled and not s.error and not s.always]
+    # Each one re-checked against its approval before any of its text is used.
+    enabled = [s for s in list(_skills.values()) if not s.always and _usable(s)]
     if not enabled:
         return ""
 
@@ -552,10 +815,28 @@ def skills_context_block(user_text: str = "", active_name: str = "",
 
 
 _STOP_WORKFLOW_RE = re.compile(
-    r"\b(?:stop|cancel|leave|exit|end)\s+(?:the\s+)?"
+    r"\b(?:stop|cancel|leave|exit|end)\s+(?:the\s+|this\s+)?"
     r"(?:interview|interviewing|ideation|brainstorm|workflow|skill)\b",
     re.I,
 )
+# A stop phrase the person negates ("don't stop the interview", "never end this
+# workflow") is not a stop: the negation within the few words before it.
+_NEGATED_BEFORE_RE = re.compile(
+    r"\b(?:don['’]?t|do\s+not|never|not|no\s+need\s+to|won['’]?t|shouldn['’]?t|"
+    r"didn['’]?t|doesn['’]?t|without|please\s+don['’]?t)\b(?:\s+\w+){0,2}\s*$",
+    re.I,
+)
+
+
+def asks_to_stop_workflow(text: str) -> bool:
+    """The person asks to end the active conversational workflow."""
+    text = str(text or "")
+    for match in _STOP_WORKFLOW_RE.finditer(text):
+        if not _NEGATED_BEFORE_RE.search(text[max(0, match.start() - 40):match.start()]):
+            return True
+    return False
+
+
 _COMPLETE_RE = re.compile(
     r"<!--\s*harbor-skill-complete:\s*([a-z0-9-]+)\s*-->", re.I)
 
@@ -570,23 +851,21 @@ def select_for_turn(user_text: str, active_name: str = "",
     wins immediately, while the completion marker lets a skill release itself
     after delivering its final artifact.
     """
-    if _STOP_WORKFLOW_RE.search(user_text):
+    if asks_to_stop_workflow(user_text):
         return ""
     complete = _COMPLETE_RE.search(last_assistant or "")
     if complete and complete.group(1).lower() == active_name.lower():
         active_name = ""
 
-    enabled = [s for s in _skills.values()
-               if s.enabled and not s.error and s.conversation_workflow]
+    enabled = [s for s in list(_skills.values()) if s.conversation_workflow and _usable(s)]
     low = user_text.lower()
     for skill in enabled:
-        if f"@{skill.name.lower()}" in low or f"${skill.name.lower()}" in low:
+        if skill.invoked(low):
             return skill.name
     for skill in enabled:
         if skill.matches(user_text):
             return skill.name
-    if (active_name and active_name in _skills and _skills[active_name].enabled
-            and _skills[active_name].conversation_workflow):
+    if active_name and any(s.name == active_name for s in enabled):
         return active_name
     return ""
 
@@ -598,8 +877,8 @@ def turn_skill_names(user_text: str) -> list[str]:
     ``select_for_turn`` only ever returns conversational workflows, so it cannot tell
     the router that an ORDINARY skill is about to be loaded. This can.
     """
-    return [s.name for s in _skills.values()
-            if s.enabled and not s.error and not s.always and s.matches(user_text)]
+    return [s.name for s in list(_skills.values())
+            if s.enabled and not s.error and not s.always and s.matches(user_text) and _usable(s)]
 
 
 # Tools that return skill content or metadata although they are not skill-defined tools.
@@ -634,14 +913,13 @@ def selected_skill_block(user_text: str = "", active_name: str = "") -> str:
     """
     active = _skills.get(active_name) if active_name else None
     selected: list[Skill] = []
-    if (active and active.enabled and not active.error
-            and active.conversation_workflow):
+    if active and active.conversation_workflow and _usable(active):
         selected = [active]
     else:
-        selected = [skill for skill in _skills.values()
+        selected = [skill for skill in list(_skills.values())
                     if skill.enabled and not skill.error
                     and skill.conversation_workflow
-                    and skill.matches(user_text)][:1]
+                    and skill.matches(user_text) and _usable(skill)][:1]
     return "".join(
         f"\n--- Active skill: {skill.name} ---\n"
         "The user chose this conversational workflow. Follow it until it "
@@ -660,8 +938,8 @@ def always_skills_block() -> str:
     distance is easy to wire into the wrong place by accident.
     """
     # A compose style (the humanizer) is not a chat style: compose_style_block.
-    always_on = [s for s in _skills.values()
-                 if s.enabled and not s.error and s.always and not s.compose]
+    always_on = [s for s in list(_skills.values())
+                 if s.always and not s.compose and _usable(s)]
     if not always_on:
         return ""
     out = []
@@ -679,7 +957,7 @@ def compose_style_block() -> str:
     adds it only on a turn that offers a COMPOSE_TOOLS schema, where it shapes
     the body/text argument the model writes. Harbor's own answers never get it.
     """
-    styles = [s for s in _skills.values() if s.enabled and not s.error and s.compose]
+    styles = [s for s in list(_skills.values()) if s.compose and _usable(s)]
     if not styles:
         return ""
     return "".join(

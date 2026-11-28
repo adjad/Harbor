@@ -17,6 +17,7 @@ skill off and on doesn't count as a change.
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -33,19 +34,72 @@ from service.paths import MOE_DIR
 
 TRUST_PATH = MOE_DIR / "skill_trust.json"
 _LOCK = threading.Lock()
-_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)", re.DOTALL)
+# Kept for callers that only test for a fence; split_frontmatter is the parser.
+_FRONTMATTER_RE = re.compile(r"^\ufeff?---[ \t]*\r?\n(.*?)^---[ \t]*\r?$\n?(.*)", re.DOTALL | re.M)
 NOT_APPROVED = "added outside Harbor, so it is off until you switch it on in Settings"
 CHANGED = "changed since you approved it, so it is off until you switch it on again in Settings"
+
+
+def split_frontmatter(text: str) -> tuple[str, str] | None:
+    """(frontmatter, body) of a SKILL.md, or None when it has no frontmatter.
+
+    The frontmatter opens with a `---` first line (after an optional UTF-8 BOM)
+    and closes at the next line that is exactly `---` (trailing blanks allowed).
+    It may be empty. A `---` later in the body is the body's own (a rule line),
+    and a line like `--- note` or `----` never closes it.
+    """
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].rstrip("\r\n").rstrip(" \t") != "---":
+        return None
+    for index in range(1, len(lines)):
+        if lines[index].rstrip("\r\n").rstrip(" \t") == "---":
+            meta = "".join(lines[1:index])
+            return meta, "".join(lines[index + 1:])
+    return None
+
+
+def _json_key(key: object) -> str:
+    """A mapping key as json.dumps writes it, for any key YAML can produce."""
+    if isinstance(key, str):
+        return key
+    if key is True:
+        return "true"
+    if key is False:
+        return "false"
+    if key is None:
+        return "null"
+    if isinstance(key, (int, float)):
+        return json.dumps(key)
+    return str(key)
+
+
+def _canonical(value: object) -> object:
+    """`value` with every mapping key a string, so json.dumps(sort_keys=True) never
+    fails on YAML's mixed keys ({1: a, b: c}). All-string mappings are unchanged, so
+    an approval recorded before this keeps matching."""
+    if isinstance(value, dict):
+        out: dict[str, object] = {}
+        for key, inner in value.items():
+            name = _json_key(key)
+            if name in out:                       # 1 and "1" both present
+                name = f"\0{type(key).__name__}:{name}"
+            out[name] = _canonical(inner)
+        return out
+    if isinstance(value, (list, tuple)):
+        return [_canonical(v) for v in value]
+    return value
 
 
 def _skill_md_bytes(raw: bytes) -> bytes:
     """SKILL.md without the on/off flag, in a stable form."""
     try:
         text = raw.decode("utf-8")
-        match = _FRONTMATTER_RE.match(text)
-        if not match:
+        split = split_frontmatter(text)
+        if split is None:
             return raw
-        meta = yaml.safe_load(match.group(1)) or {}
+        meta = yaml.safe_load(split[0]) or {}
         if not isinstance(meta, dict):
             return raw
         meta.pop("enabled", None)
@@ -58,7 +112,8 @@ def _skill_md_bytes(raw: bytes) -> bytes:
                     metadata.pop("harbor")      # Settings adds an empty one to hold the flag
             if not metadata:
                 meta.pop("metadata")
-        return (json.dumps(meta, sort_keys=True, default=str) + "\n" + match.group(2).strip()).encode("utf-8")
+        return (json.dumps(_canonical(meta), sort_keys=True, default=str) + "\n"
+                + split[1].strip()).encode("utf-8")
     except Exception:  # noqa: BLE001 — unparseable: judge the raw bytes
         return raw
 
@@ -95,6 +150,38 @@ def _read_small(path: Path, limit: int = 1 << 20) -> bytes:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             return b"type:swapped"
         return os.read(fd, limit)
+    finally:
+        os.close(fd)
+
+
+class UnsafeFile(OSError):
+    """A file that is not a plain regular file of an acceptable size."""
+
+
+def read_regular(path: Path, limit: int) -> bytes:
+    """The whole of a regular file, refusing a link, a FIFO, a device or a file over
+    `limit` bytes. Opened without following a final link and without blocking, and
+    checked on the open descriptor, so a swap after any earlier check is caught."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise UnsafeFile(f"{Path(path).name} is a link, not a file") from exc
+        raise
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise UnsafeFile(f"{Path(path).name} is not a regular file")
+        if info.st_size > limit:
+            raise UnsafeFile(f"{Path(path).name} is too large ({info.st_size // 1024} KB; "
+                             f"the limit is {limit // 1024} KB)")
+        chunks, total = [], 0
+        while chunk := os.read(fd, 1 << 16):
+            total += len(chunk)
+            if total > limit:                      # grew after the fstat
+                raise UnsafeFile(f"{Path(path).name} is too large (the limit is {limit // 1024} KB)")
+            chunks.append(chunk)
+        return b"".join(chunks)
     finally:
         os.close(fd)
 
@@ -187,8 +274,10 @@ def _write(data: dict[str, str]) -> None:
 def approve(skill_dir: Path) -> None:
     """Record the skill folder as the person approved it, as it is now."""
     key = Path(skill_dir).name
-    print_ = fingerprint(skill_dir)
+    # Fingerprinted under the lock too: two approvals of one folder at once must
+    # record the folder as one of them saw it, never an older reading saved last.
     with _LOCK:
+        print_ = fingerprint(skill_dir)
         data = _read()
         data[key] = print_
         _write(data)

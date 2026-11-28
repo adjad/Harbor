@@ -735,7 +735,8 @@ _READ_ONLY = _STARTUP_MODE.get("read_only", bool(_CFG.get("read_only", True)))
 
 
 def read_only() -> bool:
-    return _READ_ONLY
+    simulated = _SIMULATED_MODE.get()
+    return _READ_ONLY if simulated is None else simulated[0]
 
 
 def set_read_only(value: bool) -> None:
@@ -758,7 +759,8 @@ if _proof_known:
 
 
 def full_access() -> bool:
-    return _FULL_ACCESS
+    simulated = _SIMULATED_MODE.get()
+    return _FULL_ACCESS if simulated is None else simulated[1]
 
 
 def set_full_access(value: bool) -> None:
@@ -3847,6 +3849,29 @@ def _picture_unconfirmed(category: str) -> bool:
             or category in _PICTURE_UNCONFIRMED_CATEGORIES)
 
 
+# A hypothetical access mode (view-only, full access), for a check that asks what
+# a mode WOULD decide without changing the person's mode: skills.contracts
+# validates a workflow skill's steps in the default mode and under Full access.
+# Per task and thread like the scopes above, so a concurrent turn never sees it.
+# Inside it no standing grant applies and it is neither a review run nor a
+# picture turn: the answer is the mode's own. Only for decide() calls whose
+# verdict nothing acts on.
+_SIMULATED_MODE: ContextVar[tuple[bool, bool] | None] = ContextVar(
+    "harbor_policy_simulated_mode", default=None)
+
+
+@contextmanager
+def simulated_mode(*, read_only: bool = False, full_access: bool = False):
+    tokens = (_SIMULATED_MODE.set((bool(read_only), bool(full_access))),
+              _REVIEW.set(False), _PICTURE.set(False))
+    try:
+        yield
+    finally:
+        _PICTURE.reset(tokens[2])
+        _REVIEW.reset(tokens[1])
+        _SIMULATED_MODE.reset(tokens[0])
+
+
 def decide(category: str, args: dict, tool: str | None = None) -> Decision:
     """Return the policy decision for a tool action (see _decide). In a review
     run, only reads run without asking; in a picture turn, only local reads."""
@@ -4107,7 +4132,7 @@ def _decide(category: str, args: dict, tool: str | None = None) -> Decision:
     never, unknown_output = _never_run(args) if category == "shell" else (None, False)
     if never is not None:
         return never
-    if (_KEEP_FLOOR or not _FULL_ACCESS) and (floor := _hard_deny(category, args, tool)) is not None:
+    if (_KEEP_FLOOR or not full_access()) and (floor := _hard_deny(category, args, tool)) is not None:
         return floor
     # A shell program holding another command's output as an argument (see
     # _nr_shell_program): unknown, not known to be dangerous, so a card in
@@ -4193,7 +4218,7 @@ def _decide(category: str, args: dict, tool: str | None = None) -> Decision:
     # question the user already answered — including lifting view-only for that
     # one tool, which is the narrow alternative to switching full_access on
     # globally just to get one action through.
-    if tool:
+    if tool and _SIMULATED_MODE.get() is None:
         from service.safety import grants
         verdict = grants.check(tool, args)
         if verdict == "deny":
@@ -4301,7 +4326,7 @@ def _decide(category: str, args: dict, tool: str | None = None) -> Decision:
     if category in _DRAFT_CATEGORIES | _TRIAGE_CATEGORIES:
         if read_only():
             return Decision(Tier.DENY, f"view-only mode: {category} is disabled")
-        if _FULL_ACCESS:
+        if full_access():
             return Decision(Tier.ALLOW, "full-access mode")
         return Decision(Tier.CONFIRM,
                         "opens a draft for you to review — nothing is sent"
@@ -4331,7 +4356,7 @@ def _decide(category: str, args: dict, tool: str | None = None) -> Decision:
         return Decision(Tier.CONFIRM, "a tool from an installed skill runs a command Harbor "
                         "cannot see inside — confirmed even with full access")
 
-    if _FULL_ACCESS:
+    if full_access():
         # Auto-allow everything else; the floor and every confirm above already ran.
         return Decision(Tier.ALLOW, "full-access mode")
 

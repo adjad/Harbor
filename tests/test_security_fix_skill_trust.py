@@ -195,3 +195,193 @@ def test_retargeting_a_folder_link_inside_a_linked_tree_counts(skill_home, tmp_p
     (outside / "inner").unlink()
     (outside / "inner").symlink_to(tmp_path / "b")
     assert trust.problem(folder) == trust.CHANGED
+
+
+# -- tools audit 5.4: re-checked at use, safe SKILL.md reads, parsing, install ----
+
+def test_a_skill_changed_after_load_is_refused_at_use_and_switched_off(skill_home, tmp_path):
+    S.install(str(_folder(tmp_path / "source", SKILL.replace("Tidy the notes.",
+                                                              "Tidy the notes. fixture body"))))
+    S.all_skills()["fixture-notes"].triggers = ["tidy the fixture"]
+    assert S.verify_before_run("fixture-notes") == ""
+    assert "fixture body" in S.skills_context_block("tidy the fixture")
+    (skill_home / "fixture-notes" / "tool.py").write_text("print('swapped')\n")   # no reload
+    why = S.verify_before_run(skill_home / "fixture-notes")
+    assert trust.CHANGED in why
+    assert S.all_skills()["fixture-notes"].enabled is False
+    assert "fixture_tidy" not in REGISTRY
+    assert "fixture body" not in S.skills_context_block("tidy the fixture")
+    assert S.verify_before_run("no-such-skill")
+
+
+def test_injection_re_checks_the_approval_too(skill_home, tmp_path):
+    S.install(str(_folder(tmp_path / "source", SKILL.replace("enabled: true", "enabled: true\nalways: true"))))
+    assert "Tidy the notes." in S.always_skills_block()
+    (skill_home / "fixture-notes" / "tool.py").write_text("print('swapped')\n")
+    assert S.always_skills_block() == ""
+
+
+def test_approve_fingerprints_under_its_lock(skill_home, monkeypatch):
+    folder = _folder(skill_home)
+    held = []
+    real = trust.fingerprint
+
+    def spy(path):
+        held.append(trust._LOCK.locked())
+        return real(path)
+    monkeypatch.setattr(trust, "fingerprint", spy)
+    trust.approve(folder)
+    assert held == [True]
+
+
+def test_mixed_yaml_keys_still_leave_the_on_off_flag_out_of_the_fingerprint(skill_home):
+    text = SKILL.replace("enabled: true\n", "enabled: true\n1: one\nletters: two\n")
+    folder = _folder(skill_home, text)
+    before = trust.fingerprint(folder)
+    (folder / "SKILL.md").write_text(text.replace("enabled: true", "enabled: false"))
+    assert trust.fingerprint(folder) == before
+    # An all-string frontmatter keeps the fingerprint it always had.
+    assert trust._canonical({"b": {"a": [1]}}) == {"b": {"a": [1]}}
+
+
+def test_a_linked_skill_md_is_refused_unread(skill_home, tmp_path):
+    outside = tmp_path / "outside.md"
+    outside.write_text(SKILL)
+    folder = skill_home / "fixture-link"
+    folder.mkdir()
+    (folder / "SKILL.md").symlink_to(outside)
+    skill = S.load()["fixture-link"]
+    assert "link" in skill.error and not skill.enabled
+
+
+def test_a_fifo_skill_md_cannot_block_loading(skill_home):
+    import threading
+    folder = skill_home / "fixture-fifo"
+    folder.mkdir()
+    os.mkfifo(folder / "SKILL.md")
+    done = []
+    worker = threading.Thread(target=lambda: done.append(S.load()), daemon=True)
+    worker.start()
+    worker.join(5)
+    assert done, "loading blocked on a FIFO SKILL.md"
+    assert "not a regular file" in done[0]["fixture-fifo"].error
+
+
+@pytest.mark.parametrize("text,name,body", [
+    ("﻿---\nname: fixture-bom\n---\n\nBody after a BOM.\n", "fixture-bom", "Body after a BOM."),
+    ("---\n---\n\nEmpty frontmatter body.\n", "fixture-x", "Empty frontmatter body."),
+    ("---\nname: fixture-rule\n---\n\nPart one.\n\n---\n\nPart two.\n", "fixture-rule",
+     "Part one.\n\n---\n\nPart two."),
+    ("---\r\nname: fixture-crlf\r\n---  \r\nThe body.\r\n", "fixture-crlf", "The body."),
+])
+def test_frontmatter_edge_cases(skill_home, text, name, body):
+    folder = skill_home / "fixture-x"
+    folder.mkdir()
+    (folder / "SKILL.md").write_text(text)
+    skill = S._parse(folder / "SKILL.md")
+    assert not skill.error, skill.error
+    assert skill.name == name and skill.body == body
+
+
+def test_set_enabled_works_without_frontmatter_and_writes_atomically(skill_home, monkeypatch):
+    folder = skill_home / "fixture-plain"
+    folder.mkdir()
+    (folder / "SKILL.md").write_text("Just instructions, no frontmatter.\n")
+    trust.approve(folder)
+    S.load()
+    written = []
+    real_replace = os.replace
+    monkeypatch.setattr(S.os, "replace", lambda a, b: (written.append((a, b)), real_replace(a, b)))
+    assert S.set_enabled("fixture-plain", False) is True
+    assert written and Path(written[0][1]) == folder / "SKILL.md"
+    skill = S.get("fixture-plain")
+    assert skill.enabled is False and skill.body == "Just instructions, no frontmatter."
+    assert S.set_enabled("fixture-plain", True) is True and S.get("fixture-plain").enabled is True
+    assert not list(folder.glob(".*.tmp"))
+
+
+def test_parse_keeps_explicit_empty_lists_and_reads_quoted_booleans(skill_home):
+    folder = skill_home / "fixture-flags"
+    folder.mkdir()
+    (folder / "SKILL.md").write_text(
+        "---\nname: fixture-flags\ntriggers: []\ntools: []\nenabled: 'false'\nalways: 'no'\n"
+        "conversation_workflow: 'true'\ncontract: {}\n"
+        "metadata:\n  harbor:\n    triggers: [should not apply]\n"
+        "    tools: [{name: fixture_hidden, command: echo}]\n---\n\nBody.\n")
+    skill = S._parse(folder / "SKILL.md")
+    assert skill.triggers == [] and skill.tools == []
+    assert skill.enabled is False and skill.always is False and skill.conversation_workflow is True
+
+
+def test_workflow_fields_are_read_at_the_top_level_too(skill_home):
+    folder = skill_home / "fixture-top"
+    folder.mkdir()
+    (folder / "SKILL.md").write_text("---\nname: fixture-top\nconversation_workflow: true\n"
+                                     "contract: {read_only: true}\n---\n\nBody.\n")
+    skill = S._parse(folder / "SKILL.md")
+    assert skill.conversation_workflow is True and skill.contract == {"read_only": True}
+
+
+def test_an_overlong_body_is_reported_not_cut(skill_home):
+    folder = _folder(skill_home, SKILL.replace("Tidy the notes.", "y" * (S.MAX_BODY_CHARS + 1)))
+    trust.approve(folder)
+    skill = S.load()["fixture-notes"]
+    assert "limit" in skill.error and not skill.enabled and len(skill.body) == S.MAX_BODY_CHARS + 1
+
+
+def test_a_user_skill_cannot_take_a_bundled_skill_s_name(skill_home, tmp_path, monkeypatch):
+    bundled = tmp_path / "bundled"
+    _folder(bundled, SKILL.replace("Tidies invented notes.", "The shipped one."))
+    monkeypatch.setattr(S, "BUNDLED_SKILLS_DIR", bundled)
+    other = skill_home / "fixture-other"
+    other.mkdir()
+    (other / "SKILL.md").write_text(SKILL.replace("Tidies invented notes.", "An impostor."))
+    trust.approve(other)
+    found = S.load()
+    assert found["fixture-notes"].bundled and found["fixture-notes"].description == "The shipped one."
+    assert "ships with Harbor" in found["fixture-other"].error and not found["fixture-other"].enabled
+
+
+def test_installing_a_md_over_an_old_skill_drops_its_scripts(skill_home, tmp_path):
+    S.install(str(_folder(tmp_path / "source")))
+    assert (skill_home / "fixture-notes" / "tool.py").exists()
+    single = tmp_path / "fixture-notes.md"
+    single.write_text("---\nname: fixture-notes\n---\n\nInstructions only.\n")
+    assert S.install(str(single))["ok"]
+    assert sorted(p.name for p in (skill_home / "fixture-notes").iterdir()) == ["SKILL.md"]
+    assert S.get("fixture-notes").enabled is True
+
+
+def test_a_source_folder_holding_a_link_is_refused(skill_home, tmp_path):
+    source = _folder(tmp_path / "source")
+    (source / "secret.txt").symlink_to(tmp_path / "elsewhere.txt")
+    (tmp_path / "elsewhere.txt").write_text("fixture")
+    result = S.install(str(source))
+    assert not result["ok"] and "link" in result["error"]
+    assert not (skill_home / "fixture-notes").exists()
+
+
+# -- tools audit 5.7: explicit mentions and stop phrases --------------------------
+
+@pytest.mark.parametrize("text,hit", [
+    ("@fixture-notes please", True), ("use $fixture-notes now", True), ("(@fixture-notes)", True),
+    ("mail user@fixture-notes.com", False), ("@fixture-notes-v2 instead", False),
+    ("x$fixture-notes", False), ("ping @fixture-notes.", True),
+])
+def test_explicit_mentions_are_token_bounded(text, hit):
+    assert S.explicit_mention("fixture-notes", text) is hit
+
+
+@pytest.mark.parametrize("text,stop", [
+    ("stop the interview", True), ("Stop interviewing me", True), ("let's end this workflow", True),
+    ("don't stop the interview", False), ("please do not stop the interview", False),
+    ("never end the brainstorm", False), ("I don't want to stop the interview yet", False),
+])
+def test_a_negated_stop_phrase_is_not_a_stop(text, stop):
+    assert S.asks_to_stop_workflow(text) is stop
+
+
+def test_only_a_bare_fence_line_closes_the_frontmatter():
+    assert trust.split_frontmatter("---\na: 1\n----\n--- note\n") is None
+    assert trust.split_frontmatter("---\na: 1\n---\nbody\n") == ("a: 1\n", "body\n")
+    assert trust.split_frontmatter("no fence\n---\n") is None
