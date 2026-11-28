@@ -538,7 +538,11 @@ def _path_forms(raw: str) -> list[str]:
 
 def _speech_target(save_to: str) -> Path:
     """Where text_to_speech's `say -o` writes for this `save_to`."""
-    target = Path(save_to.strip()).expanduser()
+    raw = save_to.strip()
+    target = Path(raw).expanduser()
+    # Same naming as speech_tools.text_to_speech: a folder gets Speech.aiff inside it.
+    if raw.endswith(("/", "\\")) or target.is_dir():
+        target = target / "Speech.aiff"
     return target if target.suffix.lower() == ".aiff" else target.with_suffix(".aiff")
 
 

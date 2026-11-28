@@ -202,3 +202,45 @@ def test_a_forward_the_person_aimed_at_themselves_reaches_its_card(world, ask_mo
 def test_a_phone_number_is_never_an_email_recipient(world, ask_mode, tool, args):
     decision = ask_mode.decide(registry.REGISTRY[tool].category, args, tool)
     assert decision.tier == ask_mode.Tier.DENY and "phone number" in decision.reason
+
+
+# --- integration follow-ups: a confirmed self-send retry for forward and schedule; a named
+# recipient is never re-addressed to "me" -------------------------------------------------
+
+def test_forward_and_schedule_accept_a_confirmed_self_send_retry(world):
+    from service.tools import self_send
+    self_send.mark_turn("")
+    try:
+        _, problem = action_tools.prepare_send_recipient(
+            registry.REGISTRY["forward_email"], {"message_id": "<m@x>", "to": ME})
+        assert problem is not None and ME in problem
+        _, problem = action_tools.prepare_send_recipient(
+            registry.REGISTRY["forward_email"], {"message_id": "<m@x>", "to": ME, "confirmed_self_send": True})
+        assert problem is None
+        _, problem = action_tools.prepare_send_recipient(
+            registry.REGISTRY["schedule_send"], {"channel": "email", "to": ME, "confirmed_self_send": True,
+                                                 "when": "2099-01-01T09:00:00-08:00", "body": "Hi"})
+        assert problem is None
+        for name in ("forward_email", "schedule_send"):
+            assert "confirmed_self_send" in registry.REGISTRY[name].parameters["properties"]
+    finally:
+        self_send.mark_turn("")
+
+
+def test_a_recipient_the_person_named_is_never_rewritten_to_me(world):
+    from service.tools import self_send
+    self_send.mark_turn("Text me and Dana: hi Dana")
+    try:
+        assert action_tools._self_not_invented("Dana", "hi Dana") == "Dana"
+        self_send.mark_turn("Text myself: Harbor test")
+        assert action_tools._self_not_invented("Harbor test", "Harbor test") == "me"
+    finally:
+        self_send.mark_turn("")
+
+
+def test_a_speech_save_to_a_folder_is_checked_where_the_file_really_lands(tmp_path):
+    from service.safety import policy
+    assert policy._speech_target(str(tmp_path)) == tmp_path / "Speech.aiff"
+    assert policy._speech_target(str(tmp_path / "talk")) == tmp_path / "talk.aiff"
+    (tmp_path / "Speech.aiff").write_bytes(b"x")
+    assert "refusing to overwrite" in policy._speech_save_problem({"save_to": str(tmp_path)})
