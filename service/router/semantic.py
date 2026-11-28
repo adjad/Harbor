@@ -51,7 +51,10 @@ import re
 from service.paths import MOE_DIR
 from service.search.embedder import (EmbedUnavailable, _embed, _normalize,
                                      doc_key, embed_queries, embedding_model, embedding_target)
-from service.tools.registry import (REGISTRY, Tool, is_tool_routable, is_tool_searchable,
+# The registry is read through its module at call time, as its own helpers
+# (is_tool_searchable) do, so a later rebinding of registry.REGISTRY is seen.
+from service.tools import registry as _registry
+from service.tools.registry import (Tool, is_tool_routable, is_tool_searchable,
                                     searchable_tool_names)
 
 _CACHE_PATH = MOE_DIR / "cache" / "tool_vectors.json"
@@ -333,7 +336,7 @@ class ToolIndex:
                 self._loaded = True
 
             wanted: dict[str, list[str]] = {
-                n: _docs(t) for n, t in REGISTRY.items() if is_tool_searchable(n)
+                n: _docs(t) for n, t in _registry.REGISTRY.items() if is_tool_searchable(n)
             }
             keys = {n: [doc_key(d) for d in docs] for n, docs in wanted.items()}
 
@@ -379,7 +382,7 @@ class ToolIndex:
         if set(self._keys) != searchable:
             return True
         return any(self._keys.get(n) != [doc_key(d) for d in _docs(t)]
-                   for n, t in REGISTRY.items() if n in searchable)
+                   for n, t in _registry.REGISTRY.items() if n in searchable)
 
     async def rank(self, text: str, *, timeout: float = 10.0) -> list[tuple[str, float]]:
         """Every registered tool, scored against `text`, best first.
@@ -426,7 +429,7 @@ async def warm() -> int:
 
 
 def _allowed(name: str, *, writing: bool) -> bool:
-    tool = REGISTRY.get(name)
+    tool = _registry.REGISTRY.get(name)
     if tool is None or tool.unavailable_reason or tool.internal:
         return False
     return writing or tool.category not in _GATED_CATEGORIES

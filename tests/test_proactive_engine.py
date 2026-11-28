@@ -645,3 +645,12 @@ def test_api_routes(store, monkeypatch):
     assert client.post(f"/assistant/proactive/todos/{todo['id']}", json={"done": True}).json()["done"] is True
     assert next(t for t in snap(store)["todos"] if t["id"] == todo["id"])["done"] is True
     assert client.post(f"/assistant/proactive/todos/{todo['id']}", json={}).status_code == 422
+
+
+def test_a_value_after_a_credential_label_is_cut_from_triage_words():
+    text = "Dana needs your card CVV 482 and account number 55120 by Friday."
+    cut = triage.redact_identifiers(text)
+    assert "482" not in cut and "55120" not in cut and "Dana needs your card CVV" in cut
+    assert triage.has_identifier_value(text) and not triage.has_identifier_value(cut)
+    assert "0210" not in triage.redact_identifiers("Your routing number 0210 0002 is on file")
+    assert triage.redact_identifiers("Your CVV is on the back of the card") == "Your CVV is on the back of the card"

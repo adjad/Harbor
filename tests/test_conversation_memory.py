@@ -1596,10 +1596,18 @@ def test_caller_budget_up_to_2400_is_honoured_by_render_context():
     assert len(render_context({'facts': rows, 'passages': [], 'debug': {}}, max_chars=9000).encode()) <= 2400
 
 
-def test_a_phone_number_or_quote_elsewhere_in_the_turn_does_not_discard_a_clean_fact():
-    turn = 'Call the plumber on 555-0142. I prefer numbered notes. He said "ten o\'clock".'
+def test_a_phone_number_elsewhere_in_the_turn_does_not_discard_a_clean_fact():
+    turn = 'Call the plumber on 555-0142. I prefer numbered notes.'
     out = validated_candidates(json.dumps({'facts': [{'quote': 'I prefer numbered notes.'}]}), turn)
     assert [c['quote'] for c in out] == ['I prefer numbered notes.']
+
+
+def test_someone_elses_words_anywhere_in_the_turn_are_never_saved_as_the_users_facts():
+    # Reported speech or a quotation frames the whole turn: these are her words, not the user's.
+    for turn in ('My sister wrote this to me. I live in Berlin. I work at Acme as a nurse.',
+                 'I prefer numbered notes. He said "ten o\'clock".'):
+        quote = 'I live in Berlin.' if 'Berlin' in turn else 'I prefer numbered notes.'
+        assert validated_candidates(json.dumps({'facts': [{'quote': quote}]}), turn) == []
 
 
 def test_a_fact_that_itself_holds_contact_details_or_a_quote_is_still_suppressed():

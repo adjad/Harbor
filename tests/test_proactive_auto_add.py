@@ -1487,6 +1487,12 @@ def test_a_london_contact_is_not_a_maine_stranger(contacts, monkeypatch):
     unknown = lambda handle: autoadd.strict_contact_name(handle, region="")    # noqa: E731
     assert unknown("+442079460958") == "Priya Shah" and unknown("+3615550000") == "Budapest Office"
     assert unknown("+15551230001") == "" and unknown("+15551239999") == "" and unknown("+13612345678") == ""
+    # The label's full-number match wins over the loose one, and two names that
+    # share the last ten digits label nothing.
+    contacts({"+44 20 7946 0958": "Priya Shah", "+1 207 946 0958": "Jo Park", "+33 20 7946 0958": "Luc Roy"})
+    assert im.contact_name_for_handle("+12079460958") == "Jo Park"
+    assert im.contact_name_for_handle("+442079460958") == "Priya Shah"
+    assert im.contact_name_for_handle("+612079460958") == ""
 
 
 def test_settings_says_when_contacts_cannot_vouch_for_a_sender(contacts, monkeypatch, tmp_path):

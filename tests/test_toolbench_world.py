@@ -572,7 +572,8 @@ def test_contacts_apps_and_world_time(world, fk):
 
 def test_harbor_meta_tools(world, fk, extras):
     caps = fk["harbor_capabilities"](query="can you send texts?")
-    assert caps.startswith("Here's what Harbor can and can't do:") and "Yes — Send text messages" in caps
+    # A question about one ability gets only the rows about it, introduced as such.
+    assert caps.startswith("Here's what Harbor can and can't do about that:") and "Yes — Send text messages" in caps
     assert "**What I can do**" in fk["harbor_capabilities"]()
     assert "I'm **Harbor**" in fk["harbor_capabilities"](topic="identity")
     assert "No cloud model" in fk["harbor_capabilities"](topic="privacy")

@@ -328,7 +328,23 @@ def contact_name_for_handle(handle: str) -> str:
             if shown.strip().lower() == name:
                 return shown.strip()
             return name.title() if name.islower() else name
-    return shown.strip()
+    return shown.strip() or _loose_label(key)
+
+
+def _loose_label(key: str) -> str:
+    """The one saved name whose phone number shares `key`'s last ten digits, or "".
+
+    Labels only (contact_name_for_handle): the full-number key, which keeps the
+    country code, is tried first and is what matching that acts relies on. A
+    number saved in another country's format, or without its country code
+    where the handle has one, still gets its name on a label. Two different
+    names sharing those digits label nothing."""
+    if "@" in key or len(key) < 10:
+        return ""
+    tail = key[-10:]
+    names = {name.strip() for saved, name in _contacts.items()
+             if "@" not in saved and len(saved) >= 10 and saved[-10:] == tail and name.strip()}
+    return names.pop() if len(names) == 1 else ""
 
 
 # Digits-only projection of the message cache, for "has this number actually

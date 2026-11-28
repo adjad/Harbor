@@ -98,17 +98,27 @@ def _secret_spans(text: str) -> list[tuple[int, int]]:
     return spans
 
 
+# A credential label with a value after it ("card CVV 482", "account number 55120",
+# "routing number 0210 0002"): the value is cut, the label word stays.
+_LABELLED_VALUE = re.compile(guard._SECRET_WORD.pattern + r"[^\n.;\d]{0,20}(\d[\d -]{1,}\d)", re.I)
+
+
+def _labelled_spans(text: str) -> list[tuple[int, int]]:
+    return [m.span(1) for m in _LABELLED_VALUE.finditer(text)]
+
+
 def has_identifier_value(text: str) -> bool:
     """An identifier's value is in the text (an SSN, a card number, a secret with its value)."""
     text = text or ""
-    return bool(guard._SSN.search(text) or _card_spans(text) or _secret_spans(text))
+    return bool(guard._SSN.search(text) or _card_spans(text) or _secret_spans(text) or _labelled_spans(text))
 
 
 def redact_identifiers(text: str) -> str:
     """The text with every identifier value replaced by REDACTED; everything else unchanged."""
     text = text or ""
     for _ in range(4):
-        spans = [m.span() for m in guard._SSN.finditer(text)] + _card_spans(text) + _secret_spans(text)
+        spans = ([m.span() for m in guard._SSN.finditer(text)] + _card_spans(text) + _secret_spans(text)
+                 + _labelled_spans(text))
         if not spans:
             break
         for start, end in sorted(spans, reverse=True):

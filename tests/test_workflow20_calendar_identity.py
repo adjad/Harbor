@@ -177,9 +177,17 @@ def test_default_days_preserves_inclusive_upper_boundary_and_clamp(isolated):
 
 def test_explicit_window_excludes_end_and_default_excludes_elapsed(isolated):
     tomorrow = NOW.replace(hour=0) + timedelta(days=1)
-    isolated.sync_source("calendar", [event("elapsed", when=NOW - timedelta(minutes=1), location="Elapsed"),
+    # An event that has ended is elapsed. One that started a minute ago and
+    # runs another 59 minutes is in progress: the default read keeps it
+    # (end >= now) and says so, instead of dropping it at its start time.
+    elapsed = NOW - timedelta(hours=2)
+    isolated.sync_source("calendar", [event("elapsed", when=elapsed, location="Elapsed"),
+        event("running", when=NOW - timedelta(minutes=1), location="Running"),
         event("inside", location="Inside"), event("end", when=tomorrow, location="Tomorrow")])
-    assert "Elapsed" not in dispatch(calendar_only=True)
+    default = dispatch(calendar_only=True)
+    assert "Elapsed" not in default
+    assert "(in progress)** — Physics Midterm · Running" in default
+    assert "(in progress)** — Physics Midterm · Inside" not in default
     today = dispatch(period="today", calendar_only=True)
     assert "Elapsed" in today and "Inside" in today and "Tomorrow" not in today
 

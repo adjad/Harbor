@@ -25,10 +25,12 @@ information, and requests to perform actions. Return an empty facts list if unsu
 _SELF = re.compile(r"^(?:(?:Actually|Now|Correction)[:,]?\s+)?(?:I (?:(?:now|no longer|used to)\s+)?(?:prefer|like|love|dislike|hate|live|work|study|drive|own|use|am|have|usually|always|often|never)\b|My (?:name|sister|brother|mother|mom|father|dad|partner|wife|husband|project|job|team|routine|preference)\b)", re.I)
 _CONTEXT_RISK = re.compile(r'''\b(?:if|unless|suppose|imagine|hypothetical|example|pretend|role.?play|test|fixture|quote[ds]?|said|says|wrote|fiction|story|character|translate|rewrite|summarize|password|secret|token|api.?key|diagnos\w*|allerg\w*|medication|medicine|medical|health|cancer|diabet\w*|depress\w*|pregnan\w*|therapy|therapist|bank|salary|income|account|social.security|credit.card|ssn|passport|religio\w*|politic\w*|sexual\w*|probably|maybe|perhaps|might|guess|ignore|instruction|system|assistant)\b|["“”`>]|(?:^|\s)['‘].*?['’](?:\s|$)''', re.I | re.S)
 # Wording that frames the whole turn as something other than the user speaking
-# about themselves (an instruction to the assistant, role-play, a hypothetical).
-# These still disqualify the turn; quotations, contact details and sensitive
-# topics are judged on the sentence they sit in.
-_TURN_FRAME = re.compile(r'''\b(?:ignore|instructions?|system|assistant|pretend|role.?play|imagine|hypothetical|suppose|fiction|translate|rewrite|summarize)\b''', re.I)
+# about themselves: an instruction to the assistant, role-play, a hypothetical,
+# or someone else's words (a quotation or reported speech: "My sister wrote this
+# to me. I live in Berlin." is her letter, not the user's facts). These still
+# disqualify the turn; contact details and sensitive topics are judged on the
+# sentence they sit in.
+_TURN_FRAME = re.compile(r'''\b(?:ignore|instructions?|system|assistant|pretend|role.?play|imagine|hypothetical|suppose|fiction|translate|rewrite|summarize|quote[ds]?|said|says|wrote|writes|story|character|example)\b|["“”`>]''', re.I)
 _CONTACT = re.compile(r'\b[^\s@]+@[^\s@]+\.[^\s@]+\b|\+?\d[\d ().-]{6,}\d')
 _CORRECTION = re.compile(r'\b(?:actually|instead|no longer|anymore|used to|changed|correction|now (?:prefer|live|work))\b', re.I)
 

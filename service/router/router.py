@@ -1905,6 +1905,11 @@ _CORE_SOURCES = ["get_upcoming", "search_reminders", "summarize_messages",
                  "summarize_emails", "search_notes"]
 _ALL_SOURCES = [*_CORE_SOURCES, "view_emails", "view_messages", "triage_inbox",
                 "get_recent_activity"]
+# A recency question already starts from get_recent_activity, the cross-app
+# feed. Its drill-down readers stay the core digests: view_emails and
+# view_messages would repeat summarize_emails / summarize_messages, and
+# triage_inbox ranks what matters rather than what changed.
+_RECENCY_SOURCES = ["get_recent_activity", *_CORE_SOURCES]
 # Inbound "did I get/hear from <someone>" queries that name no channel ("email"/
 # "text") explicitly — "did I get anything from NSU", "did the professor email
 # me", "hear back from the recruiter". They're read intents, but without a
@@ -5589,7 +5594,7 @@ def rule_route(text: str, *, web_request: _WebRequest | None = None) -> RouteDec
                            "people-in-my-life query -> read-only contacts",
                            light=False))
     if _RECENT_RE.search(t) and not _TODO_RE.search(t) and not _PLANNING_RE.search(t):
-        _pre.append(_Claim("recency", list(dict.fromkeys(["get_recent_activity", *_ALL_SOURCES])),
+        _pre.append(_Claim("recency", list(_RECENCY_SOURCES),
                            "recency sweep -> get_recent_activity",
                            force="get_recent_activity"))
     # Device control contributes only when it is NOT the whole request: on its
@@ -5635,7 +5640,7 @@ def rule_route(text: str, *, web_request: _WebRequest | None = None) -> RouteDec
     # than the model reaching for a single source and calling that "what's new";
     # the other read tools ride along so it can drill down afterwards.
     if _RECENT_RE.search(t) and not _TODO_RE.search(t) and not _PLANNING_RE.search(t):
-        return _mk_scoped(list(dict.fromkeys(["get_recent_activity", *_ALL_SOURCES])),
+        return _mk_scoped(list(_RECENCY_SOURCES),
                           "recency sweep -> get_recent_activity",
                           force="get_recent_activity")
 

@@ -164,14 +164,15 @@ def test_mac_controls_declares_only_the_apps_it_scripts():
     assert {d.lower() for d in tools["mac_lock_screen"]["apple_events"]} == {"system events"}
 
 
-def test_blocked_ports_apply_to_this_mac_only_not_outside_hosts(skill, monkeypatch):
+def test_harbor_and_engine_ports_are_blocked_on_every_address(skill, monkeypatch):
+    # The profile language can't name this Mac's LAN address, so only "*:port" keeps
+    # a skill off an engine listening there (an outside host on the port is the cost).
     from service.safety import shell_sandbox
     monkeypatch.setattr(shell_sandbox, "harbor_ports", lambda: [8765])
     monkeypatch.setattr(shell_sandbox, "engine_ports", lambda: [8000])
     profile = sandbox.build_profile(skill, [], [])
-    assert '(remote ip "*:8765")' not in profile and '(remote ip "*:8000")' not in profile
-    assert '(deny network-outbound (remote ip "localhost:8765"))' in profile
-    assert '(deny network-outbound (remote ip "localhost:8000"))' in profile
+    assert '(deny network-outbound (remote ip "*:8765"))' in profile
+    assert '(deny network-outbound (remote ip "*:8000"))' in profile
 
 
 def test_sandbox_probe_uses_absolute_paths_and_names_a_nested_sandbox(monkeypatch):
@@ -180,7 +181,7 @@ def test_sandbox_probe_uses_absolute_paths_and_names_a_nested_sandbox(monkeypatc
             self.returncode, self.stderr = code, err
     monkeypatch.setenv("PATH", "/nonexistent")           # no /usr/bin on PATH
     cases = [(Done(0), "ready", True, ""),
-             (Done(71, "sandbox_apply: Operation not permitted"), "nested", False, ""),
+             (Done(71, "sandbox_apply: Operation not permitted"), "nested", False, "already running inside a sandbox"),
              (Done(1, "something else"), "broken", False, "could not be started")]
     for done, state, avail, refuse in cases:
         monkeypatch.setattr(sandbox, "_probe_cache", {})

@@ -180,8 +180,14 @@ def refusal() -> str:
     inside a sandbox, running without a second one is the documented fallback;
     where the binary exists but does not work, running anyway would silently drop
     the containment the confirmation card promises."""
-    return ("the sandbox that contains skill tools exists on this Mac but could not be started"
-            if _probe() == "broken" else "")
+    state = _probe()
+    if state == "broken":
+        return "the sandbox that contains skill tools exists on this Mac but could not be started"
+    if state == "nested":
+        # Harbor is itself inside a sandbox, so a second one cannot be applied.
+        # Running the tool anyway would drop the containment the card promises.
+        return "skill tools can't be contained here (Harbor is already running inside a sandbox)"
+    return ""
 
 
 def _q(path: Path) -> str:
@@ -258,12 +264,11 @@ def build_profile(skill_dir: Path, read_scopes: list[Path],
         ports = dict.fromkeys([*shell_sandbox.harbor_ports(), *shell_sandbox.engine_ports()])
     except Exception:  # noqa: BLE001 - the loopback deny above still applies
         ports = {}
-    # Loopback only. The profile language accepts just "*" or "localhost" as a
-    # host, so "*:port" (every host, outside ones that happen to listen on 8000
-    # or 8765 included) and "localhost:port" are the only choices; a Mac's own
-    # LAN address cannot be named, so this Mac's services are reached on
-    # loopback only, which is where Harbor and the engines bind.
-    lines += [f'(deny network-outbound (remote ip "localhost:{port}"))' for port in ports]
+    # Every host. The profile language accepts just "*" or "localhost" as a host,
+    # and this Mac's LAN address cannot be named, so "*:port" is the only rule
+    # that keeps a skill off an engine listening on that address. The cost is
+    # that an outside host on one of these ports is unreachable from a skill too.
+    lines += [f'(deny network-outbound (remote ip "*:{port}"))' for port in ports]
     return "\n".join(lines) + "\n"
 
 

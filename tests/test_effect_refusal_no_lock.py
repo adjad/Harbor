@@ -126,7 +126,8 @@ def test_schedule_send_with_an_unreadable_time_asks_and_the_user_corrects_it_in_
                     "What time should I send it?")
     assert chat.queue.added == []
     assert chat.store.unresolved_action(chat.sid) is None
-    assert _settled(chat) == [("completed", "not_sent")]
+    # The time is refused before any card, so no effect ever started and none settles.
+    assert chat.cards.shown == [] and _settled(chat) == []
 
     chat.script = [[tool_call("schedule_send", **call, when="tomorrow at 9am")], "Scheduled."]
     assert NOTICE not in _text(chat.request("tomorrow at 9am", chat.sid))

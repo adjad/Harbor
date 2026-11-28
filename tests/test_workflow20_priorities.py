@@ -228,7 +228,9 @@ def test_native_scan_cap_and_query_counts_are_separate(isolated):
         rows = []
         for index in range(5001):
             row = {**original, "id": f"cap-{index}", "source_id": f"native-{index}",
-                   "title": "Rare target" if index == 5000 else "Unrelated",
+                   # The scan reads the window oldest first (ASC), so the cap
+                   # keeps the earliest 5000 rows; the target is the last of them.
+                   "title": "Rare target" if index == 4998 else "Unrelated",
                    "when_ts": STAMP + 3601 + index}
             rows.append([row[key] for key in columns])
         db.executemany(sql, rows)

@@ -103,7 +103,7 @@ def test_a_forward_to_my_own_address_gets_no_card(world):
     assert problem is not None and ME in problem
     args, problem = action_tools.prepare_send_recipient(FORWARD, {"message_id": "<m@x>", "to": "Friend",
                                                                   "note": "See below\\nthanks"})
-    assert problem is None and args["to"] == FRIEND and args["note"] == "See below\nthanks"
+    assert problem is None and args["to"] == FRIEND and args["note"] == "See below\\nthanks"
 
 
 async def test_the_forward_tool_itself_refuses_my_own_address(world):
@@ -136,18 +136,16 @@ def test_schedule_send_settles_time_and_recipient_before_the_card(world):
     assert problem is not None                                  # unresolvable: asked before any card
 
 
-def test_the_card_shows_and_the_send_carries_the_same_degarbled_text(world):
+def test_the_card_shows_exactly_the_text_the_send_carries(world):
+    # A card is sent exactly as shown, so typed backslashes ("C:\\new") survive; the
+    # preflight leaves the text raw and the preview shows that same raw text.
     args, problem = action_tools.prepare_send_recipient(
         EMAIL, {"to": FRIEND, "subject": "It\\'s on", "body": "Hi\\nSee you at 5"})
-    assert problem is None and args["body"] == "Hi\nSee you at 5" and args["subject"] == "It's on"
-    preview = action_tools.confirm_preview("send_email", args)
-    assert "Hi\nSee you at 5" in preview and "\\n" not in preview
+    assert problem is None and args["body"] == "Hi\\nSee you at 5" and args["subject"] == "It\\'s on"
+    assert "Hi\\nSee you at 5" in action_tools.confirm_preview("send_email", args)
     text_args, _ = action_tools.prepare_send_recipient(TEXT, {"to": "Friend", "text": "On my way\\nsoon"})
-    assert text_args["text"] == "On my way\nsoon"
-    assert "\\n" not in action_tools.confirm_preview("send_message", text_args)
-    assert "\\n" not in action_tools.confirm_preview("forward_email", {"message_id": "<m@x>", "to": FRIEND,
-                                                                       "note": "a\\nb"})
-    assert "\\n" not in action_tools.confirm_preview("reply_to_email", {"message_id": "<m@x>", "body": "a\\nb"})
+    assert text_args["text"] == "On my way\\nsoon"
+    assert "On my way\\nsoon" in action_tools.confirm_preview("send_message", text_args)
 
 
 # --- tools audit 3.2: forward_email, schedule_send and cc get the same check ---
