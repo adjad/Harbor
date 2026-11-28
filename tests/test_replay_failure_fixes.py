@@ -155,10 +155,13 @@ def test_one_source_that_could_not_be_checked_carries_a_warning_instead_of_abort
     assert result.status == "completed"
     assert len(delivery.effects) == len(delivery.approved) == 1
     text = delivery.effects[0]["text"]
-    assert delivery.effects[0] == delivery.approved[0]["args"]          # the preview is what is sent
+    assert delivery.effects[0] == delivery.approved[0]["args"]          # the approved args are what is sent
     assert "Dentist" in text
-    assert "Note: Reminders could not be checked, so this may be incomplete." in text
+    note = "Note: Reminders could not be checked, so this may be incomplete."
+    assert note not in text and "may be incomplete" not in text, "the recipient never gets the note"
     assert "System Settings" not in text and "Harbor could not check" not in text
+    assert note in delivery.approved[0]["preview"], "the user sees it before approving"
+    assert note in str(result.response), "and in what Harbor reports back"
 
 
 @pytest.mark.parametrize("source", [

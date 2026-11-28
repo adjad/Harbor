@@ -42,7 +42,7 @@ def partial_source(name: str, raw: str) -> tuple[str, str] | None:
 
     The notice is model- and user-facing (it names settings to change), so it is taken out
     of what a recipient would read and replaced by one plain warning that the approval
-    preview shows and the delivered text keeps."""
+    preview and Harbor's own report show the user, and the sent message leaves out."""
     found = list(_PARTIAL_NOTICE.finditer(raw or ""))
     if not found:
         return None
@@ -71,6 +71,9 @@ def resolve_destination(recipient: str, channel: str) -> tuple[str, str]:
 async def execute_workflow(plan, emit, approver, *, test_mode=False, store=None,
                            session_id: str = "", session_store=None) -> TaskExecution:
     calls, results = [], []
+    # Notes for the USER (a source that could not be checked): shown in the approval preview
+    # and in the result, never put in the message the recipient gets.
+    user_notes: list[str] = []
     # Host evidence stays local to one approved final invocation, before any
     # display wrapper. This is in-process binding, not a cross-process token.
     draft_receipt = draft_binding = final_draft_binding = None
@@ -81,6 +84,8 @@ async def execute_workflow(plan, emit, approver, *, test_mode=False, store=None,
         and (plan.news_artifact_provenance or plan.sources == ["news"]))
 
     def finish(status, response):
+        if user_notes and status in {"completed", "succeeded"} and isinstance(response, str):
+            response = response + "\n" + "\n".join(user_notes)
         if news_used:
             response = DisplayOnlyToolResult(response, model_text=(
                 f"News delivery workflow ended with status '{status}'. "
@@ -126,7 +131,9 @@ async def execute_workflow(plan, emit, approver, *, test_mode=False, store=None,
                     "id": cid, "tool": name, "args": dict(args),
                     "reason": policy.reason,
                     "preview": (f"Requested recipient: {plan.recipient}\n"
-                                + (confirm_preview(name, args) or str(args)))})
+                                + (confirm_preview(name, args) or str(args))
+                                + (("\n\nFor you, not sent: " + " ".join(user_notes))
+                                   if effect and user_notes else ""))})
             if approved:
                 if effect and durable_execution:
                     # A plan has one durable attempt, independent of retries,
@@ -245,7 +252,7 @@ async def execute_workflow(plan, emit, approver, *, test_mode=False, store=None,
         partial = partial_source(name, raw) if status in {"succeeded", "failed"} else None
         if partial is not None:
             # One source of this read could not be checked, the rest could: go on with
-            # what was read and carry the warning into the previewed text.
+            # what was read and tell the user (preview and result), not the recipient.
             raw, warning = partial
             warnings.append(warning)
         elif status != "succeeded" or not usable_source(name, raw):
@@ -258,7 +265,7 @@ async def execute_workflow(plan, emit, approver, *, test_mode=False, store=None,
         sections.append((source, raw))
     body = plan.artifact_text or compose(sections)
     if warnings and not plan.artifact_text:
-        body += "\n\n" + "\n".join(dict.fromkeys(warnings))
+        user_notes.extend(dict.fromkeys(warnings))
     # Action tools normalize literal escapes. Reach the same fixed point
     # before approval so repeated production normalization cannot alter what
     # was approved (including nested literal escape sequences).
