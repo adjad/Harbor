@@ -59,6 +59,9 @@ _STORE = MOE_DIR / "cache" / "timers.json"
 _TIMERS: dict[str, dict] = {}
 _TASKS: dict[str, asyncio.Task] = {}
 _STOPWATCH: dict[str, object] = {}
+# The stopwatch counts wall-clock time, so one small file is enough to keep it
+# running across a backend restart.
+_STOPWATCH_STORE = MOE_DIR / "cache" / "stopwatch.json"
 _KINDS = frozenset({"timer", "alarm", "sleep"})
 
 # A sleeping timer re-reads the wall clock at least this often. asyncio sleeps
@@ -189,6 +192,7 @@ def _parse_duration(text: str) -> float | None:
     if _UNREAD_AMOUNT_RE.search(text):
         return None
     total = 0.0
+    found = False
     for amount, unit in _DUR_RE.findall(text):
         # Every spelling is listed in _UNIT outright rather than normalized by
         # stripping a trailing "s": "s".rstrip("s") is the empty string, so the
@@ -197,7 +201,12 @@ def _parse_duration(text: str) -> float | None:
         if seconds is None:
             return None
         total += float(amount) * seconds
-    if total:
+        found = True
+    if found:
+        # A minus sign is not decoration: "-5 minutes" must not become a
+        # five-minute timer. Callers reject anything at or below zero.
+        if re.search(r"(?<![\w.])-\s*\d", text):
+            return -abs(total)
         return total
     if bare:
         return float(bare.group()) * 60.0
@@ -413,7 +422,7 @@ async def set_timer(kind: str = "timer", duration: str = "", time: str = "",  # 
     if not (duration or "").strip():
         return not_done("(error: a timer needs a `duration`, e.g. '10 minutes'.)",
                         question="How long should it run?")
-    return _set_sleep_timer(duration) if kind == "sleep" else _set_countdown(duration, label)
+    return _set_sleep_timer(duration, label) if kind == "sleep" else _set_countdown(duration, label)
 
 
 def _set_countdown(duration: str, label: str = "") -> str:
@@ -456,7 +465,7 @@ def _set_alarm(time: str, label: str = "", repeat_daily: bool = False) -> str:  
         hour += 12
     elif ampm == "am" and hour == 12:
         hour = 0
-    if hour > 23 or minute > 59:
+    if (ampm and not 1 <= int(m.group(1)) <= 12) or hour > 23 or minute > 59:
         return not_done(f"(error: {time!r} isn't a valid clock time.)",
                         question="That isn't a valid time, so I didn't set an alarm. What time should it go off?")
 
@@ -476,7 +485,7 @@ def _set_alarm(time: str, label: str = "", repeat_daily: bool = False) -> str:  
     return f"Alarm set for {when_txt}{rep}."
 
 
-def _set_sleep_timer(duration: str) -> str:
+def _set_sleep_timer(duration: str, label: str = "") -> str:
     secs = _parse_duration(duration)
     if secs is None:
         return not_done(f"(error: I couldn't read {duration!r} as a length of time.)",
@@ -484,8 +493,11 @@ def _set_sleep_timer(duration: str) -> str:
     if secs <= 0:
         return not_done("(error: that duration is zero or negative.)",
                         question="That isn't a length of time I can count down, so I didn't set a sleep timer. How long should it run?")
+    if secs > 24 * 3600:
+        return not_done("(error: timers cap at 24 hours.)",
+                        question="Timers stop at 24 hours, so I didn't set a sleep timer. How long should it run?")
     tid = uuid.uuid4().hex[:8]
-    _TIMERS[tid] = {"kind": "sleep", "label": "Sleep timer",
+    _TIMERS[tid] = {"kind": "sleep", "label": label.strip() or "Sleep timer",
                     "deadline": time.time() + secs, "created": time.time()}
     _save()
     _arm(tid)
@@ -569,14 +581,45 @@ async def manage_timers(action: str = "list", label: str = "") -> str:
             "stopwatch_start/lap/read/stop.)")
 
 
+def _stopwatch_save() -> None:
+    try:
+        if _STOPWATCH.get("started") is None:
+            _STOPWATCH_STORE.unlink(missing_ok=True)
+        else:
+            private_write_bytes(_STOPWATCH_STORE, json.dumps(_STOPWATCH).encode("utf-8"))
+            _STOPWATCH_STORE.with_suffix(".tmp").unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001 — persistence is best-effort, never fatal
+        pass
+
+
+def _stopwatch_load() -> None:
+    """Restore a stopwatch that was running before a restart."""
+    try:
+        raw = json.loads(_STOPWATCH_STORE.read_text(encoding="utf-8"))
+        started = raw.get("started")
+        laps = raw.get("laps") or []
+        if (isinstance(started, bool) or not isinstance(started, (int, float))
+                or not math.isfinite(started) or started > time.time() + 1
+                or not isinstance(laps, list)):
+            return
+        _STOPWATCH.update({"started": float(started),
+                           "laps": [float(x) for x in laps
+                                    if isinstance(x, (int, float)) and not isinstance(x, bool)]})
+    except Exception:  # noqa: BLE001 — a missing or corrupt file is just "not running"
+        pass
+
+
 def _stopwatch(action: str = "read") -> str:
     action = (action or "read").strip().lower()
     now = time.time()
+    if _STOPWATCH.get("started") is None and action != "start":
+        _stopwatch_load()
     started = _STOPWATCH.get("started")
 
     if action == "start":
         _STOPWATCH.clear()
         _STOPWATCH.update({"started": now, "laps": []})
+        _stopwatch_save()
         return "Stopwatch started."
     if started is None:
         return "The stopwatch isn't running. Say 'start the stopwatch' first."
@@ -585,10 +628,12 @@ def _stopwatch(action: str = "read") -> str:
     if action == "lap":
         laps = _STOPWATCH.setdefault("laps", [])
         laps.append(elapsed)  # type: ignore[union-attr]
+        _stopwatch_save()
         return f"Lap {len(laps)}: {_human(elapsed)}."  # type: ignore[arg-type]
     if action == "stop":
         laps = _STOPWATCH.get("laps") or []
         _STOPWATCH.clear()
+        _stopwatch_save()
         extra = f" ({len(laps)} laps)" if laps else ""
         return f"Stopped at {_human(elapsed)}{extra}."
     return f"{_human(elapsed)} elapsed."

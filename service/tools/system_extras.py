@@ -78,6 +78,13 @@ def screen_capture(region: str = "screen", path: str = "") -> str:
     else:
         out = Path.home() / "Desktop" / f"screenshot-{time.strftime('%Y%m%d-%H%M%S')}.png"
     out.parent.mkdir(parents=True, exist_ok=True)
+    # A file already at this path must not be reported as the capture when
+    # the user pressed Escape: remember what it looked like before.
+    try:
+        before = out.stat()
+        before_sig = (before.st_mtime_ns, before.st_size)
+    except OSError:
+        before_sig = None
 
     argv = ["screencapture", "-x"]           # -x: no shutter sound
     if region == "window":
@@ -107,6 +114,11 @@ def screen_capture(region: str = "screen", path: str = "") -> str:
         return f"(could not capture: {msg or 'unknown error'})"
     if not out.exists():
         return "Screenshot cancelled — nothing was saved."
+    if before_sig is not None:
+        after = out.stat()
+        if (after.st_mtime_ns, after.st_size) == before_sig:
+            return (f"Screenshot cancelled — nothing new was saved. {out.name} "
+                    f"already existed and was left as it was.")
     kb = out.stat().st_size / 1024
     return f"Saved {out.name} to {out.parent} ({kb:.0f}KB)."
 
@@ -241,6 +253,12 @@ _SETTINGS = {
 }
 
 
+# What the tool's schema offers. bluetooth, low_power_mode and firewall stay in
+# _SETTINGS (a stored grant or a direct call still resolves) but are not
+# advertised: they need root, so the model must not promise them.
+_ADVERTISED = frozenset({"wifi", "do_not_disturb", "airdrop", "voiceover",
+                         "dark_mode", "auto_appearance"})
+
 _SETTING_ALIASES = {"dnd": "do_not_disturb", "focus": "do_not_disturb",
                     "donotdisturb": "do_not_disturb", "bt": "bluetooth",
                     "low_power": "low_power_mode", "battery_saver": "low_power_mode",
@@ -256,16 +274,15 @@ def setting_key(setting: str) -> str:
 
 @register(
     "toggle_setting",
-    "Turn a named macOS setting on or off: wifi, bluetooth, do_not_disturb, "
-    "low_power_mode, firewall, airdrop, voiceover, dark_mode, or auto_appearance "
-    "(follow the system light/dark schedule). It cannot change the volume.",
+    "Turn a macOS setting on or off: wifi, do_not_disturb, airdrop, voiceover, "
+    "dark_mode, auto_appearance (follows the system schedule). Not volume, "
+    "Bluetooth, Low Power Mode or the firewall (they need an admin password).",
     {
         "type": "object",
         "properties": {
             "setting": {"type": "string",
-                        "enum": ["wifi", "bluetooth", "do_not_disturb", "low_power_mode",
-                                 "firewall", "airdrop", "voiceover", "dark_mode",
-                                 "auto_appearance"],
+                        "enum": ["wifi", "do_not_disturb", "airdrop", "voiceover",
+                                 "dark_mode", "auto_appearance"],
                         "description": "Which setting to change."},
             "on": {"type": "boolean", "description": "true to enable, false to disable."},
         },
@@ -284,7 +301,8 @@ def toggle_setting(setting: str, on: bool) -> str:
     fn = _SETTINGS.get(key)
     if fn is None:
         return (f"(error: I can't toggle {setting!r}. Options: "
-                f"{', '.join(sorted(_SETTINGS))}.)")
+                f"{', '.join(sorted(_ADVERTISED))}. Bluetooth, Low Power Mode and the "
+                "firewall need an admin password, so they can't be changed from here.)")
     return fn(bool(on))
 
 

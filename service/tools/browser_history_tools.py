@@ -304,7 +304,7 @@ async def search_browser_history_impl(query: str | None = None, count: int | Non
     # with one, the range itself is the scope, so return everything in it
     # unless the caller explicitly asked for a smaller cap.
     if count is not None:
-        rows = rows[:count]
+        rows = rows[:max(1, int(count))]
     elif label is None:
         rows = rows[:10]
     if not rows:

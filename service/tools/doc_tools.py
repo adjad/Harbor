@@ -15,6 +15,17 @@ from pathlib import Path
 from service.tools.registry import register
 
 
+def _is_dir_target(raw: str, p: Path) -> bool:
+    return str(raw).rstrip().endswith(("/", "\\")) or p.is_dir()
+
+
+def _default_name(title: str, fallback: str) -> str:
+    import re
+    name = re.sub(r"[^\w\- ]+", "", title or "").strip()[:60].strip()
+    return name or fallback
+
+
+
 @register(
     "write_document",
     "Create a real Word (.docx) document with a title, paragraphs, and an "
@@ -46,6 +57,10 @@ def write_document(path: str, title: str, paragraphs: list[str] | None = None,
     import docx
 
     p = Path(path).expanduser()
+    if _is_dir_target(path, p):
+        # A folder is not a file name: save inside it instead of turning
+        # "~/Desktop" into "~/Desktop.docx".
+        p = p / (_default_name(title, "Document") + ".docx")
     if p.suffix.lower() != ".docx":
         p = p.with_suffix(".docx")
     if p.exists():
@@ -94,6 +109,8 @@ def spreadsheet_ops(path: str, headers: list[str], rows: list[list] | None = Non
     import openpyxl
 
     p = Path(path).expanduser()
+    if _is_dir_target(path, p):
+        p = p / "Spreadsheet.xlsx"
     if p.suffix.lower() != ".xlsx":
         p = p.with_suffix(".xlsx")
     if p.exists():

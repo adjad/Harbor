@@ -58,6 +58,7 @@ _MAX_POW_EXP = 1000
 # pow(base, exp, mod) never grows past the modulus, but its time grows with the
 # size of all three, and it is one C call that holds the GIL.
 _MAX_MOD_POW_BITS = 4096
+_MAX_LIST_ITEMS = 1000
 
 
 class _BadExpression(ValueError):
@@ -99,6 +100,9 @@ def _eval(node: ast.AST) -> float:
         if op is None:
             raise _BadExpression("that operator isn't allowed")
         left, right = _eval(node.left), _eval(node.right)
+        if isinstance(left, list) or isinstance(right, list):
+            # [1] * 1000000000 allocates before any size check could run.
+            raise _BadExpression("lists can't be used in arithmetic")
         if isinstance(node.op, ast.Pow):
             if abs(left) > _MAX_POW_BASE or abs(right) > _MAX_POW_EXP:
                 raise _BadExpression("that power is too large to compute")
@@ -109,7 +113,10 @@ def _eval(node: ast.AST) -> float:
         op = _UNARY.get(type(node.op))
         if op is None:
             raise _BadExpression("that operator isn't allowed")
-        return op(_eval(node.operand))
+        operand = _eval(node.operand)
+        if isinstance(operand, list):
+            raise _BadExpression("lists can't be used in arithmetic")
+        return op(operand)
     if isinstance(node, ast.Call):
         if not isinstance(node.func, ast.Name) or node.func.id not in _FUNCS:
             name = getattr(node.func, "id", "that function")
@@ -122,8 +129,42 @@ def _eval(node: ast.AST) -> float:
             return _CONSTS[node.id]
         raise _BadExpression(f"{node.id!r} isn't a known constant")
     if isinstance(node, (ast.List, ast.Tuple)):
-        return [_eval(e) for e in node.elts]  # type: ignore[return-value]
+        if len(node.elts) > _MAX_LIST_ITEMS:
+            raise _BadExpression("that list is too long")
+        items = [_eval(e) for e in node.elts]
+        if any(isinstance(i, list) for i in items):
+            raise _BadExpression("nested lists aren't supported")
+        return items  # type: ignore[return-value]
     raise _BadExpression("that isn't a plain arithmetic expression")
+
+
+def _strip_thousands(expr: str) -> str:
+    """Remove thousands separators ("1,200" -> "1200") except where the comma
+    separates list items or call arguments (sum([1,200]), max(1,200))."""
+    out: list[str] = []
+    stack: list[bool] = []   # True = brackets whose commas separate items
+    i, n = 0, len(expr)
+    while i < n:
+        ch = expr[i]
+        if ch == "[":
+            stack.append(True)
+        elif ch == "(":
+            j = len(out) - 1
+            while j >= 0 and out[j] == " ":
+                j -= 1
+            stack.append(j >= 0 and (out[j].isalnum() or out[j] == "_"))
+        elif ch in ")]":
+            if stack:
+                stack.pop()
+        elif ch == "," and not (stack and stack[-1]):
+            if (out and out[-1].isdigit() and expr[i + 1:i + 4].isdigit()
+                    and len(expr[i + 1:i + 4]) == 3
+                    and not expr[i + 4:i + 5].isalnum()):
+                i += 1
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def _tidy(value: float) -> str:
@@ -132,13 +173,17 @@ def _tidy(value: float) -> str:
             return str(value)
         if abs(value - round(value)) < 1e-12 and abs(value) < 1e15:
             return f"{int(round(value)):,}"
+        if value != 0 and round(value, 10) == 0:
+            # Too small for ten decimals: keep significant digits, not "0".
+            return f"{value:.6g}"
         return f"{round(value, 10):,}".rstrip("0").rstrip(".")
     return f"{value:,}" if isinstance(value, int) else str(value)
 
 
 # "20% of 250", "15 percent of 80" — the single most common shape of this
 # request, and not valid Python until it is rewritten.
-_PCT_OF_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:%|percent)\s+of\s+([\d.,]+)", re.I)
+_PCT_OF_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:%|percent)\s+of\s+"
+    r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?|\.\d+)", re.I)
 _PCT_BARE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%")
 
 # People say "15 times 32" as often as "15*32", and the model relays it
@@ -185,7 +230,7 @@ def calculate(expression: str) -> str:
     expr = _PCT_BARE_RE.sub(lambda m: f"({m.group(1)}/100)", expr)
     expr = expr.replace("×", "*").replace("÷", "/").replace("^", "**")
     expr = _WORD_OPS_RE.sub(lambda m: _WORD_OPS[m.group(0).lower()], expr)
-    expr = re.sub(r"(?<=\d),(?=\d{3}\b)", "", expr)   # thousands separators
+    expr = _strip_thousands(expr)
 
     if len(expr) > 500:
         return "(error: that expression is too long.)"
@@ -196,6 +241,11 @@ def calculate(expression: str) -> str:
                 f"Try something like '18% of 64.50' or '(120+35)*3'.)")
     try:
         value = _eval(tree)
+        # Formatting can fail too (an integer past Python's digit limit), so
+        # it belongs inside the same guard as the evaluation.
+        if isinstance(value, list):
+            return ", ".join(_tidy(v) for v in value)
+        return _tidy(value)
     except _BadExpression as e:
         return f"(error: {e}.)"
     except (ValueError, OverflowError, ZeroDivisionError) as e:
@@ -203,9 +253,6 @@ def calculate(expression: str) -> str:
     except TypeError:
         return (f"(error: I couldn't work out {raw!r}: a function or operator got "
                 f"values it can't use.)")
-    if isinstance(value, list):
-        return ", ".join(_tidy(v) for v in value)
-    return _tidy(value)
 
 
 # --------------------------------------------------------------------------
@@ -214,26 +261,38 @@ def calculate(expression: str) -> str:
 # Everything is defined against one base unit per dimension, so a conversion is
 # always (value * factor_from) / factor_to. Temperature is the exception —
 # it is affine, not linear — and is handled separately below.
-_LENGTH = {"mm": .001, "cm": .01, "m": 1.0, "km": 1000.0,
+_LENGTH = {"meter": 1.0, "meters": 1.0, "metre": 1.0, "metres": 1.0,
+           "kilometer": 1000.0, "kilometers": 1000.0, "kilometre": 1000.0,
+           "kilometres": 1000.0, "centimeter": .01, "centimeters": .01,
+           "millimeter": .001, "millimeters": .001,
+           "mm": .001, "cm": .01, "m": 1.0, "km": 1000.0,
            "in": .0254, "inch": .0254, "inches": .0254, "ft": .3048,
            "foot": .3048, "feet": .3048, "yd": .9144, "yard": .9144,
            "yards": .9144, "mi": 1609.344, "mile": 1609.344, "miles": 1609.344,
            "nmi": 1852.0}
-_MASS = {"mg": 1e-6, "g": .001, "kg": 1.0, "t": 1000.0, "tonne": 1000.0,
+_MASS = {"gram": .001, "grams": .001, "kilogram": 1.0, "kilograms": 1.0,
+         "kilo": 1.0, "kilos": 1.0, "milligram": 1e-6, "milligrams": 1e-6,
+         "mg": 1e-6, "g": .001, "kg": 1.0, "t": 1000.0, "tonne": 1000.0,
          "oz": .028349523125, "ounce": .028349523125, "ounces": .028349523125,
          "lb": .45359237, "lbs": .45359237, "pound": .45359237,
          "pounds": .45359237, "stone": 6.35029318, "st": 6.35029318}
 _VOLUME = {"ml": .001, "l": 1.0, "liter": 1.0, "litre": 1.0, "liters": 1.0,
            "litres": 1.0, "tsp": .00492892159375, "tbsp": .01478676478125,
            "cup": .2365882365, "cups": .2365882365,
-           "floz": .0295735295625, "pt": .473176473, "pint": .473176473,
+           "floz": .0295735295625, "fl oz": .0295735295625,
+           "fluid ounce": .0295735295625, "fluid ounces": .0295735295625,
+           "pints": .473176473, "quarts": .946352946,
+           "milliliter": .001, "milliliters": .001, "millilitre": .001,
+           "millilitres": .001, "pt": .473176473, "pint": .473176473,
            "qt": .946352946, "quart": .946352946,
            "gal": 3.785411784, "gallon": 3.785411784, "gallons": 3.785411784}
 _TIME = {"ms": .001, "s": 1.0, "sec": 1.0, "second": 1.0, "seconds": 1.0,
          "min": 60.0, "minute": 60.0, "minutes": 60.0, "h": 3600.0,
          "hr": 3600.0, "hour": 3600.0, "hours": 3600.0, "day": 86400.0,
          "days": 86400.0, "week": 604800.0, "weeks": 604800.0}
-_DATA = {"b": 1.0, "byte": 1.0, "bytes": 1.0, "kb": 1e3, "mb": 1e6, "gb": 1e9,
+_DATA = {"kilobyte": 1e3, "kilobytes": 1e3, "megabyte": 1e6, "megabytes": 1e6,
+         "gigabyte": 1e9, "gigabytes": 1e9, "terabyte": 1e12, "terabytes": 1e12,
+         "b": 1.0, "byte": 1.0, "bytes": 1.0, "kb": 1e3, "mb": 1e6, "gb": 1e9,
          "tb": 1e12, "kib": 1024.0, "mib": 1024.0 ** 2, "gib": 1024.0 ** 3,
          "tib": 1024.0 ** 4, "bit": .125, "bits": .125}
 _SPEED = {"mps": 1.0, "m/s": 1.0, "kmh": 1 / 3.6, "km/h": 1 / 3.6,
@@ -260,6 +319,12 @@ def _from_celsius(c: float, unit: str) -> float:
     return c + 273.15
 
 
+def _norm_unit(unit: str) -> str:
+    u = (unit or "").strip().lower().replace("°", " ")
+    u = re.sub(r"\bdegrees?\b", " ", u)
+    return re.sub(r"\s+", " ", u).strip()
+
+
 @register(
     "convert_units",
     "Convert a measurement between units — length, weight, volume, "
@@ -280,14 +345,18 @@ def _from_celsius(c: float, unit: str) -> float:
              "is 30 degrees hot in fahrenheit", "how many gigabytes is that"],
 )
 def convert_units(value: float, from_unit: str, to_unit: str) -> str:
-    src = (from_unit or "").strip().lower().replace("°", "").replace("degrees", "").strip()
-    dst = (to_unit or "").strip().lower().replace("°", "").replace("degrees", "").strip()
+    src = _norm_unit(from_unit)
+    dst = _norm_unit(to_unit)
     if not src or not dst:
         return "(error: convert_units needs both `from_unit` and `to_unit`.)"
+    if isinstance(value, bool):
+        return f"(error: {value!r} isn't a number.)"
     try:
         value = float(value)
     except (TypeError, ValueError):
         return f"(error: {value!r} isn't a number.)"
+    if not math.isfinite(value):
+        return f"(error: {value!r} isn't a finite number.)"
 
     if src in _TEMPS or dst in _TEMPS:
         if src not in _TEMPS or dst not in _TEMPS:
@@ -299,6 +368,8 @@ def convert_units(value: float, from_unit: str, to_unit: str) -> str:
     for dim, table in _DIMENSIONS.items():
         if src in table and dst in table:
             out = value * table[src] / table[dst]
+            if not math.isfinite(out):
+                return "(error: that value is too large to convert.)"
             return f"{_tidy(value)} {from_unit.strip()} = {_tidy(round(out, 10))} {to_unit.strip()}"
 
     known = {u for t in _DIMENSIONS.values() for u in t} | _TEMPS

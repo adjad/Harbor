@@ -16,7 +16,11 @@ from service.tools.registry import register
 
 
 def _run(argv: list[str], input_text: str | None = None) -> subprocess.CompletedProcess:
-    return subprocess.run(argv, capture_output=True, text=True, timeout=20, input=input_text)
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=20, input=input_text)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            argv, 124, "", "it did not answer within 20 seconds")
 
 
 # Keyboard backlight has no AppleScript "set volume"-style direct setter, and
@@ -146,11 +150,50 @@ def bluetooth_devices() -> str:
     return "\n".join(lines)
 
 
+def hardware_ports() -> list[tuple[str, str]]:
+    """(port name, device) pairs from `networksetup -listallhardwareports`;
+    empty when the list can't be read."""
+    p = _run(["networksetup", "-listallhardwareports"])
+    if p.returncode != 0:
+        return []
+    ports: list[tuple[str, str]] = []
+    name = ""
+    for line in p.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("Hardware Port:"):
+            name = line.split(":", 1)[1].strip()
+        elif line.startswith("Device:") and name:
+            device = line.split(":", 1)[1].strip()
+            if device:
+                ports.append((name, device))
+            name = ""
+    return ports
+
+
+def wifi_interface() -> str | None:
+    """The Wi-Fi device (en0 on most Macs, en1 on some, none on a Mac mini
+    without Wi-Fi). Falls back to en0 only when the port list can't be read."""
+    ports = hardware_ports()
+    if not ports:
+        return "en0"
+    for name, device in ports:
+        if name.lower() in ("wi-fi", "airport"):
+            return device
+    return None
+
+
+def ethernet_interfaces() -> list[str]:
+    """Wired network devices (Ethernet, USB or Thunderbolt LAN adapters)."""
+    return [device for name, device in hardware_ports()
+            if "ethernet" in name.lower() or re.search(r"\blan\b", name.lower())]
+
+
 def wifi_power(on: bool) -> str:
     """Wi-Fi radio on/off (toggle_setting setting='wifi')."""
-    # en0 is the Wi-Fi interface on virtually all Macs; networksetup -listallhardwareports
-    # could confirm it, but adds a second subprocess for a case that basically never varies.
-    p = _run(["networksetup", "-setairportpower", "en0", "on" if on else "off"])
+    iface = wifi_interface()
+    if iface is None:
+        return "(this Mac has no Wi-Fi interface to turn on or off.)"
+    p = _run(["networksetup", "-setairportpower", iface, "on" if on else "off"])
     if p.returncode != 0:
         return f"(could not change Wi-Fi power: {p.stderr.strip() or 'unknown error'})"
     return f"Wi-Fi turned {'on' if on else 'off'}"
